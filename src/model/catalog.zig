@@ -130,6 +130,7 @@ pub const entries = [_]CatalogEntry{
         .status = .supported,
         .tested_profiles = &.{
             "amd-rdna4-32gb",
+            "amd-rdna4-16gb",
             apple_silicon_profile,
             "intel-arc",
         },
