@@ -3692,7 +3692,7 @@ pub const InferenceEngine = struct {
             .K = k,
             .eps_bits = @bitCast(eps),
         };
-        const wg_x: u32 = (m + 1) / 2;
+        const wg_x: u32 = m;
         self.pushDispatch7(
             pip,
             std.mem.asBytes(&push),

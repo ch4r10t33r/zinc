@@ -57,7 +57,7 @@ layout(set = 0, binding = 4) writeonly buffer NormOut      { vec4  norm_out_v4[]
 layout(set = 0, binding = 5) writeonly buffer AlphaOut     { float alpha_out[]; };
 layout(set = 0, binding = 6) writeonly buffer BetaOut      { float beta_out[];  };
 
-const uint NUM_ROWS = 2u;
+const uint NUM_ROWS = 1u;
 
 shared float s_rms_inv;
 
