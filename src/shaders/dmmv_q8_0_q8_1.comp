@@ -7,7 +7,6 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
-#extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -35,21 +34,33 @@ const uint Q8_1_U32_PER_BLOCK = 9u; // 8 packed int8 quads + packed f16(d, d*sum
 shared float s_sum0[4];
 shared float s_sum1[4];
 
-int32_t load_q8_0_i32(uint qs_off, uint i) {
+uint load_q8_0_u32(uint qs_off, uint i) {
     const uint q_off = qs_off + i * 4u;
-    const uint packed =
+    return
         uint(a_data[q_off + 0u]) |
         (uint(a_data[q_off + 1u]) << 8) |
         (uint(a_data[q_off + 2u]) << 16) |
         (uint(a_data[q_off + 3u]) << 24);
-    return int32_t(packed);
+}
+
+int unpack_i8(uint packed, uint lane) {
+    const uint byte_val = (packed >> (lane * 8u)) & 0xffu;
+    return byte_val < 128u ? int(byte_val) : int(byte_val) - 256;
+}
+
+int dot_i8x4(uint a, uint b) {
+    int sum = 0;
+    [[unroll]] for (uint lane = 0u; lane < 4u; lane++) {
+        sum += unpack_i8(a, lane) * unpack_i8(b, lane);
+    }
+    return sum;
 }
 
 float dot_q8_0_q8_1_block(uint qs_off, uint x_block_u32, float d_a) {
     const vec2 ds_b = unpackHalf2x16(x_q81[x_block_u32 + 8u]);
-    int32_t q_sum = int32_t(0);
+    int q_sum = 0;
     [[unroll]] for (uint i = 0u; i < 8u; i++) {
-        q_sum += dotPacked4x8EXT(load_q8_0_i32(qs_off, i), int32_t(x_q81[x_block_u32 + i]));
+        q_sum += dot_i8x4(load_q8_0_u32(qs_off, i), x_q81[x_block_u32 + i]);
     }
     return float(q_sum) * d_a * ds_b.x;
 }
