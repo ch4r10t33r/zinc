@@ -273,6 +273,10 @@ pub const DmmvDispatch = struct {
     /// to fuse the per-token shared-expert (gate DMMV + up DMMV +
     /// SwiGLU) trio into one dispatch.
     pipeline_q8_0_fused_gate_up_swiglu: ?Pipeline,
+    /// Q8_0 fused shared-expert gate+up+SwiGLU plus the f32 shared gate
+    /// scalar (`ffn_gate_inp_shexp`) computed by WG 0. Saves the separate
+    /// one-row f32 DMMV before the shared down tail.
+    pipeline_q8_0_fused_gate_up_swiglu_gate: ?Pipeline,
     /// Q8_0 DMMV fused with sigmoid-gated scale-accumulate. Replaces
     /// the (down_shexp DMMV → barrier → sigmoid_scale_acc) pair on the
     /// Qwen 3.5 / 3.6 shared-expert tail when the shared down weights
@@ -602,6 +606,11 @@ pub const DmmvDispatch = struct {
             log.warn("Q8_0 fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q8_0_fused_gate_up_swiglu_gate_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_fused_gate_up_swiglu_gate.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_mod.createFromSpirvWithOptions(instance, q8_0_fused_gate_up_swiglu_gate_path, 6, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused gate+up+SwiGLU+gate shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         // Q8_0 DMMV fused with sigmoid-gated scale-accumulate. Replaces the
         // (down_shexp DMMV → barrier → sigmoid_scale_acc) pair on the
@@ -752,6 +761,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
             .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
+            .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
             .pipeline_q4k_o_proj_merge = pipeline_q4k_o_proj_merge,
             .pipeline_q4k_moe_fused_down_acc = pipeline_q4k_moe_fused_down_acc,
@@ -1222,6 +1232,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
         if (self.pipeline_q4k_o_proj_merge) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_down_acc) |*p| p.deinit();

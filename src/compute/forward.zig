@@ -1379,7 +1379,7 @@ pub const InferenceEngine = struct {
             logits_staging.mapped = @ptrCast(map_ptr);
         }
 
-        const argmax_phase0_workgroups: u32 = @max(@as(u32, 1), (config.vocab_size + 63) / 64);
+        const argmax_phase0_workgroups: u32 = @max(@as(u32, 1), @min((config.vocab_size + 63) / 64, 512));
         const argmax_partials_size = @as(vk.c.VkDeviceSize, argmax_phase0_workgroups) * 2 * @sizeOf(u32);
         var argmax_partials_buf = try Buffer.initDeviceLocal(
             instance,
@@ -6530,6 +6530,10 @@ pub const InferenceEngine = struct {
                         break :blk .none;
                     };
                     const fused_shexp_eligible = fused_shexp_kind != .none;
+                    const fused_shexp_gate_eligible = fused_shexp_kind == .q8_0 and
+                        shexp_gate != null and
+                        shexp_gate.?.info.type_ == .f32 and
+                        self.dmmv.pipeline_q8_0_fused_gate_up_swiglu_gate != null;
 
                     // Fuse the shared-expert tail (down DMMV + sigmoid_scale_acc)
                     // when down_shexp is Q8_0 and the model uses the sigmoid-gated
@@ -6546,12 +6550,13 @@ pub const InferenceEngine = struct {
                         self.elementwise.pipeline_sigmoid_scale_acc != null;
 
                     if (state.position == 0 and layer == 0) {
-                        log.info("FASTPATH: shared gate={s} up={s} down={s} gate_inp={s} fused_shexp={s} fused_tail={}", .{
+                        log.info("FASTPATH: shared gate={s} up={s} down={s} gate_inp={s} fused_shexp={s} fused_gate={} fused_tail={}", .{
                             if (gate_shexp) |t| @tagName(t.info.type_) else "none",
                             if (up_shexp) |t| @tagName(t.info.type_) else "none",
                             if (down_shexp) |t| @tagName(t.info.type_) else "none",
                             if (shexp_gate) |t| @tagName(t.info.type_) else "none",
                             @tagName(fused_shexp_kind),
+                            fused_shexp_gate_eligible,
                             fused_shexp_tail_eligible,
                         });
                     }
@@ -6661,6 +6666,7 @@ pub const InferenceEngine = struct {
                                 self.gate_buf,
                                 shexp_inter_dim,
                                 hidden_dim,
+                                if (fused_shexp_gate_eligible) shexp_gate else null,
                             ),
                             .none => {
                                 try self.dispatchDmmv(gate_shexp.?, self.ffn_norm_buf, hidden_size, self.gate_buf, shexp_inter_dim, hidden_dim);
@@ -6668,7 +6674,9 @@ pub const InferenceEngine = struct {
                             },
                         }
                         if (shexp_gate) |sg| {
-                            try self.dispatchDmmv(sg, self.ffn_norm_buf, hidden_size, self.router_logits_buf, 1, hidden_dim);
+                            if (!fused_shexp_gate_eligible) {
+                                try self.dispatchDmmv(sg, self.ffn_norm_buf, hidden_size, self.router_logits_buf, 1, hidden_dim);
+                            }
                         }
                     }
                     self.decode_cmd.computeBarrier();
@@ -6734,7 +6742,12 @@ pub const InferenceEngine = struct {
                             shexp_inter_dim,
                         );
                     }
-                    if (!can_fuse_down_acc or has_shared_expert) {
+                    // Skip the phase fence when the fused MoE path already
+                    // accumulated during moe_down and fused_shexp skipped the
+                    // standalone shared SwiGLU dispatch.
+                    const moe_acc_emitted_dispatch =
+                        !can_fuse_down_acc or (has_shared_expert and !fused_shexp_eligible);
+                    if (moe_acc_emitted_dispatch) {
                         self.decode_cmd.computeBarrier();
                     }
                     self.endProfilePhase(.moe_weighted_acc, moe_acc_phase);
@@ -8594,8 +8607,8 @@ pub const InferenceEngine = struct {
         swiglu_buf: Buffer,
         M: u32,
         K: u32,
+        shared_gate_tensor: ?*const LoadedTensor,
     ) !void {
-        const pip = &(self.dmmv.pipeline_q8_0_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
         const push = DmmvPushConstants{
             .M = M,
             .K = K,
@@ -8605,21 +8618,45 @@ pub const InferenceEngine = struct {
             .acc_mode = 0,
         };
         const wg_x: u32 = (M + 1) / 2;
-        self.pushDispatch4(
-            pip,
-            std.mem.asBytes(&push),
-            gate_tensor.gpu_buffer.handle,
-            gate_tensor.gpu_buffer.size,
-            up_tensor.gpu_buffer.handle,
-            up_tensor.gpu_buffer.size,
-            input_buf.handle,
-            input_size,
-            swiglu_buf.handle,
-            swiglu_buf.size,
-            wg_x,
-            1,
-            1,
-        );
+        if (shared_gate_tensor) |sg| {
+            const pip = &(self.dmmv.pipeline_q8_0_fused_gate_up_swiglu_gate orelse return error.ShaderNotLoaded);
+            self.pushDispatch6(
+                pip,
+                std.mem.asBytes(&push),
+                gate_tensor.gpu_buffer.handle,
+                gate_tensor.gpu_buffer.size,
+                up_tensor.gpu_buffer.handle,
+                up_tensor.gpu_buffer.size,
+                input_buf.handle,
+                input_size,
+                swiglu_buf.handle,
+                swiglu_buf.size,
+                sg.gpu_buffer.handle,
+                sg.gpu_buffer.size,
+                self.router_logits_buf.handle,
+                @sizeOf(f32),
+                wg_x,
+                1,
+                1,
+            );
+        } else {
+            const pip = &(self.dmmv.pipeline_q8_0_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
+            self.pushDispatch4(
+                pip,
+                std.mem.asBytes(&push),
+                gate_tensor.gpu_buffer.handle,
+                gate_tensor.gpu_buffer.size,
+                up_tensor.gpu_buffer.handle,
+                up_tensor.gpu_buffer.size,
+                input_buf.handle,
+                input_size,
+                swiglu_buf.handle,
+                swiglu_buf.size,
+                wg_x,
+                1,
+                1,
+            );
+        }
     }
 
     /// Fused Q8_0 pair DMMV. Used by the SSM path to compute wqkv and z/gate
