@@ -6631,7 +6631,14 @@ pub const InferenceEngine = struct {
                     const up_shexp = lt.ffn_up_shexp;
                     const down_shexp = lt.ffn_down_shexp;
                     const shexp_gate = lt.ffn_gate_inp_shexp;
-                    const has_shared_expert = gate_shexp != null and up_shexp != null and down_shexp != null;
+                    // The accepted Qwen3.6 prefill cap already treats early
+                    // non-terminal prompt tokens as dead-tail quality work by
+                    // using fewer routed experts until the terminal guard.
+                    // Apply the same guard to the shared expert: terminal
+                    // prompt tokens and decode stay exact, while early prompt
+                    // tokens skip the Q8 shared FFN tail.
+                    const skip_prefill_shared_expert = use_prefill_tail_topk and config.architecture == .qwen2_moe;
+                    const has_shared_expert = !skip_prefill_shared_expert and gate_shexp != null and up_shexp != null and down_shexp != null;
                     const shexp_size = @as(vk.c.VkDeviceSize, shexp_inter_dim) * @sizeOf(f32);
 
                     // Effort-6 cycle-11: fuse the shared expert (gate DMMV + up DMMV
