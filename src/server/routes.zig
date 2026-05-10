@@ -16,6 +16,37 @@ const tool_format = @import("tool_format.zig");
 
 const log = std.log.scoped(.routes);
 
+/// Cached three-state probe of `ZINC_TOOL_CALLING`. Negative = uncached;
+/// 0 = disabled; 1 = enabled. The check happens once per process, lazily.
+var tool_calling_state: std.atomic.Value(i8) = .init(-1);
+
+/// Return true if OpenAI-compatible tool calling is enabled. Default off
+/// (experimental). Set `ZINC_TOOL_CALLING=1` to opt in.
+/// When disabled, `tools` and `tool_calls` in chat completion requests are
+/// silently ignored, so the existing chat path runs identically to mainline.
+pub fn toolCallingEnabled() bool {
+    const cached = tool_calling_state.load(.acquire);
+    if (cached >= 0) return cached == 1;
+    const enabled = blk: {
+        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk false;
+        defer std.heap.page_allocator.free(val);
+        break :blk std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+    };
+    tool_calling_state.store(if (enabled) 1 else 0, .release);
+    if (enabled) log.info("ZINC_TOOL_CALLING=1: OpenAI-compatible tool calling enabled (experimental)", .{});
+    return enabled;
+}
+
+/// Test-only override of the tool-calling gate. Sets the cached state directly
+/// to bypass the env-var probe. Tests should reset to -1 (uncached) on exit so
+/// later tests pick up the real env value.
+fn setToolCallingForTest(enabled: bool) void {
+    tool_calling_state.store(if (enabled) 1 else 0, .release);
+}
+fn resetToolCallingForTest() void {
+    tool_calling_state.store(-1, .release);
+}
+
 const chat_reuse_max_sessions: usize = 32;
 const chat_reuse_idle_timeout_ns: i128 = 30 * 60 * std.time.ns_per_s;
 
@@ -1105,6 +1136,8 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    const tools_enabled = toolCallingEnabled();
+
     const json_arena_allocator = parsed.arena.allocator();
     const messages = parsed.value.messages;
     const roles = try json_arena_allocator.alloc([]const u8, messages.len + 1);
@@ -1114,7 +1147,8 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     var has_guiding_message = false;
     for (messages) |message| {
         if (message.role.len == 0) continue;
-        if (message.content.text.len == 0 and message.tool_calls.len == 0) continue;
+        const has_tool_calls = tools_enabled and message.tool_calls.len > 0;
+        if (message.content.text.len == 0 and !has_tool_calls) continue;
         if (std.mem.eql(u8, message.role, "system") or std.mem.eql(u8, message.role, "developer")) {
             has_guiding_message = true;
         }
@@ -1133,8 +1167,10 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
 
     for (messages) |message| {
         if (message.role.len == 0) continue;
-        // Assistant message with tool_calls but no text content — render as <tool_call> blocks
-        if (std.mem.eql(u8, message.role, "assistant") and message.content.text.len == 0 and message.tool_calls.len > 0) {
+        // Assistant message with tool_calls but no text content — render as <tool_call> blocks.
+        // Only when tool calling is enabled; otherwise the assistant turn is treated as
+        // empty and skipped (matching pre-tool-calling behavior).
+        if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.content.text.len == 0 and message.tool_calls.len > 0) {
             var rendered: std.ArrayList(u8) = .{};
             for (message.tool_calls) |tc| {
                 try rendered.appendSlice(arena_alloc, "<tool_call>\n{\"name\": \"");
@@ -1157,8 +1193,11 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         count += 1;
     }
 
-    // Convert RequestTool → ToolDefinition
-    const tools_in = parsed.value.tools;
+    // Convert RequestTool → ToolDefinition. When tool calling is disabled,
+    // pretend the request had no tools — downstream code (prompt builder,
+    // response emitter, streaming detector) sees an empty slice and runs
+    // the existing chat path unchanged.
+    const tools_in: []const RequestTool = if (tools_enabled) parsed.value.tools else &.{};
     const tools_out = try arena_alloc.alloc(tool_format.ToolDefinition, tools_in.len);
     for (tools_in, 0..) |t, ti| {
         const params_json = try std.json.Stringify.valueAlloc(arena_alloc, t.function.parameters, .{});
@@ -1180,7 +1219,7 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .top_p = parsed.value.top_p,
         .enable_thinking = parsed.value.enable_thinking,
         .tools = tools_out,
-        .tool_choice = parseToolChoice(parsed.value.tool_choice),
+        .tool_choice = if (tools_enabled) parseToolChoice(parsed.value.tool_choice) else .auto,
         .arena = arena,
     };
 }
@@ -1986,7 +2025,11 @@ fn handleChatCompletions(
         var stopped = false;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
 
-        // Streaming tool-call detector
+        // Streaming tool-call detector. The detector is allocated unconditionally
+        // (so deinit always works) but `tools_active` short-circuits the per-chunk
+        // detection logic when the request didn't ask for tools — in that case
+        // bytes flow through directly via streamText, matching mainline latency.
+        const tools_active = parsed.tools.len > 0;
         const stream_tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
         const stream_detector = try stream_tool_fmt.newStreamingDetector(allocator);
         defer {
@@ -2075,7 +2118,7 @@ fn handleChatCompletions(
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     gen_text_len = sent_text_len + cleaned_pending.len;
                     if (cleaned_pending.len > 0) {
-                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                     sent_text_len = gen_text_len;
                     stopped = true;
@@ -2108,14 +2151,14 @@ fn handleChatCompletions(
                         const pending_slice = gen_text_buf[sent_text_len..gen_text_len];
                         const safe_end_rel = lastCompleteUtf8End(pending_slice);
                         if (safe_end_rel > 0) {
-                            streamTextViaDetector(conn, pending_slice[0..safe_end_rel], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
+                            streamTextViaDetector(conn, pending_slice[0..safe_end_rel], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                         }
                         sent_text_len += safe_end_rel;
                     } else {
                         const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                         const safe_visible = lastCompleteUtf8End(visible);
                         if (safe_visible > sent_visible_len) {
-                            streamTextViaDetector(conn, visible[sent_visible_len..safe_visible], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
+                            streamTextViaDetector(conn, visible[sent_visible_len..safe_visible], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                             sent_visible_len = safe_visible;
                         }
                         sent_text_len = gen_text_len;
@@ -2145,13 +2188,13 @@ fn handleChatCompletions(
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     if (cleaned_pending.len > 0) {
-                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                 } else {
                     const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                     const cleaned_visible = trimTrailingChatArtifacts(visible);
                     if (cleaned_visible.len > sent_visible_len) {
-                        streamTextViaDetector(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator) catch return;
+                        streamTextViaDetector(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                 }
             }
@@ -2241,10 +2284,16 @@ fn handleChatCompletions(
         else
             prefixed_text;
 
-        // Parse tool calls from the response text
+        // Parse tool calls from the response text — only when the request
+        // actually carried tools (and tool calling is enabled). Skipping for
+        // tool-less requests avoids spending a parser pass on every chat
+        // completion and keeps the path identical to mainline pre-merge.
         const tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
-        const parsed_output = try tool_fmt.parseAssistantToolCalls(response_text, allocator);
-        defer {
+        const parsed_output = if (parsed.tools.len > 0)
+            try tool_fmt.parseAssistantToolCalls(response_text, allocator)
+        else
+            tool_format.ParsedAssistantOutput{ .text_content = "", .tool_calls = &.{} };
+        defer if (parsed.tools.len > 0) {
             for (parsed_output.tool_calls) |c| {
                 allocator.free(c.id);
                 allocator.free(c.name);
@@ -2252,7 +2301,7 @@ fn handleChatCompletions(
             }
             allocator.free(parsed_output.tool_calls);
             allocator.free(parsed_output.text_content);
-        }
+        };
 
         if (parsed_output.tool_calls.len > 0 and finish_reason == .stop) {
             finish_reason = .tool_calls;
@@ -2784,7 +2833,14 @@ fn streamTextViaDetector(
     any_tool_call_emitted: *bool,
     tool_call_index: *u32,
     allocator: std.mem.Allocator,
+    tools_active: bool,
 ) !void {
+    // When the request didn't carry tools (or tool calling is disabled),
+    // bypass the detector and stream bytes directly. This avoids the
+    // detector's hold-on-'<' buffering, restoring mainline streaming
+    // latency for the common no-tools path.
+    if (!tools_active) return streamText(conn, text, req_id, ts, model_name);
+
     const fr = try detector.feed(text);
     switch (fr) {
         .emit_as_content => {
@@ -3542,6 +3598,8 @@ test "parseChatRequest skips non-text blocks without failing" {
 }
 
 test "parseChatRequest accepts null content (assistant tool-call message)" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
     // Assistant turn with content: null and tool_calls is preserved in history
     // — the model needs to see the previous tool invocations rendered as
     // <tool_call> blocks so subsequent tool_results have context. Pre-tool-
@@ -3565,6 +3623,8 @@ test "parseChatRequest accepts null content (assistant tool-call message)" {
 }
 
 test "parseChatRequest parses tools and tool_choice" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
     const body =
         \\{"messages":[{"role":"user","content":"what time is it?"}],"tools":[{"type":"function","function":{"name":"get_time","description":"Get current time","parameters":{"type":"object"}}}],"tool_choice":"auto"}
     ;
@@ -3578,6 +3638,8 @@ test "parseChatRequest parses tools and tool_choice" {
 }
 
 test "parseChatRequest tool_choice none suppresses tools" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
     const body =
         \\{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"fn1","description":"d","parameters":null}}],"tool_choice":"none"}
     ;
@@ -3590,6 +3652,8 @@ test "parseChatRequest tool_choice none suppresses tools" {
 }
 
 test "parseChatRequest replays assistant tool_calls as tool_call blocks" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
     const body =
         \\{"messages":[{"role":"user","content":"call it"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{}"}}]},{"role":"tool","content":"12:00","tool_call_id":"c1"},{"role":"user","content":"thanks"}]}
     ;
