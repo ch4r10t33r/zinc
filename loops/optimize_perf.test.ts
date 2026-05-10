@@ -67,6 +67,30 @@ describe("formatCodexStreamLine", () => {
     expect(out).toContain("I will now edit the file.");
   });
 
+  test("formats current Codex agent message events", () => {
+    const line = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "DONE" } });
+    const out = formatCodexStreamLine(line);
+    expect(out).toContain("DONE");
+  });
+
+  test("formats current Codex command execution start events", () => {
+    const line = JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", command: "/bin/zsh -lc pwd", status: "in_progress" },
+    });
+    const out = formatCodexStreamLine(line);
+    expect(out).toContain("shell");
+    expect(out).toContain("/bin/zsh -lc pwd");
+  });
+
+  test("skips successful current Codex command execution output", () => {
+    const line = JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", command: "/bin/zsh -lc pwd", aggregated_output: "lots of text", exit_code: 0 },
+    });
+    expect(formatCodexStreamLine(line)).toBeNull();
+  });
+
   test("skips tool output", () => {
     const line = JSON.stringify({ type: "function_call_output", output: "lots of text..." });
     expect(formatCodexStreamLine(line)).toBeNull();

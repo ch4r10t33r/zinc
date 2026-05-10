@@ -1975,6 +1975,33 @@ export function formatCodexStreamLine(rawLine: string): string | null {
 
   const type = event.type as string | undefined;
 
+  if (type === "item.started" || type === "item.completed") {
+    const item = event.item as Record<string, unknown> | undefined;
+    const itemType = item?.type as string | undefined;
+    if (itemType === "agent_message") {
+      const text = item?.text ?? item?.message ?? item?.output_text ?? item?.content;
+      if (typeof text === "string" && text.trim()) {
+        return c("96", text.trim()) + "\n";
+      }
+      return null;
+    }
+    if (itemType === "command_execution") {
+      const command = item?.command as string | undefined;
+      if (type === "item.started" && command) {
+        return `\n${c("33", "\uD83D\uDD27 shell")}${c("2", `   $ ${command.length > 120 ? command.slice(0, 120) + "\u2026" : command}`)}\n`;
+      }
+      const exitCode = item?.exit_code;
+      if (type === "item.completed" && typeof exitCode === "number" && exitCode !== 0) {
+        return c("1;31", `  command exited with code ${exitCode}\n`);
+      }
+      return null;
+    }
+    if (itemType === "reasoning") {
+      return c("2", "  \u2026 thinking\n");
+    }
+    return null;
+  }
+
   // Agent message with text
   if (type === "message" || type === "agent") {
     const content = (event.content ?? event.message) as string | undefined;
