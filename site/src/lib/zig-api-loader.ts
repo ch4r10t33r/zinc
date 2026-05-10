@@ -96,7 +96,7 @@ export interface ZigApiIndex {
 
 interface ParsedComment extends ZigApiDocBlock { }
 
-const EXCLUDED_MODULES = new Set(['vulkan/vk.zig']);
+const EXCLUDED_MODULES = new Set(['vulkan/vk.zig', 'regression_tests.zig']);
 
 const SECTION_META = new Map<string, { title: string; description: string; order: number }>([
   [

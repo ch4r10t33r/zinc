@@ -39,6 +39,11 @@ pub const ToolCall = struct {
     arguments_json: []const u8,
 };
 
+/// Result of parsing a non-streaming assistant message: the prose the user
+/// should see and any tool invocations the model emitted. Returned by
+/// `ToolFormat.parseAssistantToolCalls` and consumed by the chat completions
+/// response builder when deciding between a `content` reply and a `tool_calls`
+/// reply.
 pub const ParsedAssistantOutput = struct {
     /// Anything outside `<tool_call>...</tool_call>` blocks.
     text_content: []const u8,
@@ -46,6 +51,10 @@ pub const ParsedAssistantOutput = struct {
     tool_calls: []const ToolCall,
 };
 
+/// Disposition of a streaming chunk after the `StreamingDetector` has inspected
+/// it. The chat completions streamer uses this to decide whether to forward
+/// bytes as a `content` delta, swallow them for further inspection, or flush
+/// a finished tool call.
 pub const FeedResult = enum {
     /// Bytes pass through to the SSE content delta.
     emit_as_content,
@@ -55,6 +64,10 @@ pub const FeedResult = enum {
     tool_call_complete,
 };
 
+/// Streaming-mode tool-call detector. The chat completions handler feeds each
+/// decoded chunk through this state machine; the detector buffers bytes that
+/// might be the start of a `<tool_call>` tag and flushes them either as
+/// content deltas or as parsed tool calls. One detector per streaming request.
 pub const StreamingDetector = struct {
     /// Bytes pending emission as content delta.
     content_pending: std.ArrayList(u8) = .{},
@@ -68,6 +81,8 @@ pub const StreamingDetector = struct {
     /// "<tool_call>" is 11 bytes; we use 24 for safety margin.
     const max_hold = 24;
 
+    /// Free the internal buffers and any pending tool-call payloads. Safe to
+    /// call once at end-of-stream regardless of how many `feed` calls happened.
     pub fn deinit(self: *StreamingDetector) void {
         self.content_pending.deinit(self.allocator);
         self.hold_buf.deinit(self.allocator);
@@ -79,6 +94,13 @@ pub const StreamingDetector = struct {
         self.pending_calls.deinit(self.allocator);
     }
 
+    /// Push the next decoded chunk into the detector and return how the caller
+    /// should react. The detector retains ownership of `chunk`'s contribution
+    /// to the internal buffer; callers should drain via `takeContentDelta` and
+    /// `takePendingToolCall` between feeds.
+    /// @param chunk Newly decoded model bytes.
+    /// @returns A `FeedResult` indicating whether content is ready to emit, a
+    ///     tool call is ready to consume, or the bytes are still being held.
     pub fn feed(self: *StreamingDetector, chunk: []const u8) !FeedResult {
         // If a previously-parsed call is waiting, announce it before processing new bytes.
         if (self.pending_calls.items.len > 0) return .tool_call_complete;
@@ -201,6 +223,10 @@ pub const StreamingDetector = struct {
         return out;
     }
 
+    /// Drain one fully parsed tool call, FIFO order. Caller takes ownership of
+    /// the returned `id`/`name`/`arguments_json` slices and must free them with
+    /// the same allocator that initialized this detector. Returns null when the
+    /// queue is empty.
     pub fn takePendingToolCall(self: *StreamingDetector) ?ToolCall {
         if (self.pending_calls.items.len == 0) return null;
         return self.pending_calls.orderedRemove(0);
@@ -216,6 +242,12 @@ pub const StreamingDetector = struct {
     }
 };
 
+/// Vtable interface to a per-template tool-call format. Lets the chat
+/// completions path render tool definitions, parse tool calls out of model
+/// output, and create matching streaming detectors without knowing whether
+/// the active template is ChatML, llama3, or anything else. Concrete
+/// implementations are minted via `forTemplate` or the per-format factories
+/// `chatmlToolFormat` / `noopToolFormat`.
 pub const ToolFormat = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -248,6 +280,9 @@ pub const ToolFormat = struct {
         ) anyerror!*StreamingDetector,
     };
 
+    /// Append the format-specific rendering of `tools` (e.g. Qwen's
+    /// `# Tools\n<tools>...</tools>` block) to `buf`, ready to be spliced into
+    /// the system message. Noop formats append nothing.
     pub fn renderToolDefinitions(
         self: ToolFormat,
         tools: []const ToolDefinition,
@@ -257,6 +292,9 @@ pub const ToolFormat = struct {
         return self.vtable.renderToolDefinitions(self.ptr, tools, buf, allocator);
     }
 
+    /// Append the format-specific tool-result message (e.g. ChatML's
+    /// `<tool_response>...</tool_response>`) to `buf`. Used when replaying
+    /// `role: "tool"` history entries into the prompt.
     pub fn renderToolResultMessage(
         self: ToolFormat,
         tool_call_id: []const u8,
@@ -267,6 +305,9 @@ pub const ToolFormat = struct {
         return self.vtable.renderToolResultMessage(self.ptr, tool_call_id, content, buf, allocator);
     }
 
+    /// Split a complete (non-streaming) assistant response into prose plus a
+    /// list of structured tool calls. Allocates the returned slices with the
+    /// caller's allocator; ownership transfers to the caller.
     pub fn parseAssistantToolCalls(
         self: ToolFormat,
         model_output: []const u8,
@@ -275,6 +316,8 @@ pub const ToolFormat = struct {
         return self.vtable.parseAssistantToolCalls(self.ptr, model_output, allocator);
     }
 
+    /// Create a fresh streaming-mode detector for one chat completion stream.
+    /// Caller owns the returned pointer and must `deinit` + `destroy` it.
     pub fn newStreamingDetector(
         self: ToolFormat,
         allocator: std.mem.Allocator,
@@ -287,6 +330,10 @@ pub const ToolFormat = struct {
 // NoopToolFormat — silent fallback for non-ChatML templates.
 // ============================================================
 
+/// Silent fallback `ToolFormat` for templates that don't have a tool-call
+/// dialect wired in (everything except ChatML today). Definition rendering is
+/// a no-op, parsing returns the model output verbatim with no tool calls, and
+/// the streaming detector treats everything as content.
 pub const NoopToolFormat = struct {
     fn render_defs(_: *anyopaque, _: []const ToolDefinition, _: *std.ArrayList(u8), _: std.mem.Allocator) !void {}
 
@@ -315,6 +362,8 @@ pub const NoopToolFormat = struct {
     var instance: u8 = 0; // dummy ctx pointer; Noop has no state
 };
 
+/// Build a `ToolFormat` backed by `NoopToolFormat`. Returned value is cheap to
+/// pass around and shares a single static instance.
 pub fn noopToolFormat() ToolFormat {
     return .{
         .ptr = @ptrCast(&NoopToolFormat.instance),
@@ -326,6 +375,9 @@ pub fn noopToolFormat() ToolFormat {
 // Factory: pick the right ToolFormat for a template kind.
 // ============================================================
 
+/// Pick the right `ToolFormat` for a chat template family. ChatML maps to the
+/// Qwen3-style `<tool_call>` dialect; everything else falls through to the
+/// no-op format (tools field accepted but silently ignored downstream).
 pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
     return switch (template_kind) {
         .chatml => chatmlToolFormat(),
@@ -533,6 +585,9 @@ const vtable_chatml = ToolFormat.VTable{
 
 var chatml_instance: u8 = 0;
 
+/// Build a `ToolFormat` that emits the Qwen3-family `<tool_call>...` dialect.
+/// Used for any template detected as ChatML. Returned value is cheap to pass
+/// around and shares a single static instance.
 pub fn chatmlToolFormat() ToolFormat {
     return .{
         .ptr = @ptrCast(&chatml_instance),

@@ -1106,6 +1106,10 @@ pub const Tokenizer = struct {
         return @tagName(self.detectTemplateKind());
     }
 
+    /// Classify the embedded chat template into a known family. Used by the
+    /// chat completions path to pick the right special tokens, generation
+    /// suffix, and tool-call format. Returns `.chatml` when no template is
+    /// embedded (the safest default for most Qwen-family GGUFs).
     pub fn detectTemplateKind(self: *const Tokenizer) TemplateKind {
         const tmpl = self.chat_template orelse return .chatml;
         if (std.mem.indexOf(u8, tmpl, "im_start") != null) return .chatml;

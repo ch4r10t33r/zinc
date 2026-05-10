@@ -1,4 +1,5 @@
 //! Platform-independent model types shared by Vulkan and Metal backends.
+//! @section Model Format & Loading
 //! The actual extraction logic lives in loader.zig (Vulkan) and will be
 //! duplicated for Metal when needed (the extraction is pure GGUF parsing,
 //! but loader.zig has Vulkan imports at the top level).

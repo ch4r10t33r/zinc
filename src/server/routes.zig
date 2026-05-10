@@ -888,6 +888,10 @@ const RequestTool = struct {
     function: RequestToolFunction = .{},
 };
 
+/// Resolution of the OpenAI `tool_choice` request field. `auto` lets the model
+/// decide whether to invoke a tool; `none` suppresses tool rendering even when
+/// `tools` is non-empty. Other OpenAI values (`required`, `{type:function,...}`)
+/// are not yet supported and downcast to `auto`.
 pub const ToolChoice = enum { auto, none };
 
 fn parseToolChoice(value: ?std.json.Value) ToolChoice {

@@ -104,6 +104,8 @@ pub const SsmDeltaNetPush = extern struct {
     y_stride_tok: u32, // floats: d_inner
 };
 
+/// Push constants for the SSM Q/K RMS-norm shader. Drives the per-group
+/// normalization applied to query and key projections inside Mamba/SSM blocks.
 pub const SsmQkNormPush = extern struct {
     d_state: u32,
     n_group: u32,
