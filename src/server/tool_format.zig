@@ -14,6 +14,14 @@ fn allocToolCallId(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "call_{d}", .{id});
 }
 
+fn isWhitespaceOnly(s: []const u8) bool {
+    for (s) |c| switch (c) {
+        ' ', '\t', '\r', '\n' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// One tool definition extracted from the request's `tools` array.
 pub const ToolDefinition = struct {
     name: []const u8,
@@ -183,11 +191,13 @@ pub const StreamingDetector = struct {
         return .hold;
     }
 
-    /// Drain pending content bytes. Returns a slice owned by the detector —
-    /// consume before next feed call.
+    /// Drain pending content bytes. The returned slice aliases the detector's
+    /// internal buffer — consume it before the next feed call (subsequent feeds
+    /// will overwrite the same allocation). The detector retains ownership and
+    /// the buffer is freed by deinit.
     pub fn takeContentDelta(self: *StreamingDetector) []const u8 {
         const out = self.content_pending.items;
-        self.content_pending = .{};
+        self.content_pending.clearRetainingCapacity();
         return out;
     }
 
@@ -416,9 +426,15 @@ fn chatml_parse_calls(
     errdefer text_buf.deinit(allocator);
 
     var search_from: usize = 0;
+    var just_emitted_call = false;
     while (std.mem.indexOfPos(u8, model_output, search_from, tool_call_open)) |open_at| {
-        // Append text between search_from and open_at to text_buf.
-        try text_buf.appendSlice(allocator, model_output[search_from..open_at]);
+        // Bytes between the previous position and the next <tool_call> open tag.
+        // When that segment is pure whitespace and follows an emitted tool_call,
+        // it's wire-format separator (the prompt template inserts a newline
+        // between blocks), not user-visible content — drop it.
+        const between = model_output[search_from..open_at];
+        const is_separator = just_emitted_call and isWhitespaceOnly(between);
+        if (!is_separator) try text_buf.appendSlice(allocator, between);
 
         const after_open = open_at + tool_call_open.len;
         const close_at = std.mem.indexOfPos(u8, model_output, after_open, tool_call_close) orelse {
@@ -482,12 +498,18 @@ fn chatml_parse_calls(
             .arguments_json = args_json,
         });
 
+        just_emitted_call = true;
         search_from = close_at + tool_call_close.len;
     }
 
-    // Append any tail after the last tool_call.
+    // Append any tail after the last tool_call. If we just emitted a call and
+    // the tail is pure whitespace, drop it for the same reason as the inter-call
+    // separator: wire format, not content.
     if (search_from < model_output.len) {
-        try text_buf.appendSlice(allocator, model_output[search_from..]);
+        const tail = model_output[search_from..];
+        if (!just_emitted_call or !isWhitespaceOnly(tail)) {
+            try text_buf.appendSlice(allocator, tail);
+        }
     }
 
     return .{

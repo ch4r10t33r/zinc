@@ -3541,22 +3541,26 @@ test "parseChatRequest skips non-text blocks without failing" {
 }
 
 test "parseChatRequest accepts null content (assistant tool-call message)" {
-    // Assistant turn that only invokes a tool has content: null. We don't
-    // yet act on tool_calls, but the request must parse and the empty
-    // assistant message must be skipped, not abort the whole request.
+    // Assistant turn with content: null and tool_calls is preserved in history
+    // — the model needs to see the previous tool invocations rendered as
+    // <tool_call> blocks so subsequent tool_results have context. Pre-tool-
+    // calling the assistant turn used to be skipped here; now it's rendered.
     const body =
         \\{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"user","content":"follow up"}]}
     ;
     var parsed = try parseChatRequest(std.testing.allocator, body);
     defer parsed.deinit();
 
-    // system + user + (assistant skipped: empty content) + user
-    try std.testing.expectEqual(@as(usize, 3), parsed.roles.len);
+    // system + user + assistant(rendered tool_calls) + user
+    try std.testing.expectEqual(@as(usize, 4), parsed.roles.len);
     try std.testing.expectEqualStrings("system", parsed.roles[0]);
     try std.testing.expectEqualStrings("user", parsed.roles[1]);
     try std.testing.expectEqualStrings("q", parsed.contents[1]);
-    try std.testing.expectEqualStrings("user", parsed.roles[2]);
-    try std.testing.expectEqualStrings("follow up", parsed.contents[2]);
+    try std.testing.expectEqualStrings("assistant", parsed.roles[2]);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "\"name\": \"f\"") != null);
+    try std.testing.expectEqualStrings("user", parsed.roles[3]);
+    try std.testing.expectEqualStrings("follow up", parsed.contents[3]);
 }
 
 test "parseChatRequest parses tools and tool_choice" {
