@@ -27,27 +27,27 @@ const scenarioOrder = ['core', 'context-medium', 'context-long', 'decode-extende
 const hiddenBenchmarkModels = new Set<string>();
 const scenarioMeta: Record<string, { label: string; short: string; eyebrow: string; description: string }> = {
   core: {
-    label: 'Quick Answer',
+    label: 'Quick',
     short: 'Quick',
-    eyebrow: 'Short prompt · short decode',
+    eyebrow: 'Short prompt',
     description: 'Headline workload for a short answer with minimal prompt overhead.',
   },
   'context-medium': {
-    label: 'Context Retrieval',
+    label: 'Context',
     short: 'Context',
-    eyebrow: 'Short retrieval prompt',
+    eyebrow: 'Retrieval',
     description: 'A retrieval-style prompt with explicit context so prompt throughput becomes visible.',
   },
   'context-long': {
-    label: 'Long Context Retrieval',
+    label: 'Long ctx',
     short: 'Long ctx',
-    eyebrow: 'Prefill-heavy workload',
+    eyebrow: 'Prefill-heavy',
     description: 'A long prompt with the answer embedded near the end to expose prefill bottlenecks.',
   },
   'decode-extended': {
     label: 'Long Decode',
     short: 'Long decode',
-    eyebrow: 'Sustained generation',
+    eyebrow: 'Generation',
     description: 'A longer generation target that stresses steady-state decode instead of a short factual completion.',
   },
 };
@@ -83,6 +83,14 @@ function formatDate(iso: string | null | undefined) {
     year: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
+  }).format(new Date(iso));
+}
+
+function formatShortDate(iso: string | null | undefined) {
+  if (!iso) return 'n/a';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
   }).format(new Date(iso));
 }
 
@@ -433,9 +441,9 @@ const jsonLd = {
 
   <section class="hero">
     <div class="hero-copy">
-      <p class="eyebrow">Benchmarks</p>
-      <h1>ZINC Benchmark Board</h1>
-      <p class="intro">Same-machine benchmark slices for RDNA and Metal. The page separates prompt processing, steady decode, and end-to-end latency so the tradeoffs are visible before the raw table.</p>
+      <p class="eyebrow">ZINC</p>
+      <h1>Benchmarks</h1>
+      <p class="intro">ZINC vs llama.cpp on the same machines.</p>
     </div>
     <div class="hero-stats">
       <article class="stat-card">
@@ -443,16 +451,16 @@ const jsonLd = {
         <strong>{targets.length}</strong>
       </article>
       <article class="stat-card">
-        <span>Benchmarked models</span>
+        <span>Models</span>
         <strong>{totalBenchmarkedModels}</strong>
       </article>
       <article class="stat-card">
-        <span>Successful runs</span>
-        <strong>{totalSuccessfulModels}</strong>
+        <span>Compared</span>
+        <strong>{totalComparedModels}</strong>
       </article>
       <article class="stat-card">
-        <span>Same-machine comparisons</span>
-        <strong>{totalComparedModels}</strong>
+        <span>Updated</span>
+        <strong>{formatShortDate(benchmarkData.generated_at)}</strong>
       </article>
     </div>
   </section>
@@ -474,8 +482,8 @@ const jsonLd = {
         </div>
         <div class="target-tab-stats">
           <div>
-            <strong>{formatMetric(target.summary?.average_decode_tps, 'tok/s')}</strong>
-            <small>core avg decode</small>
+            <strong>{formatNumber(target.summary?.average_decode_tps)}</strong>
+            <small>tok/s</small>
           </div>
           <div>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
@@ -483,7 +491,7 @@ const jsonLd = {
           </div>
           <div>
             <strong>{benchmarkedCount(target)}</strong>
-            <small>models</small>
+            <small>rows</small>
           </div>
         </div>
       </button>
@@ -511,81 +519,54 @@ const jsonLd = {
           <div>
             <p class="eyebrow">{target.machine.label}</p>
             <h2>{target.label}</h2>
-            <p class="panel-copy">{target.description}</p>
+            <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</p>
           </div>
-          <dl class="machine-card">
-            <div>
-              <dt>GPU</dt>
-              <dd>{target.machine.gpu}</dd>
-            </div>
-            <div>
-              <dt>Chip</dt>
-              <dd>{target.machine.chip ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>Memory</dt>
-              <dd>{target.machine.memory ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>Artifact</dt>
-              <dd>{formatDate(target.generated_at)}</dd>
-            </div>
-            <div>
-              <dt>Runs</dt>
-              <dd>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</dd>
-            </div>
-            <div>
-              <dt>Runner</dt>
-              <dd>{target.methodology?.runner ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>ZINC version</dt>
-              <dd>{zincProvenance.version ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>ZINC commit</dt>
-              <dd title={zincProvenance.commit ?? 'n/a'}>{formatCommit(zincProvenance.commit)}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp binary</dt>
-              <dd>{llamaCppProvenance.binary ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp version</dt>
-              <dd>{llamaCppProvenance.version ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp commit</dt>
-              <dd title={llamaCppProvenance.commit ?? 'n/a'}>{formatCommit(llamaCppProvenance.commit)}</dd>
-            </div>
-          </dl>
+          <details class="machine-details">
+            <summary>Run info</summary>
+            <dl class="machine-card">
+              <div>
+                <dt>GPU</dt>
+                <dd>{target.machine.gpu}</dd>
+              </div>
+              <div>
+                <dt>Chip</dt>
+                <dd>{target.machine.chip ?? 'n/a'}</dd>
+              </div>
+              <div>
+                <dt>Memory</dt>
+                <dd>{target.machine.memory ?? 'n/a'}</dd>
+              </div>
+              <div>
+                <dt>Artifact</dt>
+                <dd>{formatDate(target.generated_at)}</dd>
+              </div>
+              <div>
+                <dt>ZINC</dt>
+                <dd title={zincProvenance.commit ?? 'n/a'}>{formatCommit(zincProvenance.commit)}</dd>
+              </div>
+              <div>
+                <dt>llama.cpp</dt>
+                <dd title={llamaCppProvenance.commit ?? 'n/a'}>{formatCommit(llamaCppProvenance.commit)}</dd>
+              </div>
+            </dl>
+          </details>
         </header>
 
         <div class="summary-grid">
           <article class="summary-card">
-            <span>Fastest decode</span>
+            <span>Fastest</span>
             <strong>{formatMetric(target.summary?.fastest_decode_tps, 'tok/s')}</strong>
             <small>{target.summary?.fastest_model_label ?? 'n/a'}</small>
           </article>
           <article class="summary-card">
-            <span>Average prompt</span>
-            <strong>{formatMetric(target.summary?.average_prompt_tps, 'tok/s')}</strong>
-            <small>Core workload, ZINC</small>
-          </article>
-          <article class="summary-card">
-            <span>Average decode</span>
+            <span>Decode</span>
             <strong>{formatMetric(target.summary?.average_decode_tps, 'tok/s')}</strong>
-            <small>Core workload, ZINC</small>
+            <small>average</small>
           </article>
           <article class="summary-card">
-            <span>Average vs llama.cpp</span>
+            <span>llama.cpp</span>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>Core decode ratio</small>
-          </article>
-          <article class="summary-card">
-            <span>Run recipe</span>
-            <strong>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</strong>
-            <small>{target.methodology?.benchmark_style ?? 'Benchmark methodology'}</small>
+            <small>average ratio</small>
           </article>
         </div>
 
@@ -602,20 +583,15 @@ const jsonLd = {
               >
                 <div class="scenario-tab-head">
                   <span>{scenarioMeta[scenarioId]?.short ?? scenarioId}</span>
-                  <small>{scenarioMeta[scenarioId]?.eyebrow ?? scenarioId}</small>
                 </div>
                 <div class="scenario-tab-stats">
                   <div>
-                    <strong>{formatMetric(summary.avgPromptTokens, 'tok', 0)}</strong>
-                    <small>avg prompt</small>
-                  </div>
-                  <div>
-                    <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
-                    <small>ZINC decode</small>
+                    <strong>{formatNumber(summary.avgDecode)}</strong>
+                    <small>tok/s</small>
                   </div>
                   <div>
                     <strong>{formatPercent(summary.avgDecodeGap)}</strong>
-                    <small>vs llama</small>
+                    <small>llama</small>
                   </div>
                 </div>
               </button>
@@ -640,65 +616,55 @@ const jsonLd = {
             >
               <article class="scenario-banner">
                 <div>
-                  <p class="eyebrow">{scenarioMeta[scenarioId]?.eyebrow ?? 'Benchmark workload'}</p>
                   <h3>{scenarioMeta[scenarioId]?.label ?? scenarioId}</h3>
-                  <p>{scenarioMeta[scenarioId]?.description ?? 'Scenario benchmark slice.'}</p>
                 </div>
                 <div class="scenario-highlights">
                   <span class="info-chip">
                     <strong>{summary.count}</strong>
-                    models · {summary.comparedCount} compared
+                    rows
                   </span>
                   <span class="info-chip">
-                    <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
-                    avg prefill
+                    <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
+                    decode
                   </span>
                   <span class="info-chip">
-                    <strong>{summary.fastestModelLabel ?? 'n/a'}</strong>
-                    {summary.fastestDecode != null ? ` · ${formatMetric(summary.fastestDecode, 'tok/s')}` : ' · no decode result'}
+                    <strong>{formatPercent(summary.avgDecodeGap)}</strong>
+                    llama
                   </span>
-                  {summary.closestModelLabel && (
-                    <span class:list={['info-chip', ratioTone(summary.closestRatio)]}>
-                      <strong>{summary.closestModelLabel}</strong>
-                      {summary.closestRatio != null ? ` · ${formatPercent(summary.closestRatio)}` : ' · n/a'}
-                    </span>
-                  )}
                 </div>
               </article>
 
               <div class="scenario-readout" aria-label={`${scenarioMeta[scenarioId]?.label ?? scenarioId} summary`}>
                 <article class="readout-card">
-                  <span>Average decode</span>
+                  <span>Decode</span>
                   <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
-                  <small>{formatPercent(summary.avgDecodeGap)} of llama.cpp across compared rows</small>
+                  <small>{formatPercent(summary.avgDecodeGap)} of llama.cpp</small>
                 </article>
                 <article class="readout-card">
-                  <span>Average prefill</span>
+                  <span>Prefill</span>
                   <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
-                  <small>{formatMetric(summary.avgPromptTokens, 'prompt tok', 0)} average prompt size</small>
+                  <small>{formatMetric(summary.avgPromptTokens, 'prompt tok', 0)}</small>
                 </article>
                 <article class="readout-card">
-                  <span>Fastest ZINC row</span>
+                  <span>Fastest</span>
                   <strong>{summary.fastestModelLabel ?? 'n/a'}</strong>
                   <small>{formatMetric(summary.fastestDecode, 'tok/s')}</small>
                 </article>
                 <article class="readout-card">
-                  <span>Closest to llama.cpp</span>
+                  <span>Closest</span>
                   <strong>{summary.closestModelLabel ?? 'n/a'}</strong>
-                  <small>{formatPercent(summary.closestRatio)} decode ratio</small>
+                  <small>{formatPercent(summary.closestRatio)}</small>
                 </article>
               </div>
 
               <article class="board-card">
                 <header class="board-head">
                   <div>
-                    <h3>Head-to-Head</h3>
-                    <p>Decode ranking first, then detailed prefill, decode, and overall measurements. Bars are normalized within this workload and target.</p>
+                    <h3>Decode</h3>
                   </div>
                   <div class="legend">
                     <span><i class="legend-swatch zinc"></i>ZINC</span>
                     <span><i class="legend-swatch baseline"></i>llama.cpp</span>
-                    <span><i class="legend-swatch neutral"></i>ZINC as % of llama.cpp</span>
                   </div>
                 </header>
 
@@ -715,7 +681,7 @@ const jsonLd = {
                           <span class="rank-chip">#{rank + 1}</span>
                           <div>
                             <strong>{row.model.label}</strong>
-                            <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {rowStatus.label}</small>
+                            <small>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
                           </div>
                         </div>
                         <div class="rank-bars">
@@ -743,110 +709,119 @@ const jsonLd = {
                   })}
                 </div>
 
-                <div class="mobile-bench-list" aria-label="Detailed benchmark cards">
-                  {rankedRows.map((row) => {
-                    const zincPrompt = promptValue(row.scenario);
-                    const baselinePrompt = baselinePromptValue(row.scenario);
-                    const zincDecode = decodeValue(row.scenario);
-                    const baselineDecode = baselineDecodeValue(row.scenario);
-                    const zincEndToEnd = endToEndValue(row.scenario);
-                    const baselineEndToEnd = baselineEndToEndValue(row.scenario);
-                    const zincLatency = totalLatencyValue(row.scenario);
-                    const baselineLatency = baselineTotalLatencyValue(row.scenario);
-                    const promptRatio = promptRatioValue(row.scenario);
-                    const decodeRatio = decodeRatioValue(row.scenario);
-                    const endToEndRatio = endToEndRatioValue(row.scenario);
-                    const rowStatus = scenarioStatus(row.scenario);
+                <details class="mobile-detail-details">
+                  <summary>
+                    <strong>Details</strong>
+                  </summary>
+                  <div class="mobile-bench-list" aria-label="Detailed benchmark cards">
+                    {rankedRows.map((row) => {
+                      const zincPrompt = promptValue(row.scenario);
+                      const baselinePrompt = baselinePromptValue(row.scenario);
+                      const zincDecode = decodeValue(row.scenario);
+                      const baselineDecode = baselineDecodeValue(row.scenario);
+                      const zincEndToEnd = endToEndValue(row.scenario);
+                      const baselineEndToEnd = baselineEndToEndValue(row.scenario);
+                      const zincLatency = totalLatencyValue(row.scenario);
+                      const baselineLatency = baselineTotalLatencyValue(row.scenario);
+                      const promptRatio = promptRatioValue(row.scenario);
+                      const decodeRatio = decodeRatioValue(row.scenario);
+                      const endToEndRatio = endToEndRatioValue(row.scenario);
+                      const rowStatus = scenarioStatus(row.scenario);
 
-                    return (
-                      <article class="mobile-model">
-                        <header class="mobile-model-head">
-                          <div>
-                            <strong>{row.model.label}</strong>
-                            <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
-                          </div>
-                          <span class:list={['status-pill', rowStatus.tone]}>{rowStatus.label}</span>
-                        </header>
+                      return (
+                        <article class="mobile-model">
+                          <header class="mobile-model-head">
+                            <div>
+                              <strong>{row.model.label}</strong>
+                              <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
+                            </div>
+                            <span class:list={['status-pill', rowStatus.tone]}>{rowStatus.label}</span>
+                          </header>
 
-                        <div class="mobile-metric">
-                          <div class="mobile-metric-head">
-                            <span>Prefill</span>
-                            <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
-                          </div>
-                          <div class="bar-line">
-                            <span>ZINC</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill zinc" style={`width: ${barWidth(zincPrompt, promptMax)}%;`}></i>
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Prefill</span>
+                              <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
                             </div>
-                            <strong>{formatMetric(zincPrompt, 'tok/s')}</strong>
-                          </div>
-                          <div class="bar-line baseline">
-                            <span>llama</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill baseline" style={`width: ${barWidth(baselinePrompt, promptMax)}%;`}></i>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincPrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincPrompt, 'tok/s')}</strong>
                             </div>
-                            <strong>{formatMetric(baselinePrompt, 'tok/s')}</strong>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselinePrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselinePrompt, 'tok/s')}</strong>
+                            </div>
                           </div>
-                        </div>
 
-                        <div class="mobile-metric">
-                          <div class="mobile-metric-head">
-                            <span>Decode</span>
-                            <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
-                          </div>
-                          <div class="bar-line">
-                            <span>ZINC</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Decode</span>
+                              <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
                             </div>
-                            <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
-                          </div>
-                          <div class="bar-line baseline">
-                            <span>llama</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
                             </div>
-                            <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            </div>
                           </div>
-                        </div>
 
-                        <div class="mobile-metric">
-                          <div class="mobile-metric-head">
-                            <span>Overall</span>
-                            <strong class:list={['ratio-pill', ratioTone(endToEndRatio)]}>{formatPercent(endToEndRatio)}</strong>
-                          </div>
-                          <div class="bar-line">
-                            <span>ZINC</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill zinc" style={`width: ${barWidth(zincEndToEnd, endToEndMax)}%;`}></i>
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Overall</span>
+                              <strong class:list={['ratio-pill', ratioTone(endToEndRatio)]}>{formatPercent(endToEndRatio)}</strong>
                             </div>
-                            <strong>{formatMetric(zincEndToEnd, 'tok/s')}</strong>
-                          </div>
-                          <div class="bar-line baseline">
-                            <span>llama</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill baseline" style={`width: ${barWidth(baselineEndToEnd, endToEndMax)}%;`}></i>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincEndToEnd, endToEndMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincEndToEnd, 'tok/s')}</strong>
                             </div>
-                            <strong>{formatMetric(baselineEndToEnd, 'tok/s')}</strong>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineEndToEnd, endToEndMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineEndToEnd, 'tok/s')}</strong>
+                            </div>
+                            <small class="latency-note">Latency: ZINC {formatMetric(zincLatency, 'ms', 0)} · llama.cpp {formatMetric(baselineLatency, 'ms', 0)}</small>
                           </div>
-                          <small class="latency-note">Latency: ZINC {formatMetric(zincLatency, 'ms', 0)} · llama.cpp {formatMetric(baselineLatency, 'ms', 0)}</small>
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </details>
 
-                <div class="table-wrap">
-                  <table class="bench-table">
-                    <thead>
-                      <tr>
-                        <th>Model</th>
-                        <th>Prefill</th>
-                        <th>Decode</th>
-                        <th>Overall</th>
-                      </tr>
-                    </thead>
-                    <tbody>
+                <details class="raw-table-details">
+                  <summary>
+                    <strong>Raw data</strong>
+                  </summary>
+                  <div class="table-wrap">
+                    <table class="bench-table">
+                      <thead>
+                        <tr>
+                          <th>Model</th>
+                          <th>Prefill</th>
+                          <th>Decode</th>
+                          <th>Overall</th>
+                        </tr>
+                      </thead>
+                      <tbody>
                       {rows.map((row) => {
                         const zincPrompt = promptValue(row.scenario);
                         const baselinePrompt = baselinePromptValue(row.scenario);
@@ -983,9 +958,10 @@ const jsonLd = {
                           </tr>
                         );
                       })}
-                    </tbody>
-                  </table>
-                </div>
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
               </article>
             </section>
           );
@@ -1683,6 +1659,57 @@ const jsonLd = {
     background: var(--bench-surface-plain);
   }
 
+  .raw-table-details {
+    margin-top: 0.85rem;
+    border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+    padding-top: 0.65rem;
+  }
+
+  .raw-table-details summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    gap: 0.8rem;
+    align-items: center;
+    color: var(--color-text);
+  }
+
+  .raw-table-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .raw-table-details summary::after {
+    content: '+';
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.45rem;
+    height: 1.45rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    color: var(--color-text-muted);
+    font-weight: 800;
+  }
+
+  .raw-table-details[open] summary::after {
+    content: '-';
+  }
+
+  .raw-table-details summary strong,
+  .raw-table-details summary small {
+    display: block;
+  }
+
+  .raw-table-details summary small {
+    color: var(--color-text-muted);
+    margin-top: 0.08rem;
+  }
+
+  .raw-table-details .table-wrap {
+    margin-top: 0.7rem;
+  }
+
   .bench-table {
     width: 100%;
     min-width: 1080px;
@@ -2107,6 +2134,10 @@ const jsonLd = {
       display: none;
     }
 
+    .raw-table-details {
+      display: none;
+    }
+
     .mobile-bench-list {
       display: grid;
       gap: 0;
@@ -2114,6 +2145,709 @@ const jsonLd = {
 
     .method-summary {
       flex-direction: column;
+    }
+  }
+
+  /* Visual reset: make the benchmark page read like a dense performance tool. */
+  :global(main.container) {
+    --bench-accent: #c45c13;
+    --bench-control: #334155;
+    --bench-control-soft: color-mix(in srgb, #334155 7%, var(--color-bg) 93%);
+    --bench-surface: var(--color-bg);
+    --bench-surface-plain: color-mix(in srgb, var(--color-bg) 97%, var(--color-bg-alt) 3%);
+    --bench-surface-soft: color-mix(in srgb, var(--color-bg-alt) 62%, var(--color-bg) 38%);
+    --bench-tab-active: color-mix(in srgb, var(--bench-control) 10%, var(--color-bg) 90%);
+    --bench-table-head-bg: color-mix(in srgb, var(--color-bg-alt) 88%, var(--color-bg) 12%);
+    --bench-table-head-text: color-mix(in srgb, var(--color-text) 86%, var(--bench-control) 14%);
+    --bench-row-odd: var(--color-bg);
+    --bench-row-even: color-mix(in srgb, var(--color-bg-alt) 48%, var(--color-bg) 52%);
+    --bench-meter-track: color-mix(in srgb, var(--color-border) 54%, var(--color-bg-alt) 46%);
+    --bench-shadow: none;
+  }
+
+  .hero {
+    align-items: start;
+    padding-bottom: 1.15rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .eyebrow {
+    color: var(--bench-accent);
+  }
+
+  .hero h1 {
+    max-width: 12ch;
+  }
+
+  .hero-stats {
+    align-self: stretch;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .stat-card,
+  .summary-card,
+  .scenario-banner,
+  .machine-card,
+  .readout-card {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .stat-card {
+    min-height: 5.1rem;
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .stat-card:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .stat-card:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .target-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.35rem;
+    padding: 0.35rem;
+    margin: 1rem 0 1.15rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+  }
+
+  .target-tab {
+    padding: 0.78rem 2.35rem 0.78rem 0.85rem;
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .target-tab::before {
+    border-color: color-mix(in srgb, var(--color-text-muted) 50%, transparent);
+  }
+
+  .target-tab.active,
+  .scenario-tab.active {
+    border-color: color-mix(in srgb, var(--bench-control) 28%, var(--color-border) 72%);
+    background: var(--bench-control-soft);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bench-control) 10%, transparent);
+  }
+
+  .target-tab:hover,
+  .scenario-tab:hover {
+    border-color: color-mix(in srgb, var(--bench-control) 30%, var(--color-border) 70%);
+    background: color-mix(in srgb, var(--bench-control-soft) 72%, var(--bench-surface-plain) 28%);
+  }
+
+  .target-tab.active::before {
+    border-color: var(--bench-accent);
+    background: radial-gradient(circle at center, var(--bench-accent) 0 42%, transparent 45%);
+  }
+
+  .panel-header {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.65rem;
+    padding-bottom: 0.9rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .panel-header h2 {
+    font-size: clamp(1.55rem, 2.2vw, 2rem);
+  }
+
+  .machine-card {
+    padding: 0;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 0.45rem 1.15rem;
+  }
+
+  .machine-card dt {
+    font-size: 0.66rem;
+  }
+
+  .machine-card dd {
+    font-size: 0.85rem;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .summary-card {
+    min-width: 0;
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .summary-card:last-child {
+    border-right: 0;
+  }
+
+  .scenario-tabs {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.25rem;
+    padding: 0.28rem;
+    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
+  }
+
+  .scenario-tab {
+    padding: 0.58rem 0.68rem 0.62rem 0.82rem;
+  }
+
+  .scenario-tab::before {
+    top: 0.58rem;
+    bottom: 0.58rem;
+    background: color-mix(in srgb, var(--color-border) 58%, transparent);
+  }
+
+  .scenario-tab.active::before {
+    background: var(--bench-accent);
+  }
+
+  .scenario-banner {
+    padding: 0.15rem 0 0.1rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+  }
+
+  .scenario-banner h3 {
+    font-size: 1.16rem;
+  }
+
+  .scenario-highlights {
+    justify-content: end;
+  }
+
+  .info-chip {
+    background: var(--bench-surface-plain);
+    border-color: color-mix(in srgb, var(--color-border) 78%, transparent);
+  }
+
+  .scenario-readout {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .readout-card {
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .readout-card:last-child {
+    border-right: 0;
+  }
+
+  .board-card,
+  .method-card {
+    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
+    background: var(--bench-surface);
+  }
+
+  .board-card {
+    padding: 1rem;
+  }
+
+  .decode-rank,
+  .table-wrap {
+    border-radius: 8px;
+  }
+
+  .rank-chip {
+    background: color-mix(in srgb, var(--bench-accent) 10%, transparent);
+    color: var(--bench-accent);
+  }
+
+  .bar-fill.zinc {
+    background: linear-gradient(90deg, #b45309, #d97706);
+  }
+
+  .ratio-pill.caution {
+    background: color-mix(in srgb, #f59e0b 20%, transparent);
+  }
+
+  @media (max-width: 1100px) {
+    .machine-card {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .summary-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .summary-card:nth-child(3n) {
+      border-right: 0;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .scenario-banner {
+      grid-template-columns: 1fr;
+    }
+
+    .scenario-highlights {
+      justify-content: start;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .hero {
+      gap: 0.85rem;
+      padding-bottom: 0.9rem;
+    }
+
+    .hero h1 {
+      max-width: 10ch;
+    }
+
+    .hero-stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stat-card {
+      min-height: 4.75rem;
+      padding: 0.75rem;
+    }
+
+    .target-tabs {
+      grid-template-columns: 1fr;
+      margin: 0.85rem 0 1rem;
+    }
+
+    .target-tab {
+      padding-top: 0.72rem;
+      padding-bottom: 0.72rem;
+    }
+
+    .machine-card {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      padding: 0;
+    }
+
+    .summary-grid,
+    .scenario-readout {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .summary-card,
+    .readout-card {
+      border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+      border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+    }
+
+    .summary-card:nth-child(2n),
+    .readout-card:nth-child(2n) {
+      border-right: 0;
+    }
+
+    .summary-card:last-child {
+      grid-column: 1 / -1;
+      border-bottom: 0;
+    }
+
+    .readout-card:nth-last-child(-n + 2) {
+      border-bottom: 0;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: 1fr;
+    }
+
+    .scenario-tab {
+      padding: 0.58rem 0.62rem 0.62rem 0.82rem;
+    }
+
+    .board-card {
+      padding: 0.85rem;
+    }
+  }
+
+  /* Minimal pass: remove prose-heavy benchmark chrome. */
+  .hero {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1.8rem;
+    align-items: center;
+  }
+
+  .hero h1 {
+    max-width: none;
+    margin-bottom: 0.25rem;
+  }
+
+  .intro {
+    font-size: 1rem;
+  }
+
+  .hero-stats {
+    display: flex;
+    align-self: center;
+    border: 0;
+    background: transparent;
+    border-radius: 0;
+    overflow: visible;
+    gap: 0;
+  }
+
+  .stat-card {
+    min-width: 6.6rem;
+    min-height: auto;
+    padding: 0 0.85rem;
+    border: 0;
+    border-left: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .stat-card:first-child {
+    border-left: 0;
+  }
+
+  .stat-card span,
+  .summary-card span {
+    display: block;
+    font-size: 0.64rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .stat-card strong {
+    margin-top: 0.08rem;
+    font-size: 1rem;
+  }
+
+  .target-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 0.25rem;
+  }
+
+  .target-tab {
+    display: grid;
+    grid-template-columns: minmax(6rem, auto) minmax(0, 1fr);
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.72rem 0.85rem;
+  }
+
+  .target-tab::before {
+    display: none;
+  }
+
+  .target-tab-head {
+    margin: 0;
+  }
+
+  .target-tab-head small {
+    display: none;
+  }
+
+  .target-tab-stats {
+    justify-self: end;
+    width: min(100%, 19rem);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .target-tab-stats strong,
+  .scenario-tab-stats strong {
+    font-size: 0.86rem;
+    white-space: nowrap;
+  }
+
+  .target-tab-stats small,
+  .scenario-tab-stats small {
+    font-size: 0.64rem;
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .panel-copy {
+    margin-top: 0.25rem;
+    font-size: 0.9rem;
+  }
+
+  .machine-details {
+    justify-self: end;
+    position: relative;
+  }
+
+  .machine-details summary {
+    list-style: none;
+    cursor: pointer;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 999px;
+    padding: 0.34rem 0.72rem;
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+
+  .machine-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .machine-details[open] summary {
+    color: var(--color-text);
+  }
+
+  .machine-details .machine-card {
+    margin-top: 0.65rem;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scenario-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .scenario-tab {
+    min-width: 0;
+  }
+
+  .scenario-tab-head {
+    margin-bottom: 0.28rem;
+  }
+
+  .scenario-tab-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scenario-banner {
+    align-items: center;
+    padding: 0.62rem 0 0.54rem;
+  }
+
+  .scenario-banner h3 {
+    font-size: 1.05rem;
+  }
+
+  .scenario-highlights {
+    gap: 0.32rem;
+  }
+
+  .info-chip {
+    padding: 0.24rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+  }
+
+  .scenario-readout {
+    display: none;
+  }
+
+  .board-head {
+    align-items: center;
+    margin-bottom: 0.55rem;
+  }
+
+  .board-head h3 {
+    font-size: 1rem;
+    letter-spacing: 0;
+  }
+
+  .legend {
+    font-size: 0.72rem;
+  }
+
+  .rank-row {
+    padding: 0.68rem 0.78rem;
+  }
+
+  .rank-model small,
+  .rank-ratio small {
+    font-size: 0.78rem;
+  }
+
+  .mobile-detail-details {
+    display: none;
+  }
+
+  .mobile-detail-details summary,
+  .raw-table-details summary {
+    min-height: 2.3rem;
+  }
+
+  .mobile-detail-details summary strong,
+  .raw-table-details summary strong {
+    font-size: 0.92rem;
+  }
+
+  @media (max-width: 760px) {
+    .hero {
+      grid-template-columns: 1fr;
+      gap: 0.35rem;
+    }
+
+    .hero h1 {
+      max-width: none;
+      font-size: clamp(2.25rem, 14vw, 3.2rem);
+    }
+
+    .intro,
+    .hero-stats,
+    .machine-details,
+    .summary-grid,
+    .scenario-banner {
+      display: none;
+    }
+
+    .target-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin: 0.75rem 0 0.9rem;
+    }
+
+    .target-tab {
+      grid-template-columns: 1fr;
+      gap: 0.48rem;
+      padding: 0.66rem;
+    }
+
+    .target-tab-stats {
+      justify-self: stretch;
+      width: 100%;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .target-tab-stats div:nth-child(3) {
+      display: none;
+    }
+
+    .panel-header {
+      align-items: start;
+      padding-bottom: 0.65rem;
+    }
+
+    .panel-header h2 {
+      font-size: 1.5rem;
+    }
+
+    .panel-copy {
+      font-size: 0.82rem;
+      line-height: 1.4;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.24rem;
+      padding: 0.24rem;
+    }
+
+    .scenario-tab {
+      padding: 0.55rem 0.58rem;
+    }
+
+    .scenario-tab::before {
+      display: none;
+    }
+
+    .scenario-tab-stats small {
+      display: none;
+    }
+
+    .board-card {
+      padding: 0.72rem;
+    }
+
+    .board-head {
+      flex-direction: row;
+      align-items: center;
+    }
+
+    .legend span:nth-child(2) {
+      display: inline-flex;
+    }
+
+    .rank-row {
+      grid-template-columns: 1fr;
+      gap: 0.48rem;
+      padding: 0.74rem 0.68rem;
+    }
+
+    .rank-model {
+      grid-template-columns: auto 1fr auto;
+    }
+
+    .rank-model small {
+      display: none;
+    }
+
+    .rank-ratio {
+      grid-auto-flow: column;
+      justify-content: start;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .rank-ratio small {
+      display: block;
+    }
+
+    .mobile-detail-details {
+      display: block;
+      margin-top: 0.65rem;
+      border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+      padding-top: 0.5rem;
+    }
+
+    .mobile-detail-details summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--color-text);
+    }
+
+    .mobile-detail-details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .mobile-detail-details summary::after {
+      content: '+';
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.35rem;
+      height: 1.35rem;
+      border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+      border-radius: 999px;
+      color: var(--color-text-muted);
+      font-weight: 800;
+    }
+
+    .mobile-detail-details[open] summary::after {
+      content: '-';
+    }
+
+    .mobile-detail-details[open] .mobile-bench-list {
+      display: grid;
+      gap: 0;
+      margin-top: 0.6rem;
+    }
+
+    .method-card {
+      display: none;
     }
   }
 </style>
