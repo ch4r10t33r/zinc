@@ -1243,6 +1243,20 @@ pub const InferenceEngine = struct {
     a3b_gate_capture: ?Buffer = null,
     a3b_capture_max_tokens: u32 = 0,
 
+    // A3b production enablement: layer-major prefill needs to replay one
+    // layer at a time over all prompt tokens while reading/writing each
+    // token's hidden state from a strided scratch buffer. Defaults preserve
+    // the normal full-token decodeStep path. Future A3b production code can
+    // set these before calling decodeStep to execute [start, end) without
+    // duplicating the attention/SSM/MoE layer bodies.
+    partial_decode_start_layer: u32 = 0,
+    partial_decode_end_layer: u32 = 0, // 0 means config.n_layers
+    partial_decode_hidden_in: ?vk.c.VkBuffer = null,
+    partial_decode_hidden_in_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_hidden_out: ?vk.c.VkBuffer = null,
+    partial_decode_hidden_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_advance_position: bool = true,
+
     // Scratch buffers for the Vulkan/RDNA batched prefill path (lazy-init,
     // reused across prefill calls). Sized to hold all N prompt tokens at
     // once so dmmv_q4k_batch + rope_batched + flash_attn_batched can each
@@ -4531,6 +4545,16 @@ pub const InferenceEngine = struct {
         const shexp_inter_dim = if (config.shared_expert_intermediate_dim > 0) config.shared_expert_intermediate_dim else inter_dim;
         // Hybrid models: every Nth layer is full attention, rest are SSM/linear attention
         const full_attn_interval = if (config.full_attn_interval > 0) config.full_attn_interval else 1;
+        const layer_start = @min(self.partial_decode_start_layer, config.n_layers);
+        const requested_layer_end = if (self.partial_decode_end_layer == 0) config.n_layers else self.partial_decode_end_layer;
+        const layer_end = @min(@max(requested_layer_end, layer_start), config.n_layers);
+        const has_partial_hidden_in = self.partial_decode_hidden_in != null;
+        const has_partial_hidden_out = self.partial_decode_hidden_out != null;
+        const partial_layer_decode = layer_start != 0 or
+            layer_end != config.n_layers or
+            has_partial_hidden_in or
+            has_partial_hidden_out or
+            !self.partial_decode_advance_position;
 
         // Log MoE dimensions once (first decode)
         if (state.generated_tokens.items.len == 0 and is_moe) {
@@ -4540,8 +4564,10 @@ pub const InferenceEngine = struct {
         // 1. CPU: dequantize embedding
         const track_decode_timing = self.profile_enabled or self.prefill_active;
         const cpu_embed_start = if (track_decode_timing) std.time.nanoTimestamp() else 0;
-        try self.embedToken(token_id);
-        if (collect_output and state.generated_tokens.items.len == 0 and config.architecture == .gpt_oss) {
+        if (!has_partial_hidden_in) {
+            try self.embedToken(token_id);
+        }
+        if (!has_partial_hidden_in and collect_output and state.generated_tokens.items.len == 0 and config.architecture == .gpt_oss) {
             const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
             const staging_f32: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
             log.info("EMBED_CHECK pos={d} token={d}: type={s} emb[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
@@ -4580,16 +4606,26 @@ pub const InferenceEngine = struct {
         // memory visibility — add an explicit compute→compute barrier.
         if (self.prefill_pipeline_mode) self.decode_cmd.computeBarrier();
 
+        if (self.partial_decode_hidden_in) |hidden_in| {
+            const region = vk.c.VkBufferCopy{
+                .srcOffset = self.partial_decode_hidden_in_offset,
+                .dstOffset = 0,
+                .size = hidden_size,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, hidden_in, self.hidden_buf.handle, 1, &region);
+            self.decode_cmd.transferToComputeBarrier();
+        }
+
         // Reset profiling timestamps for this token
         self.resetTimestamps();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
 
-        for (0..config.n_layers) |layer_idx| {
+        for (layer_start..layer_end) |layer_idx| {
             const layer: u32 = @intCast(layer_idx);
             const lt = self.layer_tensors[layer_idx];
 
             // --- Upload embedding (only first layer) ---
-            if (layer == 0) {
+            if (layer == 0 and !has_partial_hidden_in) {
                 const embed_phase = self.beginProfilePhase();
                 // During prefill, prefillBatch pre-dequantized every prompt
                 // embedding row into prefill_embed_big. Read from there with
@@ -7957,8 +7993,8 @@ pub const InferenceEngine = struct {
         // or norm_buf for those — the next prefill token overwrites hidden_buf via
         // embedding upload before needing any derived state.
         const have_gpu_argmax = self.argmax.pipeline != null and self.argmax_descriptor_set != null;
-        const need_logits_readback = collect_output and (self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax);
-        if (collect_output) {
+        const need_logits_readback = collect_output and !partial_layer_decode and (self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax);
+        if (collect_output and !partial_layer_decode) {
             const final_tail_phase = self.beginProfilePhase();
 
             // Final RMS norm: hidden_buf → norm_buf
@@ -8124,6 +8160,15 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.final_copy, final_copy_phase);
             self.endProfilePhase(.final_tail, final_tail_phase);
         }
+        if (self.partial_decode_hidden_out) |hidden_out| {
+            self.decode_cmd.computeToTransferBarrier();
+            const region = vk.c.VkBufferCopy{
+                .srcOffset = 0,
+                .dstOffset = self.partial_decode_hidden_out_offset,
+                .size = hidden_size,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &region);
+        }
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
         try self.decode_cmd.end();
@@ -8226,7 +8271,9 @@ pub const InferenceEngine = struct {
         }
         self.recordProfilingSample();
 
-        state.position += 1;
+        if (self.partial_decode_advance_position) {
+            state.position += 1;
+        }
     }
 
     // -----------------------------------------------------------------------
