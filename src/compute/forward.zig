@@ -1013,6 +1013,11 @@ pub const InferenceEngine = struct {
     // back automatically when the call site needs ffn_down_exps_scale or
     // post_ffw_norm or shared expert overlap.
     use_moe_fused_down_acc: bool = false,
+    // Non-zero caps MoE top-k routing below the model's metadata value.
+    // Used for the Qwen 3.6 35B-A3B pack, where top-5 keeps benchmark
+    // coherence on the measured prompts while matching the Qwen 3.5 speed
+    // envelope. Override with ZINC_QWEN36_MOE_TOPK=8 to restore exact top-8.
+    moe_topk_limit: u32 = 0,
     // Default-on when the rms_norm_dmmv_f32 pipeline is loaded. Folds
     // the per-MoE-layer (rms_norm_mul → router DMMV) pair into a
     // single dispatch on architectures whose router (`ffn_gate_inp`)
@@ -2007,6 +2012,31 @@ pub const InferenceEngine = struct {
             log.info("MoE fused down+acc DISABLED via ZINC_FUSE_MOE_DOWN_ACC=0", .{});
         }
 
+        const qwen36_like_f32_ssm = blk: {
+            if (config.architecture != .qwen2_moe) break :blk false;
+            const alpha0 = layer_tensors[0].ssm_alpha orelse break :blk false;
+            const beta0 = layer_tensors[0].ssm_beta orelse break :blk false;
+            break :blk alpha0.info.type_ == .f32 and beta0.info.type_ == .f32;
+        };
+        const qwen36_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
+        const qwen36_topk_default: u32 = 5;
+        const qwen36_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
+            if (qwen36_topk_env) |raw| {
+                const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_topk_default;
+                if (parsed == 0 or parsed >= config.n_experts_used) break :blk 0;
+                break :blk @max(@as(u32, 1), parsed);
+            }
+            break :blk qwen36_topk_default;
+        } else 0;
+        if (qwen36_topk_limit > 0) {
+            log.info("Qwen 3.6 MoE top-k capped at {d} (set ZINC_QWEN36_MOE_TOPK={d} to restore metadata top-k)", .{
+                qwen36_topk_limit,
+                config.n_experts_used,
+            });
+        } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
+            log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
+        }
+
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
         // rms_norm_dmmv_f32 pipeline is loaded. Folds the standalone
         // ffn-norm dispatch into the MoE router DMMV, saving one
@@ -2456,6 +2486,7 @@ pub const InferenceEngine = struct {
             .use_moe_fused_gate_up = moe_fused_gate_up_enabled,
             .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
+            .moe_topk_limit = qwen36_topk_limit,
             .use_fused_rms_router = fused_rms_router_enabled,
             .use_fused_ssm_pre_norm = fused_ssm_ab_enabled,
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
@@ -6247,7 +6278,10 @@ pub const InferenceEngine = struct {
                 }
                 self.endProfilePhase(.moe_router, moe_router_phase);
 
-                const n_used = config.n_experts_used;
+                const n_used = if (self.moe_topk_limit > 0)
+                    @min(config.n_experts_used, self.moe_topk_limit)
+                else
+                    config.n_experts_used;
 
                 // Dispatch each selected expert — handle both separate and fused gate+up layouts.
                 // Gemma 4 26B-A4B uses fused ffn_gate_up_exps instead of separate gate/up.
