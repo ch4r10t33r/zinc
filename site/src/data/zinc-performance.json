@@ -28,15 +28,15 @@
         }
       },
       "methodology": {
-        "runner": "zinc cli + remote llama.cpp baseline",
-        "benchmark_style": "remote repeated multi-scenario runs over SSH with per-model same-machine llama.cpp baselines",
+        "runner": "ZINC CLI with same-host llama.cpp baselines",
+        "benchmark_style": "SSH-orchestrated scenario matrix on the RDNA node",
         "notes": [
-          "ZINC runs use the remote ReleaseFast build with RADV_PERFTEST=coop_matrix.",
-          "llama.cpp comparison runs on the RDNA node against the same model file, preferably through one per-model llama-server launch reused across the scenario matrix.",
-          "Each model runs a scenario matrix: core prompt, medium context, long context, and extended decode.",
-          "Use --all-models to auto-discover GGUFs on the RDNA node instead of the default reference set.",
-          "If remote llama-server is unavailable, the suite falls back to remote llama-cli for baseline collection.",
-          "The suite assumes the remote node is already in a clean benchmark state unless --rdna-sync / --rdna-build / --rdna-start-llama are provided."
+          "Measurements are collected on a single AMD Radeon AI PRO R9700 node. ZINC and llama.cpp use the same GGUF file for each model.",
+          "ZINC is built in ReleaseFast mode and run with RADV cooperative matrix support enabled.",
+          "Each model is evaluated across four scenarios: short prompt, medium context, long context, and extended decode.",
+          "Reported values are medians from the measured runs after the warmup pass.",
+          "llama.cpp is measured through a per-model llama-server when available, reused across the scenario matrix; otherwise the suite records llama-cli results.",
+          "Published runs assume the benchmark node is dedicated to the test, with no competing GPU workload."
         ],
         "runs": 3,
         "warmup_runs": 1
@@ -5723,16 +5723,16 @@
         }
       },
       "methodology": {
-        "runner": "zinc cli + local llama.cpp baseline",
-        "benchmark_style": "multi-scenario repeated CLI runs with same-model local llama.cpp comparison",
+        "runner": "ZINC CLI with same-host llama.cpp baselines",
+        "benchmark_style": "Local Apple Silicon scenario matrix",
         "notes": [
-          "ZINC is measured from the local ReleaseFast build in the current workspace.",
-          "Each model runs a scenario matrix: core prompt, medium context, long context, and extended decode.",
-          "Gemma and GPT-OSS cases use chat-template mode; Qwen cases use raw completion mode to avoid visible thinking scaffolds in CLI output.",
-          "Default Metal reference cases resolve from the managed model cache in ~/Library/Caches/zinc/models/models.",
-          "Use --metal-pull-missing to install missing managed models through `zinc model pull` before the suite runs.",
-          "When available, llama.cpp is measured from one local llama-server launch per model so the same loaded model can serve the whole scenario matrix.",
-          "If llama-server is unavailable, the suite falls back to local llama-cli for same-model CLI comparison."
+          "Measurements are collected on the local Apple Silicon machine. ZINC and llama.cpp use the same GGUF file for each model.",
+          "ZINC is built in ReleaseFast mode from the current workspace.",
+          "Each model is evaluated across four scenarios: short prompt, medium context, long context, and extended decode.",
+          "Reported values are medians from the measured runs after the warmup pass.",
+          "Managed catalog models are resolved from the ZINC model cache when available.",
+          "llama.cpp is measured through a per-model llama-server when available, reused across the scenario matrix; otherwise the suite records llama-cli results.",
+          "Published runs assume no competing local workload is saturating CPU, memory bandwidth, or GPU."
         ],
         "runs": 3,
         "warmup_runs": 1
