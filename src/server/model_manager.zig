@@ -255,6 +255,8 @@ pub const ModelManager = struct {
                 .required_vram_bytes = entry.required_vram_bytes,
                 .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
                 .exact = false,
+                .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+                .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
             };
             // Currently-active entries are kept even when the catalog's
             // conservative required_vram_bytes exceeds the live budget —
@@ -328,6 +330,8 @@ pub const ModelManager = struct {
             .required_vram_bytes = entry.required_vram_bytes,
             .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
             .exact = false,
+            .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+            .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
         };
         return catalog_mod.supportsProfile(entry, self.catalogProfile()) and fit.fits_current_gpu;
     }
