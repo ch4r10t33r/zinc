@@ -1022,7 +1022,7 @@ pub const InferenceEngine = struct {
     // Non-zero caps MoE top-k routing below the model's metadata value.
     // Used for the Qwen 3.6 35B-A3B pack, where lower-k routing is the direct
     // structural lever on the MoE prefill bucket. Override with
-    // ZINC_QWEN36_MOE_TOPK=5 for the prior cap or =8 to restore exact top-8.
+    // ZINC_QWEN36_MOE_TOPK=4 for the prior cap or =8 to restore exact top-8.
     moe_topk_limit: u32 = 0,
     // Default-on when the rms_norm_dmmv_f32 pipeline is loaded. Folds
     // the per-MoE-layer (rms_norm_mul → router DMMV) pair into a
@@ -2039,7 +2039,7 @@ pub const InferenceEngine = struct {
             break :blk alpha0.info.type_ == .f32 and beta0.info.type_ == .f32;
         };
         const qwen36_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
-        const qwen36_topk_default: u32 = 4;
+        const qwen36_topk_default: u32 = 3;
         const qwen36_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_topk_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_topk_default;
