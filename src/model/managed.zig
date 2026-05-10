@@ -1135,6 +1135,50 @@ test "writeManifest then readInstalledManifest round-trips offloadable_vram_byte
     try std.testing.expectEqual(@as(?u64, 19_327_352_832), manifest.offloadable_vram_bytes);
 }
 
+test "describeFit uninstalled returns catalog estimate with fit_state populated" {
+    // Synthesize a CatalogEntry whose id is unique enough that isInstalled()
+    // returns false against any real cache root. This exercises the
+    // catalog-estimate branch of describeFit without filesystem fixtures.
+    const synthetic = catalog.CatalogEntry{
+        .id = "phase-e-test-fixture-not-installed-zzzz",
+        .display_name = "Phase E Fixture",
+        .release_date = "2099-12-31",
+        .family = "qwen3.5",
+        .format = "gguf",
+        .quantization = "Q4_K_XL",
+        .file_name = "fixture.gguf",
+        .homepage_url = "",
+        .download_url = "",
+        .sha256 = "",
+        .size_bytes = 22 * 1024 * 1024 * 1024,
+        .required_vram_bytes = 22 * 1024 * 1024 * 1024,
+        .offloadable_vram_bytes = 18 * 1024 * 1024 * 1024,
+        .default_context_length = 4096,
+        .recommended_for_chat = false,
+        .thinking_stable = true,
+        .status = .experimental,
+        .tested_profiles = &.{},
+    };
+
+    // 16 GiB budget: doesn't fit straight (22 > 16), fits with offload (4 <= 16).
+    const fit = try describeFit(synthetic, 16 * 1024 * 1024 * 1024, std.testing.allocator);
+    try std.testing.expectEqual(false, fit.fits_current_gpu);
+    try std.testing.expectEqual(false, fit.exact);
+    try std.testing.expectEqual(catalog.FitState.fits_with_offload, fit.fit_state);
+    try std.testing.expectEqual(@as(u64, 22 * 1024 * 1024 * 1024), fit.required_vram_bytes);
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), fit.required_vram_with_offload_bytes);
+
+    // 32 GiB budget: fits straight. fit_state collapses to .fits.
+    const big_fit = try describeFit(synthetic, 32 * 1024 * 1024 * 1024, std.testing.allocator);
+    try std.testing.expectEqual(true, big_fit.fits_current_gpu);
+    try std.testing.expectEqual(catalog.FitState.fits, big_fit.fit_state);
+
+    // 2 GiB budget: too small even with offload.
+    const small_fit = try describeFit(synthetic, 2 * 1024 * 1024 * 1024, std.testing.allocator);
+    try std.testing.expectEqual(false, small_fit.fits_current_gpu);
+    try std.testing.expectEqual(catalog.FitState.does_not_fit, small_fit.fit_state);
+}
+
 test "readInstalledManifest tolerates old format without offloadable_vram_bytes" {
     // Backward compat: manifests written before the offload field was added
     // must still parse, with offloadable_vram_bytes = null. describeFit then

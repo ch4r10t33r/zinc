@@ -2225,15 +2225,28 @@ test "resolveCheckTarget prefers managed model id over raw gguf path" {
 ///
 /// Returns an allocated slice owned by the caller.
 fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
+    return resolveShaderDirFrom(allocator, std.fs.cwd(), null);
+}
+
+/// Test-friendly variant: probe `base_dir` for the cwd-relative candidates,
+/// then fall back to `exe_dir_override/../share/zinc/shaders` (or the
+/// running executable's directory when override is null).
+fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.fs.Dir, exe_dir_override: ?[]const u8) ![]u8 {
     const candidates = [_][]const u8{
         "zig-out/share/zinc/shaders",
         "share/zinc/shaders",
     };
     for (candidates) |candidate| {
-        std.fs.cwd().access(candidate, .{}) catch continue;
+        base_dir.access(candidate, .{}) catch continue;
         return allocator.dupe(u8, candidate);
     }
     // Derive from the running executable's directory: bin/../share/zinc/shaders
+    if (exe_dir_override) |exe_dir| {
+        const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
+        errdefer allocator.free(derived);
+        std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
+        return derived;
+    }
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
@@ -2241,6 +2254,50 @@ fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
     errdefer allocator.free(derived);
     std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
     return derived;
+}
+
+test "resolveShaderDirFrom finds first cwd-relative candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("zig-out/share/zinc/shaders");
+    const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("zig-out/share/zinc/shaders", result);
+}
+
+test "resolveShaderDirFrom falls back to second candidate when first missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("share/zinc/shaders");
+    const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("share/zinc/shaders", result);
+}
+
+test "resolveShaderDirFrom falls back to exe-relative when cwd has nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Build an installed layout: <prefix>/bin/zinc with shaders at
+    // <prefix>/share/zinc/shaders. POSIX path resolution requires each
+    // component on the way to ".." to exist as a real directory, so create
+    // both bin/ and share/zinc/shaders/.
+    try tmp.dir.makePath("install/bin");
+    try tmp.dir.makePath("install/share/zinc/shaders");
+    const bin_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "install/bin");
+    defer std.testing.allocator.free(bin_dir);
+
+    var empty = std.testing.tmpDir(.{});
+    defer empty.cleanup();
+    const result = try resolveShaderDirFrom(std.testing.allocator, empty.dir, bin_dir);
+    defer std.testing.allocator.free(result);
+    // The derived path is bin_dir + ../share/zinc/shaders → install/share/zinc/shaders.
+    try std.testing.expect(std.mem.endsWith(u8, result, "share/zinc/shaders"));
+}
+
+test "resolveShaderDirFrom returns ShaderDirNotFound when no path exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.ShaderDirNotFound, resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/this/path/has/no/shaders"));
 }
 
 fn makeTestTokenizer(chat_template: ?[]const u8) tokenizer_mod.Tokenizer {

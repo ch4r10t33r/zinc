@@ -3722,6 +3722,27 @@ test "parseChatRequest with gate off forces tool_choice to auto" {
     try std.testing.expectEqual(@as(usize, 0), parsed.tools.len);
 }
 
+test "toolCallingEnabled cache state machine" {
+    const prev = tool_calling_state.load(.acquire);
+    defer tool_calling_state.store(prev, .release);
+
+    // Forced-on cache → returns true, cache unchanged.
+    tool_calling_state.store(1, .release);
+    try std.testing.expect(toolCallingEnabled());
+    try std.testing.expectEqual(@as(i8, 1), tool_calling_state.load(.acquire));
+
+    // Forced-off cache → returns false, cache unchanged.
+    tool_calling_state.store(0, .release);
+    try std.testing.expect(!toolCallingEnabled());
+    try std.testing.expectEqual(@as(i8, 0), tool_calling_state.load(.acquire));
+
+    // Uncached → probes env, then caches the result. We don't control the
+    // env here, but the post-call cache must be 0 or 1 (no longer -1).
+    tool_calling_state.store(-1, .release);
+    _ = toolCallingEnabled();
+    try std.testing.expect(tool_calling_state.load(.acquire) >= 0);
+}
+
 test "prefixThinkingEnvelope adds think prefix when enabled" {
     var buf: [128]u8 = undefined;
     const prefixed = try prefixThinkingEnvelope("17 * 24 = 408\n</think>\n408", true, &buf);
