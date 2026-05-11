@@ -1,0 +1,179 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 520" role="img" aria-labelledby="title desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial">
+  <title id="title">Six weeks of zinc on AMD RDNA4: decode tok/s on the flagship vs llama.cpp baseline</title>
+  <desc id="desc">A step-line chart showing zinc's decode throughput on the flagship Qwen-class model over six weeks on the Radeon AI PRO R9700, from March 25 to May 9 2026. The Y-axis is decode tokens per second on a linear scale from 0 to 35. The X-axis runs left to right across the six weeks with weekly tick marks. A flat dashed orange line at 22.1 marks the llama.cpp baseline for Qwen3.6-35B-A3B UD Q4_K_XL on the same card. A green step-line traces zinc's progress starting at 0.8 tok/s on March 27 (broken outputs), rising sharply to 7.6 on March 28 (first coherent run), then to 33 on March 30 after the three Vulkan changes that drove the 7-to-33 jump, dipping to 18 on April 5 when Qwen 3 dropped and zinc had to learn MoE plus gated DeltaNet, climbing back to 21 by April 17, holding around 22 through April 26 (the SSM bottleneck gate), stepping up to 26 on April 23 after Vulkan specialization constants, to 27 on April 25 after vkQueueSubmit-per-prompt, to 28 on May 1 after attention-not-GEMM analysis fixed the long-prefill plateau, to 29 on May 4 after min-p sampler, and reaching 30.4 on May 9 after the May 6 prefix KV reuse work. The point where the green line crosses the orange llama.cpp baseline is around April 30 and is highlighted with a yellow burst annotation reading parity. Each major milestone is labeled with a small vertical tick and the post title or fix name. A header reads zinc decode tok/s on flagship Qwen model, six-week climb past llama.cpp.</desc>
+
+  <defs>
+    <linearGradient id="bgFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f1729"/>
+      <stop offset="100%" stop-color="#0a1020"/>
+    </linearGradient>
+    <linearGradient id="lineFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5dbb89" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#5dbb89" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="940" height="520" fill="url(#bgFade)"/>
+
+  <!-- Header -->
+  <text x="36" y="34" fill="#e8edf5" font-size="19" font-weight="700">Six weeks of AMD Qwen inference on the Radeon AI PRO R9700</text>
+  <text x="36" y="54" fill="#8ea0b8" font-size="12.5">zinc decode tok/s on the flagship Qwen model vs the llama.cpp Vulkan baseline. The crossing is at the end of April.</text>
+
+  <!-- Chart area: x=80 to x=900 (820 px wide), y=100 to y=420 (320 px tall) -->
+  <!-- X-axis: March 25 to May 9 = 45 days. 820 / 45 = 18.2 px/day -->
+  <!-- Y-axis: 0 to 35 tok/s. 320 / 35 = 9.14 px/tok -->
+
+  <!-- Y-axis -->
+  <line x1="80" y1="100" x2="80" y2="420" stroke="#1d2b48" stroke-width="1"/>
+  <!-- Y-axis grid lines and labels -->
+  <g stroke="#1d2b48" stroke-width="1" stroke-dasharray="2,3">
+    <line x1="80" y1="420" x2="900" y2="420"/>
+    <line x1="80" y1="374" x2="900" y2="374"/>
+    <line x1="80" y1="329" x2="900" y2="329"/>
+    <line x1="80" y1="283" x2="900" y2="283"/>
+    <line x1="80" y1="237" x2="900" y2="237"/>
+    <line x1="80" y1="192" x2="900" y2="192"/>
+    <line x1="80" y1="146" x2="900" y2="146"/>
+    <line x1="80" y1="100" x2="900" y2="100"/>
+  </g>
+  <g fill="#5b6b85" font-size="10" text-anchor="end">
+    <text x="74" y="424">0</text>
+    <text x="74" y="378">5</text>
+    <text x="74" y="333">10</text>
+    <text x="74" y="287">15</text>
+    <text x="74" y="241">20</text>
+    <text x="74" y="196">25</text>
+    <text x="74" y="150">30</text>
+    <text x="74" y="104">35</text>
+  </g>
+  <text x="20" y="260" fill="#8ea0b8" font-size="11" font-weight="600" transform="rotate(-90, 20, 260)" text-anchor="middle">decode tok/s</text>
+
+  <!-- X-axis date ticks. Day 0 = Mar 25 at x=80. -->
+  <g stroke="#1d2b48" stroke-width="1">
+    <line x1="80" y1="420" x2="80" y2="424"/>
+    <line x1="227" y1="420" x2="227" y2="424"/>
+    <line x1="373" y1="420" x2="373" y2="424"/>
+    <line x1="519" y1="420" x2="519" y2="424"/>
+    <line x1="666" y1="420" x2="666" y2="424"/>
+    <line x1="812" y1="420" x2="812" y2="424"/>
+    <line x1="900" y1="420" x2="900" y2="424"/>
+  </g>
+  <g fill="#5b6b85" font-size="10" text-anchor="middle">
+    <text x="80" y="438">Mar 25</text>
+    <text x="227" y="438">Apr 1</text>
+    <text x="373" y="438">Apr 8</text>
+    <text x="519" y="438">Apr 15</text>
+    <text x="666" y="438">Apr 22</text>
+    <text x="812" y="438">Apr 29</text>
+    <text x="900" y="438">May 9</text>
+  </g>
+
+  <!-- llama.cpp baseline: 22.1 tok/s → y = 420 - (22.1 * 9.14) = 420 - 202 = 218 -->
+  <line x1="80" y1="218" x2="900" y2="218" stroke="#f4a261" stroke-width="1.6" stroke-dasharray="6,4" opacity="0.85"/>
+  <rect x="755" y="208" width="148" height="20" rx="4" fill="#0a1020" stroke="#f4a261" stroke-width="1"/>
+  <text x="829" y="222" fill="#f4a261" font-size="10.5" font-weight="600" text-anchor="middle">llama.cpp 22.1 tok/s</text>
+
+  <!-- zinc step-line path
+       Day 0 (Mar 25) = x=80
+       Day 2 (Mar 27) = 80 + 2*18.2 = 116.4
+       Day 3 (Mar 28) = 80 + 3*18.2 = 134.6
+       Day 5 (Mar 30) = 80 + 5*18.2 = 171
+       Day 11 (Apr 5) = 80 + 11*18.2 = 280.2
+       Day 23 (Apr 17) = 80 + 23*18.2 = 498.6
+       Day 29 (Apr 23) = 80 + 29*18.2 = 607.8
+       Day 31 (Apr 25) = 80 + 31*18.2 = 644.2
+       Day 32 (Apr 26) = 80 + 32*18.2 = 662.4
+       Day 37 (May 1) = 80 + 37*18.2 = 753.4
+       Day 39 (May 3) = 80 + 39*18.2 = 789.8
+       Day 40 (May 4) = 80 + 40*18.2 = 808
+       Day 42 (May 6) = 80 + 42*18.2 = 844.4
+       Day 45 (May 9) = 80 + 45*18.2 = 899
+
+       y = 420 - (tok/s * 9.14)
+       0.8 → 412.7
+       7.6 → 350.5
+       33  → 118.4
+       18  → 255.5
+       21  → 228.0
+       22  → 219
+       26  → 182
+       27  → 173
+       28  → 164
+       29  → 155
+       30.4 → 142
+  -->
+
+  <!-- Filled area under curve -->
+  <path d="M 116.4,420 L 116.4,412.7 L 134.6,412.7 L 134.6,350.5 L 171,350.5 L 171,118.4 L 280.2,118.4 L 280.2,255.5 L 498.6,255.5 L 498.6,228.0 L 607.8,228.0 L 607.8,182 L 644.2,182 L 644.2,173 L 662.4,173 L 753.4,173 L 753.4,164 L 808,164 L 808,155 L 844.4,155 L 844.4,142 L 899,142 L 899,420 Z" fill="url(#lineFade)"/>
+
+  <!-- Step line -->
+  <path d="M 116.4,412.7 L 134.6,412.7 L 134.6,350.5 L 171,350.5 L 171,118.4 L 280.2,118.4 L 280.2,255.5 L 498.6,255.5 L 498.6,228.0 L 607.8,228.0 L 607.8,182 L 644.2,182 L 644.2,173 L 662.4,173 L 753.4,173 L 753.4,164 L 808,164 L 808,155 L 844.4,155 L 844.4,142 L 899,142" fill="none" stroke="#5dbb89" stroke-width="2.4" stroke-linejoin="round" filter="url(#glow)"/>
+
+  <!-- Crossing point: zinc step from 22 to 26 between x=607.8 (Apr 23). Baseline at y=218. -->
+  <!-- The step jumps from y=228 (at 21 tok/s) to y=182 (at 26 tok/s) at x=607.8 Apr 23.
+       So the crossing of y=218 happens at x ≈ 607.8 (or right at that step). -->
+  <circle cx="608" cy="218" r="9" fill="none" stroke="#fbbf24" stroke-width="2"/>
+  <circle cx="608" cy="218" r="3" fill="#fbbf24"/>
+  <line x1="608" y1="218" x2="608" y2="86" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>
+  <rect x="544" y="68" width="128" height="22" rx="11" fill="#3a2e0c" stroke="#fbbf24"/>
+  <text x="608" y="83" fill="#fde047" font-size="11" font-weight="700" text-anchor="middle">parity · Apr 23</text>
+
+  <!-- Milestone markers -->
+  <!-- M1: Mar 28, 7.6 tok/s, first coherent -->
+  <g>
+    <circle cx="134.6" cy="350.5" r="4" fill="#5dbb89"/>
+    <line x1="134.6" y1="350.5" x2="100" y2="320" stroke="#8ea0b8" stroke-width="1"/>
+    <text x="100" y="312" fill="#8ea0b8" font-size="10" text-anchor="start">first coherent · 7.6</text>
+  </g>
+
+  <!-- M2: Mar 30, 33 tok/s, 7-to-33 jump -->
+  <g>
+    <circle cx="171" cy="118.4" r="5" fill="#5dbb89"/>
+    <line x1="171" y1="118.4" x2="200" y2="90" stroke="#8ea0b8" stroke-width="1"/>
+    <text x="200" y="86" fill="#9ddcb6" font-size="11" font-weight="600">33 tok/s · Qwen3.5 35B</text>
+  </g>
+
+  <!-- M3: Apr 5, drop to 18 tok/s on Qwen 3 -->
+  <g>
+    <circle cx="280.2" cy="255.5" r="4" fill="#f4a261"/>
+    <line x1="280.2" y1="255.5" x2="280.2" y2="290" stroke="#8ea0b8" stroke-width="1"/>
+    <text x="280.2" y="305" fill="#f4d9c3" font-size="10" text-anchor="middle">Qwen 3 lands</text>
+    <text x="280.2" y="318" fill="#8ea0b8" font-size="9.5" text-anchor="middle">MoE + GDN to learn</text>
+  </g>
+
+  <!-- M4: Apr 17, Qwen 3.6 GA at 21 tok/s -->
+  <g>
+    <circle cx="498.6" cy="228" r="3.5" fill="#5dbb89"/>
+    <text x="498.6" y="335" fill="#8ea0b8" font-size="10" text-anchor="middle">Qwen 3.6 GA</text>
+  </g>
+
+  <!-- M5: Apr 23, Vulkan spec constants → 26 -->
+  <g>
+    <circle cx="607.8" cy="182" r="4" fill="#5dbb89"/>
+    <text x="615" y="170" fill="#8ea0b8" font-size="10">Vulkan spec constants</text>
+  </g>
+
+  <!-- M6: May 6, prefix KV reuse → 30 -->
+  <g>
+    <circle cx="844.4" cy="142" r="4" fill="#5dbb89"/>
+    <line x1="844.4" y1="142" x2="820" y2="118" stroke="#8ea0b8" stroke-width="1"/>
+    <text x="820" y="112" fill="#9ddcb6" font-size="10" text-anchor="end">prefix KV reuse</text>
+  </g>
+
+  <!-- M7: May 9, today at 30.4 -->
+  <g>
+    <circle cx="899" cy="142" r="6" fill="#5dbb89" stroke="#9ddcb6" stroke-width="2"/>
+    <text x="899" y="130" fill="#9ddcb6" font-size="11" font-weight="700" text-anchor="end">30.4 today</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="36" y="478" fill="#8ea0b8" font-size="11">All measurements on AMD Radeon AI PRO R9700, single GPU, UD Q4_K_XL weights. The flagship model rolls forward from Qwen 2.5 → Qwen 3 → Qwen 3.5-35B-A3B → Qwen 3.6-35B-A3B as the family ships.</text>
+  <text x="36" y="496" fill="#8ea0b8" font-size="11">Each step is one fix from one post in the zinc blog. The cumulative gain looks dramatic. Each individual change was small.</text>
+</svg>

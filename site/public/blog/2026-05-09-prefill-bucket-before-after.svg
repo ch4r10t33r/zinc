@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 480" role="img" aria-labelledby="title desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial">
+  <title id="title">Where prefill time went on Qwen 35B-A3B before and after the late-April fixes</title>
+  <desc id="desc">Two horizontal stacked bars comparing the prefill GPU phase budget on Qwen 3.5-35B-A3B on a Radeon AI PRO R9700, before and after the late-April fixes. The top bar, labeled before, is 2,110 ms long and split into colored segments: SSM 925 ms in purple, MoE 739 ms in teal, attention 333 ms in orange, GEMM and other 113 ms in grey. The bottom bar, labeled after, is 1,096 ms long, with SSM shrunk to 165 ms after block-resident gated DeltaNet state, MoE held at 720 ms, attention reduced to 165 ms after long-prefill plateau fixes, and GEMM and other still at about 46 ms. A bar above each shows total elapsed prefill time, with the before bar marked 2,110 ms and the after bar marked 1,096 ms, annotated as 1.93x faster overall. A footer notes that the fix was one Vulkan compute shader that keeps the recurrent state in registers across the token loop, plus the specialization-constant dmmv variants for the GEMM stage. A header reads Where prefill time went on Qwen 35B-A3B, before and after the late-April fixes.</desc>
+
+  <defs>
+    <linearGradient id="bgFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f1729"/>
+      <stop offset="100%" stop-color="#0a1020"/>
+    </linearGradient>
+    <linearGradient id="ssmFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c63d6"/>
+    </linearGradient>
+    <linearGradient id="moeFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3eb1c8"/>
+      <stop offset="100%" stop-color="#2a8aa0"/>
+    </linearGradient>
+    <linearGradient id="attnFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f4a261"/>
+      <stop offset="100%" stop-color="#c97f3a"/>
+    </linearGradient>
+    <linearGradient id="gemmFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#94a3b8"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="940" height="480" fill="url(#bgFade)"/>
+
+  <!-- Header -->
+  <text x="36" y="34" fill="#e8edf5" font-size="19" font-weight="700">Where prefill time went on Qwen 35B-A3B, before and after the late-April fixes</text>
+  <text x="36" y="54" fill="#8ea0b8" font-size="12.5">GPU phase budget for a 154-token prompt on the Radeon AI PRO R9700. The SSM bucket shrinks 5.6x. The total halves.</text>
+
+  <!-- Legend -->
+  <g transform="translate(36, 80)">
+    <rect width="14" height="14" fill="url(#ssmFill)"/>
+    <text x="22" y="12" fill="#c8d1e0" font-size="11">gated DeltaNet SSM</text>
+    <rect x="172" width="14" height="14" fill="url(#moeFill)"/>
+    <text x="194" y="12" fill="#c8d1e0" font-size="11">MoE expert routing + matmul</text>
+    <rect x="394" width="14" height="14" fill="url(#attnFill)"/>
+    <text x="416" y="12" fill="#c8d1e0" font-size="11">full softmax attention</text>
+    <rect x="566" width="14" height="14" fill="url(#gemmFill)"/>
+    <text x="588" y="12" fill="#c8d1e0" font-size="11">GEMM + rms-norm + other</text>
+  </g>
+
+  <!-- Scale: chart from x=36 to x=900 (864 px wide). Total before = 2110 ms → 1 ms = 0.41 px -->
+
+  <!-- ===== BEFORE bar ===== -->
+  <text x="36" y="138" fill="#8ea0b8" font-size="11" font-weight="600">BEFORE · April 26 cycle-50 profile</text>
+  <text x="900" y="138" fill="#f7a8b6" font-size="13" font-weight="700" text-anchor="end">2,110 ms total</text>
+
+  <!-- BEFORE segments. SSM 925, MoE 739, attn 333, GEMM 113. Each = 0.41 px/ms
+       SSM: 0..925 → x=36..415 width=379
+       MoE: 925..1664 → x=415..718 width=303
+       Attn: 1664..1997 → x=718..854 width=137
+       GEMM: 1997..2110 → x=854..900 width=46
+  -->
+  <g transform="translate(0, 148)">
+    <rect x="36" y="0" width="379" height="56" rx="3" fill="url(#ssmFill)"/>
+    <rect x="415" y="0" width="303" height="56" fill="url(#moeFill)"/>
+    <rect x="718" y="0" width="137" height="56" fill="url(#attnFill)"/>
+    <rect x="855" y="0" width="45" height="56" rx="3" fill="url(#gemmFill)"/>
+
+    <!-- segment labels -->
+    <text x="225" y="22" fill="#1a1230" font-size="13" font-weight="700" text-anchor="middle">SSM</text>
+    <text x="225" y="40" fill="#1a1230" font-size="14" font-weight="700" text-anchor="middle">925 ms</text>
+    <text x="225" y="54" fill="#1a1230" font-size="10" text-anchor="middle">44 % of prefill</text>
+
+    <text x="567" y="22" fill="#062b34" font-size="13" font-weight="700" text-anchor="middle">MoE</text>
+    <text x="567" y="40" fill="#062b34" font-size="14" font-weight="700" text-anchor="middle">739 ms</text>
+    <text x="567" y="54" fill="#062b34" font-size="10" text-anchor="middle">35 %</text>
+
+    <text x="787" y="22" fill="#1f1208" font-size="12" font-weight="700" text-anchor="middle">attn</text>
+    <text x="787" y="40" fill="#1f1208" font-size="13" font-weight="700" text-anchor="middle">333 ms</text>
+    <text x="787" y="54" fill="#1f1208" font-size="10" text-anchor="middle">16 %</text>
+  </g>
+
+  <!-- ===== Annotation arrow between bars ===== -->
+  <text x="225" y="244" fill="#a78bfa" font-size="11" font-weight="600" text-anchor="middle">↓ block-resident gated DeltaNet state</text>
+  <text x="567" y="244" fill="#3eb1c8" font-size="11" font-weight="600" text-anchor="middle">↓ MUL_MAT_ID dispatch coalescing</text>
+  <text x="787" y="244" fill="#f4a261" font-size="11" font-weight="600" text-anchor="middle">↓ FA softmax fix</text>
+
+  <!-- ===== AFTER bar ===== -->
+  <text x="36" y="282" fill="#8ea0b8" font-size="11" font-weight="600">AFTER · May 9</text>
+  <text x="900" y="282" fill="#9ddcb6" font-size="13" font-weight="700" text-anchor="end">1,096 ms total · 1.93× faster</text>
+
+  <!-- AFTER segments (same scale: 0.41 px/ms)
+       SSM: 165 ms → width 68
+       MoE: 720 ms → width 295
+       Attn: 165 ms → width 68
+       GEMM: 46 ms → width 19
+  -->
+  <g transform="translate(0, 292)">
+    <rect x="36" y="0" width="68" height="56" rx="3" fill="url(#ssmFill)"/>
+    <rect x="104" y="0" width="295" height="56" fill="url(#moeFill)"/>
+    <rect x="399" y="0" width="68" height="56" fill="url(#attnFill)"/>
+    <rect x="467" y="0" width="19" height="56" rx="3" fill="url(#gemmFill)"/>
+
+    <text x="70" y="22" fill="#1a1230" font-size="11" font-weight="700" text-anchor="middle">SSM</text>
+    <text x="70" y="40" fill="#1a1230" font-size="12" font-weight="700" text-anchor="middle">165</text>
+    <text x="251" y="22" fill="#062b34" font-size="13" font-weight="700" text-anchor="middle">MoE</text>
+    <text x="251" y="40" fill="#062b34" font-size="14" font-weight="700" text-anchor="middle">720 ms</text>
+    <text x="251" y="54" fill="#062b34" font-size="10" text-anchor="middle">66 % of new total</text>
+    <text x="433" y="22" fill="#1f1208" font-size="11" font-weight="700" text-anchor="middle">attn</text>
+    <text x="433" y="40" fill="#1f1208" font-size="11" font-weight="700" text-anchor="middle">165</text>
+
+    <!-- Empty space showing time saved -->
+    <line x1="486" y1="28" x2="900" y2="28" stroke="#1d2b48" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="693" y="22" fill="#5dbb89" font-size="11" font-weight="600" text-anchor="middle">↑ 1,014 ms returned to decode budget</text>
+    <text x="693" y="40" fill="#8ea0b8" font-size="10" text-anchor="middle">SSM dropped 5.6× · attn dropped 2.0×</text>
+  </g>
+
+  <!-- Scale ticks -->
+  <g stroke="#1d2b48" stroke-width="1">
+    <line x1="36" y1="384" x2="900" y2="384"/>
+    <line x1="36" y1="384" x2="36" y2="388"/>
+    <line x1="241" y1="384" x2="241" y2="388"/>
+    <line x1="446" y1="384" x2="446" y2="388"/>
+    <line x1="651" y1="384" x2="651" y2="388"/>
+    <line x1="857" y1="384" x2="857" y2="388"/>
+  </g>
+  <g fill="#5b6b85" font-size="10" text-anchor="middle">
+    <text x="36" y="400">0</text>
+    <text x="241" y="400">500 ms</text>
+    <text x="446" y="400">1,000 ms</text>
+    <text x="651" y="400">1,500 ms</text>
+    <text x="857" y="400">2,000 ms</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="36" y="438" fill="#8ea0b8" font-size="11">The single largest change was keeping the gated DeltaNet recurrent state in registers across the whole 154-token loop, instead of</text>
+  <text x="36" y="454" fill="#8ea0b8" font-size="11">re-reading 2 MB per layer per token. The Vulkan kernel for it is ~120 lines. It returned a full second of compute to the decode budget.</text>
+  <text x="36" y="470" fill="#5b6b85" font-size="10">Source: zinc cycle-50 profile (Apr 26 post) and May 9 internal trace · Qwen 3.5-35B-A3B UD Q4_K_XL · 154-token prompt · Radeon AI PRO R9700</text>
+</svg>
