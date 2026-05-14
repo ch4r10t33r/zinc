@@ -4135,6 +4135,11 @@ fn canUseDenseQ4KQKDual(
     M_k: u32,
     K: u32,
 ) bool {
+    // Gemma-only: on Qwen3-8B (M_q=4096, M_k=1024) the dual kernel measured
+    // ~4% slower than the two separate Q and K matvec dispatches the
+    // concurrent encoder runs in parallel — the fused kernel's per-thread
+    // Q-vs-K branch cost doesn't amortize on smaller M_q the way it does on
+    // Gemma 31B (M_q=8192, M_k=4096). See EFFORT_14_NOTES.md Cycle 4.
     return engine.config.architecture == .gemma and
         engine.config.n_experts == 0 and
         q.info.type_ == .q4_k and
