@@ -83,13 +83,25 @@ kernel void main0(
             device const uchar* sc = block + 192u + uint(is);
             const float d = fp16_to_fp32(uint(block[208]) | (uint(block[209]) << 8u));
 
+            // Cycle 35: batch the 12 scalar byte reads (q1[0..3], q2[0..3], qh[0..3])
+            // into 3 uchar4 vector loads. Pointers are 4-byte aligned by construction
+            // (q_offset_l = 64*ip + 4*il, q_offset_h = 32*ip + 4*il; both 4-aligned),
+            // so the vector loads are safe. Mirrors cycle 28's ushort4 batching applied
+            // to dmmv_q4k.metal, but on the Q6_K side — covers ffn_down on Qwen3-8B
+            // (27.3% of all DMMV bytes/token, the entire Q6_K slice).
+            const uchar4 q1v4 = *((device const uchar4*)q1);
+            const uchar4 q2v4 = *((device const uchar4*)q2);
+            const uchar4 qhv4 = *((device const uchar4*)qh);
+
             float4 sums = float4(0.0f);
             for (ushort l = 0u; l < 4u; ++l) {
-                const uint h = uint(qh[l]);
-                const float q0 = float(int((uint(q1[l]) & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
-                const float q1v = float(int((uint(q2[l]) & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
-                const float q2v = float(int((uint(q1[l]) >> 4u) | ((h & kmask3) << 0u)) - 32);
-                const float q3 = float(int((uint(q2[l]) >> 4u) | ((h & kmask4) >> 2u)) - 32);
+                const uint h = uint(qhv4[l]);
+                const uint q1b = uint(q1v4[l]);
+                const uint q2b = uint(q2v4[l]);
+                const float q0 = float(int((q1b & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
+                const float q1v = float(int((q2b & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
+                const float q2v = float(int((q1b >> 4u) | ((h & kmask3) << 0u)) - 32);
+                const float q3 = float(int((q2b >> 4u) | ((h & kmask4) >> 2u)) - 32);
 
                 sums[0] += yl[4u * l + 0u] * q0;
                 sums[1] += yl[4u * l + 1u] * q1v;
