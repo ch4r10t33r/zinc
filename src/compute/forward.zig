@@ -784,11 +784,17 @@ const LayerTensors = struct {
 /// or fall back to `prefillBatch`. Until the batched body lands this just
 /// guards the env flag so enabling it on an unsupported model is a no-op.
 fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
-    // Batched prefill uses portable Q4_K/Q6_K batch shaders on Intel Arc, and
-    // the wave64 kpar variant is gated separately at init.
+    // Intel Arc can compile the serial Q4_K/Q6_K batch shaders, but the BMG
+    // G31 path can still fence-fail under the full prefill graph. Keep it
+    // opt-in until the Intel batched path is validated end-to-end.
     const vendor = engine.gpu_config.vendor;
-    if (vendor != .amd_rdna3 and vendor != .amd_rdna4 and vendor != .amd_rdna4_apu and
-        vendor != .intel_arc_xe2 and vendor != .intel_arc) return false;
+    const is_amd = vendor == .amd_rdna3 or vendor == .amd_rdna4 or vendor == .amd_rdna4_apu;
+    const is_intel = vendor == .intel_arc_xe2 or vendor == .intel_arc;
+    if (!is_amd and !is_intel) return false;
+    if (is_intel) {
+        const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
+        if (intel_batched_env == null or !std.mem.eql(u8, intel_batched_env.?, "1")) return false;
+    }
     const cfg = engine.model.config;
     if (cfg.n_experts > 0) return false;
     if (cfg.ssm_d_inner > 0) return false;

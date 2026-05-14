@@ -116,6 +116,17 @@ test "Vulkan prefillBatched gates on env flag + canUseBatchedPrefillRdna" {
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "ensureBatchedScratchCapacity", 2000);
 }
 
+test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
+    const src = @embedFile("compute/forward.zig");
+    const fn_marker = "fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {";
+    try expectContainsNear(src, fn_marker, "vendor == .amd_rdna3", 900);
+    try expectContainsNear(src, fn_marker, "vendor == .amd_rdna4", 900);
+    try expectContainsNear(src, fn_marker, "vendor == .amd_rdna4_apu", 900);
+    try expectContainsNear(src, fn_marker, "vendor == .intel_arc_xe2", 900);
+    try expectContainsNear(src, fn_marker, "ZINC_INTEL_BATCHED_PREFILL", 1200);
+    try expectContainsNear(src, "if (is_intel) {", "return false;", 400);
+}
+
 test "Vulkan prefillBatched uses all batched primitives in the per-layer loop" {
     const src = @embedFile("compute/forward.zig");
     const fn_marker = "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
