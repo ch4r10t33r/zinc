@@ -177,31 +177,42 @@ kernel void main0(
                 ? (block_base + token_offset * token_stride)
                 : kvBaseForToken(page_table, p, kv_head, token_idx);
 
-            // Cycle 90: vectorize the QK score reduction. The legacy form
-            // `score += dot(qv, kv)` collapses each 4-wide qv*kv to a scalar
-            // *inside* the loop, forcing a serial scalar accumulator chain
-            // vec4_dim-deep (32 for Qwen3-8B head_dim=128). Replace with a
-            // 4-wide FMA accumulator `score4 = fma(qv, kv, score4)` that
-            // builds 4 independent parallel accumulator lanes (one per lane
-            // of qv*kv), then collapse with `dot(score4, 1.f)` after the
-            // loop — reduction depth vec4_dim → vec4_dim/4. Same compiler-
-            // hint philosophy as cycles 44-89 on Q4_K matvec kernels: tell
-            // the compiler the 4-wide ALU shape explicitly instead of relying
-            // on auto-vectorization across a scalar reduction. Sum-of-
-            // products = sum-of-sums by reassociation; the lane order of
-            // additions differs but with fast:: math already enabled (see
-            // fast::exp/max/divide in this kernel) the result is within
-            // existing tolerance. flash_attn is the second-largest dispatch
-            // bucket since cycle 30 (per EFFORT_14_NOTES.md priorities) and
-            // fires ~1152 times per token on Qwen3-8B (32 Q-heads ×
-            // 36 layers).
-            float4 score4 = float4(0.0f);
-            for (uint i = 0; i < vec4_dim; i++) {
+            // Cycle 95: split cycle 90's single `score4` accumulator into two
+            // independent chains (score4a, score4b) over even/odd i. The
+            // 4-lane parallelism inside one `score4` only gives 4-wide ILP;
+            // the iteration-to-iteration dep `score4 = fma(qv, kv, score4)`
+            // still serializes on a single FMA chain vec4_dim-deep
+            // (32 FMAs for Qwen3-8B head_dim=128). With Apple GPU FMA latency
+            // ~4 cycles and 1 FMA/cycle issue, a 32-deep chain costs ~128
+            // cycles latency-bound. Splitting to 2 chains lets the compiler
+            // interleave: chain A FMA at cycle 0, chain B at cycle 1, A at 4
+            // (resp dep), B at 5 — saturates issue at 2/4 = 0.5 FMA/cycle
+            // (~64 cycles for the same 32 multiplies). Same compiler-hint
+            // philosophy as cycle 93's V 4→8-wide split, applied to the QK
+            // reduction in the same kernel. vec4_dim=32 is even on Qwen3-8B
+            // so the tail is dead code; head_dim=512 (Gemma) → vec4_dim=128
+            // also even. Sum-of-products = sum-of-sums (within fast:: math
+            // tolerance already accepted in this kernel). Final collapse
+            // `score4a + score4b` keeps reduction depth at 1 extra add
+            // before the dot-with-ones. flash_attn fires ~1152×/token on
+            // Qwen3-8B decode (32 Q-heads × 36 layers).
+            float4 score4a = float4(0.0f);
+            float4 score4b = float4(0.0f);
+            uint i = 0u;
+            for (; i + 2u <= vec4_dim; i += 2u) {
+                const float4 qv0 = q_cache4[i];
+                const float4 kv0 = *(device const float4*)(k_cache + kv_base + (i << 2));
+                const float4 qv1 = q_cache4[i + 1u];
+                const float4 kv1 = *(device const float4*)(k_cache + kv_base + ((i + 1u) << 2));
+                score4a = fma(qv0, kv0, score4a);
+                score4b = fma(qv1, kv1, score4b);
+            }
+            for (; i < vec4_dim; ++i) {
                 const float4 qv = q_cache4[i];
                 const float4 kv = *(device const float4*)(k_cache + kv_base + (i << 2));
-                score4 = fma(qv, kv, score4);
+                score4a = fma(qv, kv, score4a);
             }
-            float score = dot(score4, float4(1.0f));
+            float score = dot(score4a + score4b, float4(1.0f));
             score *= scale;
             local_scores[local_idx++] = score;
             local_max = fast::max(local_max, score);
