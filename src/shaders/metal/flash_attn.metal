@@ -155,7 +155,13 @@ kernel void main0(
             scores[token_offset] = score;
             local_max = fast::max(local_max, score);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // No threadgroup barrier here: scores writes above are at per-thread
+        // indices {tid, tid+64, ...} and the softmax loop below reads the
+        // same per-thread indices — pure intra-thread dependency. The cross-
+        // thread scores read happens in the V loop, which is guarded by the
+        // barrier after the softmax loop. reduceThreadgroupMax uses thread-
+        // local local_max and has its own internal barrier on the scratch
+        // array (separate shmem region from scores).
 
         const float block_max = reduceThreadgroupMax(local_max, reduce, tid, subgroup_size, simd_lane, simd_group);
         const float next_max = fast::max(running_max, block_max);
