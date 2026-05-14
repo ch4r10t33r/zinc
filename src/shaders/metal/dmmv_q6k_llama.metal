@@ -148,19 +148,19 @@ kernel void main0(
             const float q21 = float((q1b1 >> 4u)    | ((h1 & kmask3) << 0u));
             const float q31 = float((q2b1 >> 4u)    | ((h1 & kmask4) >> 2u));
 
-            const float ylv0 = yl[4u * l + 0u];
-            const float ylv1 = yl[4u * l + 1u];
-            const float ylv2 = yl[4u * l + 2u];
-            const float ylv3 = yl[4u * l + 3u];
-
-            sums_0[0] += ylv0 * q00;
-            sums_1[0] += ylv0 * q01;
-            sums_0[1] += ylv1 * q10;
-            sums_1[1] += ylv1 * q11;
-            sums_0[2] += ylv2 * q20;
-            sums_1[2] += ylv2 * q21;
-            sums_0[3] += ylv3 * q30;
-            sums_1[3] += ylv3 * q31;
+            // Cycle 44: replace 16 indexed scalar `sums_X[k] += ylv * q` writes
+            // (8 per row × 2 rows) with 2 explicit `float4` `fma(yl4, q4_X, sums_X)`
+            // calls. ylv0..ylv3 are shared between row0 and row1, so packing them
+            // once and using vector FMA exposes the 4-wide SIMD operation directly
+            // to the metal compiler instead of relying on it to lift indexed
+            // per-lane writes into a single vector op. Apple7 ALU is naturally
+            // 4-wide; the indexed scalar form sometimes leaves the compiler
+            // emitting 4 narrower FMAs back-to-back instead of a single quad FMA.
+            const float4 yl4 = float4(yl[4u * l + 0u], yl[4u * l + 1u], yl[4u * l + 2u], yl[4u * l + 3u]);
+            const float4 q4_0 = float4(q00, q10, q20, q30);
+            const float4 q4_1 = float4(q01, q11, q21, q31);
+            sums_0 = fma(yl4, q4_0, sums_0);
+            sums_1 = fma(yl4, q4_1, sums_1);
         }
 
         const float sc00 = float(sc_0[0]);
