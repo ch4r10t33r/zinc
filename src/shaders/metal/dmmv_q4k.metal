@@ -114,11 +114,40 @@ kernel void main0(
             float4(c1.zw, d1.zw),
         };
 
-        const float4 ones = float4(1.0f);
-        sumy[0] = dot(a0, ones) + dot(a1, ones);
-        sumy[1] = dot(b0, ones) + dot(b1, ones);
-        sumy[2] = dot(c0, ones) + dot(c1, ones);
-        sumy[3] = dot(d0, ones) + dot(d1, ones);
+        // Cycle 88: port cycle 87's sumy-from-yl4_arr derivation. Compute
+        // sumy from the yl4_arr / yh4_arr register vectors built above
+        // instead of from the original a0/a1/b0/b1/c0/c1/d0/d1 float4 loads.
+        // The 8 dot-of-ones partials (16 reads of a*/b*/c*/d* + 8 horizontal
+        // reductions + 4 scalar adds) form a separate consumer of the
+        // original y4v float4 loads that runs *parallel* to the yl4_arr/
+        // yh4_arr shuffle build — so the compiler must keep all 8 a*/b*/c*/d*
+        // vectors live until both consumers complete. Since the inner FMA
+        // loop only ever reads from yl4_arr / yh4_arr (lines 217-218), we
+        // can derive sumy from those same arrays and let a*/b*/c*/d* die
+        // immediately after the shuffle.
+        //
+        // Lane mapping (from yl4_arr build above): yl4_arr[0]=(a0.x,a0.y,
+        // b0.x,b0.y), [1]=(a0.z,a0.w,b0.z,b0.w), [2]=(a1.x,a1.y,b1.x,b1.y),
+        // [3]=(a1.z,a1.w,b1.z,b1.w). Summing i=0..3 gives partials at
+        // lanes 0,1 = (a0+a1) split into halves and lanes 2,3 = (b0+b1)
+        // split. So (yl_tot.x + yl_tot.y) = sum(a0+a1) = sumy[0] and
+        // (yl_tot.z + yl_tot.w) = sum(b0+b1) = sumy[1]; analogous for
+        // yh4_arr → sumy[2,3].
+        //
+        // Cost: 6 float4 adds + 4 scalar adds vs prior 8 dot4 + 4 scalar
+        // (~28 effective adds either way). The win is register-file: ~128B
+        // of a*/b*/c*/d* state can be freed before the q1v/q2v ushort4
+        // loads and the 32-FMA inner chain. Mirrors cycle 87's port to
+        // dmmv_q4k_dense_gate_up_swiglu.metal. dmmv_q4k.metal serves
+        // attn_qkv V + attn_o + ffn_down on Qwen3-8B dense (~53% of Q4_K
+        // bytes/token, complementing the swiglu kernel's ~50%
+        // ffn_gate+ffn_up share; Q4_K = 71.6% of decode bytes/token).
+        const float4 yl_tot = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
+        const float4 yh_tot = (yh4_arr[0] + yh4_arr[1]) + (yh4_arr[2] + yh4_arr[3]);
+        sumy[0] = yl_tot.x + yl_tot.y;
+        sumy[1] = yl_tot.z + yl_tot.w;
+        sumy[2] = yh_tot.x + yh_tot.y;
+        sumy[3] = yh_tot.z + yh_tot.w;
 
         // Cycle 33: interleave row0/row1 of NR0=2. Load both rows' sc_u/q1/q2/dh
         // up front and run a single FOR_UNROLL i=0..3 that updates both rows'
