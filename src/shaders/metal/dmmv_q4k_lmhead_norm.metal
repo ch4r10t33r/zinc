@@ -126,13 +126,28 @@ kernel void main0(
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+            // Cycle 63: vectorize the per-quant nibble-mask expansion. Replace
+            // `float4(qi & 0x000F, qi & 0x0F00, qi & 0x00F0, qi & 0xF000)` —
+            // 4 scalar ANDs + 4 scalar int→float casts per nibble-set — with
+            // `float4(ushort4(qi) & nibble_mask)`, which lowers to 1 ushort4
+            // splat, 1 ushort4 AND vs a constexpr mask, then 1 ushort4→float4
+            // widen. Mirrors cycle 49 (dmmv_q4k_dense_gate_up_swiglu.metal) and
+            // cycle 50 (dmmv_q4k.metal). The fused-norm LM-head kernel is on
+            // the Qwen3-8B decode hot path (vocab=151936, hidden_dim=4096,
+            // lm-head = 15.21 GiB/step = ~11% of decode bytes/token), and the
+            // nibble-mask change is a local expression-level rewrite that does
+            // not raise register pressure — unlike cycle 54's per-ib reduction
+            // attempt which regressed on this kernel due to the per-simdgroup
+            // RMS prologue's existing register footprint.
+            constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
+
             FOR_UNROLL (short i = 0; i < 4; ++i) {
                 const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
                 const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
                 const ushort q1i = q1v[i];
                 const ushort q2i = q2v[i];
-                const float4 q1m = float4(q1i & 0x000F, q1i & 0x0F00, q1i & 0x00F0, q1i & 0xF000);
-                const float4 q2m = float4(q2i & 0x000F, q2i & 0x0F00, q2i & 0x00F0, q2i & 0xF000);
+                const float4 q1m = float4(ushort4(q1i) & nibble_mask);
+                const float4 q2m = float4(ushort4(q2i) & nibble_mask);
                 acc1 = fma(yl4, q1m, acc1);
                 acc2 = fma(yh4, q2m, acc2);
             }
