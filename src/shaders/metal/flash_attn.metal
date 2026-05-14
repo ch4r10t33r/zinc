@@ -145,12 +145,31 @@ kernel void main0(
                 ? (block_base + token_offset * token_stride)
                 : kvBaseForToken(page_table, p, kv_head, token_idx);
 
-            float score = 0.0f;
+            // Cycle 90: vectorize the QK score reduction. The legacy form
+            // `score += dot(qv, kv)` collapses each 4-wide qv*kv to a scalar
+            // *inside* the loop, forcing a serial scalar accumulator chain
+            // vec4_dim-deep (32 for Qwen3-8B head_dim=128). Replace with a
+            // 4-wide FMA accumulator `score4 = fma(qv, kv, score4)` that
+            // builds 4 independent parallel accumulator lanes (one per lane
+            // of qv*kv), then collapse with `dot(score4, 1.f)` after the
+            // loop — reduction depth vec4_dim → vec4_dim/4. Same compiler-
+            // hint philosophy as cycles 44-89 on Q4_K matvec kernels: tell
+            // the compiler the 4-wide ALU shape explicitly instead of relying
+            // on auto-vectorization across a scalar reduction. Sum-of-
+            // products = sum-of-sums by reassociation; the lane order of
+            // additions differs but with fast:: math already enabled (see
+            // fast::exp/max/divide in this kernel) the result is within
+            // existing tolerance. flash_attn is the second-largest dispatch
+            // bucket since cycle 30 (per EFFORT_14_NOTES.md priorities) and
+            // fires ~1152 times per token on Qwen3-8B (32 Q-heads ×
+            // 36 layers).
+            float4 score4 = float4(0.0f);
             for (uint i = 0; i < vec4_dim; i++) {
                 const float4 qv = q_cache4[i];
                 const float4 kv = *(device const float4*)(k_cache + kv_base + (i << 2));
-                score += dot(qv, kv);
+                score4 = fma(qv, kv, score4);
             }
+            float score = dot(score4, float4(1.0f));
             score *= scale;
             scores[token_offset] = score;
             local_max = fast::max(local_max, score);
