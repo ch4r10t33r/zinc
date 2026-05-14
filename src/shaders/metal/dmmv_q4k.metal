@@ -109,28 +109,37 @@ kernel void main0(
         // Mirrors cycle 32's interleaved gate+up pattern from the swiglu helper,
         // applied here across row0/row1 of the same matrix instead of across
         // gate/up matrices. Covers attn_qkv/attn_o/ffn_down on Qwen3 dense.
-        device const packed_uint3* sc_u3_0 = (device const packed_uint3*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
-        device const packed_uint3* sc_u3_1 = (device const packed_uint3*)((device const uchar*)sc_u3_0 + nb01);
+        //
+        // Cycle 79: port cycle 78's packed_uint4 block-header fusion to
+        // dmmv_q4k.metal. Fuses each row's 4-byte half2 dh-load (block+0..3)
+        // and 12-byte packed_uint3 sc_u-load (block+4..15) into a single
+        // 16-byte coalesced `packed_uint4` load. The Q4_K block layout places
+        // `[d (half), dmin (half), sc_u (12 bytes)]` contiguously at offsets
+        // 0..15 with 4-byte alignment — exactly the natural shape for
+        // packed_uint4 (16 bytes, 4-byte aligned). Per ib × NR0=2 rows this
+        // folds 4 device loads (2 × half2 + 2 × packed_uint3) → 2
+        // packed_uint4 loads. The 8 bytes of dh-pair register state for
+        // both rows is held across the full per-ib body until the final
+        // cross-row fold — negligible. Builds on cycle 67 (half2 dh-load
+        // here) + cycle 73 (packed_uint3 sc_u-load here) by collapsing them
+        // into the natural single-block-header read shape, mirroring cycle
+        // 78's win on dmmv_q4k_qk_dual.metal (49.4 → 50.0 tok/s).
+        // dmmv_q4k.metal serves attn_qkv V + attn_o + ffn_down on Qwen3-8B
+        // dense (~53% Q4_K slice, complementing the swiglu kernel's
+        // ffn_gate+ffn_up share).
+        device const uchar* blk_0 = x_base + (uint64_t)ib * BLOCK_SIZE;
+        device const uchar* blk_1 = blk_0 + nb01;
+        const packed_uint4 hdr_0 = *((device const packed_uint4*)blk_0);
+        const packed_uint4 hdr_1 = *((device const packed_uint4*)blk_1);
+        const half2 dh_pair_0 = as_type<half2>(hdr_0.x);
+        const half2 dh_pair_1 = as_type<half2>(hdr_1.x);
         const uint sc_shift = uint(iq) * 16u;
-        device const ushort* q1_0 = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 16) + 16 * iq + 4 * ir;
+        device const ushort* q1_0 = (device const ushort*)(blk_0 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_1 = q1_0 + nb01 / 2;
-        device const half* dh_0 = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
-        device const half* dh_1 = dh_0 + nb01 / 2;
 
         // Cycle 73: collapse the 3 scalar `sc_u_X[0/1/2]` uint reads into a
-        // single `packed_uint3` load per row. The Q4_K block's 12-byte
-        // packed-scales field sits at byte offsets 4..15 of the block —
-        // contiguous and 4-byte aligned — which is exactly the natural
-        // shape for `packed_uint3` (12 bytes, 4-byte alignment). The
-        // previous form was 3 independent `*sc_u_0` indexed loads that
-        // the compiler had to prove contiguous via alias analysis before
-        // it could coalesce them. Explicit `packed_uint3` removes the
-        // proof obligation and guarantees one 12-byte coalesced load
-        // per row per ib. Mirrors cycles 66/67/68's "packed loads via
-        // typed pointer aliasing" wins (half2 dh loads on the same Q4_K
-        // shaders). dmmv_q4k.metal serves attn_qkv V + attn_o + ffn_down
-        // on Qwen3-8B dense — the ~53% Q4_K slice complementing the
-        // swiglu kernel's ffn_gate+ffn_up share.
+        // single `packed_uint3` load per row. Now extracted from the
+        // packed_uint4 block-header loaded above (cycle 79).
         // Cycle 69: store sc16 as `ushort4` register vectors instead of
         // stack-allocated `ushort[4]` arrays accessed via `(uchar*)` byte
         // alias. The previous form forced the compiler to materialize
@@ -141,7 +150,7 @@ kernel void main0(
         // 8 scalar uchar loads from spilled stack memory. Same compiler-
         // hint philosophy as cycles 49/50 (nibble-mask vectorize), 51
         // (per-ib reduction), and 61 (cross-row reduction).
-        const uint3 sc_u3v_0 = uint3(*sc_u3_0);
+        const uint3 sc_u3v_0 = uint3(hdr_0.y, hdr_0.z, hdr_0.w);
         const ushort sc_0_0 = ushort((sc_u3v_0.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_0 = ushort((sc_u3v_0.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_0 = ushort((sc_u3v_0.z >> sc_shift) & 0xFFFFu);
@@ -151,7 +160,7 @@ kernel void main0(
             ((sc_4_0 >> 0) & kmask2) | ((sc_0_0 & kmask3) >> 2),
             ((sc_4_0 >> 4) & kmask2) | ((sc_2_0 & kmask3) >> 2));
 
-        const uint3 sc_u3v_1 = uint3(*sc_u3_1);
+        const uint3 sc_u3v_1 = uint3(hdr_1.y, hdr_1.z, hdr_1.w);
         const ushort sc_0_1 = ushort((sc_u3v_1.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_1 = ushort((sc_u3v_1.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_1 = ushort((sc_u3v_1.z >> sc_shift) & 0xFFFFu);
@@ -262,20 +271,11 @@ kernel void main0(
         // serves attn_qkv / attn_o / ffn_down on Qwen3-8B dense (Q4_K =
         // 71.6% of decode bytes/token, this kernel covers the ~53% slice
         // complementing the swiglu kernel's ffn_gate+ffn_up).
-        // Cycle 67: vectorize the 4 scalar dh half-loads. Replace
-        // `dh_X[0]`/`dh_X[1]` pairs (2 rows × 2 scalar half reads = 4 loads
-        // per ib) with `*(device const half2*)dh_X` (2 packed half2 loads per
-        // ib), then build the cross-row `dh_d`/`dh_dmin` float2s via `.x`/`.y`
-        // swizzles that lower to a single half2→float2 widen per row instead
-        // of 2 scalar half→float casts. Q4_K block layout starts with
-        // `[d (half), dmin (half)]` at byte offsets 0..3 — exactly a half2
-        // pair, matching the natural 4-byte block alignment. Mirrors cycle 66
-        // (same change to dmmv_q4k_dense_gate_up_swiglu.metal, 8 → 4 loads
-        // there); this kernel covers attn_qkv / attn_o / ffn_down on Qwen3-8B
-        // (the ~53% Q4_K slice complementing the swiglu kernel's ffn_gate+
-        // ffn_up share).
-        const half2 dh_pair_0 = *((device const half2*)dh_0);
-        const half2 dh_pair_1 = *((device const half2*)dh_1);
+        // Cycle 67/79: the dh_pair_0/dh_pair_1 half2 values are now extracted
+        // from the packed_uint4 block-header load at the top of this ib body
+        // (cycle 79); build the cross-row `dh_d`/`dh_dmin` float2s via
+        // `.x`/`.y` swizzles that lower to a single half2→float2 widen per
+        // row instead of 2 scalar half→float casts.
         const float2 dh_d = float2(float(dh_pair_0.x), float(dh_pair_1.x));
         const float2 dh_dmin = float2(float(dh_pair_0.y), float(dh_pair_1.y));
         const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
