@@ -89,10 +89,22 @@ kernel void main0(
         // yl_sum is shared across NR0=2 rows; the per-row tail correction adds
         // 4 fmas + 1 fnma per row. Mirrors the Q4_K dh_min · sumy correction
         // pattern that already lives in dmmv_q4k.metal's tail.
-        const float yl_sum_0 = yl[ 0] + yl[ 4] + yl[ 8] + yl[12];
-        const float yl_sum_1 = yl[ 1] + yl[ 5] + yl[ 9] + yl[13];
-        const float yl_sum_2 = yl[ 2] + yl[ 6] + yl[10] + yl[14];
-        const float yl_sum_3 = yl[ 3] + yl[ 7] + yl[11] + yl[15];
+        //
+        // Cycle 59: vectorize the 4 strided yl_sum reductions. The 4 sums
+        // yl_sum_k = Σ_l yl[4l+k] for k=0..3 are 4 independent reductions
+        // across the 4 "slabs" yl[0..3], yl[4..7], yl[8..11], yl[12..15] —
+        // exactly what a 4-wide vector add chain expresses naturally. Replace
+        // 12 scalar adds with 3 float4 adds in a 4-way tree
+        // ((a+b)+(c+d)). Same compiler-hint pattern as cycles 44-58 — tell
+        // the compiler the 4-wide ALU shape directly instead of letting it
+        // infer it from indexed lane writes that may schedule as narrower
+        // FMAs. Q6_K covers ffn_down on Qwen3-8B (28.4% of decode bytes/
+        // token = 38.46 GiB/step).
+        const float4 yl_sum4 =
+            (float4(yl[ 0], yl[ 1], yl[ 2], yl[ 3]) +
+             float4(yl[ 4], yl[ 5], yl[ 6], yl[ 7])) +
+            (float4(yl[ 8], yl[ 9], yl[10], yl[11]) +
+             float4(yl[12], yl[13], yl[14], yl[15]));
 
         // Cycle 36: interleave NR0=2 row0/row1 — load both rows' q1v4/q2v4/qhv4/
         // sc/d up front, then run a single FOR_UNROLL l=0..3 that updates both
@@ -188,7 +200,6 @@ kernel void main0(
         // leaves the compiler emitting narrower lane-by-lane FMAs.
         const float4 sc4_0 = float4(float(sc_0[0]), float(sc_0[2]), float(sc_0[4]), float(sc_0[6]));
         const float4 sc4_1 = float4(float(sc_1[0]), float(sc_1[2]), float(sc_1[4]), float(sc_1[6]));
-        const float4 yl_sum4 = float4(yl_sum_0, yl_sum_1, yl_sum_2, yl_sum_3);
         sumf[0] += d_0 * fma(-32.0f, dot(yl_sum4, sc4_0), dot(sums_0, sc4_0));
         sumf[1] += d_1 * fma(-32.0f, dot(yl_sum4, sc4_1), dot(sums_1, sc4_1));
     }
