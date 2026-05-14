@@ -54,33 +54,25 @@ inline float4 q4k_block_dot_parts(
     constexpr ushort kmask2 = 0x0f0f;
     constexpr ushort kmask3 = 0xc0c0;
 
-    // Cycle 75: port cycles 73/74's `packed_uint3` sc_u load pattern to
-    // qk_dual. The Q4_K block's 12-byte packed-scales field sits at byte
-    // offsets 4..15 — contiguous and 4-byte aligned — matching
-    // packed_uint3 (12 bytes, 4-byte alignment). The previous form's
-    // `+ iq` ushort-pointer offset (iq ∈ {0,1}) left the base 2- or
-    // 4-byte aligned depending on iq, forcing the compiler to treat each
-    // sc[k] as an independent strided ushort load it had to prove
-    // contiguous via alias analysis before coalescing. Replacing with
-    // packed_uint3 + a runtime `sc_shift = iq*16` to select the lower
-    // or upper ushort lane of each uint guarantees one 12-byte coalesced
-    // load per row per ib. The helper is called twice per ib (once per
-    // NR0=2 row), so per-ib this folds 6 strided ushort loads → 2
-    // packed_uint3 loads. dmmv_q4k_qk_dual.metal handles Qwen3-8B
-    // attn_qkv Q+K paired (~18.5% of decode bytes/token via 25.08 GiB
-    // attn path).
-    device const packed_uint3* sc_u3 = (device const packed_uint3*)(block + 4);
+    // Cycle 78: fuse the 4-byte half2 dh-load (block offset 0..3) and the
+    // 12-byte packed_uint3 sc_u-load (block offset 4..15) into a single
+    // 16-byte `packed_uint4` block-header load. The Q4_K block layout
+    // places `[d (half), dmin (half), sc_u (12 bytes)]` contiguously at
+    // offsets 0..15 with 4-byte alignment, exactly matching packed_uint4
+    // (16 bytes, 4-byte aligned). Replaces 2 device loads (one 4-byte
+    // half2 + one 12-byte uint3) with one 16-byte coalesced load. The
+    // half2 dh value is held across ~30 lines until the final return,
+    // but it's only 4 bytes of register state — negligible. Builds on
+    // cycle 68 (half2 dh-load) and cycle 75 (packed_uint3 sc_u-load)
+    // by collapsing them into the natural single-block-header read shape.
+    // The helper is called twice per ib (once per NR0=2 row), so per-ib
+    // this folds 4 loads → 2 packed_uint4 loads. dmmv_q4k_qk_dual.metal
+    // handles Qwen3-8B attn_qkv Q+K paired (~18.5% of decode bytes/token
+    // via the 25.08 GiB attn path).
+    const packed_uint4 hdr = *((device const packed_uint4*)block);
+    const half2 dh = as_type<half2>(hdr.x);
     const uint sc_shift = uint(iq) * 16u;
     device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
-    // Cycle 68: port cycles 66/67's half2 dh-load pattern to qk_dual.
-    // Block layout starts with `[d (half), dmin (half)]` at byte offsets
-    // 0..3, exactly a half2 pair matching 4-byte block alignment. Replaces
-    // 2 scalar half reads (dh[0] = d, dh[1] = dmin) with one packed half2
-    // load + .x/.y swizzles. The helper is called twice per ib (once per
-    // row), so per-ib this folds 4 scalar half loads → 2 half2 loads.
-    // dmmv_q4k_qk_dual.metal handles Qwen3-8B attn_qkv Q+K paired
-    // (~18.5% of decode bytes/token via the 25.08 GiB attn path).
-    const half2 dh = *((device const half2*)block);
 
     // Cycle 71: port cycle 69's ushort4-sc16 register-vector pattern to
     // qk_dual. Replace the stack-allocated `ushort sc16[4]` + uchar*
@@ -94,7 +86,7 @@ inline float4 q4k_block_dot_parts(
     // ushort4 byte-extractions. Same compiler-hint philosophy as cycles
     // 49/50 (nibble-mask vectorize), 51 (per-ib reduction), 61
     // (cross-row reduction), 69 (dmmv_q4k.metal), 70 (swiglu).
-    const uint3 sc_u3v = uint3(*sc_u3);
+    const uint3 sc_u3v = uint3(hdr.y, hdr.z, hdr.w);
     const ushort sc_0 = ushort((sc_u3v.x >> sc_shift) & 0xFFFFu);
     const ushort sc_2 = ushort((sc_u3v.y >> sc_shift) & 0xFFFFu);
     const ushort sc_4 = ushort((sc_u3v.z >> sc_shift) & 0xFFFFu);
