@@ -36,97 +36,6 @@ struct DualQ4KDmmvPush {
 #define BLOCK_SIZE 144
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
-// Cycle 32: fused gate+up block-dot pair. Loads both blocks' q1/q2/sc/dh
-// up front and interleaves the FOR_UNROLL inner accumulator updates so the
-// compiler can schedule independent gate-vs-up FMAs simultaneously. Same
-// algorithm as two sequential q4k_block_dot calls but the interleaving
-// removes a serialization point across the inline-helper boundary, which
-// the Metal compiler does not always reorder aggressively across.
-inline float2 q4k_block_dot_pair(
-    device const uchar* block_g,
-    device const uchar* block_u,
-    thread const float* yl,
-    thread const float* yh,
-    float4 sumy,
-    ushort iq,
-    ushort ir
-) {
-    constexpr ushort kmask1 = 0x3f3f;
-    constexpr ushort kmask2 = 0x0f0f;
-    constexpr ushort kmask3 = 0xc0c0;
-
-    ushort sc16_g[4];
-    ushort sc16_u[4];
-    thread const uchar* sc8_g = (thread const uchar*)sc16_g;
-    thread const uchar* sc8_u = (thread const uchar*)sc16_u;
-
-    device const ushort* sc_g = (device const ushort*)(block_g + 4) + iq;
-    device const ushort* sc_u = (device const ushort*)(block_u + 4) + iq;
-    device const ushort* q1_g = (device const ushort*)(block_g + 16) + 16 * iq + 4 * ir;
-    device const ushort* q1_u = (device const ushort*)(block_u + 16) + 16 * iq + 4 * ir;
-    device const half* dh_g = (device const half*)block_g;
-    device const half* dh_u = (device const half*)block_u;
-
-    sc16_g[0] = sc_g[0] & kmask1;
-    sc16_g[1] = sc_g[2] & kmask1;
-    sc16_g[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
-    sc16_g[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
-
-    sc16_u[0] = sc_u[0] & kmask1;
-    sc16_u[1] = sc_u[2] & kmask1;
-    sc16_u[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
-    sc16_u[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
-
-    const ushort4 q1v_g = *((device const ushort4*)q1_g);
-    const ushort4 q2v_g = *((device const ushort4*)(q1_g + 32));
-    const ushort4 q1v_u = *((device const ushort4*)q1_u);
-    const ushort4 q2v_u = *((device const ushort4*)(q1_u + 32));
-
-    float4 acc1_g = {0.f, 0.f, 0.f, 0.f};
-    float4 acc2_g = {0.f, 0.f, 0.f, 0.f};
-    float4 acc1_u = {0.f, 0.f, 0.f, 0.f};
-    float4 acc2_u = {0.f, 0.f, 0.f, 0.f};
-
-    FOR_UNROLL (short i = 0; i < 4; ++i) {
-        const float yl0 = yl[2 * i + 0];
-        const float yl1 = yl[2 * i + 1];
-        const float yl8 = yl[2 * i + 8];
-        const float yl9 = yl[2 * i + 9];
-        const float yh0 = yh[2 * i + 0];
-        const float yh1 = yh[2 * i + 1];
-        const float yh8 = yh[2 * i + 8];
-        const float yh9 = yh[2 * i + 9];
-        acc1_g[0] += yl0 * (q1v_g[i] & 0x000F);
-        acc1_u[0] += yl0 * (q1v_u[i] & 0x000F);
-        acc1_g[1] += yl1 * (q1v_g[i] & 0x0F00);
-        acc1_u[1] += yl1 * (q1v_u[i] & 0x0F00);
-        acc1_g[2] += yl8 * (q1v_g[i] & 0x00F0);
-        acc1_u[2] += yl8 * (q1v_u[i] & 0x00F0);
-        acc1_g[3] += yl9 * (q1v_g[i] & 0xF000);
-        acc1_u[3] += yl9 * (q1v_u[i] & 0xF000);
-        acc2_g[0] += yh0 * (q2v_g[i] & 0x000F);
-        acc2_u[0] += yh0 * (q2v_u[i] & 0x000F);
-        acc2_g[1] += yh1 * (q2v_g[i] & 0x0F00);
-        acc2_u[1] += yh1 * (q2v_u[i] & 0x0F00);
-        acc2_g[2] += yh8 * (q2v_g[i] & 0x00F0);
-        acc2_u[2] += yh8 * (q2v_u[i] & 0x00F0);
-        acc2_g[3] += yh9 * (q2v_g[i] & 0xF000);
-        acc2_u[3] += yh9 * (q2v_u[i] & 0xF000);
-    }
-
-    const float g = dh_g[0] * ((acc1_g[0] + 1.f / 256.f * acc1_g[1]) * sc8_g[0] +
-            (acc1_g[2] + 1.f / 256.f * acc1_g[3]) * sc8_g[1] * 1.f / 16.f +
-            (acc2_g[0] + 1.f / 256.f * acc2_g[1]) * sc8_g[4] +
-            (acc2_g[2] + 1.f / 256.f * acc2_g[3]) * sc8_g[5] * 1.f / 16.f) -
-        dh_g[1] * (sumy[0] * sc8_g[2] + sumy[1] * sc8_g[3] + sumy[2] * sc8_g[6] + sumy[3] * sc8_g[7]);
-    const float u = dh_u[0] * ((acc1_u[0] + 1.f / 256.f * acc1_u[1]) * sc8_u[0] +
-            (acc1_u[2] + 1.f / 256.f * acc1_u[3]) * sc8_u[1] * 1.f / 16.f +
-            (acc2_u[0] + 1.f / 256.f * acc2_u[1]) * sc8_u[4] +
-            (acc2_u[2] + 1.f / 256.f * acc2_u[3]) * sc8_u[5] * 1.f / 16.f) -
-        dh_u[1] * (sumy[0] * sc8_u[2] + sumy[1] * sc8_u[3] + sumy[2] * sc8_u[6] + sumy[3] * sc8_u[7]);
-    return float2(g, u);
-}
-
 inline float swiglu(float gate, float up) {
     // SiLU(gate) * up = (gate / (1 + exp(-gate))) * up
     // fast::exp maps to Apple GPU hardware exp2 (vs precise::exp polynomial).
@@ -197,15 +106,150 @@ kernel void main0(
         sumy[2] = dot(c0, ones) + dot(c1, ones);
         sumy[3] = dot(d0, ones) + dot(d1, ones);
 
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            const int dst_row = first_row + row;
-            if (dst_row < int(p.M0)) {
-                const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
-                const float2 gu = q4k_block_dot_pair(gate_src + row_off, up_src + row_off, yl, yh, sumy, iq, ir);
-                gate_sum[row] += gu.x;
-                up_sum[row] += gu.y;
-            }
+        // Cycle 34: inline the q4k_block_dot_pair helper and interleave a
+        // 4-way row0/row1 × gate/up FOR_UNROLL. Loads all 4 blocks' q1v/q2v/
+        // sc16/dh up front and folds 64 independent FMAs into a single i=0..3
+        // unrolled loop — extends cycle 33's row0/row1 inline pattern (which
+        // landed in dmmv_q4k.metal) by also interleaving the gate/up axis on
+        // top, matching the cross-axis interleaving cycle 32 applied within
+        // the helper. Frees the compiler to schedule 4 independent FMA chains
+        // simultaneously, which the helper-function boundary previously
+        // blocked. Covers ffn_gate+ffn_up on Qwen3-8B dense path (~50% of
+        // Q4_K bytes/token).
+        constexpr ushort kmask1 = 0x3f3f;
+        constexpr ushort kmask2 = 0x0f0f;
+        constexpr ushort kmask3 = 0xc0c0;
+
+        const int dst_row_0 = first_row + 0;
+        const int dst_row_1 = first_row + 1;
+        const ulong row_off_0 = ulong(dst_row_0) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
+        const ulong row_off_1 = ulong(dst_row_1) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
+
+        device const uchar* block_g0 = gate_src + row_off_0;
+        device const uchar* block_u0 = up_src + row_off_0;
+        device const uchar* block_g1 = gate_src + row_off_1;
+        device const uchar* block_u1 = up_src + row_off_1;
+
+        device const ushort* sc_g0 = (device const ushort*)(block_g0 + 4) + iq;
+        device const ushort* sc_u0 = (device const ushort*)(block_u0 + 4) + iq;
+        device const ushort* sc_g1 = (device const ushort*)(block_g1 + 4) + iq;
+        device const ushort* sc_u1 = (device const ushort*)(block_u1 + 4) + iq;
+        device const ushort* q1_g0 = (device const ushort*)(block_g0 + 16) + 16 * iq + 4 * ir;
+        device const ushort* q1_u0 = (device const ushort*)(block_u0 + 16) + 16 * iq + 4 * ir;
+        device const ushort* q1_g1 = (device const ushort*)(block_g1 + 16) + 16 * iq + 4 * ir;
+        device const ushort* q1_u1 = (device const ushort*)(block_u1 + 16) + 16 * iq + 4 * ir;
+        device const half* dh_g0 = (device const half*)block_g0;
+        device const half* dh_u0 = (device const half*)block_u0;
+        device const half* dh_g1 = (device const half*)block_g1;
+        device const half* dh_u1 = (device const half*)block_u1;
+
+        ushort sc16_g0[4]; ushort sc16_u0[4]; ushort sc16_g1[4]; ushort sc16_u1[4];
+        thread const uchar* sc8_g0 = (thread const uchar*)sc16_g0;
+        thread const uchar* sc8_u0 = (thread const uchar*)sc16_u0;
+        thread const uchar* sc8_g1 = (thread const uchar*)sc16_g1;
+        thread const uchar* sc8_u1 = (thread const uchar*)sc16_u1;
+
+        sc16_g0[0] = sc_g0[0] & kmask1;
+        sc16_g0[1] = sc_g0[2] & kmask1;
+        sc16_g0[2] = ((sc_g0[4] >> 0) & kmask2) | ((sc_g0[0] & kmask3) >> 2);
+        sc16_g0[3] = ((sc_g0[4] >> 4) & kmask2) | ((sc_g0[2] & kmask3) >> 2);
+
+        sc16_u0[0] = sc_u0[0] & kmask1;
+        sc16_u0[1] = sc_u0[2] & kmask1;
+        sc16_u0[2] = ((sc_u0[4] >> 0) & kmask2) | ((sc_u0[0] & kmask3) >> 2);
+        sc16_u0[3] = ((sc_u0[4] >> 4) & kmask2) | ((sc_u0[2] & kmask3) >> 2);
+
+        sc16_g1[0] = sc_g1[0] & kmask1;
+        sc16_g1[1] = sc_g1[2] & kmask1;
+        sc16_g1[2] = ((sc_g1[4] >> 0) & kmask2) | ((sc_g1[0] & kmask3) >> 2);
+        sc16_g1[3] = ((sc_g1[4] >> 4) & kmask2) | ((sc_g1[2] & kmask3) >> 2);
+
+        sc16_u1[0] = sc_u1[0] & kmask1;
+        sc16_u1[1] = sc_u1[2] & kmask1;
+        sc16_u1[2] = ((sc_u1[4] >> 0) & kmask2) | ((sc_u1[0] & kmask3) >> 2);
+        sc16_u1[3] = ((sc_u1[4] >> 4) & kmask2) | ((sc_u1[2] & kmask3) >> 2);
+
+        const ushort4 q1v_g0 = *((device const ushort4*)q1_g0);
+        const ushort4 q2v_g0 = *((device const ushort4*)(q1_g0 + 32));
+        const ushort4 q1v_u0 = *((device const ushort4*)q1_u0);
+        const ushort4 q2v_u0 = *((device const ushort4*)(q1_u0 + 32));
+        const ushort4 q1v_g1 = *((device const ushort4*)q1_g1);
+        const ushort4 q2v_g1 = *((device const ushort4*)(q1_g1 + 32));
+        const ushort4 q1v_u1 = *((device const ushort4*)q1_u1);
+        const ushort4 q2v_u1 = *((device const ushort4*)(q1_u1 + 32));
+
+        float4 acc1_g0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_g0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc1_u0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_u0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc1_g1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_g1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc1_u1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_u1 = {0.f, 0.f, 0.f, 0.f};
+
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            const float yl0 = yl[2 * i + 0];
+            const float yl1 = yl[2 * i + 1];
+            const float yl8 = yl[2 * i + 8];
+            const float yl9 = yl[2 * i + 9];
+            const float yh0 = yh[2 * i + 0];
+            const float yh1 = yh[2 * i + 1];
+            const float yh8 = yh[2 * i + 8];
+            const float yh9 = yh[2 * i + 9];
+            acc1_g0[0] += yl0 * (q1v_g0[i] & 0x000F);
+            acc1_u0[0] += yl0 * (q1v_u0[i] & 0x000F);
+            acc1_g1[0] += yl0 * (q1v_g1[i] & 0x000F);
+            acc1_u1[0] += yl0 * (q1v_u1[i] & 0x000F);
+            acc1_g0[1] += yl1 * (q1v_g0[i] & 0x0F00);
+            acc1_u0[1] += yl1 * (q1v_u0[i] & 0x0F00);
+            acc1_g1[1] += yl1 * (q1v_g1[i] & 0x0F00);
+            acc1_u1[1] += yl1 * (q1v_u1[i] & 0x0F00);
+            acc1_g0[2] += yl8 * (q1v_g0[i] & 0x00F0);
+            acc1_u0[2] += yl8 * (q1v_u0[i] & 0x00F0);
+            acc1_g1[2] += yl8 * (q1v_g1[i] & 0x00F0);
+            acc1_u1[2] += yl8 * (q1v_u1[i] & 0x00F0);
+            acc1_g0[3] += yl9 * (q1v_g0[i] & 0xF000);
+            acc1_u0[3] += yl9 * (q1v_u0[i] & 0xF000);
+            acc1_g1[3] += yl9 * (q1v_g1[i] & 0xF000);
+            acc1_u1[3] += yl9 * (q1v_u1[i] & 0xF000);
+            acc2_g0[0] += yh0 * (q2v_g0[i] & 0x000F);
+            acc2_u0[0] += yh0 * (q2v_u0[i] & 0x000F);
+            acc2_g1[0] += yh0 * (q2v_g1[i] & 0x000F);
+            acc2_u1[0] += yh0 * (q2v_u1[i] & 0x000F);
+            acc2_g0[1] += yh1 * (q2v_g0[i] & 0x0F00);
+            acc2_u0[1] += yh1 * (q2v_u0[i] & 0x0F00);
+            acc2_g1[1] += yh1 * (q2v_g1[i] & 0x0F00);
+            acc2_u1[1] += yh1 * (q2v_u1[i] & 0x0F00);
+            acc2_g0[2] += yh8 * (q2v_g0[i] & 0x00F0);
+            acc2_u0[2] += yh8 * (q2v_u0[i] & 0x00F0);
+            acc2_g1[2] += yh8 * (q2v_g1[i] & 0x00F0);
+            acc2_u1[2] += yh8 * (q2v_u1[i] & 0x00F0);
+            acc2_g0[3] += yh9 * (q2v_g0[i] & 0xF000);
+            acc2_u0[3] += yh9 * (q2v_u0[i] & 0xF000);
+            acc2_g1[3] += yh9 * (q2v_g1[i] & 0xF000);
+            acc2_u1[3] += yh9 * (q2v_u1[i] & 0xF000);
         }
+
+        gate_sum[0] += dh_g0[0] * ((acc1_g0[0] + 1.f / 256.f * acc1_g0[1]) * sc8_g0[0] +
+                (acc1_g0[2] + 1.f / 256.f * acc1_g0[3]) * sc8_g0[1] * 1.f / 16.f +
+                (acc2_g0[0] + 1.f / 256.f * acc2_g0[1]) * sc8_g0[4] +
+                (acc2_g0[2] + 1.f / 256.f * acc2_g0[3]) * sc8_g0[5] * 1.f / 16.f) -
+            dh_g0[1] * (sumy[0] * sc8_g0[2] + sumy[1] * sc8_g0[3] + sumy[2] * sc8_g0[6] + sumy[3] * sc8_g0[7]);
+        up_sum[0] += dh_u0[0] * ((acc1_u0[0] + 1.f / 256.f * acc1_u0[1]) * sc8_u0[0] +
+                (acc1_u0[2] + 1.f / 256.f * acc1_u0[3]) * sc8_u0[1] * 1.f / 16.f +
+                (acc2_u0[0] + 1.f / 256.f * acc2_u0[1]) * sc8_u0[4] +
+                (acc2_u0[2] + 1.f / 256.f * acc2_u0[3]) * sc8_u0[5] * 1.f / 16.f) -
+            dh_u0[1] * (sumy[0] * sc8_u0[2] + sumy[1] * sc8_u0[3] + sumy[2] * sc8_u0[6] + sumy[3] * sc8_u0[7]);
+        gate_sum[1] += dh_g1[0] * ((acc1_g1[0] + 1.f / 256.f * acc1_g1[1]) * sc8_g1[0] +
+                (acc1_g1[2] + 1.f / 256.f * acc1_g1[3]) * sc8_g1[1] * 1.f / 16.f +
+                (acc2_g1[0] + 1.f / 256.f * acc2_g1[1]) * sc8_g1[4] +
+                (acc2_g1[2] + 1.f / 256.f * acc2_g1[3]) * sc8_g1[5] * 1.f / 16.f) -
+            dh_g1[1] * (sumy[0] * sc8_g1[2] + sumy[1] * sc8_g1[3] + sumy[2] * sc8_g1[6] + sumy[3] * sc8_g1[7]);
+        up_sum[1] += dh_u1[0] * ((acc1_u1[0] + 1.f / 256.f * acc1_u1[1]) * sc8_u1[0] +
+                (acc1_u1[2] + 1.f / 256.f * acc1_u1[3]) * sc8_u1[1] * 1.f / 16.f +
+                (acc2_u1[0] + 1.f / 256.f * acc2_u1[1]) * sc8_u1[4] +
+                (acc2_u1[2] + 1.f / 256.f * acc2_u1[3]) * sc8_u1[5] * 1.f / 16.f) -
+            dh_u1[1] * (sumy[0] * sc8_u1[2] + sumy[1] * sc8_u1[3] + sumy[2] * sc8_u1[6] + sumy[3] * sc8_u1[7]);
 
         y4 += 4 * QK_K;
     }
