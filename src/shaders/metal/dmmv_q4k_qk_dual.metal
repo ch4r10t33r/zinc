@@ -54,7 +54,23 @@ inline float4 q4k_block_dot_parts(
     constexpr ushort kmask2 = 0x0f0f;
     constexpr ushort kmask3 = 0xc0c0;
 
-    device const ushort* sc = (device const ushort*)(block + 4) + iq;
+    // Cycle 75: port cycles 73/74's `packed_uint3` sc_u load pattern to
+    // qk_dual. The Q4_K block's 12-byte packed-scales field sits at byte
+    // offsets 4..15 — contiguous and 4-byte aligned — matching
+    // packed_uint3 (12 bytes, 4-byte alignment). The previous form's
+    // `+ iq` ushort-pointer offset (iq ∈ {0,1}) left the base 2- or
+    // 4-byte aligned depending on iq, forcing the compiler to treat each
+    // sc[k] as an independent strided ushort load it had to prove
+    // contiguous via alias analysis before coalescing. Replacing with
+    // packed_uint3 + a runtime `sc_shift = iq*16` to select the lower
+    // or upper ushort lane of each uint guarantees one 12-byte coalesced
+    // load per row per ib. The helper is called twice per ib (once per
+    // NR0=2 row), so per-ib this folds 6 strided ushort loads → 2
+    // packed_uint3 loads. dmmv_q4k_qk_dual.metal handles Qwen3-8B
+    // attn_qkv Q+K paired (~18.5% of decode bytes/token via 25.08 GiB
+    // attn path).
+    device const packed_uint3* sc_u3 = (device const packed_uint3*)(block + 4);
+    const uint sc_shift = uint(iq) * 16u;
     device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
     // Cycle 68: port cycles 66/67's half2 dh-load pattern to qk_dual.
     // Block layout starts with `[d (half), dmin (half)]` at byte offsets
@@ -78,11 +94,15 @@ inline float4 q4k_block_dot_parts(
     // ushort4 byte-extractions. Same compiler-hint philosophy as cycles
     // 49/50 (nibble-mask vectorize), 51 (per-ib reduction), 61
     // (cross-row reduction), 69 (dmmv_q4k.metal), 70 (swiglu).
+    const uint3 sc_u3v = uint3(*sc_u3);
+    const ushort sc_0 = ushort((sc_u3v.x >> sc_shift) & 0xFFFFu);
+    const ushort sc_2 = ushort((sc_u3v.y >> sc_shift) & 0xFFFFu);
+    const ushort sc_4 = ushort((sc_u3v.z >> sc_shift) & 0xFFFFu);
     const ushort4 sc16 = ushort4(
-        sc[0] & kmask1,
-        sc[2] & kmask1,
-        ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2),
-        ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2));
+        sc_0 & kmask1,
+        sc_2 & kmask1,
+        ((sc_4 >> 0) & kmask2) | ((sc_0 & kmask3) >> 2),
+        ((sc_4 >> 4) & kmask2) | ((sc_2 & kmask3) >> 2));
 
     const ushort4 q1v = *((device const ushort4*)q1);
     const ushort4 q2v = *((device const ushort4*)(q1 + 32));
