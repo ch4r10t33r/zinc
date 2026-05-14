@@ -295,8 +295,25 @@ kernel void main0(
         // ib (12 scalar ops); the new form is 1 vec mul + 1 vec fnma + 4
         // scalar accumulator adds (~6 ops). This is the hottest Q4_K shader
         // (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B dense).
-        const float4 dh_d = float4(float(dh_g0[0]), float(dh_u0[0]), float(dh_g1[0]), float(dh_u1[0]));
-        const float4 dh_dmin = float4(float(dh_g0[1]), float(dh_u0[1]), float(dh_g1[1]), float(dh_u1[1]));
+        //
+        // Cycle 66: replace 8 scalar half loads (dh_X[0], dh_X[1] × 4 rows)
+        // with 4 explicit half2 loads. Q4_K's block layout starts with
+        // [d (half), dmin (half)] at offsets 0..3 — exactly a half2 pair
+        // — so a half2 load matches the natural alignment and tells the
+        // compiler the pair is intended to be read together. Subsequent
+        // `float(h2.x)` / `float(h2.y)` lowers to a single half2→float2
+        // widen per row instead of 2 scalar half→float casts. Same
+        // compiler-hint philosophy as cycles 38 (single-half Q6_K load),
+        // 49/50 (nibble-mask vectorize), 51-53 (per-ib reduction), and
+        // 60-62 (cross-row reduction): tell the compiler the SIMD shape
+        // explicitly. 8 scalar half loads → 4 half2 loads per ib, × 64
+        // threads/TG × 3072 TGs per layer × 36 layers per token.
+        const half2 dh_g0_h2 = *((device const half2*)dh_g0);
+        const half2 dh_u0_h2 = *((device const half2*)dh_u0);
+        const half2 dh_g1_h2 = *((device const half2*)dh_g1);
+        const half2 dh_u1_h2 = *((device const half2*)dh_u1);
+        const float4 dh_d = float4(float(dh_g0_h2.x), float(dh_u0_h2.x), float(dh_g1_h2.x), float(dh_u1_h2.x));
+        const float4 dh_dmin = float4(float(dh_g0_h2.y), float(dh_u0_h2.y), float(dh_g1_h2.y), float(dh_u1_h2.y));
         const float4 head_dots = float4(
             dot(head_pair_g0, sc_pos_g0),
             dot(head_pair_u0, sc_pos_u0),
