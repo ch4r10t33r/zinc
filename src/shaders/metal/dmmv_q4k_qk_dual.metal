@@ -44,8 +44,8 @@ struct QKDualPush {
 // finalizing each row's reduction to scalar inside the helper.
 inline float4 q4k_block_dot_parts(
     device const uchar* block,
-    thread const float* yl,
-    thread const float* yh,
+    thread const float4* yl4_arr,
+    thread const float4* yh4_arr,
     float4 sumy,
     ushort iq,
     ushort ir
@@ -103,8 +103,8 @@ inline float4 q4k_block_dot_parts(
     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
-        const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
+        const float4 yl4 = yl4_arr[i];
+        const float4 yh4 = yh4_arr[i];
         const ushort q1i = q1v[i];
         const ushort q2i = q2v[i];
         const float4 q1m = float4(q1i & 0x000F, q1i & 0x0F00, q1i & 0x00F0, q1i & 0xF000);
@@ -161,8 +161,6 @@ kernel void main0(
 
     device const float* x = X + (p.x_offset / 4);
 
-    float yl[16];
-    float yh[16];
     float sumf[NR0] = {0.f, 0.f};
 
     device const float* y4 = x + ix * QK_K + 64 * iq + 8 * ir;
@@ -189,14 +187,36 @@ kernel void main0(
         const float4 c0 = y4v[32];  const float4 c1 = y4v[33];
         const float4 d0 = y4v[40];  const float4 d1 = y4v[41];
 
-        yl[ 0] = a0[0]; yl[ 1] = a0[1]; yl[ 2] = a0[2]; yl[ 3] = a0[3];
-        yl[ 4] = a1[0]; yl[ 5] = a1[1]; yl[ 6] = a1[2]; yl[ 7] = a1[3];
-        yl[ 8] = b0[0]; yl[ 9] = b0[1]; yl[10] = b0[2]; yl[11] = b0[3];
-        yl[12] = b1[0]; yl[13] = b1[1]; yl[14] = b1[2]; yl[15] = b1[3];
-        yh[ 0] = c0[0]; yh[ 1] = c0[1]; yh[ 2] = c0[2]; yh[ 3] = c0[3];
-        yh[ 4] = c1[0]; yh[ 5] = c1[1]; yh[ 6] = c1[2]; yh[ 7] = c1[3];
-        yh[ 8] = d0[0]; yh[ 9] = d0[1]; yh[10] = d0[2]; yh[11] = d0[3];
-        yh[12] = d1[0]; yh[13] = d1[1]; yh[14] = d1[2]; yh[15] = d1[3];
+        // Cycle 86: store the per-i y-gather directly as `float4 yl4_arr[4]`
+        // / `float4 yh4_arr[4]` register-vector arrays instead of the legacy
+        // `float yl[16]` / `float yh[16]` scalar layout. The helper's FMA
+        // loop consumes exactly one float4 per i from each side — yl4_arr[i]
+        // = (yl[2i], yl[2i+1], yl[2i+8], yl[2i+9]) — which under the old
+        // layout was reconstructed each iteration inside the helper via a
+        // 4-lane indexed gather off 16-wide flat stack arrays filled here
+        // via 32 scalar lane writes. Eliminates 32 scalar stack writes and
+        // 8 4-lane gather reconstructions per ib (the helper runs twice per
+        // ib for NR0=2 rows), keeping all y data in SSA-eligible vector
+        // registers. The lane mapping is yl4_arr[i] = (a*.xy, b*.xy) for
+        // i∈{0,2} and (a*.zw, b*.zw) for i∈{1,3} where a*/b* picks between
+        // (a0,b0)/(a1,b1) based on i/2. Mirrors cycle 85's port to
+        // dmmv_q4k.metal, cycle 84's port to dmmv_q4k_dense_gate_up_swiglu
+        // .metal (hottest Q4_K shader, ffn_gate+ffn_up), and cycle 83's
+        // original in dmmv_q6k_llama.metal. dmmv_q4k_qk_dual.metal pairs
+        // Qwen3-8B attn_qkv Q+K (~18.5% of decode bytes/token via the
+        // 25.08 GiB attn path; Q4_K = 71.6% of decode bytes/token).
+        const float4 yl4_arr[4] = {
+            float4(a0.xy, b0.xy),
+            float4(a0.zw, b0.zw),
+            float4(a1.xy, b1.xy),
+            float4(a1.zw, b1.zw),
+        };
+        const float4 yh4_arr[4] = {
+            float4(c0.xy, d0.xy),
+            float4(c0.zw, d0.zw),
+            float4(c1.xy, d1.xy),
+            float4(c1.zw, d1.zw),
+        };
 
         const float4 ones = float4(1.0f);
         sumy[0] = dot(a0, ones) + dot(a1, ones);
@@ -221,10 +241,10 @@ kernel void main0(
         const ulong row_off_0 = ulong(dst_row_0) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
         const ulong row_off_1 = ulong(dst_row_1) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
         const float4 parts_0 = (dst_row_0 < M)
-            ? q4k_block_dot_parts(src + row_off_0, yl, yh, sumy, iq, ir)
+            ? q4k_block_dot_parts(src + row_off_0, yl4_arr, yh4_arr, sumy, iq, ir)
             : float4(0.0f);
         const float4 parts_1 = (dst_row_1 < M)
-            ? q4k_block_dot_parts(src + row_off_1, yl, yh, sumy, iq, ir)
+            ? q4k_block_dot_parts(src + row_off_1, yl4_arr, yh4_arr, sumy, iq, ir)
             : float4(0.0f);
         const float2 dh_d = float2(parts_0[2], parts_1[2]);
         const float2 dh_dmin = float2(parts_0[3], parts_1[3]);
