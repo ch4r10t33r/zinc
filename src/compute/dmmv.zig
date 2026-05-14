@@ -522,13 +522,13 @@ pub const DmmvDispatch = struct {
         };
 
         const q4k_batch_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_batch_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q4k_batch_kpar_path, 3, batch_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q4k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q4k_batch_kpar_path, 3, batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K batch kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q6k_batch_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_batch_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q6k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q6k_batch_kpar_path, 3, batch_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q6k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q6k_batch_kpar_path, 3, batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q6_K batch kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };

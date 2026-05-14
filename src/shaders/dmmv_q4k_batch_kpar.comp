@@ -28,6 +28,12 @@
 
 layout(local_size_x = 64) in;
 
+// RDNA wave64 has one subgroup per workgroup. Intel Xe2/Alchemist commonly
+// runs this 64-thread workgroup as two or four subgroups, so subgroupAdd alone
+// only reduces part of K. Store one elected partial per subgroup and merge it
+// in shared memory before writing the output column.
+shared float s_sg_sums[4];
+
 // MAX_COLS trades off register pressure vs number of prefill chunks.
 // Five-sample sweep on Qwen3-8B Q4_K_M on R9700 (105-token prefill,
 // median tok/s):
@@ -161,9 +167,20 @@ void main() {
         }
     }
 
-    // wave64 subgroupAdd across all 64 lanes, one column at a time.
+    // Reduce across all local threads. subgroupAdd covers wave64 directly and
+    // the shared-memory merge handles wave32/wave16 devices.
     for (uint c = 0u; c < num_cols; c++) {
         float reduced = subgroupAdd(sums[c]);
+        if (gl_NumSubgroups > 1u) {
+            if (subgroupElect()) s_sg_sums[gl_SubgroupID] = reduced;
+            barrier();
+            if (tid == 0u) {
+                for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                    reduced += s_sg_sums[sg];
+                }
+            }
+            barrier();
+        }
         if (tid == 0u) {
             y_data[y_offset / 4u + c * M + row] = reduced;
         }

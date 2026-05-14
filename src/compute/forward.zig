@@ -864,7 +864,7 @@ fn isIntelGpuVendor(vendor: GpuVendor) bool {
 
 fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
     if (!isIntelGpuVendor(vendor)) return 0;
-    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 16;
+    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 0;
     if (std.mem.eql(u8, raw, "0")) return 0;
     return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
@@ -1990,13 +1990,13 @@ pub const InferenceEngine = struct {
             log.info("MoE Q4_K kpar variant DISABLED via ZINC_MOE_KPAR=0", .{});
         }
 
-        // Q4_K batched projection, K-parallel wave64 variant. Default ON when
-        // the pipeline is loaded — measured 2× speedup vs the serial variant
-        // on Qwen3-8B Q4_K_M (143 tok/s vs 62 tok/s on a 105-token prompt,
-        // R9700). Disable via ZINC_Q4K_BATCH_KPAR=0 to run the serial shader.
+        // Q4_K/Q6_K batched projection, K-parallel variant. Default ON when
+        // the pipeline is loaded. The shaders merge cross-subgroup partials,
+        // so this is valid on RDNA wave64 and Intel wave32/wave16 devices.
+        // Disable via ZINC_Q4K_BATCH_KPAR=0 to run the serial shader.
         const q4k_batch_kpar_env = std.posix.getenv("ZINC_Q4K_BATCH_KPAR");
         const q4k_batch_kpar_explicitly_off = q4k_batch_kpar_env != null and std.mem.eql(u8, q4k_batch_kpar_env.?, "0");
-        const q4k_batch_kpar_enabled = gpu_config.wave_size == 64 and !q4k_batch_kpar_explicitly_off and dmmv.pipeline_q4k_batch_kpar != null;
+        const q4k_batch_kpar_enabled = !q4k_batch_kpar_explicitly_off and dmmv.pipeline_q4k_batch_kpar != null;
         if (q4k_batch_kpar_enabled) {
             log.info("Q4_K batched projection kpar variant ENABLED (default, set ZINC_Q4K_BATCH_KPAR=0 to disable)", .{});
         } else if (q4k_batch_kpar_explicitly_off) {

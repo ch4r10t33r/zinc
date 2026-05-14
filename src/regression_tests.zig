@@ -136,9 +136,37 @@ test "Vulkan batched projection chunk size matches selected shader family" {
     try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 2400);
 }
 
-test "Vulkan Intel batched prefill chunks the monolithic graph by default" {
+test "Vulkan batched projection kpar is allowed on Intel wave32" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const q4k_batch_kpar_enabled =";
+    const start = std.mem.indexOf(u8, src, marker) orelse return error.TestExpectedEqual;
+    const end = @min(start + 300, src.len);
+    try expectContains(src[start..end], "dmmv.pipeline_q4k_batch_kpar != null");
+    try expectNotContains(src[start..end], "gpu_config.wave_size == 64");
+}
+
+test "Vulkan batched kpar shaders merge cross-subgroup partials" {
+    const q4 = @embedFile("shaders/dmmv_q4k_batch_kpar.comp");
+    const q6 = @embedFile("shaders/dmmv_q6k_batch_kpar.comp");
+    for ([_][]const u8{ q4, q6 }) |src| {
+        try expectContains(src, "shared float s_sg_sums[4];");
+        try expectContains(src, "gl_NumSubgroups > 1u");
+        try expectContains(src, "subgroupElect()");
+        try expectContains(src, "s_sg_sums[gl_SubgroupID]");
+        try expectContains(src, "barrier();");
+    }
+}
+
+test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
+    const src = @embedFile("compute/dmmv.zig");
+    try expectContainsNear(src, "const q4k_batch_kpar_path", "effective_wave64_options", 700);
+    try expectContainsNear(src, "const q6k_batch_kpar_path", "effective_wave64_options", 700);
+}
+
+test "Vulkan Intel batched prefill keeps chunk override for fallback debugging" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "ZINC_INTEL_BATCHED_PREFILL_CHUNK");
+    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "orelse return 0;", 500);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "intelBatchedPrefillChunkLimit", 1200);
     try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
 }
