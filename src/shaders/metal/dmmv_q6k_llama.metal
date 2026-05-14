@@ -91,7 +91,14 @@ kernel void main0(
         const uchar4 q1v4_0 = *((device const uchar4*)(block0 + q_offset_l));
         const uchar4 q2v4_0 = *((device const uchar4*)(block0 + q_offset_l + 32u));
         const uchar4 qhv4_0 = *((device const uchar4*)(block0 + 128u + q_offset_h));
-        device const uchar* sc_0 = block0 + 192u + uint(is);
+        // Cycle 42: cast scales pointer to `device const char*` (signed) so the
+        // 4 per-block scale reads compile to ld.s8 + scvtf directly, replacing
+        // the s8_to_f32 helper's ld.u8 + branch (or select) + scvtf chain. Q6_K
+        // scales are signed 8-bit in [-128,127]; the old helper paid for the
+        // sign-extend at runtime, the new path bakes it into the load opcode.
+        // 8 calls per inner-loop iteration (4 scales × 2 rows) × nb=16 × 36
+        // layers × decode step. Same memory traffic, fewer ALU ops.
+        device const char* sc_0 = (device const char*)(block0 + 192u + uint(is));
         // Cycle 38: replace 2 scalar uchar reads + bit-shift + as_type<half> with a
         // single 2-byte aligned half load. block+208 is 2-byte aligned (BLOCK_SIZE=210
         // is even, row_bytes = nb*210 is even, base buffer is ≥16-byte aligned by Metal
@@ -102,7 +109,7 @@ kernel void main0(
         const uchar4 q1v4_1 = *((device const uchar4*)(block1 + q_offset_l));
         const uchar4 q2v4_1 = *((device const uchar4*)(block1 + q_offset_l + 32u));
         const uchar4 qhv4_1 = *((device const uchar4*)(block1 + 128u + q_offset_h));
-        device const uchar* sc_1 = block1 + 192u + uint(is);
+        device const char* sc_1 = (device const char*)(block1 + 192u + uint(is));
         const float d_1 = float(*((device const half*)(block1 + 208)));
 
         float4 sums_0 = float4(0.0f);
@@ -140,16 +147,16 @@ kernel void main0(
         }
 
         sumf[0] += d_0 * (
-            sums_0[0] * s8_to_f32(uint(sc_0[0])) +
-            sums_0[1] * s8_to_f32(uint(sc_0[2])) +
-            sums_0[2] * s8_to_f32(uint(sc_0[4])) +
-            sums_0[3] * s8_to_f32(uint(sc_0[6]))
+            sums_0[0] * float(sc_0[0]) +
+            sums_0[1] * float(sc_0[2]) +
+            sums_0[2] * float(sc_0[4]) +
+            sums_0[3] * float(sc_0[6])
         );
         sumf[1] += d_1 * (
-            sums_1[0] * s8_to_f32(uint(sc_1[0])) +
-            sums_1[1] * s8_to_f32(uint(sc_1[2])) +
-            sums_1[2] * s8_to_f32(uint(sc_1[4])) +
-            sums_1[3] * s8_to_f32(uint(sc_1[6]))
+            sums_1[0] * float(sc_1[0]) +
+            sums_1[1] * float(sc_1[2]) +
+            sums_1[2] * float(sc_1[4]) +
+            sums_1[3] * float(sc_1[6])
         );
     }
 
