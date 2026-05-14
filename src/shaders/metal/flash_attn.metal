@@ -130,7 +130,10 @@ kernel void main0(
 
     threadgroup float4 q_cache4[FLASH_MAX_HEAD_VEC4];
     threadgroup float scores[FLASH_BLOCK_TOKENS];
-    threadgroup float reduce[FLASH_TG_SIZE];
+    // Cycle 100: `reduce[]` scratch is dead — both reduceThreadgroup{Max,Sum}
+    // were inlined to bare `simd_max`/`simd_sum` since TG=32=simd_width on
+    // Apple7/Apple9 makes the cross-simdgroup merge branch statically dead.
+    // Frees 128B of threadgroup memory, slightly easing occupancy pressure.
     // running_max/running_sum are per-thread registers (every thread maintains
     // the identical running state in lockstep since rescale/block_max/block_sum
     // are produced by full-threadgroup reductions). Saves the broadcast barrier
@@ -158,10 +161,17 @@ kernel void main0(
 
     // Strided loop: vec4_dim may exceed FLASH_TG_SIZE when head_dim > 256
     // (e.g. Gemma 4 global attention layers use head_dim=512 → vec4_dim=128).
+    // Cycle 100: TG=32=simd_width (Apple7/Apple9 single simdgroup) → downgrade
+    // the post-load barrier from threadgroup_barrier to simdgroup_barrier.
+    // The full threadgroup_barrier on Apple GPUs serializes both simdgroups
+    // and threadgroup-memory caches; with a single simdgroup the cross-
+    // simdgroup wait is dead, only the in-simdgroup memory ordering is
+    // needed. ~1152 barriers/token (32 Q-heads × 36 layers × 1 call/head),
+    // each replaced with the cheaper variant.
     for (uint i = tid; i < vec4_dim; i += FLASH_TG_SIZE) {
         q_cache4[i] = *(device const float4*)(q + q_base + (i << 2));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
     // Cycle 92: keep per-thread scores in a register array across the
     // QK→softmax pipeline. The two strided loops below visit the same
@@ -255,7 +265,11 @@ kernel void main0(
         // local local_max and has its own internal barrier on the scratch
         // array (separate shmem region from scores).
 
-        const float block_max = reduceThreadgroupMax(local_max, reduce, tid, subgroup_size, simd_lane, simd_group);
+        // Cycle 100: TG=32=simd_width → block_max collapses to `simd_max`
+        // (the helper's subgroup_size<FLASH_TG_SIZE branch is statically
+        // false in the actual dispatch shape, but inlining lets the
+        // compiler erase the unused `reduce` scratch slot too).
+        const float block_max = simd_max(local_max);
         const float next_max = fast::max(running_max, block_max);
 
         float local_sum = 0.0f;
@@ -268,38 +282,17 @@ kernel void main0(
 
         // Cycle 98: fuse the post-softmax `scores[]` barrier with the
         // block_sum reduce-write barrier so a single threadgroup_barrier
-        // covers both writes. The legacy form did:
-        //   barrier (for scores[])
-        //   reduceThreadgroupSum (= simd_sum, write reduce[], barrier, merge)
-        // — two barriers per block_start iter. We now hoist the simd_sum +
-        // reduce[] write *before* the barrier, so one barrier covers both
-        // scores[] and reduce[] writes. Inline the merge so we don't have
-        // to revisit reduceThreadgroupSum's internal barrier. Saves ~1152
-        // barriers/token on Qwen3-8B decode (36 layers × 32 Q-heads × 1
-        // block iter at avg ctx ≤256). Same "kill dead-after-use threadgroup
-        // roundtrips" philosophy as cycles 92-94, applied to the softmax-
-        // to-reduce handoff. Note: the wave_sum→reduce[simd_group] write
-        // races with no other writer (each simdgroup's lane-0 owns one slot
-        // of reduce[]); the merge after the barrier reads all reduce[]
-        // entries. The legacy reduceThreadgroupSum is preserved for callers
-        // (none after this point in this kernel) and unchanged.
-        const float wave_sum = simd_sum(local_sum);
-        if (subgroup_size < FLASH_TG_SIZE && simd_lane == 0u) {
-            reduce[simd_group] = wave_sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float block_sum;
-        if (subgroup_size < FLASH_TG_SIZE) {
-            const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
-            float merged = 0.0f;
-            for (uint sg = 0u; sg < n_groups; ++sg) {
-                merged += reduce[sg];
-            }
-            block_sum = merged;
-        } else {
-            block_sum = wave_sum;
-        }
+        // covers both writes. Cycle 100: TG=32=simd_width on Apple7/Apple9
+        // means there is exactly one simdgroup per dispatch, so the
+        // `subgroup_size < FLASH_TG_SIZE` branch is statically false — the
+        // reduce[] write, its scratch slot, and the cross-simdgroup merge
+        // are all dead code. `block_sum = simd_sum(local_sum)` is fully
+        // wave-resident. The barrier downgrades from threadgroup_barrier
+        // to simdgroup_barrier because the only cross-thread reader is
+        // the V loop's `scores[token_offset]` reads, all within the same
+        // simdgroup.
+        const float block_sum = simd_sum(local_sum);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
         const float rescale = running_sum > 0.0f ? fast::exp(running_max - next_max) : 0.0f;
 
         // Strided loop over head_dim slices when vec4_dim > FLASH_TG_SIZE.
