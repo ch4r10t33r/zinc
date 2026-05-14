@@ -115,18 +115,18 @@ kernel void main0(
     threadgroup float4 acc_cache4[FLASH_MAX_HEAD_VEC4];
     threadgroup float scores[FLASH_BLOCK_TOKENS];
     threadgroup float reduce[FLASH_TG_SIZE];
-    threadgroup float running_max;
-    threadgroup float running_sum;
+    // running_max/running_sum are per-thread registers (every thread maintains
+    // the identical running state in lockstep since rescale/block_max/block_sum
+    // are produced by full-threadgroup reductions). Saves the broadcast barrier
+    // that previously protected tid==0's update to threadgroup-scoped versions.
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
     // Strided loop: vec4_dim may exceed FLASH_TG_SIZE when head_dim > 256
     // (e.g. Gemma 4 global attention layers use head_dim=512 → vec4_dim=128).
     for (uint i = tid; i < vec4_dim; i += FLASH_TG_SIZE) {
         q_cache4[i] = *(device const float4*)(q + q_base + (i << 2));
         acc_cache4[i] = float4(0.0f);
-    }
-    if (tid == 0) {
-        running_max = -INFINITY;
-        running_sum = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -193,11 +193,11 @@ kernel void main0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (tid == 0) {
-            running_sum = running_sum * rescale + block_sum;
-            running_max = next_max;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Every thread maintains the identical running state in registers — no
+        // broadcast needed because rescale/block_sum/next_max are all derived
+        // from full-threadgroup reductions executed above.
+        running_sum = running_sum * rescale + block_sum;
+        running_max = next_max;
     }
 
     // Attention sink: per-head learned scalar acts as virtual token in softmax.
