@@ -334,6 +334,22 @@ kernel void main0(
         //
         // Cycles 66/80: dh half2 pairs come from the fused packed_uint4
         // block-header load up top (see cycle 80 comment near hdr_*).
+        //
+        // Cycle 82: express the per-ib cross-row delta as an explicit
+        // `fma(dh_d, head_dots, -dh_dmin * tail_dots)` instead of the
+        // algebraically equivalent `dh_d * head_dots - dh_dmin * tail_dots`.
+        // The plain `a*b - c*d` form is 2 vector muls + 1 vector sub (3 ops)
+        // and only collapses to 1 mul + 1 fma when the metal compiler is
+        // willing to fuse across the `-` (IEEE-strict mode won't, fast::*
+        // usually does — but the helper is consumed across an explicit
+        // float4 boundary). The explicit fma form is unconditionally 1
+        // vector mul + 1 vector fma, matching the cycle 61 pattern that
+        // already landed in dmmv_q4k.metal line 283 (cross-row 2-wide) and
+        // cycle 64's port to dmmv_q4k_qk_dual.metal line 233. This shader
+        // is the only Q4_K sibling still using the implicit form — porting
+        // makes the 3 hot Q4_K matvec kernels uniform on the same explicit
+        // fma shape. Hottest Q4_K shader (~50% of Q4_K bytes/token = 71.6%
+        // of decode bytes/token via Q4_K).
         const float4 dh_d = float4(float(dh_g0_h2.x), float(dh_u0_h2.x), float(dh_g1_h2.x), float(dh_u1_h2.x));
         const float4 dh_dmin = float4(float(dh_g0_h2.y), float(dh_u0_h2.y), float(dh_g1_h2.y), float(dh_u1_h2.y));
         const float4 head_dots = float4(
@@ -346,7 +362,7 @@ kernel void main0(
             dot(sumy, sc_neg_u0),
             dot(sumy, sc_neg_g1),
             dot(sumy, sc_neg_u1));
-        const float4 delta = dh_d * head_dots - dh_dmin * tail_dots;
+        const float4 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
         gate_sum[0] += delta[0];
         up_sum[0]   += delta[1];
         gate_sum[1] += delta[2];
