@@ -613,15 +613,26 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     }
   }
 
-  // Aggregate samples. Default is median of all timed samples. When
-  // BENCHMARK_TRIM is on and there are ≥5 samples, drop one high and
-  // one low before taking the median so a single cold-GPU outlier
-  // can't poison the verdict (and the symmetric trim guards against
-  // a too-warm outlier in the other direction).
+  // Aggregate samples. Default is median of all timed samples. With
+  // BENCHMARK_TRIM, drop symmetric high+low extremes before taking the
+  // median:
+  //   * 5–6 samples:  drop 1 high + 1 low  → median of remaining 3–4
+  //   * 7+   samples: drop 2 high + 2 low  → median of remaining ≥3
+  // The 2-trim variant kicks in for overnight runs (BENCHMARK_RUNS=7),
+  // where Effort 14 logged bimodal samples on M1 Max — e.g. [42, 45]
+  // sets where a single-trim still picked the wrong cluster. Symmetric
+  // 2-trim from 7 samples leaves the middle 3, which is robust to the
+  // cold-GPU outlier and the occasional too-warm outlier together.
   const sorted = [...tokPerSecSamples].sort((a, b) => a - b);
   let kept: number[] = sorted;
   let trimmed = false;
-  if (BENCHMARK_TRIM && sorted.length >= 5) {
+  let trimCount = 0;
+  if (BENCHMARK_TRIM && sorted.length >= 7) {
+    trimCount = 2;
+    kept = sorted.slice(2, sorted.length - 2);
+    trimmed = true;
+  } else if (BENCHMARK_TRIM && sorted.length >= 5) {
+    trimCount = 1;
     kept = sorted.slice(1, sorted.length - 1);
     trimmed = true;
   }
@@ -632,8 +643,20 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
 
   if (tokPerSec != null && sorted.length > 1) {
     const range = sorted[sorted.length - 1] - sorted[0];
-    const aggLabel = trimmed ? `trimmed median (drop 1 high + 1 low)` : "median";
-    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}`));
+    const aggLabel = trimmed
+      ? `trimmed median (drop ${trimCount} high + ${trimCount} low)`
+      : "median";
+    // Bimodal heuristic: if range > 1.5 AND samples straddle a ~1.5
+    // tok/s gap (low cluster ≤ median−0.75 and high cluster ≥
+    // median+0.75 both present), flag THERMAL — the loop's accept
+    // band is tighter than this spread, so a "kept" verdict at this
+    // noise level should be read with suspicion.
+    const med = tokPerSec;
+    const hasLow = sorted.some(s => s <= med - 0.75);
+    const hasHigh = sorted.some(s => s >= med + 0.75);
+    const bimodal = range > 1.5 && hasLow && hasHigh;
+    const flag = bimodal ? " ⚠ THERMAL" : "";
+    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}${flag}`));
   }
 
   const result: BuildRunResult = {

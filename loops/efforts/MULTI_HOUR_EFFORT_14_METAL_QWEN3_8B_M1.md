@@ -231,6 +231,50 @@ On exit, the notes file's "Outcome" section must contain:
 - list of attempted-and-reverted changes with reasons
 - the single most useful learning from the effort
 
+## Status as of 2026-05-14 (after 21 loop cycles)
+
+**Current state**: ~45.0 tok/s decode on Qwen3-8B Q4_K_M, M1 Max.
+**Starting state**: 8.6 tok/s (cold) / 10.6 tok/s (warm).
+**Improvement**: ~5× cold / ~4× warm.
+
+**See `EFFORT_14_NOTES.md` for the full cycle history.** Before any new
+cycle, read its "Consolidated cycle history" section. Key categorical
+findings:
+
+- **Dispatch-count reduction is NOT the lever on M1 Max** — falsified
+  three independent ways (Cycles 1, 3, 4 of the loop, plus the pre-loop
+  dispatch-consolidation and SwiGLU fusion changes). Do not propose
+  another fusion that's primarily about saving dispatches.
+- **precise → fast Metal math is essentially exhausted.** Grep
+  `precise::` in `src/shaders/metal/` before proposing — most hot paths
+  already use `fast::*`.
+- **simdgroup-redundant-reduction pattern** has been applied to all
+  four shaders that use broadcast barriers heavily (rms_norm_mul,
+  residual_rms_norm, rope_kv_cache_write Q/K-norm, flash_attn). Look
+  elsewhere.
+- The biggest single win (Cycle 2, 5×) came from unblocking an
+  optimized kernel that was artificially gated to `.gemma`. Keep
+  hunting for those — grep `cfg.architecture == .gemma` and
+  `architecture == .gemma` in `src/compute/forward_metal.zig`.
+
+## Pivot priorities (post-Cycle-21)
+
+The loop's stall-warning fired at Cycle 20+ because cycles 12-20
+followed the same micro-template (precise→fast, eliminate broadcast
+barriers). For categorical pivots, see
+`EFFORT_14_NOTES.md` → "Still-open structural levers" — ordered by
+expected impact. Top three for a fresh cycle:
+
+1. **KV-cache quantization to q8_0** — llama.cpp uses this by default
+   on Metal; ZINC's decode path still uses f16. Real bandwidth saving
+   at any context length.
+2. **Fused rms_norm + Q projection** — the Vulkan equivalent
+   (`rms_norm_dmmv_q4k_alpha_beta`) shipped +0.6 tok/s on RDNA4. No
+   Metal equivalent yet for the attention prologue.
+3. **Single-kernel Q+K+V projection** — three outputs from one input
+   read, no branch (unlike Cycle 1's failed Q+K dual which only fused
+   two).
+
 ## Why this plan is safe to run unattended
 
 - Every change pays for itself with measured evidence before it lands.

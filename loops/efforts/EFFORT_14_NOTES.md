@@ -306,3 +306,120 @@ ceiling. The remaining gap is likely a mix of:
 3. GPU clock scaling — sustained-load throttling.
 
 The next cycle should target item 2 or 3 (item 1 is a hardware bound).
+
+## Consolidated cycle history (21 loop cycles completed)
+
+This table is the **primary reference** for any future agent invocation
+on this effort. Read it before proposing a change. Most levers in
+columns "Already shipped" or "Falsified" do not need to be re-tried.
+
+### Wins kept (sticky)
+
+| Cycle | Headline tok/s | Change |
+|---|---:|---|
+| 2 | **8.6 → 44.3** | **Q6_K matvec routed through `dmmv_q6k_llama` instead of legacy SPIRV-Cross kernel** (was gated to `.gemma`). The single biggest win of the effort. |
+| 9 | 44.7 | `precise::exp` → `fast::exp` in dense SwiGLU activation (~442K calls/token) |
+| 10 | 44.8 | `cos/sin` → `fast::cos/sin` in `rope_kv_cache_write` (~92K sincos pairs/token) |
+| 11 | 45.0 | `precise /` → `fast::divide` in SwiGLU activation |
+| 12 | 43.6 | `1.0f / final_sum` → `fast::divide` in flash_attn final softmax (1152 calls/token) |
+| 13 | 43.9 | Hoist `rms_inv` compute to one thread in `residual_rms_norm` (saves 255× redundant `fast::rsqrt+fast::divide` per dispatch) |
+| 14 | 44.9 | `precise rsqrt+/` → `fast::rsqrt+fast::divide` in `rms_norm_mul` (most-called norm shader, 144 dispatches/token) |
+| 15 | 45.1 | Eliminate rms_inv broadcast barrier in `rms_norm_mul` (simdgroup-redundant pattern, −144 barriers/token) |
+| 16 | 45.0 | Same pattern in `residual_rms_norm` (−36 barriers/token) |
+| 17 | 44.9 | Same pattern in Q-norm/K-norm of `rope_kv_cache_write` (−72 barriers/token) |
+| 18 | 45.0 | Same pattern in `flash_attn` reduceThreadgroupMax/Sum (−72 barriers/token) |
+| 19 | 44.9 | flash_attn running_max/sum moved from threadgroup memory to per-thread registers (−36 barriers/token) |
+| 20 | 45.0 | Redundant barrier removed between K-dot loop and reduceThreadgroupMax in `flash_attn` |
+| 21 | 45.1 | Partial-reduction barrier elimination in Q-norm/K-norm of `rope_kv_cache_write` (1440 TG dispatches/token) |
+
+### Reverts (falsified)
+
+| Cycle | Reason |
+|---|---|
+| 1 | Q+K dual matvec gate extended to `.qwen2` — −3.9% regression. The dual kernel's Q-vs-K branch cost doesn't amortize on Qwen3-8B's smaller (M_q=4096, M_k=1024) shapes, and separate Q+K dispatches were already running concurrently via the Metal concurrent encoder. |
+| 3 | Q6_K LM head fused-norm kernel (port of `dmmv_q4k_lmhead_norm` pattern) — −10% regression. Different shape constraints; kernel-level rms+matvec fusion not a fit for the Q6_K lm_head. |
+| 4 | `dense_cmd_group_layers` bumped 30 → 36 — flat. Profile confirmed cmds/step dropped 2.89 → 1.89 but wall time didn't move. Dispatch count is **not the lever** on M1 Max for this workload. |
+
+### Do-not-retry list (post-Cycle-21)
+
+Levers that have been shipped or proven flat — should NOT be attempted again:
+
+1. **Dispatch-count reduction in any form** (cycles 1, 3, 4, plus the
+   pre-loop Cycle 3 SwiGLU fusion and Cycle 1 dense-shared-cmd-buffer).
+   The Metal concurrent encoder already overlaps independent dispatches;
+   eliminating commits or compute-encoder calls does not move the
+   single-token decode wall clock.
+2. **precise → fast Metal math** is essentially done. Already applied to:
+   `fast::exp`, `fast::cos`, `fast::sin`, `fast::divide`,
+   `fast::rsqrt` across SwiGLU, RoPE, flash_attn, rms_norm,
+   residual_rms_norm, rope_kv_cache_write. Grepping for `precise::`
+   in `src/shaders/metal/` should return very few hits worth swapping.
+3. **simdgroup-redundant-reduction pattern for broadcast barriers** has
+   been applied to all four shaders that use it heavily (rms_norm_mul,
+   residual_rms_norm, rope_kv_cache_write Q/K-norm, flash_attn
+   reduceThreadgroupMax/Sum). Re-applying to a fifth shader is unlikely
+   to move the headline.
+4. **Kernel-level rms+matvec fusion for q6_K lm_head** (Cycle 3 result).
+
+### Still-open structural levers
+
+Ordered by likely impact. The loop's "stall warning" fired at Cycle 20+
+because cycles 12-20 all followed the same micro-optimization
+template — these are the categorical pivots a future agent should
+consider:
+
+1. **KV-cache quantization to q8_0** (or smaller). llama.cpp's local
+   reference Metal config uses `-ctk q8_0 -ctv q8_0`. ZINC's M1 Max
+   path still uses f16 KV. At any non-trivial context length this is
+   a real bandwidth saving on the attention path. There is a
+   `--kv-q8` knob in the bench harness already; verify what the
+   end-to-end decode actually uses.
+2. **Fused rms_norm + matvec on attention prologue** (rms_norm + Q
+   projection, in particular). The Vulkan side has
+   `rms_norm_dmmv_q4k_alpha_beta` proven to ship +0.6 tok/s on
+   RDNA4. The Metal `rms_norm_mul` is independently fast now, but
+   collapsing the (rms_norm → barrier → Q-proj) sequence into one
+   kernel removes the barrier *and* one DRAM round-trip on norm_buf.
+3. **Single-kernel Q+K+V projection.** Q/K/V projections all read
+   the same input. A single kernel that writes three outputs would
+   save 2 dispatches + 2 barriers per attention layer (72 each per
+   token) AND save 2× input re-reads. Different from Cycle 1's Q+K
+   dual which only fused two of them and required a branch — a
+   three-output kernel can keep one straight-line loop and three
+   separate accumulators.
+4. **GPU-side greedy argmax for the LM head step.** Currently the
+   full logits vector is copied to CPU and scanned by
+   `sampleGreedy`. Tail cost, not a primary lever, but real at
+   high tok/s.
+5. **Microbench-driven kernel rewrites.** `zig build
+   bench-metal-dmmv-q4k` exists. The dmmv_q4k matvec currently runs
+   at 54–60% of M1 Max bandwidth in isolation — there is room. But
+   any rewrite should beat the microbench by ≥5% *first* before
+   whole-model rollout.
+6. **Thermal/clock-state characterization** (diagnostic, not a code
+   lever). Run `powermetrics --samplers gpu_power -i 1000` in
+   parallel with a decode run to confirm whether the bimodal sample
+   pattern is GPU clock ramp-down/up or something else. If it's
+   clock-related, the right "fix" is to keep the GPU warmer (e.g.,
+   shorter idle gaps between samples, or a tiny background dispatch
+   between samples).
+
+## Loop measurement gotchas (for any future cycle)
+
+1. **3-run median is too small at this thermal noise level.** Range
+   between samples regularly hits 2–3 tok/s on a M1 Max that has been
+   running for >1 hour, so a 3-run median can be pulled in either
+   direction by a single sample. The loop now defaults to 5 samples
+   with symmetric 1-trim; for overnight runs, prefer 7 samples with
+   symmetric 2-trim (`ZINC_BENCHMARK_RUNS=7 ZINC_BENCHMARK_TRIM=true`).
+2. **Bimodal samples mean THERMAL.** The harness now annotates these
+   with `⚠ THERMAL` when range > 1.5 AND samples straddle the median
+   by ±0.75 tok/s on both sides. Treat a "kept" verdict at this
+   noise level with suspicion — the change may be flat in code but
+   look winning in measurement, or vice versa.
+3. **First run after model load is always slower.** Each verifier
+   sample is a fresh `./zig-out/bin/zinc` invocation. The single
+   warmup run helps the OS page cache but does NOT preserve Metal
+   GPU clocks. For real per-cycle A/B confidence, either run a longer
+   single decode (-n 256+ averages out the cold tail) or accept that
+   each sample carries a cold component.
