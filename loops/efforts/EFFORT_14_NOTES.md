@@ -236,3 +236,73 @@ HUD via `MTL_HUD_ENABLED=1`) showing the per-dispatch GPU timeline.
 That tells us within minutes whether the GPU has visible idle gaps,
 which kernels are slow, and whether barriers are forcing pipeline
 drains. Without it, we're running blind on the orchestration layer.
+
+## Cycle 4 — Q+K dual matvec for Qwen3 (REVERTED)
+
+### Change
+
+Extended `canUseDenseQ4KQKDual` gate in `forward_metal.zig` from
+`arch == .gemma` to `arch == .gemma or arch == .qwen2`. Reuses
+`dmmv_q4k_qk_dual.metal` for Qwen3 dense Q+K projection. M_q=4096,
+M_k=1024, K=4096 — all gate preconditions (Q4_K, K%256==0, M_q%4==0)
+already satisfied. No new shader.
+
+### Result
+
+```
+Baseline (gate Gemma-only),     warm GPU, 5 runs:  8.74, 10.62, 10.59, 10.60, 10.60
+With change (gate +Qwen3),      warm GPU, 5 runs: 10.20,  8.60, 10.19, 10.19, 10.18
+Median (excluding warmup):  baseline 10.60  |  change 10.19  (-3.9%)
+```
+
+Profile (n=64): dispatch/step dropped 507.8 → 471.8 (exactly -36, one
+per dense layer — the fusion fired as designed). Output byte-identical.
+
+### Verdict: REVERT — first measured regression of this effort
+
+The dispatch count drop happened exactly as predicted, but the dual
+kernel is ~4% slower on Qwen3-8B's shapes than the two separate
+matvecs. On Gemma 31B (M_q=8192, M_k=4096) the dual kernel won by ~1
+dispatch's worth of overhead. On Qwen3-8B (M_q=4096, M_k=1024) two
+things changed:
+
+- M_q is half the size, so per-thread Q-vs-K branch cost in the dual
+  kernel is amortized over half as many output rows.
+- The two separate Q and K dispatches were already running concurrently
+  via the Metal concurrent encoder (`barrier_enabled = mode == .concurrent`).
+  Fusing them into one grid did not unlock new parallelism — the GPU
+  was already saturating both at once.
+
+Documented the regression-case in the gate with a comment so future
+cycles don't re-attempt this fusion on Qwen3 without changing the
+kernel itself.
+
+### Lesson (third dispatch-fusion attempt with same outcome)
+
+Three cycles in a row (1 collapse 73→1 commits, 3 fuse gate+up+swiglu,
+4 fuse Q+K) have demonstrated that **reducing dispatch count is not
+the lever on M1 Max for this workload**. Cycles 1 and 3 had flat
+decode; Cycle 4 actually regressed. The GPU is already overlapping
+back-to-back dispatches via the concurrent encoder, and fusion either
+costs nothing (best case) or actively hurts when the fused kernel has
+worse per-thread cost.
+
+Also discovered: the prior "8.67 baseline" in Cycles 0–3 was a
+**cold-GPU** number. With the GPU warm (after 1 throwaway run), the
+real baseline on this M1 Max is **10.60 tok/s** — ~24% higher than
+Cycle 3 reported. The Phase 0 protocol's "1 warmup run" assumed one
+run is enough to warm the GPU; on this M1 Max it takes one run *for
+the model load* and a second run for the GPU clocks to ramp.
+
+Updated ceiling math: 10.60 tok/s is ~18% of peak M1 Max bandwidth
+(microbench ceiling at 244 GB/s implies ~59 tok/s). We are no longer
+9% of peak — we're 18%, with ~3× headroom left to the kernel-only
+ceiling. The remaining gap is likely a mix of:
+
+1. Cold-weight reads (per-token weights don't fit in 48 MB SLC, so
+   each layer pays L2-miss latency to main RAM).
+2. Per-dispatch GPU launch latency on the ~250 non-matvec small
+   kernels (RoPE, norms, KV writes, flash attention).
+3. GPU clock scaling — sustained-load throttling.
+
+The next cycle should target item 2 or 3 (item 1 is a hardware bound).
