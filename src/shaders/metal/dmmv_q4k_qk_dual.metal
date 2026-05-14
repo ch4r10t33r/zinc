@@ -54,9 +54,6 @@ inline float4 q4k_block_dot_parts(
     constexpr ushort kmask2 = 0x0f0f;
     constexpr ushort kmask3 = 0xc0c0;
 
-    ushort sc16[4];
-    thread const uchar* sc8 = (thread const uchar*)sc16;
-
     device const ushort* sc = (device const ushort*)(block + 4) + iq;
     device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
     // Cycle 68: port cycles 66/67's half2 dh-load pattern to qk_dual.
@@ -69,10 +66,23 @@ inline float4 q4k_block_dot_parts(
     // (~18.5% of decode bytes/token via the 25.08 GiB attn path).
     const half2 dh = *((device const half2*)block);
 
-    sc16[0] = sc[0] & kmask1;
-    sc16[1] = sc[2] & kmask1;
-    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+    // Cycle 71: port cycle 69's ushort4-sc16 register-vector pattern to
+    // qk_dual. Replace the stack-allocated `ushort sc16[4]` + uchar*
+    // alias with a register-resident `ushort4`; the previous form
+    // forced the compiler to materialize sc16 in thread-private memory
+    // so the byte alias could address individual lanes. The new form
+    // keeps the four packed scales in SSA-eligible registers and lowers
+    // the per-ib sc_pos / sc_neg byte gathers to vector AND + vector
+    // shift over packed lanes. The helper is called twice per ib (once
+    // per row), so per-ib this folds 8 scalar uchar loads → 4 packed
+    // ushort4 byte-extractions. Same compiler-hint philosophy as cycles
+    // 49/50 (nibble-mask vectorize), 51 (per-ib reduction), 61
+    // (cross-row reduction), 69 (dmmv_q4k.metal), 70 (swiglu).
+    const ushort4 sc16 = ushort4(
+        sc[0] & kmask1,
+        sc[2] & kmask1,
+        ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2),
+        ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2));
 
     const ushort4 q1v = *((device const ushort4*)q1);
     const ushort4 q2v = *((device const ushort4*)(q1 + 32));
@@ -95,12 +105,17 @@ inline float4 q4k_block_dot_parts(
         float4(acc1[1], acc1[3], acc2[1], acc2[3]),
         float4(1.f / 256.f),
         float4(acc1[0], acc1[2], acc2[0], acc2[2]));
-    const float4 sc_pos = float4(
-        float(sc8[0]),
-        float(sc8[1]) * (1.f / 16.f),
-        float(sc8[4]),
-        float(sc8[5]) * (1.f / 16.f));
-    const float4 sc_neg = float4(sc8[2], sc8[3], sc8[6], sc8[7]);
+    // Cycle 71: derive sc_pos / sc_neg via vector byte-extraction from
+    // the ushort4 sc16. sc8[0..7] (the old uchar* alias) maps to
+    // {sc16.x.lo, sc16.x.hi, sc16.y.lo, sc16.y.hi, sc16.z.lo, sc16.z.hi,
+    // sc16.w.lo, sc16.w.hi}, so:
+    //   sc_pos = (sc16.x.lo, sc16.x.hi/16, sc16.z.lo, sc16.z.hi/16)
+    //   sc_neg = (sc16.y.lo, sc16.y.hi,    sc16.w.lo, sc16.w.hi)
+    constexpr ushort4 lo_mask = ushort4(0x00FFu);
+    const ushort4 sc_pos_bytes = ushort4(sc16.x, sc16.x >> 8, sc16.z, sc16.z >> 8) & lo_mask;
+    constexpr float4 sc_pos_scale = float4(1.f, 1.f / 16.f, 1.f, 1.f / 16.f);
+    const float4 sc_pos = float4(sc_pos_bytes) * sc_pos_scale;
+    const float4 sc_neg = float4(ushort4(sc16.y, sc16.y >> 8, sc16.w, sc16.w >> 8) & lo_mask);
     return float4(dot(head_pair, sc_pos), dot(sumy, sc_neg), float(dh.x), float(dh.y));
 }
 
