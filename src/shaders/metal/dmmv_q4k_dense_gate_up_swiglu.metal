@@ -232,26 +232,60 @@ kernel void main0(
             acc2_u1 = fma(yh4, q2m_u1, acc2_u1);
         }
 
-        gate_sum[0] += dh_g0[0] * ((acc1_g0[0] + 1.f / 256.f * acc1_g0[1]) * sc8_g0[0] +
-                (acc1_g0[2] + 1.f / 256.f * acc1_g0[3]) * sc8_g0[1] * 1.f / 16.f +
-                (acc2_g0[0] + 1.f / 256.f * acc2_g0[1]) * sc8_g0[4] +
-                (acc2_g0[2] + 1.f / 256.f * acc2_g0[3]) * sc8_g0[5] * 1.f / 16.f) -
-            dh_g0[1] * (sumy[0] * sc8_g0[2] + sumy[1] * sc8_g0[3] + sumy[2] * sc8_g0[6] + sumy[3] * sc8_g0[7]);
-        up_sum[0] += dh_u0[0] * ((acc1_u0[0] + 1.f / 256.f * acc1_u0[1]) * sc8_u0[0] +
-                (acc1_u0[2] + 1.f / 256.f * acc1_u0[3]) * sc8_u0[1] * 1.f / 16.f +
-                (acc2_u0[0] + 1.f / 256.f * acc2_u0[1]) * sc8_u0[4] +
-                (acc2_u0[2] + 1.f / 256.f * acc2_u0[3]) * sc8_u0[5] * 1.f / 16.f) -
-            dh_u0[1] * (sumy[0] * sc8_u0[2] + sumy[1] * sc8_u0[3] + sumy[2] * sc8_u0[6] + sumy[3] * sc8_u0[7]);
-        gate_sum[1] += dh_g1[0] * ((acc1_g1[0] + 1.f / 256.f * acc1_g1[1]) * sc8_g1[0] +
-                (acc1_g1[2] + 1.f / 256.f * acc1_g1[3]) * sc8_g1[1] * 1.f / 16.f +
-                (acc2_g1[0] + 1.f / 256.f * acc2_g1[1]) * sc8_g1[4] +
-                (acc2_g1[2] + 1.f / 256.f * acc2_g1[3]) * sc8_g1[5] * 1.f / 16.f) -
-            dh_g1[1] * (sumy[0] * sc8_g1[2] + sumy[1] * sc8_g1[3] + sumy[2] * sc8_g1[6] + sumy[3] * sc8_g1[7]);
-        up_sum[1] += dh_u1[0] * ((acc1_u1[0] + 1.f / 256.f * acc1_u1[1]) * sc8_u1[0] +
-                (acc1_u1[2] + 1.f / 256.f * acc1_u1[3]) * sc8_u1[1] * 1.f / 16.f +
-                (acc2_u1[0] + 1.f / 256.f * acc2_u1[1]) * sc8_u1[4] +
-                (acc2_u1[2] + 1.f / 256.f * acc2_u1[3]) * sc8_u1[5] * 1.f / 16.f) -
-            dh_u1[1] * (sumy[0] * sc8_u1[2] + sumy[1] * sc8_u1[3] + sumy[2] * sc8_u1[6] + sumy[3] * sc8_u1[7]);
+        // Cycle 52: port cycle 51's vectorized per-ib reduction from
+        // dmmv_q4k.metal here. Replace each row's 4-term head sum
+        // `(acc[even] + 1/256*acc[odd]) * sc8[*]` and 4-term tail
+        // `sumy[k]*sc8[*]` with one `fma`-built `head_pair` float4 plus a
+        // `dot(head_pair, sc_pos4)` and a `dot(sumy, sc_neg4)`. Two rows ×
+        // (gate + up) = 4 independent reductions per ib here vs 2 in the
+        // base kernel, so ~2× the impact area of cycle 51. Maps the per-
+        // block accumulator collapse onto Apple7's 4-wide ALU shape. The
+        // swiglu kernel handles ffn_gate + ffn_up on Qwen3-8B dense
+        // (~50% of Q4_K bytes/token), the hottest Q4_K kernel.
+        const float4 head_pair_g0 = fma(
+            float4(acc1_g0[1], acc1_g0[3], acc2_g0[1], acc2_g0[3]),
+            float4(1.f / 256.f),
+            float4(acc1_g0[0], acc1_g0[2], acc2_g0[0], acc2_g0[2]));
+        const float4 head_pair_u0 = fma(
+            float4(acc1_u0[1], acc1_u0[3], acc2_u0[1], acc2_u0[3]),
+            float4(1.f / 256.f),
+            float4(acc1_u0[0], acc1_u0[2], acc2_u0[0], acc2_u0[2]));
+        const float4 head_pair_g1 = fma(
+            float4(acc1_g1[1], acc1_g1[3], acc2_g1[1], acc2_g1[3]),
+            float4(1.f / 256.f),
+            float4(acc1_g1[0], acc1_g1[2], acc2_g1[0], acc2_g1[2]));
+        const float4 head_pair_u1 = fma(
+            float4(acc1_u1[1], acc1_u1[3], acc2_u1[1], acc2_u1[3]),
+            float4(1.f / 256.f),
+            float4(acc1_u1[0], acc1_u1[2], acc2_u1[0], acc2_u1[2]));
+        const float4 sc_pos_g0 = float4(
+            float(sc8_g0[0]),
+            float(sc8_g0[1]) * (1.f / 16.f),
+            float(sc8_g0[4]),
+            float(sc8_g0[5]) * (1.f / 16.f));
+        const float4 sc_pos_u0 = float4(
+            float(sc8_u0[0]),
+            float(sc8_u0[1]) * (1.f / 16.f),
+            float(sc8_u0[4]),
+            float(sc8_u0[5]) * (1.f / 16.f));
+        const float4 sc_pos_g1 = float4(
+            float(sc8_g1[0]),
+            float(sc8_g1[1]) * (1.f / 16.f),
+            float(sc8_g1[4]),
+            float(sc8_g1[5]) * (1.f / 16.f));
+        const float4 sc_pos_u1 = float4(
+            float(sc8_u1[0]),
+            float(sc8_u1[1]) * (1.f / 16.f),
+            float(sc8_u1[4]),
+            float(sc8_u1[5]) * (1.f / 16.f));
+        const float4 sc_neg_g0 = float4(sc8_g0[2], sc8_g0[3], sc8_g0[6], sc8_g0[7]);
+        const float4 sc_neg_u0 = float4(sc8_u0[2], sc8_u0[3], sc8_u0[6], sc8_u0[7]);
+        const float4 sc_neg_g1 = float4(sc8_g1[2], sc8_g1[3], sc8_g1[6], sc8_g1[7]);
+        const float4 sc_neg_u1 = float4(sc8_u1[2], sc8_u1[3], sc8_u1[6], sc8_u1[7]);
+        gate_sum[0] += dh_g0[0] * dot(head_pair_g0, sc_pos_g0) - dh_g0[1] * dot(sumy, sc_neg_g0);
+        up_sum[0]   += dh_u0[0] * dot(head_pair_u0, sc_pos_u0) - dh_u0[1] * dot(sumy, sc_neg_u0);
+        gate_sum[1] += dh_g1[0] * dot(head_pair_g1, sc_pos_g1) - dh_g1[1] * dot(sumy, sc_neg_g1);
+        up_sum[1]   += dh_u1[0] * dot(head_pair_u1, sc_pos_u1) - dh_u1[1] * dot(sumy, sc_neg_u1);
 
         y4 += 4 * QK_K;
     }
