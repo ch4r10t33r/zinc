@@ -1258,6 +1258,18 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
+    // Auto-enable for dense Gemma (original case) and dense Qwen3 (Effort 14
+    // post-loop-cycle-29 finding). Per-token prefill on Qwen3-8B Q4_K_M ran
+    // at ~48 tok/s; batched ran at ~354 tok/s — 7.4x improvement, lifting
+    // ZINC from 12% to 85% of llama.cpp's 416 tok/s prefill on this M1 Max.
+    // The structural checks in canUseBatchedPrefill (non-Gemma branch at
+    // line 1336+) already accept Qwen3 dense via the generic structural
+    // path; this function only controls whether the path fires WITHOUT
+    // ZINC_BATCHED_PREFILL=1 being set explicitly. Qwen3 8B has
+    // hidden_dim=4096 < 5000, so it would NOT match the original Gemma
+    // dim guard — we drop the dim guard for .qwen2 dense and keep it for
+    // Gemma where the kernel was originally tuned for hidden_dim=5376.
+    if (cfg.architecture == .qwen2 and cfg.n_experts == 0) return true;
     return cfg.architecture == .gemma and cfg.n_experts == 0 and cfg.hidden_dim >= 5000;
 }
 
