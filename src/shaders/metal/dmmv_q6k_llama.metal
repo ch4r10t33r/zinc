@@ -63,8 +63,14 @@ kernel void main0(
     for (uint bi = ix; bi < nb; bi += 2u) {
         device const float* y = src1 + bi * QK_K + y_offset;
 
+        // Cycle 39: explicit FOR_UNROLL on the yl-fill loop. Mirrors cycle 37's
+        // pragma added to the inner 32-FMA loop. Without unroll the yl[]
+        // register array is indexed by a runtime loop variable, which can
+        // force the compiler to spill yl[] to stack instead of promoting to
+        // registers. Unrolling makes all 16 indices compile-time constants so
+        // yl can live in SSA values for the duration of the FMA loop.
         float yl[16];
-        for (ushort l = 0u; l < 4u; ++l) {
+        FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
             yl[4u * l + 0u] = y[l + 0u];
             yl[4u * l + 1u] = y[l + 32u];
             yl[4u * l + 2u] = y[l + 64u];
