@@ -200,8 +200,26 @@ kernel void main0(
         // leaves the compiler emitting narrower lane-by-lane FMAs.
         const float4 sc4_0 = float4(float(sc_0[0]), float(sc_0[2]), float(sc_0[4]), float(sc_0[6]));
         const float4 sc4_1 = float4(float(sc_1[0]), float(sc_1[2]), float(sc_1[4]), float(sc_1[6]));
-        sumf[0] += d_0 * fma(-32.0f, dot(yl_sum4, sc4_0), dot(sums_0, sc4_0));
-        sumf[1] += d_1 * fma(-32.0f, dot(yl_sum4, sc4_1), dot(sums_1, sc4_1));
+        // Cycle 62: port cycles 60/61's cross-row reduction vectorization to
+        // this Q6_K kernel. The two independent
+        // `d * fma(-32, dot(yl_sum4, sc4), dot(sums, sc4))` chains (row 0,
+        // row 1) form a natural 2-wide ALU shape: pack the per-row `d`
+        // scalars into a float2, the (head_dot, tail_dot) reductions per
+        // row into float2s, and fold the 2 scalar `d * (head - 32*tail)`
+        // chains into one vec2 fma (build `head - 32*tail`) + one vec2 mul
+        // by `d`, producing a float2 `delta` of the 2 per-row increments.
+        // Mirrors cycle 61's 2-wide pattern on dmmv_q4k.metal applied at
+        // the cross-row axis. dmmv_q6k_llama.metal serves ffn_down on
+        // Qwen3-8B dense (Q6_K = 28.4% of decode bytes/token, 38.46 GiB
+        // per step). Per ib iteration: 2 scalar fmas + 2 scalar muls
+        // (~6 scalar ops) → 1 vec2 fma + 1 vec2 mul (~2 vector ops),
+        // matching Apple7's natural SIMD shape.
+        const float2 dh_d = float2(d_0, d_1);
+        const float2 head_dots = float2(dot(sums_0, sc4_0), dot(sums_1, sc4_1));
+        const float2 tail_dots = float2(dot(yl_sum4, sc4_0), dot(yl_sum4, sc4_1));
+        const float2 delta = dh_d * fma(float2(-32.0f), tail_dots, head_dots);
+        sumf[0] += delta[0];
+        sumf[1] += delta[1];
     }
 
     device float* out = Y + (p.y_offset / 4u);
