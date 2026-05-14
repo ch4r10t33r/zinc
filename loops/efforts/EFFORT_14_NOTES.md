@@ -451,3 +451,47 @@ consider:
    GPU clocks. For real per-cycle A/B confidence, either run a longer
    single decode (-n 256+ averages out the cold tail) or accept that
    each sample carries a cold component.
+
+## Out-of-cycle prefill fix (commit 8221e8a, 2026-05-14)
+
+The 25-cycle decode loop never measured prefill — its prompt was 5
+tokens, so the prefill window was overhead-dominated and uninformative.
+A side-channel measurement at 122 tokens revealed a much larger gap
+than decode had ever shown:
+
+| Metric | Before fix | After fix | llama.cpp on same M1 Max |
+|---|---:|---:|---:|
+| Decode (n=128) | ~46 tok/s | ~46–50 tok/s | 34 tok/s |
+| Prefill (122 tok) | 48 tok/s | **319 tok/s** | 416 tok/s |
+| ZINC % of llama.cpp prefill | 12% | **76%** | — |
+
+Root cause was identical to loop Cycle 2 (Q6_K routing): the optimized
+path existed in the tree, gated to `.gemma`. `shouldDefaultDenseGemmaBatchedPrefill`
+auto-enabled batched prefill only for Gemma dense with `hidden_dim >= 5000`.
+Qwen3-8B is `.qwen2` with `hidden_dim=4096`, so it fell through to the
+per-token "decode-as-prefill" path — 122 separate forward passes, each
+reading the full ~4 GiB of weights, total 503 GiB of dispatch traffic.
+
+The `canUseBatchedPrefill` structural checks at line 1330 already accept
+Qwen3 8B via the generic non-Gemma branch — no kernel work was needed,
+just the gate extension. One line of code, output byte-identical, +7.4×
+prefill.
+
+**Combined headline on this M1 Max + Qwen3-8B Q4_K_M as of commit 8221e8a:**
+- Decode: ~46 tok/s vs llama.cpp's 34 tok/s — **ZINC +35% ahead**.
+- Prefill: 319 tok/s vs llama.cpp's 416 tok/s — **ZINC at 76%**.
+
+### Implication for future cycles
+
+The "extend `.gemma` gate to `.qwen2`" pattern has now produced two
+giant wins on this effort:
+
+1. Cycle 2 of the loop: `canUseDenseSharedDecodeCommand` → 8.6 → 44.3
+   tok/s decode.
+2. Out-of-cycle prefill fix: `shouldDefaultDenseGemmaBatchedPrefill` →
+   48 → 319 tok/s prefill.
+
+Both came from grep-ing `cfg.architecture == .gemma` in `forward_metal.zig`
+and asking "could this fire for Qwen3 dense?". That grep should be the
+first thing any future agent runs on this codebase when looking for
+M1 Max wins on a non-Gemma dense model.

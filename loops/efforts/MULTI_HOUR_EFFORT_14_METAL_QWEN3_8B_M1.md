@@ -239,9 +239,16 @@ On exit, the notes file's "Outcome" section must contain:
 
 **llama.cpp on the same M1 Max + model: 33.96 tok/s decode** (captured
 2026-05-14, see EFFORT_14_NOTES.md). The plan's termination condition
-"ZINC matches or exceeds llama.cpp" is **MET AND EXCEEDED**: ZINC is
-~+30% faster than llama.cpp on this configuration. Further cycles are
-optimizing past the comparator, not toward parity.
+"ZINC matches or exceeds llama.cpp" is **MET AND EXCEEDED** on decode:
+ZINC is ~+35% faster than llama.cpp on this configuration. Further
+decode cycles are optimizing past the comparator, not toward parity.
+
+**Prefill (commit 8221e8a, 2026-05-14):** ZINC was at 12% of llama.cpp
+prefill (48 vs 416 tok/s) until the `shouldDefaultDenseGemmaBatchedPrefill`
+gate was extended from `.gemma` to also `.qwen2`. Now at 319 tok/s
+prefill (76% of llama.cpp). The plan's primary metric is decode, but if
+a future cycle picks up the prefill metric, the next levers are batched-
+prefill kernel tuning, not gate extensions.
 
 **See `EFFORT_14_NOTES.md` for the full cycle history.** Before any new
 cycle, read its "Consolidated cycle history" section. Key categorical
