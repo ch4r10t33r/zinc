@@ -85,7 +85,9 @@ inline float q4k_block_dot(
 
 inline float swiglu(float gate, float up) {
     // SiLU(gate) * up = (gate / (1 + exp(-gate))) * up
-    return (gate / (1.0f + precise::exp(-gate))) * up;
+    // fast::exp maps to Apple GPU hardware exp2 (vs precise::exp polynomial).
+    // ~5-10× faster on this scalar path; fires inter_dim × n_layers times per token.
+    return (gate / (1.0f + fast::exp(-gate))) * up;
 }
 
 kernel void main0(
