@@ -122,11 +122,36 @@ kernel void main0(
             float4(c1.zw, d1.zw),
         };
 
-        const float4 ones = float4(1.0f);
-        sumy[0] = dot(a0, ones) + dot(a1, ones);
-        sumy[1] = dot(b0, ones) + dot(b1, ones);
-        sumy[2] = dot(c0, ones) + dot(c1, ones);
-        sumy[3] = dot(d0, ones) + dot(d1, ones);
+        // Cycle 87: compute sumy from the yl4_arr / yh4_arr register vectors
+        // built above instead of from the original a0/a1/b0/b1/c0/c1/d0/d1
+        // loads. The 8 dot-of-ones partials (16 reads of a*/b*/c*/d* + 8
+        // horizontal reductions + 4 scalar adds) form a separate consumer of
+        // the original float4 y4v loads that runs *parallel* to the yl4_arr/
+        // yh4_arr build — so the compiler must keep all 8 a*/b*/c*/d* vectors
+        // live until both consumers complete. Since the inner FMA loop (lines
+        // 255-296) only ever reads from yl4_arr/yh4_arr, we can derive sumy
+        // from those same arrays and let a*/b*/c*/d* die at the shuffle.
+        //
+        // Lane mapping: yl4_arr[0]=(a0.x,a0.y,b0.x,b0.y), [1]=(a0.z,a0.w,b0.z,
+        // b0.w), [2]=(a1.x,a1.y,b1.x,b1.y), [3]=(a1.z,a1.w,b1.z,b1.w). Summing
+        // i=0..3 gives partials at lanes 0,1 = (a0+a1) split into halves and
+        // lanes 2,3 = (b0+b1) split. So (yl_tot.x + yl_tot.y) = sum(a0+a1) =
+        // sumy[0], (yl_tot.z + yl_tot.w) = sum(b0+b1) = sumy[1], and the
+        // analogous holds for yh4_arr → sumy[2,3].
+        //
+        // Cost: 6 float4 adds + 4 scalar adds (vs prior 8 dot4 + 4 scalar);
+        // both shapes are ~28 effective adds, so this is a register-pressure
+        // optimization rather than an arithmetic-count reduction. Freeing
+        // 8 float4 registers (32 floats, ~128B of register file) earlier in
+        // the schedule gives the compiler more room for the q1v/q2v loads
+        // and the 32 FMA chain that follow. Hottest Q4_K shader (ffn_gate +
+        // ffn_up on Qwen3-8B dense, ~50% of Q4_K bytes/token).
+        const float4 yl_tot = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
+        const float4 yh_tot = (yh4_arr[0] + yh4_arr[1]) + (yh4_arr[2] + yh4_arr[3]);
+        sumy[0] = yl_tot.x + yl_tot.y;
+        sumy[1] = yl_tot.z + yl_tot.w;
+        sumy[2] = yh_tot.x + yh_tot.y;
+        sumy[3] = yh_tot.z + yh_tot.w;
 
         // Cycle 34: inline the q4k_block_dot_pair helper and interleave a
         // 4-way row0/row1 × gate/up FOR_UNROLL. Loads all 4 blocks' q1v/q2v/
