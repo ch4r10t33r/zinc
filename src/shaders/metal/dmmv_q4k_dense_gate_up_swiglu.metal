@@ -12,6 +12,12 @@ using namespace metal;
 // Saves 2 dispatches + 1 barrier per Qwen3 dense FFN layer compared to
 // the un-fused gate / up / swiglu sequence, and skips the DRAM round
 // trip through gate_buf and up_buf for the intermediate FFN width.
+//
+// Cycle 5 (reverted): NR0 bump 2→4 (8 rows/TG) measured 43.66 vs 44.5
+// baseline median (-2%) on Qwen3-8B M1 Max. The doubled per-TG arithmetic
+// hurt more than the halved TG count helped — the GPU was already
+// saturating on the 3072-TG dispatch and TG launch overhead is not the
+// lever on M1 Max. Reverted to NR0=2.
 
 struct DualQ4KDmmvPush {
     uint M0;
