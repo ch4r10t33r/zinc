@@ -112,7 +112,6 @@ kernel void main0(
     const uint sliding_start = use_sliding_window ? (p.seq_len - p.sliding_window_size) : 0u;
 
     threadgroup float4 q_cache4[FLASH_MAX_HEAD_VEC4];
-    threadgroup float4 acc_cache4[FLASH_MAX_HEAD_VEC4];
     threadgroup float scores[FLASH_BLOCK_TOKENS];
     threadgroup float reduce[FLASH_TG_SIZE];
     // running_max/running_sum are per-thread registers (every thread maintains
@@ -122,11 +121,28 @@ kernel void main0(
     float running_max = -INFINITY;
     float running_sum = 0.0f;
 
+    // Cycle 94: keep per-thread V accumulators in registers instead of the
+    // threadgroup `acc_cache4` buffer. Because the V loop reads/writes
+    // `acc_cache4[vi]` with the strided pattern `vi = tid; vi += FLASH_TG_SIZE`,
+    // each thread *always* owns the same set of vi values across every
+    // block_start iter (and across the sink-scale + output-writeback passes).
+    // So the buffer was acting as expensive per-thread state instead of cross-
+    // thread shared state. With FLASH_MAX_HEAD_VEC4=128 and FLASH_TG_SIZE=64,
+    // each thread owns at most ceil(128/64)=2 vi values → `float4 acc_local[2]`
+    // = 8 floats = 32B per thread (fits easily in registers). Removes a 2 KiB
+    // threadgroup allocation, the per-block-iter TG read+write of acc_cache4,
+    // and the sink-rescale + output-write TG roundtrips. Mirrors cycle 92's
+    // "kill dead-after-use threadgroup roundtrips" philosophy applied to the
+    // V accumulator, in the same kernel.
+    float4 acc_local[(FLASH_MAX_HEAD_VEC4 + FLASH_TG_SIZE - 1u) / FLASH_TG_SIZE];
+    for (uint li = 0u; li < (FLASH_MAX_HEAD_VEC4 + FLASH_TG_SIZE - 1u) / FLASH_TG_SIZE; ++li) {
+        acc_local[li] = float4(0.0f);
+    }
+
     // Strided loop: vec4_dim may exceed FLASH_TG_SIZE when head_dim > 256
     // (e.g. Gemma 4 global attention layers use head_dim=512 → vec4_dim=128).
     for (uint i = tid; i < vec4_dim; i += FLASH_TG_SIZE) {
         q_cache4[i] = *(device const float4*)(q + q_base + (i << 2));
-        acc_cache4[i] = float4(0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -228,8 +244,9 @@ kernel void main0(
         // existing fast::math tolerance. Collapse with a balanced 3-level
         // tree `((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7))` to keep the final
         // reduction depth at log2(8)=3 instead of serial.
+        uint li = 0u;
         for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
-            float4 acc0 = acc_cache4[vi] * rescale;
+            float4 acc0 = acc_local[li] * rescale;
             float4 acc1 = float4(0.0f);
             float4 acc2 = float4(0.0f);
             float4 acc3 = float4(0.0f);
@@ -319,7 +336,8 @@ kernel void main0(
                 }
             }
 
-            acc_cache4[vi] = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7));
+            acc_local[li] = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7));
+            ++li;
         }
         // No threadgroup_barrier here: acc_cache4 is accessed exclusively via
         // per-thread strided indexing (vi = tid; vi += FLASH_TG_SIZE), so each
@@ -340,8 +358,9 @@ kernel void main0(
         const float sink_max = fast::max(running_max, sink_val);
         const float rescale_s = running_sum > 0.0f ? fast::exp(running_max - sink_max) : 0.0f;
         final_sum = running_sum * rescale_s + fast::exp(sink_val - sink_max);
+        uint li = 0u;
         for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
-            acc_cache4[vi] *= rescale_s;
+            acc_local[li++] *= rescale_s;
         }
     }
 
@@ -351,7 +370,8 @@ kernel void main0(
     // fast::exp uses above in the running softmax; precision stays within the
     // already-accepted FA approximation budget.
     const float inv_sum = final_sum > 0.0f ? fast::divide(1.0f, final_sum) : 0.0f;
+    uint li_out = 0u;
     for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
-        *(device float4*)(out + q_base + (vi << 2)) = acc_cache4[vi] * inv_sum;
+        *(device float4*)(out + q_base + (vi << 2)) = acc_local[li_out++] * inv_sum;
     }
 }
