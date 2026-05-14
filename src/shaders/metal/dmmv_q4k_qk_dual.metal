@@ -60,20 +60,34 @@ inline float q4k_block_dot(
     sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
     sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
-    device const ushort* q2 = q1 + 32;
+    // Block layout note: `block` is row-aligned (row stride = nb*144 bytes),
+    // so `block + 16 + (16*iq + 4*ir)*2` is always 8-byte aligned (iq∈{0,1},
+    // ir∈{0..3} → byte offsets 16,20,24,28,32,36,40,44 from block; with
+    // block 8-byte aligned all of these are 8-byte aligned). Safe to load
+    // q1/q2 as ushort4.
+    const ushort4 q1v = *((device const ushort4*)q1);
+    const ushort4 q2v = *((device const ushort4*)(q1 + 32));
 
     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+        // Cycle 47: port the cycle 45 explicit-float4-fma pattern from
+        // dmmv_q4k.metal to this Q+K dual helper. Replace 8 indexed scalar
+        // `accX[k] += y* * (q* & mask)` writes per `i` iteration with 2
+        // explicit `float4 fma(y4, q4, acc4)` calls. Packs the shared yl/yh
+        // lanes once into yl4/yh4 and each matrix's masked quants into
+        // float4s so the Apple7 compiler emits quad FMAs directly instead
+        // of lifting lane-by-lane indexed writes. Covers Qwen3-8B attn_qkv
+        // when this kernel fires (Q+K paired into one dispatch).
+        const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
+        const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
+        const ushort q1i = q1v[i];
+        const ushort q2i = q2v[i];
+        const float4 q1m = float4(q1i & 0x000F, q1i & 0x0F00, q1i & 0x00F0, q1i & 0xF000);
+        const float4 q2m = float4(q2i & 0x000F, q2i & 0x0F00, q2i & 0x00F0, q2i & 0xF000);
+        acc1 = fma(yl4, q1m, acc1);
+        acc2 = fma(yh4, q2m, acc2);
     }
 
     return dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
