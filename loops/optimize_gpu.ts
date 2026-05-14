@@ -533,6 +533,13 @@ export function combinedCommandOutput(result: Pick<CommandResult, "stdout" | "st
   return [result.stdout, result.stderr].filter((part) => part.length > 0).join("\n");
 }
 
+export function isAgentAuthFailure(result: Pick<CommandResult, "exitCode" | "stdout" | "stderr">): boolean {
+  if (result.exitCode === 0) return false;
+  return /(?:Failed to authenticate|Invalid authentication credentials|API Error:\s*401|401 Unauthorized|authentication credentials)/i.test(
+    combinedCommandOutput(result),
+  );
+}
+
 function median(values: number[]): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -993,6 +1000,11 @@ async function main(): Promise<void> {
     console.log(`\nCycle ${cycle}`);
     const dirtyBeforeAgent = await currentChangedFiles();
     const agentResult = await runAgent(prompt, opts.agent);
+    if (isAgentAuthFailure(agentResult)) {
+      throw new Error(
+        `Agent authentication failed for ${opts.agent}; stopping the loop before burning more cycles. Refresh the ${opts.agent} CLI credentials, then resume this run.`,
+      );
+    }
     const changedFiles = opts.allowDirty
       ? changedSince(dirtyBeforeAgent, await currentChangedFiles())
       : await currentChangedFiles();

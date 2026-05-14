@@ -6,6 +6,7 @@ import {
   buildRemoteZincCommand,
   changedSince,
   combinedCommandOutput,
+  isAgentAuthFailure,
   managedCachePath,
   parseArgsFrom,
   parseLlamaBenchMetrics,
@@ -147,6 +148,29 @@ describe("optimize_gpu remote commands", () => {
 });
 
 describe("optimize_gpu parsers", () => {
+  test("detects fatal agent authentication failures", () => {
+    expect(isAgentAuthFailure({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+    })).toBe(true);
+
+    expect(isAgentAuthFailure({
+      exitCode: 1,
+      signal: null,
+      stdout: "remote command failed (1): err: FenceWaitFailed",
+      stderr: "",
+    })).toBe(false);
+
+    expect(isAgentAuthFailure({
+      exitCode: 0,
+      signal: null,
+      stdout: "API Error: 401 Invalid authentication credentials",
+      stderr: "",
+    })).toBe(false);
+  });
+
   test("extracts distinct ZINC decode and prefill rates", () => {
     const metrics = parseZincMetrics(`
 info(forward): Prefill complete: 12 tokens in 60.0 ms (200.00 tok/s)
