@@ -143,31 +143,43 @@ kernel void main0(
         device const half* dh_g1 = (device const half*)block_g1;
         device const half* dh_u1 = (device const half*)block_u1;
 
-        ushort sc16_g0[4]; ushort sc16_u0[4]; ushort sc16_g1[4]; ushort sc16_u1[4];
-        thread const uchar* sc8_g0 = (thread const uchar*)sc16_g0;
-        thread const uchar* sc8_u0 = (thread const uchar*)sc16_u0;
-        thread const uchar* sc8_g1 = (thread const uchar*)sc16_g1;
-        thread const uchar* sc8_u1 = (thread const uchar*)sc16_u1;
+        // Cycle 70: store sc16 as `ushort4` register vectors instead of
+        // stack-allocated `ushort[4]` arrays accessed via `(uchar*)` byte
+        // alias. The previous form forced the compiler to materialize
+        // sc16 in thread-private memory so the byte alias could read
+        // individual lanes; the new form keeps the four packed scales in
+        // SSA-eligible registers and lets the per-ib sc_pos / sc_neg
+        // byte gathers compile to vector AND + vector shift rather than
+        // 8 scalar uchar loads from spilled stack memory. Port of cycle
+        // 69 (same change in dmmv_q4k.metal, 2 sc16 sites); this shader
+        // has 4 sc16 sites (g0, u0, g1, u1) so the impact area is ~2×:
+        // 32 scalar uchar loads per ib → 16 packed byte-extractions.
+        // dmmv_q4k_dense_gate_up_swiglu.metal is the hottest Q4_K
+        // shader (~50% of Q4_K bytes/token = ffn_gate+ffn_up on
+        // Qwen3-8B dense; Q4_K = 71.6% of decode bytes/token).
+        const ushort4 sc16_g0 = ushort4(
+            sc_g0[0] & kmask1,
+            sc_g0[2] & kmask1,
+            ((sc_g0[4] >> 0) & kmask2) | ((sc_g0[0] & kmask3) >> 2),
+            ((sc_g0[4] >> 4) & kmask2) | ((sc_g0[2] & kmask3) >> 2));
 
-        sc16_g0[0] = sc_g0[0] & kmask1;
-        sc16_g0[1] = sc_g0[2] & kmask1;
-        sc16_g0[2] = ((sc_g0[4] >> 0) & kmask2) | ((sc_g0[0] & kmask3) >> 2);
-        sc16_g0[3] = ((sc_g0[4] >> 4) & kmask2) | ((sc_g0[2] & kmask3) >> 2);
+        const ushort4 sc16_u0 = ushort4(
+            sc_u0[0] & kmask1,
+            sc_u0[2] & kmask1,
+            ((sc_u0[4] >> 0) & kmask2) | ((sc_u0[0] & kmask3) >> 2),
+            ((sc_u0[4] >> 4) & kmask2) | ((sc_u0[2] & kmask3) >> 2));
 
-        sc16_u0[0] = sc_u0[0] & kmask1;
-        sc16_u0[1] = sc_u0[2] & kmask1;
-        sc16_u0[2] = ((sc_u0[4] >> 0) & kmask2) | ((sc_u0[0] & kmask3) >> 2);
-        sc16_u0[3] = ((sc_u0[4] >> 4) & kmask2) | ((sc_u0[2] & kmask3) >> 2);
+        const ushort4 sc16_g1 = ushort4(
+            sc_g1[0] & kmask1,
+            sc_g1[2] & kmask1,
+            ((sc_g1[4] >> 0) & kmask2) | ((sc_g1[0] & kmask3) >> 2),
+            ((sc_g1[4] >> 4) & kmask2) | ((sc_g1[2] & kmask3) >> 2));
 
-        sc16_g1[0] = sc_g1[0] & kmask1;
-        sc16_g1[1] = sc_g1[2] & kmask1;
-        sc16_g1[2] = ((sc_g1[4] >> 0) & kmask2) | ((sc_g1[0] & kmask3) >> 2);
-        sc16_g1[3] = ((sc_g1[4] >> 4) & kmask2) | ((sc_g1[2] & kmask3) >> 2);
-
-        sc16_u1[0] = sc_u1[0] & kmask1;
-        sc16_u1[1] = sc_u1[2] & kmask1;
-        sc16_u1[2] = ((sc_u1[4] >> 0) & kmask2) | ((sc_u1[0] & kmask3) >> 2);
-        sc16_u1[3] = ((sc_u1[4] >> 4) & kmask2) | ((sc_u1[2] & kmask3) >> 2);
+        const ushort4 sc16_u1 = ushort4(
+            sc_u1[0] & kmask1,
+            sc_u1[2] & kmask1,
+            ((sc_u1[4] >> 0) & kmask2) | ((sc_u1[0] & kmask3) >> 2),
+            ((sc_u1[4] >> 4) & kmask2) | ((sc_u1[2] & kmask3) >> 2));
 
         const ushort4 q1v_g0 = *((device const ushort4*)q1_g0);
         const ushort4 q2v_g0 = *((device const ushort4*)(q1_g0 + 32));
@@ -258,30 +270,25 @@ kernel void main0(
             float4(acc1_u1[1], acc1_u1[3], acc2_u1[1], acc2_u1[3]),
             float4(1.f / 256.f),
             float4(acc1_u1[0], acc1_u1[2], acc2_u1[0], acc2_u1[2]));
-        const float4 sc_pos_g0 = float4(
-            float(sc8_g0[0]),
-            float(sc8_g0[1]) * (1.f / 16.f),
-            float(sc8_g0[4]),
-            float(sc8_g0[5]) * (1.f / 16.f));
-        const float4 sc_pos_u0 = float4(
-            float(sc8_u0[0]),
-            float(sc8_u0[1]) * (1.f / 16.f),
-            float(sc8_u0[4]),
-            float(sc8_u0[5]) * (1.f / 16.f));
-        const float4 sc_pos_g1 = float4(
-            float(sc8_g1[0]),
-            float(sc8_g1[1]) * (1.f / 16.f),
-            float(sc8_g1[4]),
-            float(sc8_g1[5]) * (1.f / 16.f));
-        const float4 sc_pos_u1 = float4(
-            float(sc8_u1[0]),
-            float(sc8_u1[1]) * (1.f / 16.f),
-            float(sc8_u1[4]),
-            float(sc8_u1[5]) * (1.f / 16.f));
-        const float4 sc_neg_g0 = float4(sc8_g0[2], sc8_g0[3], sc8_g0[6], sc8_g0[7]);
-        const float4 sc_neg_u0 = float4(sc8_u0[2], sc8_u0[3], sc8_u0[6], sc8_u0[7]);
-        const float4 sc_neg_g1 = float4(sc8_g1[2], sc8_g1[3], sc8_g1[6], sc8_g1[7]);
-        const float4 sc_neg_u1 = float4(sc8_u1[2], sc8_u1[3], sc8_u1[6], sc8_u1[7]);
+        // Cycle 70: derive sc_pos / sc_neg via vector byte-extraction
+        // from the ushort4 sc16. sc8_X[0..7] (the old uchar* alias)
+        // maps to {sc16.x.lo, sc16.x.hi, sc16.y.lo, sc16.y.hi,
+        // sc16.z.lo, sc16.z.hi, sc16.w.lo, sc16.w.hi}, so:
+        //   sc_pos = (sc16.x.lo, sc16.x.hi/16, sc16.z.lo, sc16.z.hi/16)
+        //   sc_neg = (sc16.y.lo, sc16.y.hi,    sc16.w.lo, sc16.w.hi)
+        // Builds each float4 in 1 vector AND + 1 ushort4→float4 widen
+        // (+ 1 vector mul for sc_pos), replacing 4 scalar byte loads +
+        // 2 scalar muls. × 4 sc16 sites per ib (g0, u0, g1, u1).
+        constexpr ushort4 lo_mask = ushort4(0x00FFu);
+        constexpr float4 sc_pos_scale = float4(1.f, 1.f / 16.f, 1.f, 1.f / 16.f);
+        const float4 sc_pos_g0 = float4(ushort4(sc16_g0.x, sc16_g0.x >> 8, sc16_g0.z, sc16_g0.z >> 8) & lo_mask) * sc_pos_scale;
+        const float4 sc_pos_u0 = float4(ushort4(sc16_u0.x, sc16_u0.x >> 8, sc16_u0.z, sc16_u0.z >> 8) & lo_mask) * sc_pos_scale;
+        const float4 sc_pos_g1 = float4(ushort4(sc16_g1.x, sc16_g1.x >> 8, sc16_g1.z, sc16_g1.z >> 8) & lo_mask) * sc_pos_scale;
+        const float4 sc_pos_u1 = float4(ushort4(sc16_u1.x, sc16_u1.x >> 8, sc16_u1.z, sc16_u1.z >> 8) & lo_mask) * sc_pos_scale;
+        const float4 sc_neg_g0 = float4(ushort4(sc16_g0.y, sc16_g0.y >> 8, sc16_g0.w, sc16_g0.w >> 8) & lo_mask);
+        const float4 sc_neg_u0 = float4(ushort4(sc16_u0.y, sc16_u0.y >> 8, sc16_u0.w, sc16_u0.w >> 8) & lo_mask);
+        const float4 sc_neg_g1 = float4(ushort4(sc16_g1.y, sc16_g1.y >> 8, sc16_g1.w, sc16_g1.w >> 8) & lo_mask);
+        const float4 sc_neg_u1 = float4(ushort4(sc16_u1.y, sc16_u1.y >> 8, sc16_u1.w, sc16_u1.w >> 8) & lo_mask);
         // Cycle 60: vectorize the cross-(gate,up) × cross-row final reduction.
         // The 4 independent per-block updates here (gate0, up0, gate1, up1)
         // each compute `dh[0] * dot(head, sc_pos) - dh[1] * dot(sumy, sc_neg)`
