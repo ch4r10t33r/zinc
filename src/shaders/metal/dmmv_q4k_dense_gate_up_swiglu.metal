@@ -36,8 +36,15 @@ struct DualQ4KDmmvPush {
 #define BLOCK_SIZE 144
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
-inline float q4k_block_dot(
-    device const uchar* block,
+// Cycle 32: fused gate+up block-dot pair. Loads both blocks' q1/q2/sc/dh
+// up front and interleaves the FOR_UNROLL inner accumulator updates so the
+// compiler can schedule independent gate-vs-up FMAs simultaneously. Same
+// algorithm as two sequential q4k_block_dot calls but the interleaving
+// removes a serialization point across the inline-helper boundary, which
+// the Metal compiler does not always reorder aggressively across.
+inline float2 q4k_block_dot_pair(
+    device const uchar* block_g,
+    device const uchar* block_u,
     thread const float* yl,
     thread const float* yh,
     float4 sumy,
@@ -48,51 +55,76 @@ inline float q4k_block_dot(
     constexpr ushort kmask2 = 0x0f0f;
     constexpr ushort kmask3 = 0xc0c0;
 
-    ushort sc16[4];
-    thread const uchar* sc8 = (thread const uchar*)sc16;
+    ushort sc16_g[4];
+    ushort sc16_u[4];
+    thread const uchar* sc8_g = (thread const uchar*)sc16_g;
+    thread const uchar* sc8_u = (thread const uchar*)sc16_u;
 
-    device const ushort* sc = (device const ushort*)(block + 4) + iq;
-    device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
-    device const half* dh = (device const half*)block;
+    device const ushort* sc_g = (device const ushort*)(block_g + 4) + iq;
+    device const ushort* sc_u = (device const ushort*)(block_u + 4) + iq;
+    device const ushort* q1_g = (device const ushort*)(block_g + 16) + 16 * iq + 4 * ir;
+    device const ushort* q1_u = (device const ushort*)(block_u + 16) + 16 * iq + 4 * ir;
+    device const half* dh_g = (device const half*)block_g;
+    device const half* dh_u = (device const half*)block_u;
 
-    sc16[0] = sc[0] & kmask1;
-    sc16[1] = sc[2] & kmask1;
-    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+    sc16_g[0] = sc_g[0] & kmask1;
+    sc16_g[1] = sc_g[2] & kmask1;
+    sc16_g[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+    sc16_g[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
 
-    device const ushort* q2 = q1 + 32;
+    sc16_u[0] = sc_u[0] & kmask1;
+    sc16_u[1] = sc_u[2] & kmask1;
+    sc16_u[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+    sc16_u[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
 
-    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+    const ushort4 q1v_g = *((device const ushort4*)q1_g);
+    const ushort4 q2v_g = *((device const ushort4*)(q1_g + 32));
+    const ushort4 q1v_u = *((device const ushort4*)q1_u);
+    const ushort4 q2v_u = *((device const ushort4*)(q1_u + 32));
 
-    // ushort4 vectorized loads of the 8 q-quant ushorts: q1[0..3] and q2[0..3].
-    // Pointers are 8-byte aligned by Q4_K block layout (block base is 144-byte
-    // stride; +16 byte qs offset; +16*iq + 4*ir ushort offsets all preserve 8B
-    // alignment; q2 = q1 + 64 bytes). Replaces 8 scalar ushort loads with 2
-    // ushort4 loads — same coalescing pattern cycle 28 landed in dmmv_q4k.metal
-    // for attn_qkv/attn_o/ffn_down. This kernel handles ffn_gate + ffn_up on
-    // the Qwen3 dense path (~50% of dense Q4_K traffic), and the helper is also
-    // called twice per row (once for gate weights, once for up weights) so the
-    // saving applies on both calls per outer-loop iteration.
-    const ushort4 q1v = *((device const ushort4*)q1);
-    const ushort4 q2v = *((device const ushort4*)q2);
+    float4 acc1_g = {0.f, 0.f, 0.f, 0.f};
+    float4 acc2_g = {0.f, 0.f, 0.f, 0.f};
+    float4 acc1_u = {0.f, 0.f, 0.f, 0.f};
+    float4 acc2_u = {0.f, 0.f, 0.f, 0.f};
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        acc1[0] += yl[2 * i + 0] * (q1v[i] & 0x000F);
-        acc1[1] += yl[2 * i + 1] * (q1v[i] & 0x0F00);
-        acc1[2] += yl[2 * i + 8] * (q1v[i] & 0x00F0);
-        acc1[3] += yl[2 * i + 9] * (q1v[i] & 0xF000);
-        acc2[0] += yh[2 * i + 0] * (q2v[i] & 0x000F);
-        acc2[1] += yh[2 * i + 1] * (q2v[i] & 0x0F00);
-        acc2[2] += yh[2 * i + 8] * (q2v[i] & 0x00F0);
-        acc2[3] += yh[2 * i + 9] * (q2v[i] & 0xF000);
+        const float yl0 = yl[2 * i + 0];
+        const float yl1 = yl[2 * i + 1];
+        const float yl8 = yl[2 * i + 8];
+        const float yl9 = yl[2 * i + 9];
+        const float yh0 = yh[2 * i + 0];
+        const float yh1 = yh[2 * i + 1];
+        const float yh8 = yh[2 * i + 8];
+        const float yh9 = yh[2 * i + 9];
+        acc1_g[0] += yl0 * (q1v_g[i] & 0x000F);
+        acc1_u[0] += yl0 * (q1v_u[i] & 0x000F);
+        acc1_g[1] += yl1 * (q1v_g[i] & 0x0F00);
+        acc1_u[1] += yl1 * (q1v_u[i] & 0x0F00);
+        acc1_g[2] += yl8 * (q1v_g[i] & 0x00F0);
+        acc1_u[2] += yl8 * (q1v_u[i] & 0x00F0);
+        acc1_g[3] += yl9 * (q1v_g[i] & 0xF000);
+        acc1_u[3] += yl9 * (q1v_u[i] & 0xF000);
+        acc2_g[0] += yh0 * (q2v_g[i] & 0x000F);
+        acc2_u[0] += yh0 * (q2v_u[i] & 0x000F);
+        acc2_g[1] += yh1 * (q2v_g[i] & 0x0F00);
+        acc2_u[1] += yh1 * (q2v_u[i] & 0x0F00);
+        acc2_g[2] += yh8 * (q2v_g[i] & 0x00F0);
+        acc2_u[2] += yh8 * (q2v_u[i] & 0x00F0);
+        acc2_g[3] += yh9 * (q2v_g[i] & 0xF000);
+        acc2_u[3] += yh9 * (q2v_u[i] & 0xF000);
     }
 
-    return dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-            (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-            (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-            (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-        dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+    const float g = dh_g[0] * ((acc1_g[0] + 1.f / 256.f * acc1_g[1]) * sc8_g[0] +
+            (acc1_g[2] + 1.f / 256.f * acc1_g[3]) * sc8_g[1] * 1.f / 16.f +
+            (acc2_g[0] + 1.f / 256.f * acc2_g[1]) * sc8_g[4] +
+            (acc2_g[2] + 1.f / 256.f * acc2_g[3]) * sc8_g[5] * 1.f / 16.f) -
+        dh_g[1] * (sumy[0] * sc8_g[2] + sumy[1] * sc8_g[3] + sumy[2] * sc8_g[6] + sumy[3] * sc8_g[7]);
+    const float u = dh_u[0] * ((acc1_u[0] + 1.f / 256.f * acc1_u[1]) * sc8_u[0] +
+            (acc1_u[2] + 1.f / 256.f * acc1_u[3]) * sc8_u[1] * 1.f / 16.f +
+            (acc2_u[0] + 1.f / 256.f * acc2_u[1]) * sc8_u[4] +
+            (acc2_u[2] + 1.f / 256.f * acc2_u[3]) * sc8_u[5] * 1.f / 16.f) -
+        dh_u[1] * (sumy[0] * sc8_u[2] + sumy[1] * sc8_u[3] + sumy[2] * sc8_u[6] + sumy[3] * sc8_u[7]);
+    return float2(g, u);
 }
 
 inline float swiglu(float gate, float up) {
@@ -169,8 +201,9 @@ kernel void main0(
             const int dst_row = first_row + row;
             if (dst_row < int(p.M0)) {
                 const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
-                gate_sum[row] += q4k_block_dot(gate_src + row_off, yl, yh, sumy, iq, ir);
-                up_sum[row] += q4k_block_dot(up_src + row_off, yl, yh, sumy, iq, ir);
+                const float2 gu = q4k_block_dot_pair(gate_src + row_off, up_src + row_off, yl, yh, sumy, iq, ir);
+                gate_sum[row] += gu.x;
+                up_sum[row] += gu.y;
             }
         }
 
