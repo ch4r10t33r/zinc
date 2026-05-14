@@ -90,8 +90,8 @@ kernel void main0(
 
         for (uint i = tid; i < half_rot; i += 64) {
             const float theta = float(p.position) * freqs[i];
-            const float cos_t = cos(theta);
-            const float sin_t = sin(theta);
+            const float cos_t = fast::cos(theta);
+            const float sin_t = fast::sin(theta);
             float x0 = q_inout[base + i];
             float x1 = q_inout[base + i + half_rot];
             if (p.apply_qk_norm != 0u) {
@@ -141,8 +141,8 @@ kernel void main0(
     // K rotary: apply RoPE pair (i, i+half_rot) and write to cache.
     for (uint i = tid; i < half_rot; i += 64) {
         const float theta = float(p.position) * freqs[i];
-        const float cos_t = cos(theta);
-        const float sin_t = sin(theta);
+        const float cos_t = fast::cos(theta);
+        const float sin_t = fast::sin(theta);
         float x0 = k_in[base + i];
         float x1 = k_in[base + i + half_rot];
         if (p.apply_qk_norm != 0u) {
