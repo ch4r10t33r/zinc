@@ -4559,6 +4559,16 @@ fn dispatchLmHeadOnCmd(
 /// threads) used by `dmmv_q4k.metal` for K=hidden_dim=5376 on Gemma
 /// 31B, so we only enable it where the base kernel would already have
 /// been selected (Q4_K, K%256==0, no private weight buffer).
+//
+// Tried porting this to Q6_K (dmmv_q6k_lmhead_norm.metal, deleted)
+// for Qwen3-8B's Q6_K LM head: decode regressed ~10% (43.3 → 39.0
+// tok/s on M1 Max). The per-simdgroup-redundant RMS plus the extra
+// norm_weight reads thrashed L1 across the vocab=151936 LM head's
+// 76K simdgroups. The Q4_K version pays off on Gemma because the
+// dense-decode matvec budget per simdgroup is larger relative to
+// the redundant norm-weight reads. Do not re-attempt without a
+// different fusion strategy (e.g. a single-TG pre-RMS that writes a
+// scratch then the unfused matvec re-reads it).
 fn canUseLmHeadFusedNorm(engine: *const InferenceEngine, hidden_dim: u32) bool {
     return engine.lm_head.info.type_ == .q4_k and
         hidden_dim > 0 and
