@@ -276,6 +276,9 @@ describe("optimize_gpu agent prompt", () => {
     expect(prompt).toContain("remote: tempuser@gpu.local:8888 /home/tempuser/zinc-loop");
     expect(prompt).toContain("Objective: beat llama.cpp on both sustained decode and prompt prefill for Qwen3 8B Q4_K_M.");
     expect(prompt).toContain("Current attack metric: prefill");
+    expect(prompt).toContain("All-cycle memory:");
+    expect(prompt).toContain("decode=75.00 [74.00, 75.00, 76.00]");
+    expect(prompt).toContain("prefill=211.00 [210.00, 211.00, 212.00]");
     expect(prompt).toContain("Do not commit, push, reset, stash, or edit secrets.");
     expect(prompt).toContain("STEP_KIND");
   });

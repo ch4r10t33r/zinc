@@ -848,7 +848,103 @@ async function saveState(runDir: string, state: RunState): Promise<void> {
 
 function summarizeBench(summary: BenchmarkSummary | null): string {
   if (!summary) return "not measured";
-  return `${summary.metric}=${summary.value?.toFixed(2) ?? "?"} tok/s [${summary.samples.map((v) => v.toFixed(2)).join(", ")}], coherent=${summary.coherent ? "yes" : "no"}`;
+  const selected = summary.value == null ? "?" : `${summary.value.toFixed(2)} [${summary.samples.map((v) => v.toFixed(2)).join(", ")}]`;
+  const decode = summarizeMetricSamples(summary.decodeSamples);
+  const prefill = summarizeMetricSamples(summary.prefillSamples);
+  return `${summary.metric}=${selected} tok/s; decode=${decode}; prefill=${prefill}; coherent=${summary.coherent ? "yes" : "no"}`;
+}
+
+function summarizeMetricSamples(samples: number[]): string {
+  const value = median(samples);
+  if (value == null) return "?";
+  return `${value.toFixed(2)} [${samples.map((v) => v.toFixed(2)).join(", ")}]`;
+}
+
+function cycleMetricValue(cycle: CycleRecord, metric: MetricKind): number | null {
+  const after = cycle.after;
+  if (!after) return null;
+  return valueForMetric(after, metric);
+}
+
+function classifyCycle(cycle: CycleRecord): string {
+  const files = (cycle.changedFiles ?? []).join(" ");
+  const reason = cycle.reason.toLowerCase();
+  if (reason.includes("authentication") || reason.includes("401")) return "agent auth";
+  if (reason.includes("no source changes")) return "no source";
+  if (reason.includes("remote build") || reason.includes("benchmark failed")) return "build/bench fail";
+  if (cycle.after && !cycle.after.coherent) return "coherence";
+  if (files.includes("dmmv_q6k_batch")) return "q6k batch";
+  if (files.includes("dmmv_q4k_batch")) return "q4k batch";
+  if (files.includes("mul_mm_q4k")) return "mul_mm q4k";
+  if (files.includes("src/compute/dmmv.zig")) return "dmmv host";
+  if (files.includes("src/compute/forward.zig")) return "forward dispatch";
+  if (files.includes("dmmv_q6k.comp")) return "q6k decode";
+  if (files.includes("dmmv_q4k.comp")) return "q4k decode";
+  return "other";
+}
+
+function formatCycleBrief(cycle: CycleRecord): string {
+  const decode = cycleMetricValue(cycle, "decode");
+  const prefill = cycleMetricValue(cycle, "prefill");
+  const files = cycle.changedFiles.length > 0 ? cycle.changedFiles.join(",") : "none";
+  return `#${cycle.cycle} ${cycle.kept ? "kept" : "reverted"} d=${decode?.toFixed(2) ?? "?"} p=${prefill?.toFixed(2) ?? "?"} files=${files}`;
+}
+
+function buildCycleMemory(state: RunState): string {
+  const cycles = state.cycles;
+  if (cycles.length === 0) return "(no prior cycles)";
+
+  const measured = cycles.filter((c) => c.after != null);
+  const kept = cycles.filter((c) => c.kept);
+  const noSource = cycles.filter((c) => c.changedFiles.length === 0).length;
+  const bestDecode = measured
+    .map((c) => cycleMetricValue(c, "decode"))
+    .filter((v): v is number => v != null)
+    .sort((a, b) => b - a)[0];
+  const bestPrefill = measured
+    .map((c) => cycleMetricValue(c, "prefill"))
+    .filter((v): v is number => v != null)
+    .sort((a, b) => b - a)[0];
+
+  const categories = new Map<string, { total: number; kept: number; bestDecode: number | null; bestPrefill: number | null }>();
+  for (const cycle of cycles) {
+    const key = classifyCycle(cycle);
+    const entry = categories.get(key) ?? { total: 0, kept: 0, bestDecode: null, bestPrefill: null };
+    entry.total += 1;
+    if (cycle.kept) entry.kept += 1;
+    const decode = cycleMetricValue(cycle, "decode");
+    const prefill = cycleMetricValue(cycle, "prefill");
+    if (decode != null) entry.bestDecode = entry.bestDecode == null ? decode : Math.max(entry.bestDecode, decode);
+    if (prefill != null) entry.bestPrefill = entry.bestPrefill == null ? prefill : Math.max(entry.bestPrefill, prefill);
+    categories.set(key, entry);
+  }
+
+  const categoryLines = [...categories.entries()]
+    .sort((a, b) => b[1].total - a[1].total)
+    .slice(0, 8)
+    .map(([key, entry]) =>
+      `${key}: ${entry.kept}/${entry.total} kept, best d=${entry.bestDecode?.toFixed(2) ?? "?"}, p=${entry.bestPrefill?.toFixed(2) ?? "?"}`
+    );
+  const keptLines = kept.slice(-8).map(formatCycleBrief);
+  const rejectedMeasured = cycles.filter((c) => !c.kept && c.after != null && c.after.coherent);
+  const topRejectedPrefill = [...rejectedMeasured]
+    .sort((a, b) => (cycleMetricValue(b, "prefill") ?? -Infinity) - (cycleMetricValue(a, "prefill") ?? -Infinity))
+    .slice(0, 5)
+    .map(formatCycleBrief);
+  const topRejectedDecode = [...rejectedMeasured]
+    .sort((a, b) => (cycleMetricValue(b, "decode") ?? -Infinity) - (cycleMetricValue(a, "decode") ?? -Infinity))
+    .slice(0, 5)
+    .map(formatCycleBrief);
+
+  return [
+    `cycles=${cycles.length}; measured=${measured.length}; kept=${kept.length}; no-source=${noSource}`,
+    `best observed decode=${bestDecode?.toFixed(2) ?? "?"} tok/s; best observed prefill=${bestPrefill?.toFixed(2) ?? "?"} tok/s`,
+    `accepted baseline: ${summarizeBench(state.best)}`,
+    `categories: ${categoryLines.join(" | ")}`,
+    `kept changes: ${keptLines.join(" | ") || "none"}`,
+    `top rejected prefill: ${topRejectedPrefill.join(" | ") || "none"}`,
+    `top rejected decode: ${topRejectedDecode.join(" | ") || "none"}`,
+  ].join("\n");
 }
 
 export function buildAgentPrompt(state: RunState, opts: LoopOptions, target: ModelTarget, baseline: BenchmarkSummary, llama: LlamaSummary | null): string {
@@ -874,6 +970,9 @@ Target:
 
 Llama.cpp gap:
 ${goal}
+
+All-cycle memory:
+${buildCycleMemory(state)}
 
 Required workflow:
 1. Inspect the relevant local code before editing.
