@@ -171,6 +171,7 @@ export type LoopOptions = {
   llamaDecodeTokens: number;
   allowDirty: boolean;
   autoRevert: boolean;
+  maxStallCycles: number;
 };
 
 export type CommandResult = {
@@ -301,6 +302,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     llamaDecodeTokens: 128,
     allowDirty: false,
     autoRevert: true,
+    maxStallCycles: Number(envMap.ZINC_GPU_MAX_STALL_CYCLES ?? fileEnv.ZINC_GPU_MAX_STALL_CYCLES ?? envMap.ZINC_INTEL_MAX_STALL_CYCLES ?? fileEnv.ZINC_INTEL_MAX_STALL_CYCLES ?? envMap.ZINC_MAX_STALL_CYCLES ?? fileEnv.ZINC_MAX_STALL_CYCLES ?? "50"),
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -345,6 +347,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     else if (arg === "--llama-decode-tokens" && argv[i + 1]) opts.llamaDecodeTokens = Number(argv[++i]);
     else if (arg === "--allow-dirty") opts.allowDirty = true;
     else if (arg === "--no-revert") opts.autoRevert = false;
+    else if (arg === "--max-stall-cycles" && argv[i + 1]) opts.maxStallCycles = Number(argv[++i]);
     else if (arg === "--help" || arg === "-h") {
       printUsage();
       process.exit(0);
@@ -356,6 +359,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
   if (opts.agent !== "codex" && opts.agent !== "claude") throw new Error("--agent must be codex or claude");
   if (opts.metric !== "decode" && opts.metric !== "prefill") throw new Error("--metric must be decode or prefill");
   if (!Number.isFinite(opts.cycles) || opts.cycles < 0) throw new Error("--cycles must be >= 0");
+  if (!Number.isFinite(opts.maxStallCycles) || opts.maxStallCycles < 0) throw new Error("--max-stall-cycles must be >= 0");
   if (!Number.isFinite(opts.samples) || opts.samples < 1) throw new Error("--samples must be >= 1");
   if (!remoteHomeExplicit) opts.remoteHome = defaultHomeForUser(opts.user);
   if (!remoteDirExplicit) opts.remoteDir = `${opts.remoteHome}/zinc-gpu-loop`;
@@ -377,6 +381,7 @@ function printUsage(): void {
   console.log("  --remote-dir <path>       Remote checkout directory");
   console.log("  --metric decode|prefill   Primary keep metric");
   console.log("                            With llama.cpp available, keep decisions attack the largest remaining decode/prefill gap");
+  console.log("  --max-stall-cycles <n>    Stop after n cycles without a kept improvement (default 50, 0 disables)");
   console.log("  --skip-llama              Only benchmark ZINC");
   console.log("  --dry-run                 Preflight + baseline only");
 }
@@ -846,6 +851,15 @@ async function saveState(runDir: string, state: RunState): Promise<void> {
   await writeFile(join(runDir, "state.json"), JSON.stringify(state, null, 2));
 }
 
+async function saveCyclePatch(runDir: string, cycle: number, changedFiles: string[]): Promise<void> {
+  if (changedFiles.length === 0) return;
+  const diff = await runCommand("git", ["diff", "--binary", "--", ...changedFiles], { cwd: REPO_ROOT });
+  const body = combinedCommandOutput(diff).trimEnd();
+  if (body.length === 0) return;
+  await mkdir(runDir, { recursive: true });
+  await writeFile(join(runDir, `cycle-${String(cycle).padStart(4, "0")}.diff`), `${body}\n`);
+}
+
 function summarizeBench(summary: BenchmarkSummary | null): string {
   if (!summary) return "not measured";
   const selected = summary.value == null ? "?" : `${summary.value.toFixed(2)} [${summary.samples.map((v) => v.toFixed(2)).join(", ")}]`;
@@ -945,6 +959,13 @@ function buildCycleMemory(state: RunState): string {
     `top rejected prefill: ${topRejectedPrefill.join(" | ") || "none"}`,
     `top rejected decode: ${topRejectedDecode.join(" | ") || "none"}`,
   ].join("\n");
+}
+
+function cyclesSinceLastKeep(state: RunState): number {
+  for (let i = state.cycles.length - 1; i >= 0; i--) {
+    if (state.cycles[i].kept) return state.cycles.length - 1 - i;
+  }
+  return state.cycles.length;
 }
 
 export function buildAgentPrompt(state: RunState, opts: LoopOptions, target: ModelTarget, baseline: BenchmarkSummary, llama: LlamaSummary | null): string {
@@ -1093,6 +1114,14 @@ async function main(): Promise<void> {
   }
 
   for (let i = 0; i < opts.cycles; i++) {
+    const stalledCycles = cyclesSinceLastKeep(state);
+    if (opts.maxStallCycles > 0 && stalledCycles >= opts.maxStallCycles) {
+      console.log(`\nPlateau stop: ${stalledCycles} cycles since the last kept improvement (limit ${opts.maxStallCycles}).`);
+      console.log(`Accepted best remains: ${summarizeBench(state.best)}`);
+      console.log("Use --max-stall-cycles 0 to disable this guard after choosing a structurally different direction.");
+      break;
+    }
+
     const cycle = state.cycles.length + 1;
     const before = state.best ?? await benchmarkZinc(opts, target);
     const prompt = buildAgentPrompt(state, opts, target, before, state.llamaBaseline);
@@ -1107,6 +1136,7 @@ async function main(): Promise<void> {
     const changedFiles = opts.allowDirty
       ? changedSince(dirtyBeforeAgent, await currentChangedFiles())
       : await currentChangedFiles();
+    await saveCyclePatch(runDir, cycle, changedFiles);
 
     let after: BenchmarkSummary | null = null;
     let kept = false;
@@ -1155,6 +1185,9 @@ async function main(): Promise<void> {
     });
     await saveState(runDir, state);
     console.log(`  ${kept ? "kept" : "reverted"}: ${reason}`);
+    if (!kept && changedFiles.length > 0 && opts.autoRevert && !opts.allowDirty) {
+      console.log(`  restored accepted best: ${summarizeBench(state.best)}`);
+    }
 
     if (opts.targetTps != null && state.best?.value != null && state.best.value >= opts.targetTps) {
       console.log(`Target reached: ${state.best.value.toFixed(2)} >= ${opts.targetTps}`);

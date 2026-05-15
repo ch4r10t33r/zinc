@@ -34,6 +34,7 @@ describe("optimize_gpu args and model resolution", () => {
       "--model-id", "qwen3-8b-q4k-m",
       "--metric", "prefill",
       "--cycles", "7",
+      "--max-stall-cycles", "12",
       "--skip-llama",
     ], env);
 
@@ -43,6 +44,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.modelId).toBe("qwen3-8b-q4k-m");
     expect(opts.metric).toBe("prefill");
     expect(opts.cycles).toBe(7);
+    expect(opts.maxStallCycles).toBe(12);
     expect(opts.skipLlama).toBe(true);
   });
 
