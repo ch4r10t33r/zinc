@@ -169,6 +169,7 @@ export type LoopOptions = {
   targetTps: number | null;
   samples: number;
   skipLlama: boolean;
+  continueAfterLlama: boolean;
   llamaDir: string;
   llamaBench: string | null;
   llamaPromptTokens: number;
@@ -316,6 +317,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     targetTps: null,
     samples: 3,
     skipLlama: false,
+    continueAfterLlama: false,
     llamaDir: envLlamaDir ?? `${remoteHome}/llama.cpp`,
     llamaBench: envMap.ZINC_LLAMA_BENCH ?? fileEnv.ZINC_LLAMA_BENCH ?? null,
     llamaPromptTokens: 128,
@@ -360,6 +362,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     else if (arg === "--target" && argv[i + 1]) opts.targetTps = Number(argv[++i]);
     else if (arg === "--samples" && argv[i + 1]) opts.samples = Number(argv[++i]);
     else if (arg === "--skip-llama") opts.skipLlama = true;
+    else if (arg === "--continue-after-llama") opts.continueAfterLlama = true;
     else if (arg === "--llama-dir" && argv[i + 1]) {
       opts.llamaDir = argv[++i];
       llamaDirExplicit = true;
@@ -405,6 +408,7 @@ function printUsage(): void {
   console.log("  --remote-dir <path>       Remote checkout directory");
   console.log("  --metric decode|prefill   Primary keep metric");
   console.log("                            With llama.cpp available, keep decisions attack the largest remaining decode/prefill gap");
+  console.log("  --continue-after-llama    Keep optimizing after ZINC beats llama.cpp on decode and prefill");
   console.log("  --max-stall-cycles <n>    Stop after n cycles without a kept improvement (default 50, 0 disables)");
   console.log("  --skip-llama              Only benchmark ZINC");
   console.log("  --dry-run                 Preflight + baseline only");
@@ -1221,7 +1225,7 @@ async function main(): Promise<void> {
       console.log(`Target reached: ${state.best.value.toFixed(2)} >= ${opts.targetTps}`);
       break;
     }
-    if (opts.targetTps == null && beatsLlamaOnBoth(state.best, state.llamaBaseline)) {
+    if (opts.targetTps == null && !opts.continueAfterLlama && beatsLlamaOnBoth(state.best, state.llamaBaseline)) {
       console.log("Target reached: ZINC beats llama.cpp on both decode and prefill.");
       break;
     }

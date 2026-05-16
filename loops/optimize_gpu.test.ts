@@ -77,6 +77,7 @@ describe("optimize_gpu args and model resolution", () => {
       "--cycles", "7",
       "--max-stall-cycles", "12",
       "--skip-llama",
+      "--continue-after-llama",
     ], env);
 
     expect(opts.agent).toBe("claude");
@@ -88,6 +89,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.cycles).toBe(7);
     expect(opts.maxStallCycles).toBe(12);
     expect(opts.skipLlama).toBe(true);
+    expect(opts.continueAfterLlama).toBe(true);
   });
 
   test("maps managed model ids to the ZINC cache layout", () => {
