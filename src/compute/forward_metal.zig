@@ -723,24 +723,17 @@ const MoeAccBatchedBiasPush = extern struct {
     w_sh: f32,
 };
 
+/// Push constants for GPT-OSS routed batched accumulate with per-expert down bias.
+const MoeAccBatchedBiasRoutedPush = extern struct {
+    n: u32,
+    n_used: u32,
+    expert_stride: u32,
+    bias_offset: u32,
+};
+
 /// Push constants for GPT-OSS OAI SwiGLU across a contiguous [expert][dim] batch.
 const OaiSwiGLUBatchedBiasPush = extern struct {
     n: u32,
-    gate_bias_offset: u32,
-    up_bias_offset: u32,
-};
-
-/// Push constants for fused GPT-OSS MXFP4 gate/up projection + OAI SwiGLU.
-const MoeGateUpOaiPush = extern struct {
-    M: u32,
-    K: u32,
-    gate_offset: u32,
-    up_offset: u32,
-    gate_expert_stride: u32,
-    up_expert_stride: u32,
-    x_expert_stride: u32,
-    x_offset: u32,
-    y_offset: u32,
     gate_bias_offset: u32,
     up_bias_offset: u32,
 };
@@ -755,6 +748,12 @@ const SoftmaxTopkScaledPush = extern struct {
     n_experts: u32,
     k: u32,
     logit_scale_bits: u32,
+};
+
+const SoftmaxTopkWeightBiasPush = extern struct {
+    n_experts: u32,
+    k: u32,
+    bias_offset: u32,
 };
 
 /// Push constants for batched GPU softmax + top-k routing.
@@ -1709,7 +1708,6 @@ pub const InferenceEngine = struct {
     dmmv_q5_1_pipe: MetalPipeline,
     dmmv_mxfp4_pipe: MetalPipeline,
     dmmv_mxfp4_moe_pipe: MetalPipeline,
-    dmmv_mxfp4_moe_gate_up_oai_pipe: MetalPipeline,
     dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
@@ -1754,8 +1752,10 @@ pub const InferenceEngine = struct {
     moe_acc_pipe: MetalPipeline,
     moe_acc_batched_pipe: MetalPipeline,
     moe_acc_batched_bias_pipe: MetalPipeline,
+    moe_acc_batched_bias_routed_pipe: MetalPipeline,
     softmax_topk_pipe: MetalPipeline,
     softmax_topk_scaled_pipe: MetalPipeline,
+    softmax_topk_weight_bias_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
     moe_route_ids_pipe: MetalPipeline,
@@ -2080,7 +2080,6 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_1_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1");
         self.dmmv_mxfp4_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4");
         self.dmmv_mxfp4_moe_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe");
-        self.dmmv_mxfp4_moe_gate_up_oai_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_gate_up_oai");
         self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
@@ -2125,8 +2124,10 @@ pub const InferenceEngine = struct {
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
         self.moe_acc_batched_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
         self.moe_acc_batched_bias_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias");
+        self.moe_acc_batched_bias_routed_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias_routed");
         self.softmax_topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
         self.softmax_topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
+        self.softmax_topk_weight_bias_pipe = try loadShaderPipeline(ctx, "softmax_topk_weight_bias");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
         self.moe_route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
@@ -2793,7 +2794,6 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_1_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_pipe);
-        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_gate_up_oai_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
@@ -2836,8 +2836,10 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_bias_pipe);
+        metal_pipeline.freePipeline(&self.moe_acc_batched_bias_routed_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_scaled_pipe);
+        metal_pipeline.freePipeline(&self.softmax_topk_weight_bias_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
         metal_pipeline.freePipeline(&self.moe_route_ids_pipe);
@@ -5089,56 +5091,6 @@ fn dispatchDmmvMoeMxfp4OnCmd(
     cmd.dispatchV2(&engine.dmmv_mxfp4_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
 }
 
-fn dispatchDmmvMoeGateUpOaiMxfp4OnCmd(
-    engine: *InferenceEngine,
-    cmd: *MetalCommand,
-    gate_tensor: *const metal_loader.LoadedTensor,
-    up_tensor: *const metal_loader.LoadedTensor,
-    input_buf: *const MetalBuffer,
-    output_buf: *const MetalBuffer,
-    routing_buf: *const MetalBuffer,
-    gate_bias: *const metal_loader.LoadedTensor,
-    up_bias: *const metal_loader.LoadedTensor,
-    M: u32,
-    K: u32,
-    gate_expert_stride: u32,
-    up_expert_stride: u32,
-    gate_base_offset: u32,
-    up_base_offset: u32,
-) !void {
-    if (gate_tensor.info.type_ != .mxfp4 or up_tensor.info.type_ != .mxfp4) return error.UnsupportedQuantType;
-    if (K > 4096) return error.UnsupportedQuantType;
-    if (engine.dmmv_mxfp4_moe_gate_up_oai_pipe.handle == null) return error.UnsupportedQuantType;
-
-    recordMoeDmmvProfile(engine, gate_tensor.info.type_, M, K, engine.config.n_experts_used * 2);
-
-    const push = MoeGateUpOaiPush{
-        .M = M,
-        .K = K,
-        .gate_offset = tensorPageOffset(engine.model, gate_tensor) + gate_base_offset,
-        .up_offset = tensorPageOffset(engine.model, up_tensor) + up_base_offset,
-        .gate_expert_stride = gate_expert_stride,
-        .up_expert_stride = up_expert_stride,
-        .x_expert_stride = 0,
-        .x_offset = 0,
-        .y_offset = 0,
-        .gate_bias_offset = tensorPageOffset(engine.model, gate_bias),
-        .up_bias_offset = tensorPageOffset(engine.model, up_bias),
-    };
-    const bufs = [_]*const MetalBuffer{
-        &gate_tensor.gpu_buffer,
-        &up_tensor.gpu_buffer,
-        input_buf,
-        output_buf,
-        routing_buf,
-        &gate_bias.gpu_buffer,
-        &up_bias.gpu_buffer,
-    };
-    const rows_per_wg: u32 = 64;
-    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
-    cmd.dispatchV2(&engine.dmmv_mxfp4_moe_gate_up_oai_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpOaiPush), 0);
-}
-
 fn dispatchDmmvMoeOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -5903,6 +5855,45 @@ fn dispatchMoeAccBatchedBiasOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ dst, experts, shared, routing, &down_bias.gpu_buffer };
     cmd.dispatchV2(&engine.moe_acc_batched_bias_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeAccBatchedBiasPush), 0);
+}
+
+fn dispatchMoeAccBatchedBiasRoutedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    dst: *const MetalBuffer,
+    experts: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    down_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_used: u32,
+    expert_stride: u32,
+) void {
+    const push = MoeAccBatchedBiasRoutedPush{
+        .n = n,
+        .n_used = n_used,
+        .expert_stride = expert_stride,
+        .bias_offset = tensorPageOffset(engine.model, down_bias),
+    };
+    const bufs = [_]*const MetalBuffer{ dst, experts, routing, &down_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_acc_batched_bias_routed_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeAccBatchedBiasRoutedPush), 0);
+}
+
+fn dispatchSoftmaxTopkWeightBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    logits: *const MetalBuffer,
+    output: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = SoftmaxTopkWeightBiasPush{
+        .n_experts = n_experts,
+        .k = k,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ logits, output, &bias.gpu_buffer };
+    cmd.dispatchV2(&engine.softmax_topk_weight_bias_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkWeightBiasPush), 0);
 }
 
 fn fillRopeInvFreqs(dst: []f32, rope_dim: u32, freq_base: f32, freq_factors: ?[]const f32) void {
@@ -7343,9 +7334,30 @@ fn canUseBatchedMxfp4GptOssMoe(
     if (gate_bias.info.type_ != .f32 or up_bias.info.type_ != .f32 or down_bias.info.type_ != .f32) return false;
 
     return engine.dmmv_mxfp4_moe_pipe.handle != null and
-        engine.dmmv_mxfp4_moe_gate_up_oai_pipe.handle != null and
         engine.swiglu_oai_batched_bias_pipe.handle != null and
         engine.moe_acc_batched_bias_pipe.handle != null;
+}
+
+fn canUseGpuRoutedGptOssMoe(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    layer_idx: usize,
+    hidden_dim: u32,
+    inter_dim: u32,
+) bool {
+    if (engine.post_ffn_norm_present[layer_idx]) return false;
+
+    const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, hidden_dim) catch return false;
+    const down_exps = lt.ffn_down_exps orelse return false;
+    if (!canUseBatchedMxfp4GptOssMoe(engine, lt, gate_up_layout.gate_tensor.info.type_, gate_up_layout.up_tensor.info.type_, down_exps.info.type_, hidden_dim, inter_dim)) {
+        return false;
+    }
+
+    const router_bias = lt.ffn_gate_inp_bias orelse return false;
+    if (router_bias.info.type_ != .f32) return false;
+
+    return engine.softmax_topk_weight_bias_pipe.handle != null and
+        engine.moe_acc_batched_bias_routed_pipe.handle != null;
 }
 
 fn canUseGpuRoutedMoeDown(engine: *const InferenceEngine, down_quant: GGMLType) bool {
@@ -8297,6 +8309,98 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer's RMS norm
 }
 
+fn recordGpuRoutedGptOssMoeOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+) !void {
+    const cfg = engine.config;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+    const gate_bias = lt.ffn_gate_exps_bias orelse return error.MissingTensor;
+    const up_bias = lt.ffn_up_exps_bias orelse return error.MissingTensor;
+    const down_bias = lt.ffn_down_exps_bias orelse return error.MissingTensor;
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    dispatchSoftmaxTopkWeightBiasOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used);
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        gate_exps,
+        &engine.norm_buf,
+        &engine.expert_gate_batch_buf,
+        &engine.router_output_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.gate_expert_stride,
+        0,
+        gate_up_layout.gate_base_offset,
+    );
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        up_exps,
+        &engine.norm_buf,
+        &engine.expert_up_batch_buf,
+        &engine.router_output_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.up_expert_stride,
+        0,
+        gate_up_layout.up_base_offset,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    dispatchOaiSwiGLUBatchedBiasOnCmd(
+        engine,
+        cmd,
+        &engine.expert_gate_batch_buf,
+        &engine.expert_swiglu_batch_buf,
+        &engine.expert_up_batch_buf,
+        &engine.router_output_buf,
+        gate_bias,
+        up_bias,
+        inter_dim,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        down_exps,
+        &engine.expert_swiglu_batch_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        hidden_dim,
+        inter_dim,
+        expert_down_bytes,
+        inter_dim,
+        0,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    dispatchMoeAccBatchedBiasRoutedOnCmd(
+        engine,
+        cmd,
+        &engine.hidden_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        down_bias,
+        hidden_dim,
+        cfg.n_experts_used,
+        hidden_dim,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+}
+
 fn acquireLayerCommand(
     engine: *InferenceEngine,
     shared_cmd: ?*MetalCommand,
@@ -8526,7 +8630,9 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
         const layer: u32 = @intCast(layer_idx);
         const lt = engine.layer_tensors[layer_idx];
         const is_full_attn = ((layer + 1) % full_attn_interval == 0);
-        const use_gpu_routed_moe = is_moe and canUseGpuRoutedBatchedMoe(engine, lt);
+        const use_standard_gpu_routed_moe = is_moe and canUseGpuRoutedBatchedMoe(engine, lt);
+        const use_gpt_oss_gpu_routed_moe = is_moe and !use_standard_gpu_routed_moe and canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim);
+        const use_gpu_routed_moe = use_standard_gpu_routed_moe or use_gpt_oss_gpu_routed_moe;
         const skip_pre_ffn_router = is_moe and !use_gpu_routed_moe and hasExplicitGemmaMoeTensors(cfg, lt);
         const layer_output_scale = engine.layer_output_scales[layer_idx];
         // Set true when the per-layer `layer_output_scale` is folded into the
@@ -8647,7 +8753,11 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
-                    try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    if (use_standard_gpu_routed_moe) {
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    } else {
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim);
+                    }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
                     p.layer_record_ns += profileElapsedNs(layer_record_start);
@@ -8846,7 +8956,11 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
-                    try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    if (use_standard_gpu_routed_moe) {
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    } else {
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim);
+                    }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
                     p.layer_record_ns += profileElapsedNs(layer_record_start);
@@ -8995,22 +9109,32 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     } else if (use_batched_mxfp4_moe) {
                         // GPT-OSS MXFP4 experts: keep all selected experts in
                         // contiguous batched buffers and apply OAI biases on GPU.
-                        try dispatchDmmvMoeGateUpOaiMxfp4OnCmd(
+                        try dispatchDmmvMoeOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+                        try dispatchDmmvMoeOnCmd(
                             engine,
                             &cmd,
-                            gate_exps,
                             up_exps,
                             &engine.norm_buf,
+                            &engine.expert_up_batch_buf,
+                            &engine.expert_ids_buf,
+                            inter_dim,
+                            hidden_dim,
+                            gate_up_layout.up_expert_stride,
+                            0,
+                            0,
+                        );
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        dispatchOaiSwiGLUBatchedBiasOnCmd(
+                            engine,
+                            &cmd,
+                            &engine.expert_gate_batch_buf,
                             &engine.expert_swiglu_batch_buf,
+                            &engine.expert_up_batch_buf,
                             &engine.expert_ids_buf,
                             lt.ffn_gate_exps_bias.?,
                             lt.ffn_up_exps_bias.?,
                             inter_dim,
-                            hidden_dim,
-                            expert_gate_bytes,
-                            gate_up_layout.up_expert_stride,
-                            gate_up_layout.gate_base_offset,
-                            gate_up_layout.up_base_offset,
                         );
                         profileBarrier(&cmd, profile, .fallback_moe);
 
