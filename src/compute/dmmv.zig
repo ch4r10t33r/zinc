@@ -75,6 +75,18 @@ pub const MoeFusedDownAccPushConstants = extern struct {
     n_used: u32,
 };
 
+/// Push constants for Gemma's packed Q4_K MoE gate+up+GEGLU shader.
+/// The shader reads expert ids from the routing buffer, so `expert_stride`
+/// spans the full packed gate+up expert and `up_offset` selects the up half.
+pub const MoeGateUpGegluPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    up_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+};
+
 /// Push constants for the fused split-K merge + o_proj DMMV-acc shader
 /// (src/shaders/dmmv_q4k_o_proj_merge.comp). Adds the merge-pass parameters
 /// to the standard DmmvPushConstants so a single dispatch reads partials,
@@ -292,6 +304,10 @@ pub const DmmvDispatch = struct {
     /// gate/up rows into one Q4_K tensor, so this takes independent byte
     /// offsets into that tensor and writes GEGLU(gate, up) directly.
     pipeline_q4k_fused_gate_up_geglu: ?Pipeline,
+    /// Gemma batched MoE front-end: reads CPU-selected expert ids from the
+    /// routing buffer and writes GEGLU activations for all selected experts
+    /// into contiguous activation slabs.
+    pipeline_q4k_moe_fused_gate_up_geglu: ?Pipeline,
     /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
     /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
     /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
@@ -342,6 +358,10 @@ pub const DmmvDispatch = struct {
     /// Q5_1 DMMV fused with scaled accumulation. Used by Gemma CPU-routed
     /// MoE to fold down projection + weighted accumulation into one dispatch.
     pipeline_q5_1_acc: ?Pipeline,
+    /// Gemma Q5_1 MoE down projection fused across all selected experts.
+    /// Reads ids/weights from the routing buffer and writes the accumulated
+    /// hidden vector directly, replacing per-expert down+acc dispatches.
+    pipeline_q5_1_moe_fused_down_acc: ?Pipeline,
     /// MoE Q6K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q6k_moe: ?Pipeline,
     /// Foundation for future mul_mmq work: quantize an F32 activation into
@@ -639,6 +659,12 @@ pub const DmmvDispatch = struct {
             log.warn("Q4_K Gemma fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q4k_moe_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
+        const moe_gate_up_geglu_push_size = @sizeOf(MoeGateUpGegluPushConstants);
+        const pipeline_q4k_moe_fused_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_fused_gate_up_geglu_path, 4, moe_gate_up_geglu_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma MoE fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         // Q8_0 fused gate+up+SwiGLU. 4 bindings, same push struct as the
         // Q4_K variant. Used by the shared expert path on Qwen 3.5 / 3.6
@@ -695,6 +721,12 @@ pub const DmmvDispatch = struct {
         const q5k_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
         const pipeline_q5k_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(instance, q5k_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_K MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q5_1_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 Gemma MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -803,6 +835,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
             .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
             .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
+            .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
@@ -812,6 +845,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mxfp4_moe = pipeline_mxfp4_moe,
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
             .pipeline_q5_1_acc = pipeline_q5_1_acc,
+            .pipeline_q5_1_moe_fused_down_acc = pipeline_q5_1_moe_fused_down_acc,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
             .pipeline_q6k_moe = pipeline_q6k_moe,
@@ -1276,6 +1310,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
@@ -1285,6 +1320,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
         if (self.pipeline_count_experts) |*p| p.deinit();
