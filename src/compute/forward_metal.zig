@@ -756,6 +756,11 @@ const SoftmaxTopkWeightBiasPush = extern struct {
     bias_offset: u32,
 };
 
+const AddBiasPush = extern struct {
+    n: u32,
+    bias_offset: u32,
+};
+
 /// Push constants for batched GPU softmax + top-k routing.
 /// Outputs one packed routing row per token: [k expert ids][k f32 weights as u32].
 const SoftmaxTopkBatchedPush = extern struct {
@@ -1747,6 +1752,7 @@ pub const InferenceEngine = struct {
     swiglu_oai_batched_bias_pipe: MetalPipeline,
     scale_acc_pipe: MetalPipeline,
     scale_in_place_pipe: MetalPipeline,
+    add_bias_pipe: MetalPipeline,
     rms_norm_pipe: MetalPipeline,
     rms_norm_offset_pipe: MetalPipeline,
     moe_acc_pipe: MetalPipeline,
@@ -2119,6 +2125,7 @@ pub const InferenceEngine = struct {
         self.swiglu_oai_batched_bias_pipe = try loadShaderPipeline(ctx, "swiglu_oai_batched_bias");
         self.scale_acc_pipe = try loadShaderPipeline(ctx, "scale_accumulate");
         self.scale_in_place_pipe = try loadShaderPipeline(ctx, "scale_in_place");
+        self.add_bias_pipe = try loadShaderPipeline(ctx, "add_bias");
         self.rms_norm_pipe = try loadShaderPipeline(ctx, "rms_norm_mul");
         self.rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
@@ -2831,6 +2838,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.swiglu_oai_batched_bias_pipe);
         metal_pipeline.freePipeline(&self.scale_acc_pipe);
         metal_pipeline.freePipeline(&self.scale_in_place_pipe);
+        metal_pipeline.freePipeline(&self.add_bias_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_offset_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
@@ -5775,6 +5783,21 @@ fn dispatchScaleInPlaceOnCmd(
     profileBarrier(cmd, profile, barrier_class);
 }
 
+fn dispatchAddBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    data: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n: u32,
+) void {
+    const push = AddBiasPush{
+        .n = n,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ data, &bias.gpu_buffer };
+    cmd.dispatchV2(&engine.add_bias_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(AddBiasPush), 0);
+}
+
 fn dispatchSigmoidMulOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -6533,23 +6556,22 @@ fn dispatchFullAttnPrepOnCmd(
         profileBarrier(cmd, profile, .full_attn);
     }
 
+    // Apply Q/K/V biases if present (gpt-oss)
+    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        if (lt.attn_q_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.q_buf, b, attn.q_dim);
+        if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
+        if (!attn.use_k_as_v) {
+            if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
+        }
+        profileBarrier(cmd, profile, .full_attn);
+    }
+
     if (engine.debug_validation_enabled and shouldDebugAttentionValidation(cfg, engine.position, layer_idx)) {
         commitAndWaitProfiled(cmd, profile);
         const debug_start = profileStart(profile != null);
         try debugCompareAttentionProjectionStage(engine, @intCast(layer_idx), layer_idx, lt, hidden_dim);
         if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
         cmd.* = try beginProfiledCommand(engine, profile);
-    }
-
-    // Apply Q/K/V biases if present (gpt-oss)
-    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
-        cmd.commitAndWait();
-        if (lt.attn_q_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.q_buf.cpu_ptr.?)), b, attn.q_dim);
-        if (lt.attn_k_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.k_buf.cpu_ptr.?)), b, attn.kv_dim);
-        if (!attn.use_k_as_v) {
-            if (lt.attn_v_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.v_buf.cpu_ptr.?)), b, attn.kv_dim);
-        }
-        cmd.* = try metal_command.beginCommand(engine.device.ctx);
     }
 
     // Fuse RoPE-K with the K/V cache write when:
@@ -8690,10 +8712,8 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
             profileBarrier(cmd, profile, .full_attn);
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
-                commitAndWaitProfiled(cmd, profile);
-                addBiasFromTensor(engine, @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?)), b, hidden_dim);
-                local_cmd_storage = try beginProfiledCommand(engine, profile);
-                cmd = &local_cmd_storage;
+                dispatchAddBiasOnCmd(engine, cmd, &engine.down_buf, b, hidden_dim);
+                profileBarrier(cmd, profile, .full_attn);
             }
             const should_debug_attn_compare = engine.debug_validation_enabled and using_local_cmd and
                 shouldDebugAttentionValidation(cfg, engine.position, layer_idx);
