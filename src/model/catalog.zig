@@ -129,6 +129,7 @@ pub const entries = [_]CatalogEntry{
         .thinking_stable = true,
         .status = .supported,
         .tested_profiles = &.{
+            "amd-rdna4-32gb",
             apple_silicon_profile,
             "intel-arc",
         },

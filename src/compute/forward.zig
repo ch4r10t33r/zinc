@@ -13316,5 +13316,5 @@ test "push constant struct sizes match GLSL expectations" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(ew.SsmConv1dPush));
     try std.testing.expectEqual(@as(usize, 52), @sizeOf(ew.SsmDeltaNetPush));
     try std.testing.expectEqual(@as(usize, 20), @sizeOf(ew.SsmGatedNormPush));
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ew.SoftmaxTopkPush));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(ew.SoftmaxTopkPush));
 }

@@ -4,6 +4,7 @@ import {
   buildArtifact,
   buildComparison,
   buildMeasurementPhases,
+  benchmarkFailureReason,
   canonicalModelIdFromPath,
   compareModelsByName,
   detectRdnaServerStartupFailure,
@@ -199,6 +200,14 @@ main: exiting due to model loading error
 
   expect(failure).toBe("unknown model architecture: 'gemma4'");
   expect(detectRdnaServerStartupFailure("server ready")).toBeNull();
+});
+
+test("benchmark failure reasons do not publish shell commands", () => {
+  const error = new Error("Command failed (1): remote benchmark command with private args\nprivate details");
+  expect(benchmarkFailureReason("ZINC run failed", error)).toBe("ZINC run failed: command exited unsuccessfully (1).");
+  const diagnostic = new Error("Command failed (1): remote benchmark command with private args\nerr(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("ZINC run failed", diagnostic)).toBe("ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("Intel baseline failed", new Error("Remote server failed to start"))).toBe("Intel baseline failed: Remote server failed to start");
 });
 
 test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {
