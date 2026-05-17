@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3 LMHead decode budget on the Radeon AI PRO R9700 and how it scales by hidden size</title>
+  <desc id="desc">A two-panel data visualization on a cream background. The upper panel is a horizontal stacked bar showing where one decode token's 8.5 milliseconds go on a Radeon AI PRO R9700 at 117 tokens per second on Qwen3.6-35B-A3B. The segments left to right are active MoE expert weights 2.55 ms, KV cache reads 1.65 ms, attention compute 1.20 ms, FFN shared expert and router 0.95 ms, RMSNorms and residual 0.55 ms, LMHead matmul 0.40 ms highlighted in orange with a callout reading 255 megabytes Q6 K read on hidden 2048, sampler plus softmax 0.30 ms, and other overhead 0.85 ms. The lower panel is a small horizontal bar chart titled LMHead size at Q6 K versus hidden size across Qwen3 variants. Five bars from top: Qwen3-1.7B and Qwen3-Next-80B-A3B at 255 megabytes, Qwen3-4B at 319 megabytes drawn in pale blue, and below a dashed line labeled tying cutoff the bars Qwen3-8B and Qwen3-235B-A22B at 510 megabytes and Qwen3-32B at 638 megabytes drawn in orange. A footer credits the llama.cpp Q4 K M recipe at Q6 K for token embd weight and output weight and the Hugging Face Qwen3 config files for the tie word embeddings flag.</desc>
+
+  <style>
+    .bg { fill: #f7f3ea; }
+    .ink { fill: #1a1f2c; }
+    .ink-soft { fill: #4a5161; }
+    .ink-faint { fill: #7a818e; }
+    .axis { stroke: #c6bda7; stroke-width: 1; }
+    .axis-grid { stroke: #d8d0b8; stroke-width: 0.75; stroke-dasharray: 2 3; }
+    .tick { stroke: #1a1f2c; stroke-width: 1; }
+    .label { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #1a1f2c; }
+    .label-soft { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11px; fill: #4a5161; }
+    .label-faint { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #7a818e; }
+    .label-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: #1a1f2c; }
+    .label-bold { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #1a1f2c; font-weight: 600; }
+    .title-text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 16px; fill: #1a1f2c; font-weight: 600; }
+    .subtitle-text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #4a5161; }
+    .accent { fill: #d36b1f; }
+    .accent-outline { stroke: #1a1f2c; stroke-width: 2; fill: #ef8e3a; }
+  </style>
+
+  <rect class="bg" width="960" height="600"/>
+
+  <!-- Header -->
+  <text class="title-text" x="40" y="44">Where one decode token's 8.5 ms goes on a Radeon AI PRO R9700</text>
+  <text class="subtitle-text" x="40" y="64">Qwen3.6-35B-A3B at Q4_K_M, single-slot decode at 117 tok/s, 16k KV resident</text>
+
+  <!-- Upper panel: stacked bar -->
+  <!-- Bar from x=80 to x=880 (800px wide). y=110, height 56. -->
+  <!-- Total = 8.55 ms. Scale = 800/8.55 = 93.57 px/ms -->
+  <!-- Segments:
+       MoE active 2.55ms -> 238.6 px
+       KV reads 1.65ms -> 154.4 px
+       Attention 1.20ms -> 112.3 px
+       FFN shared+router 0.95ms -> 88.9 px
+       RMSNorms 0.55ms -> 51.5 px
+       LMHead 0.40ms -> 37.4 px  (orange, highlighted)
+       Sampler 0.30ms -> 28.1 px
+       Other 0.85ms -> 79.5 px
+       Total 800 px
+  -->
+
+  <!-- Tick labels above bar -->
+  <line class="axis" x1="80" y1="100" x2="880" y2="100"/>
+  <g>
+    <line class="axis-grid" x1="80" y1="100" x2="80" y2="180"/>
+    <line class="axis-grid" x1="80" y1="100" x2="80" y2="180"/>
+    <line class="axis-grid" x1="174" y1="100" x2="174" y2="180"/>
+    <line class="axis-grid" x1="267" y1="100" x2="267" y2="180"/>
+    <line class="axis-grid" x1="361" y1="100" x2="361" y2="180"/>
+    <line class="axis-grid" x1="455" y1="100" x2="455" y2="180"/>
+    <line class="axis-grid" x1="548" y1="100" x2="548" y2="180"/>
+    <line class="axis-grid" x1="642" y1="100" x2="642" y2="180"/>
+    <line class="axis-grid" x1="735" y1="100" x2="735" y2="180"/>
+    <line class="axis-grid" x1="829" y1="100" x2="829" y2="180"/>
+    <line class="axis-grid" x1="880" y1="100" x2="880" y2="180"/>
+  </g>
+  <text class="label-faint" x="80" y="92" text-anchor="middle">0</text>
+  <text class="label-faint" x="174" y="92" text-anchor="middle">1</text>
+  <text class="label-faint" x="267" y="92" text-anchor="middle">2</text>
+  <text class="label-faint" x="361" y="92" text-anchor="middle">3</text>
+  <text class="label-faint" x="455" y="92" text-anchor="middle">4</text>
+  <text class="label-faint" x="548" y="92" text-anchor="middle">5</text>
+  <text class="label-faint" x="642" y="92" text-anchor="middle">6</text>
+  <text class="label-faint" x="735" y="92" text-anchor="middle">7</text>
+  <text class="label-faint" x="829" y="92" text-anchor="middle">8</text>
+  <text class="label-faint" x="888" y="92" text-anchor="start">ms</text>
+
+  <!-- Stacked bar segments -->
+  <!-- 1. Active MoE expert weights: x=80, width 238.6 -->
+  <rect x="80" y="110" width="238.6" height="56" fill="#34495e"/>
+  <text class="label" x="199.3" y="138" text-anchor="middle" fill="#f7f3ea">MoE experts</text>
+  <text class="label-mono" x="199.3" y="156" text-anchor="middle" fill="#f7f3ea">2.55 ms · 1.65 GB</text>
+
+  <!-- 2. KV cache reads: x=318.6, width 154.4 -->
+  <rect x="318.6" y="110" width="154.4" height="56" fill="#4e7e84"/>
+  <text class="label" x="395.8" y="138" text-anchor="middle" fill="#f7f3ea">KV reads</text>
+  <text class="label-mono" x="395.8" y="156" text-anchor="middle" fill="#f7f3ea">1.65 ms · 1.06 GB</text>
+
+  <!-- 3. Attention compute: x=473.0, width 112.3 -->
+  <rect x="473.0" y="110" width="112.3" height="56" fill="#6fa3a4"/>
+  <text class="label" x="529.2" y="138" text-anchor="middle" fill="#1a1f2c">Attention</text>
+  <text class="label-mono" x="529.2" y="156" text-anchor="middle" fill="#1a1f2c">1.20 ms</text>
+
+  <!-- 4. FFN shared + router: x=585.3, width 88.9 -->
+  <rect x="585.3" y="110" width="88.9" height="56" fill="#a7c599"/>
+  <text class="label" x="629.8" y="138" text-anchor="middle" fill="#1a1f2c">Shared FFN</text>
+  <text class="label-mono" x="629.8" y="156" text-anchor="middle" fill="#1a1f2c">0.95 ms</text>
+
+  <!-- 5. RMSNorms + residual: x=674.2, width 51.5 -->
+  <rect x="674.2" y="110" width="51.5" height="56" fill="#c8d8a8"/>
+  <text class="label-soft" x="699.95" y="143" text-anchor="middle" fill="#1a1f2c">RMSNorm</text>
+  <text class="label-mono" x="699.95" y="158" text-anchor="middle" fill="#1a1f2c">0.55</text>
+
+  <!-- 6. LMHead matmul: x=725.7, width 37.4 (HIGHLIGHTED) -->
+  <rect class="accent-outline" x="725.7" y="106" width="37.4" height="64"/>
+  <text class="label-bold" x="744.4" y="140" text-anchor="middle" fill="#1a1f2c">LMHead</text>
+  <text class="label-mono" x="744.4" y="156" text-anchor="middle" fill="#1a1f2c">0.40</text>
+
+  <!-- 7. Sampler + softmax: x=763.1, width 28.1 -->
+  <rect x="763.1" y="110" width="28.1" height="56" fill="#f3c79a"/>
+  <text class="label-faint" x="777.15" y="143" text-anchor="middle" fill="#1a1f2c">Smp</text>
+  <text class="label-mono" x="777.15" y="158" text-anchor="middle" fill="#1a1f2c">0.30</text>
+
+  <!-- 8. Other overhead: x=791.2, width 79.5 (extends slightly to round 800) -->
+  <rect x="791.2" y="110" width="88.8" height="56" fill="#cfcab9"/>
+  <text class="label-soft" x="835.6" y="138" text-anchor="middle" fill="#1a1f2c">Other</text>
+  <text class="label-mono" x="835.6" y="156" text-anchor="middle" fill="#1a1f2c">0.85 ms</text>
+
+  <!-- Callout to LMHead -->
+  <path d="M 744 102 L 744 80 L 820 80 L 820 60" fill="none" stroke="#d36b1f" stroke-width="1.5"/>
+  <circle cx="744" cy="106" r="2.5" fill="#d36b1f"/>
+  <text class="label-bold" x="824" y="58" fill="#d36b1f">LMHead = 4.7% of decode budget</text>
+  <text class="label-soft" x="824" y="73" fill="#4a5161">510 MB Q6_K matmul on Qwen3-8B class</text>
+  <text class="label-soft" x="824" y="86" fill="#4a5161">255 MB on Qwen3-Next hidden 2048</text>
+
+  <!-- Divider -->
+  <line class="axis" x1="40" y1="220" x2="920" y2="220"/>
+
+  <!-- Lower panel header -->
+  <text class="title-text" x="40" y="252">LMHead at Q6_K across Qwen3 variants</text>
+  <text class="subtitle-text" x="40" y="272">All variants share the same 151,936-token vocabulary. The tying choice changes the storage footprint, not the per-decode bandwidth.</text>
+
+  <!-- Bar chart: x=200 to x=720 (520 px). Max value 638 MB. Scale = 520/700 = 0.7429 px/MB. -->
+  <!-- Or scale so max bar is 520 px: 520/638 = 0.815 px/MB -->
+  <!-- 255 MB = 207.8 px
+       319 MB = 260.0 px
+       510 MB = 415.6 px
+       638 MB = 520.0 px
+  -->
+
+  <!-- Row y positions:
+       row 1: y=300  Qwen3-1.7B 255 MB
+       row 2: y=336  Qwen3-Next-80B-A3B 255 MB
+       row 3: y=372  Qwen3-4B 319 MB
+       (tying cutoff line at y=400)
+       row 4: y=420  Qwen3-8B 510 MB
+       row 5: y=456  Qwen3-235B-A22B 510 MB
+       row 6: y=492  Qwen3-32B 638 MB
+  -->
+
+  <!-- Model labels -->
+  <text class="label" x="195" y="312" text-anchor="end">Qwen3-1.7B</text>
+  <text class="label-faint" x="195" y="324" text-anchor="end">hidden 2048 · tied</text>
+  <text class="label" x="195" y="348" text-anchor="end">Qwen3-Next-80B-A3B</text>
+  <text class="label-faint" x="195" y="360" text-anchor="end">hidden 2048 · untied</text>
+  <text class="label" x="195" y="384" text-anchor="end">Qwen3-4B</text>
+  <text class="label-faint" x="195" y="396" text-anchor="end">hidden 2560 · tied</text>
+  <text class="label" x="195" y="432" text-anchor="end">Qwen3-8B</text>
+  <text class="label-faint" x="195" y="444" text-anchor="end">hidden 4096 · untied</text>
+  <text class="label" x="195" y="468" text-anchor="end">Qwen3-235B-A22B</text>
+  <text class="label-faint" x="195" y="480" text-anchor="end">hidden 4096 · untied</text>
+  <text class="label" x="195" y="504" text-anchor="end">Qwen3-32B</text>
+  <text class="label-faint" x="195" y="516" text-anchor="end">hidden 5120 · untied</text>
+
+  <!-- Bars -->
+  <!-- Tied / smaller hidden: pale blue -->
+  <rect x="200" y="302" width="207.8" height="20" fill="#7fa6c4" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="412" y="316" fill="#1a1f2c">255 MB</text>
+
+  <rect x="200" y="338" width="207.8" height="20" fill="#7fa6c4" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="412" y="352" fill="#1a1f2c">255 MB</text>
+
+  <rect x="200" y="374" width="260.0" height="20" fill="#7fa6c4" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="464" y="388" fill="#1a1f2c">319 MB</text>
+
+  <!-- Tying cutoff -->
+  <line x1="60" y1="406" x2="900" y2="406" stroke="#d36b1f" stroke-width="1" stroke-dasharray="6 4"/>
+  <text class="label-bold" x="900" y="402" text-anchor="end" fill="#d36b1f">tying cutoff in Qwen3 (between 4B and 8B)</text>
+
+  <!-- Untied / larger hidden: orange -->
+  <rect class="accent" x="200" y="422" width="415.6" height="20" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="619" y="436" fill="#1a1f2c">510 MB</text>
+
+  <rect class="accent" x="200" y="458" width="415.6" height="20" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="619" y="472" fill="#1a1f2c">510 MB</text>
+
+  <rect x="200" y="494" width="520.0" height="20" fill="#b85614" stroke="#1a1f2c" stroke-width="0.5"/>
+  <text class="label-mono" x="724" y="508" fill="#1a1f2c">638 MB</text>
+
+  <!-- Axis ticks under bottom chart -->
+  <line class="axis" x1="200" y1="538" x2="720" y2="538"/>
+  <line class="tick" x1="200" y1="538" x2="200" y2="544"/>
+  <line class="tick" x1="304" y1="538" x2="304" y2="544"/>
+  <line class="tick" x1="408" y1="538" x2="408" y2="544"/>
+  <line class="tick" x1="512" y1="538" x2="512" y2="544"/>
+  <line class="tick" x1="616" y1="538" x2="616" y2="544"/>
+  <line class="tick" x1="720" y1="538" x2="720" y2="544"/>
+  <text class="label-faint" x="200" y="558" text-anchor="middle">0</text>
+  <text class="label-faint" x="304" y="558" text-anchor="middle">125</text>
+  <text class="label-faint" x="408" y="558" text-anchor="middle">250</text>
+  <text class="label-faint" x="512" y="558" text-anchor="middle">375</text>
+  <text class="label-faint" x="616" y="558" text-anchor="middle">500</text>
+  <text class="label-faint" x="720" y="558" text-anchor="middle">625</text>
+  <text class="label-faint" x="460" y="576" text-anchor="middle">MB read per decode step (output.weight at Q6_K, llama.cpp Q4_K_M recipe)</text>
+
+  <!-- Footer -->
+  <text class="label-faint" x="40" y="594">Sources: Hugging Face Qwen3 config.json files for tie_word_embeddings and hidden_size · llama.cpp tools/quantize README for Q4_K_M / Q6_K recipe · AMD R9700 product page for 644.6 GB/s.</text>
+</svg>
