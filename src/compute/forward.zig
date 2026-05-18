@@ -1281,6 +1281,20 @@ pub const InferenceEngine = struct {
     a3b_gate_capture: ?Buffer = null,
     a3b_capture_max_tokens: u32 = 0,
 
+    // Default-off Qwen3.6 27B dense-FFN prefill validator. During the
+    // per-token prefill path it captures one layer's FFN norm input plus
+    // pre/post FFN hidden for a small token chunk, then post-prefill replays
+    // gate/up/SwiGLU/down with the batched projection helpers and diffs the
+    // reconstructed post-FFN hidden. It does not feed production output.
+    use_qwen36_dense_prefill_validate: bool = false,
+    dense_prefill_validate_layer: u32 = 0,
+    dense_prefill_validate_max_tokens: u32 = 0,
+    dense_prefill_validate_captured_tokens: u32 = 0,
+    dense_prefill_validate_norm_ref: ?Buffer = null,
+    dense_prefill_validate_pre_hidden_ref: ?Buffer = null,
+    dense_prefill_validate_post_hidden_ref: ?Buffer = null,
+    dense_prefill_validate_staging: ?Buffer = null,
+
     // A3b production enablement: layer-major prefill needs to replay one
     // layer at a time over all prompt tokens while reading/writing each
     // token's hidden state from a strided scratch buffer. Defaults preserve
@@ -2606,6 +2620,72 @@ pub const InferenceEngine = struct {
             log.info("ZINC_A3B_PRODUCTION=1 set but currently a no-op (cycle 125 wire-up reverted in cycle 127; layer-major restructure pending in cycle 128).", .{});
         }
 
+        const dense_prefill_validate_env = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE");
+        const dense_prefill_validate_requested = dense_prefill_validate_env != null and
+            std.mem.eql(u8, dense_prefill_validate_env.?, "1");
+        var dense_prefill_validate_enabled = false;
+        var dense_prefill_validate_layer: u32 = 0;
+        var dense_prefill_validate_max_tokens: u32 = 0;
+        var dense_prefill_validate_norm_ref: ?Buffer = null;
+        var dense_prefill_validate_pre_hidden_ref: ?Buffer = null;
+        var dense_prefill_validate_post_hidden_ref: ?Buffer = null;
+        var dense_prefill_validate_staging: ?Buffer = null;
+        if (dense_prefill_validate_requested and
+            config.n_experts == 0 and
+            config.ssm_d_inner > 0 and
+            config.n_layers > 0 and
+            config.hidden_dim > 0 and
+            inter_val > 0)
+        {
+            const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
+            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 8 else 8;
+            dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), @as(u32, 16));
+            const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
+            const parsed_layer = if (raw_layer) |raw| std.fmt.parseInt(u32, raw, 10) catch 0 else 0;
+            dense_prefill_validate_layer = @min(parsed_layer, config.n_layers - 1);
+
+            const hidden_capture_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                @as(vk.c.VkDeviceSize, config.hidden_dim) *
+                @sizeOf(f32);
+            const usage_ref = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            dense_prefill_validate_norm_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_norm_ref) |*b| b.deinit();
+            dense_prefill_validate_pre_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
+            dense_prefill_validate_post_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
+
+            const staging_bytes = hidden_capture_bytes * 3;
+            dense_prefill_validate_staging = try Buffer.init(
+                instance,
+                staging_bytes,
+                vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                vk.c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            );
+            errdefer if (dense_prefill_validate_staging) |*b| b.deinit();
+            {
+                var map_ptr: ?*anyopaque = null;
+                if (dense_prefill_validate_staging) |*staging_buf| {
+                    const mr = vk.c.vkMapMemory(instance.device, staging_buf.memory, 0, staging_bytes, 0, &map_ptr);
+                    if (mr != vk.c.VK_SUCCESS) return error.MapMemoryFailed;
+                    staging_buf.mapped = @ptrCast(map_ptr);
+                }
+            }
+            dense_prefill_validate_enabled = true;
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B", .{
+                dense_prefill_validate_layer,
+                dense_prefill_validate_max_tokens,
+                config.hidden_dim,
+                inter_val,
+                staging_bytes,
+            });
+        } else if (dense_prefill_validate_requested) {
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1 requested but prerequisites missing (requires dense SSM model with nonzero hidden/intermediate dims); skipping", .{});
+        }
+
         return InferenceEngine{
             .model = model,
             .gpu_config = gpu_config,
@@ -2655,6 +2735,13 @@ pub const InferenceEngine = struct {
             .a3b_per_token_delta_out = a3b_per_token_delta_out,
             .a3b_gate_capture = a3b_gate_capture,
             .a3b_capture_max_tokens = a3b_capture_max_tokens,
+            .use_qwen36_dense_prefill_validate = dense_prefill_validate_enabled,
+            .dense_prefill_validate_layer = dense_prefill_validate_layer,
+            .dense_prefill_validate_max_tokens = dense_prefill_validate_max_tokens,
+            .dense_prefill_validate_norm_ref = dense_prefill_validate_norm_ref,
+            .dense_prefill_validate_pre_hidden_ref = dense_prefill_validate_pre_hidden_ref,
+            .dense_prefill_validate_post_hidden_ref = dense_prefill_validate_post_hidden_ref,
+            .dense_prefill_validate_staging = dense_prefill_validate_staging,
             .routing_capture_buf = routing_capture_buf,
             .routing_capture_slot_bytes = routing_capture_slot_bytes,
             .routing_capture_max_tokens = routing_capture_max_tokens,
@@ -8089,6 +8176,24 @@ pub const InferenceEngine = struct {
                 const gate_tensor = lt.ffn_gate orelse return error.TensorNotFound;
                 const up_tensor = lt.ffn_up orelse return error.TensorNotFound;
                 const down_tensor = lt.ffn_down orelse return error.TensorNotFound;
+                const dense_prefill_validate_capture = self.use_qwen36_dense_prefill_validate and
+                    self.prefill_active and
+                    layer == self.dense_prefill_validate_layer and
+                    self.prefill_current_token_idx < self.dense_prefill_validate_max_tokens and
+                    self.dense_prefill_validate_norm_ref != null and
+                    self.dense_prefill_validate_pre_hidden_ref != null and
+                    self.dense_prefill_validate_post_hidden_ref != null;
+                if (dense_prefill_validate_capture) {
+                    const tok_idx = self.prefill_current_token_idx;
+                    const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.decode_cmd.computeAndTransferBarrier();
+                    const norm_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = hidden_size };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.ffn_norm_buf.handle, self.dense_prefill_validate_norm_ref.?.handle, 1, &norm_region);
+                    const pre_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = hidden_size };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.dense_prefill_validate_pre_hidden_ref.?.handle, 1, &pre_region);
+                    self.decode_cmd.transferToComputeBarrier();
+                    self.dense_prefill_validate_captured_tokens = @max(self.dense_prefill_validate_captured_tokens, tok_idx + 1);
+                }
 
                 const fused_dense_ffn_eligible = self.use_fused_dense_ffn and
                     self.dmmv.pipeline_q4k_fused_gate_up_swiglu != null and
@@ -8242,6 +8347,15 @@ pub const InferenceEngine = struct {
                             1.0,
                         );
                     }
+                }
+                if (dense_prefill_validate_capture) {
+                    const tok_idx = self.prefill_current_token_idx;
+                    const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.decode_cmd.computeAndTransferBarrier();
+                    const post_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = hidden_size };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.dense_prefill_validate_post_hidden_ref.?.handle, 1, &post_region);
+                    // Copy reads hidden_buf; keep layer-boundary compute sync.
+                    self.decode_cmd.computeBarrier();
                 }
                 self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
                 self.endProfilePhase(.dense_ffn, dense_ffn_phase);
@@ -9070,6 +9184,95 @@ pub const InferenceEngine = struct {
             }
             chunk_start += chunk;
         }
+    }
+
+    fn validateDensePrefillFfnChunk(self: *InferenceEngine, n_tokens: u32) !void {
+        if (!self.use_qwen36_dense_prefill_validate or n_tokens == 0) return;
+        const cfg = self.model.config;
+        if (self.dense_prefill_validate_layer >= cfg.n_layers) return;
+
+        const norm_ref = self.dense_prefill_validate_norm_ref orelse return;
+        const pre_hidden_ref = self.dense_prefill_validate_pre_hidden_ref orelse return;
+        const post_hidden_ref = self.dense_prefill_validate_post_hidden_ref orelse return;
+        const staging = self.dense_prefill_validate_staging orelse return;
+        const lt = self.layer_tensors[self.dense_prefill_validate_layer];
+        const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
+        const up_t = lt.ffn_up orelse return error.TensorNotFound;
+        const down_t = lt.ffn_down orelse return error.TensorNotFound;
+        const hidden_dim = cfg.hidden_dim;
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const hidden_capture_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const hidden_elems: usize = @intCast(@as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim));
+        if (hidden_capture_bytes * 3 > staging.size) return error.BufferTooSmall;
+
+        try self.ensureBatchedScratchCapacity(n_tokens);
+        const scratch_gate = self.batched_scratch_gate.?;
+        const scratch_up = self.batched_scratch_up.?;
+        const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const scratch_down = self.batched_scratch_down.?;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        try self.dispatchProjectionBatched(gate_t, norm_ref, scratch_gate, inter_dim, hidden_dim, n_tokens);
+        try self.dispatchProjectionBatched(up_t, norm_ref, scratch_up, inter_dim, hidden_dim, n_tokens);
+        self.decode_cmd.computeBarrier();
+        try self.dispatchFfnActivation(
+            scratch_gate.handle,
+            scratch_gate.size,
+            scratch_up.handle,
+            scratch_up.size,
+            scratch_swiglu.handle,
+            scratch_swiglu.size,
+            n_tokens * inter_dim,
+        );
+        self.decode_cmd.computeBarrier();
+        try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        self.decode_cmd.computeToTransferBarrier();
+        const copies = [_]vk.c.VkBufferCopy{
+            .{ .srcOffset = 0, .dstOffset = 0, .size = hidden_capture_bytes },
+            .{ .srcOffset = 0, .dstOffset = hidden_capture_bytes, .size = hidden_capture_bytes },
+            .{ .srcOffset = 0, .dstOffset = hidden_capture_bytes * 2, .size = hidden_capture_bytes },
+        };
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, pre_hidden_ref.handle, staging.handle, 1, &copies[0]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, post_hidden_ref.handle, staging.handle, 1, &copies[1]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, staging.handle, 1, &copies[2]);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        const base: [*]const f32 = @ptrCast(@alignCast(staging.mapped.?));
+        const pre = base[0..hidden_elems];
+        const post = base[hidden_elems..][0..hidden_elems];
+        const down = base[(hidden_elems * 2)..][0..hidden_elems];
+        var max_abs: f32 = 0;
+        var max_idx: usize = 0;
+        for (0..hidden_elems) |i| {
+            const candidate = pre[i] + down[i];
+            const diff = @abs(candidate - post[i]);
+            if (diff > max_abs) {
+                max_abs = diff;
+                max_idx = i;
+            }
+        }
+        const token_idx = max_idx / hidden_dim;
+        const elem_idx = max_idx % hidden_dim;
+        const candidate_at_max = pre[max_idx] + down[max_idx];
+        const tol: f32 = 3e-3;
+        const verdict: []const u8 = if (max_abs <= tol) "PASS" else "FAIL";
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense_ffn layer={d} tokens={d} verdict={s} post_hidden max_abs_diff={e:.6} tok={d} elem={d} ref={d:.6} batched={d:.6} tol={e:.3}", .{
+            self.dense_prefill_validate_layer,
+            n_tokens,
+            verdict,
+            max_abs,
+            token_idx,
+            elem_idx,
+            post[max_idx],
+            candidate_at_max,
+            tol,
+        });
     }
 
     /// Dispatch a DMMV with accumulation: output_buf += weight × input_buf.
@@ -11146,6 +11349,9 @@ pub const InferenceEngine = struct {
         self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
         self.prefill_gpu_total_ns = 0;
         self.prefill_active = true;
+        if (self.use_qwen36_dense_prefill_validate) {
+            self.dense_prefill_validate_captured_tokens = 0;
+        }
         defer self.prefill_active = false;
 
         // Dequantize every prompt-token embedding row upfront into a single
@@ -11340,6 +11546,13 @@ pub const InferenceEngine = struct {
                 try self.decode_cmd.end();
                 try self.decode_cmd.submitAndWait(self.instance.compute_queue);
             }
+        }
+
+        if (self.use_qwen36_dense_prefill_validate and self.dense_prefill_validate_captured_tokens > 0) {
+            const n_validate = @min(self.dense_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
+            self.validateDensePrefillFfnChunk(n_validate) catch |err| {
+                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay skipped: {s}", .{@errorName(err)});
+            };
         }
 
         // Effort-6 cycle 123 (A3b all-layer extension): batched
@@ -12263,6 +12476,10 @@ pub const InferenceEngine = struct {
         if (self.a3b_delta_out) |*b| b.deinit();
         if (self.a3b_per_token_delta_out) |*b| b.deinit();
         if (self.a3b_gate_capture) |*b| b.deinit();
+        if (self.dense_prefill_validate_norm_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_staging) |*b| b.deinit();
         // KV cache + page table
         self.freeActiveKvPages();
         self.kv_page_pool.deinit();
