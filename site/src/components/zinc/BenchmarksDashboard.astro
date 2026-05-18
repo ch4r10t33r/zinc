@@ -99,7 +99,7 @@ function formatCommit(value: string | null | undefined, digits = 12) {
   return value.length > digits ? value.slice(0, digits) : value;
 }
 
-function mean(values: Array<number | null>) {
+function mean(values: Array<number | null | undefined>) {
   const xs = values.filter((value): value is number => value != null && !Number.isNaN(value));
   if (!xs.length) return null;
   return xs.reduce((sum, value) => sum + value, 0) / xs.length;
@@ -161,6 +161,10 @@ function promptTokensValue(scenario: any) {
   return scenario?.zinc?.prompt_tokens ?? scenario?.baseline?.prompt_tokens ?? null;
 }
 
+function generatedTokensValue(scenario: any) {
+  return scenario?.zinc?.generated_tokens ?? scenario?.baseline?.generated_tokens ?? scenario?.max_tokens ?? null;
+}
+
 function prefillMsValue(scenario: any) {
   return metricValue(scenario?.zinc?.prefill_ms);
 }
@@ -210,6 +214,92 @@ function endToEndRatioValue(scenario: any) {
 
 function endToEndDeltaValue(scenario: any) {
   return scenario?.comparison?.end_to_end_delta_tps ?? null;
+}
+
+function combinedPhaseSeconds(
+  prefillTps: number | null | undefined,
+  decodeTps: number | null | undefined,
+  promptTokens: number | null | undefined,
+  generatedTokens: number | null | undefined,
+) {
+  const prompt = promptTokens ?? 0;
+  const generated = generatedTokens ?? 0;
+  if (prompt <= 0 && generated <= 0) return null;
+
+  let seconds = 0;
+  if (prompt > 0) {
+    if (!hasValue(prefillTps) || (prefillTps ?? 0) <= 0) return null;
+    seconds += prompt / (prefillTps ?? 1);
+  }
+  if (generated > 0) {
+    if (!hasValue(decodeTps) || (decodeTps ?? 0) <= 0) return null;
+    seconds += generated / (decodeTps ?? 1);
+  }
+  return seconds > 0 ? seconds : null;
+}
+
+function combinedPhaseThroughput(
+  prefillTps: number | null | undefined,
+  decodeTps: number | null | undefined,
+  promptTokens: number | null | undefined,
+  generatedTokens: number | null | undefined,
+) {
+  const seconds = combinedPhaseSeconds(prefillTps, decodeTps, promptTokens, generatedTokens);
+  if (!hasValue(seconds) || (seconds ?? 0) <= 0) return null;
+  return ((promptTokens ?? 0) + (generatedTokens ?? 0)) / (seconds ?? 1);
+}
+
+function overallValue(scenario: any) {
+  return combinedPhaseThroughput(
+    promptValue(scenario),
+    decodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  ) ?? endToEndValue(scenario);
+}
+
+function baselineOverallValue(scenario: any) {
+  return combinedPhaseThroughput(
+    baselinePromptValue(scenario),
+    baselineDecodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  ) ?? baselineEndToEndValue(scenario);
+}
+
+function overallRatioValue(scenario: any) {
+  if (hasValue(scenario?.comparison?.overall_pct_of_baseline)) {
+    return scenario.comparison.overall_pct_of_baseline;
+  }
+
+  const zincSeconds = combinedPhaseSeconds(
+    promptValue(scenario),
+    decodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  );
+  const baselineSeconds = combinedPhaseSeconds(
+    baselinePromptValue(scenario),
+    baselineDecodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  );
+  if (hasValue(zincSeconds) && hasValue(baselineSeconds) && (zincSeconds ?? 0) > 0) {
+    return ((baselineSeconds ?? 0) / (zincSeconds ?? 1)) * 100;
+  }
+
+  if (hasValue(endToEndRatioValue(scenario))) return endToEndRatioValue(scenario);
+  return mean([promptRatioValue(scenario), decodeRatioValue(scenario)]);
+}
+
+function overallDeltaValue(scenario: any) {
+  if (hasValue(scenario?.comparison?.overall_delta_tps)) {
+    return scenario.comparison.overall_delta_tps;
+  }
+  const zinc = overallValue(scenario);
+  const baseline = baselineOverallValue(scenario);
+  if (!hasValue(zinc) || !hasValue(baseline)) return null;
+  return (zinc ?? 0) - (baseline ?? 0);
 }
 
 function ratioTone(value: number | null | undefined) {
@@ -271,7 +361,8 @@ function normalizeTarget(target: any) {
     }));
 
   const successful = visibleModels.filter((model: any) => model?.zinc?.decode_tps);
-  const compared = visibleModels.filter((model: any) => model?.comparison?.pct_of_baseline != null);
+  const allScenarios = visibleModels.flatMap((model: any) => ensureScenarios(model));
+  const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => overallRatioValue(scenario) != null));
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg ?? 0) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg ?? 0))[0]
     : null;
@@ -289,7 +380,7 @@ function normalizeTarget(target: any) {
       compared_models: compared.length,
       average_decode_tps: mean(successful.map((model: any) => model.zinc.decode_tps.median ?? model.zinc.decode_tps.avg ?? null)),
       average_prompt_tps: mean(successful.map((model: any) => model.zinc.prefill_tps?.median ?? model.zinc.prefill_tps?.avg ?? null)),
-      average_pct_of_llama: mean(compared.map((model: any) => model.comparison.pct_of_baseline)),
+      average_pct_of_llama: mean(allScenarios.map((scenario: any) => overallRatioValue(scenario))),
     },
   };
 }
@@ -383,12 +474,12 @@ function scenarioRows(target: any, scenarioId: string) {
 
 function scenarioSummary(target: any, scenarioId: string) {
   const rows = scenarioRows(target, scenarioId);
-  const comparedRows = rows.filter((row) => row.scenario?.comparison?.pct_of_baseline != null);
+  const comparedRows = rows.filter((row) => overallRatioValue(row.scenario) != null);
   const fastestRow = rows.length > 0
     ? [...rows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1))[0]
     : null;
   const closestRow = comparedRows.length > 0
-    ? [...comparedRows].sort((a, b) => (decodeRatioValue(b.scenario) ?? 0) - (decodeRatioValue(a.scenario) ?? 0))[0]
+    ? [...comparedRows].sort((a, b) => (overallRatioValue(b.scenario) ?? 0) - (overallRatioValue(a.scenario) ?? 0))[0]
     : null;
   return {
     count: rows.length,
@@ -401,10 +492,12 @@ function scenarioSummary(target: any, scenarioId: string) {
     avgPrefillMs: mean(rows.map((row) => prefillMsValue(row.scenario))),
     avgPromptGap: mean(rows.map((row) => promptRatioValue(row.scenario))),
     avgDecodeGap: mean(rows.map((row) => decodeRatioValue(row.scenario))),
+    avgOverall: mean(rows.map((row) => overallValue(row.scenario))),
+    avgOverallGap: mean(rows.map((row) => overallRatioValue(row.scenario))),
     fastestModelLabel: fastestRow?.model?.label ?? null,
     fastestDecode: fastestRow ? decodeValue(fastestRow.scenario) : null,
     closestModelLabel: closestRow?.model?.label ?? null,
-    closestRatio: closestRow ? decodeRatioValue(closestRow.scenario) : null,
+    closestRatio: closestRow ? overallRatioValue(closestRow.scenario) : null,
   };
 }
 
@@ -498,7 +591,7 @@ const jsonLd = {
           </div>
           <div>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>vs llama</small>
+            <small>overall</small>
           </div>
           <div>
             <strong>{benchmarkedCount(target)}</strong>
@@ -575,9 +668,9 @@ const jsonLd = {
             <small>average</small>
           </article>
           <article class="summary-card">
-            <span>llama.cpp</span>
+            <span>Overall</span>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>average ratio</small>
+            <small>prefill + decode vs llama.cpp</small>
           </article>
         </div>
 
@@ -597,12 +690,16 @@ const jsonLd = {
                 </div>
                 <div class="scenario-tab-stats">
                   <div>
-                    <strong>{formatNumber(summary.avgDecode)}</strong>
-                    <small>tok/s</small>
+                    <strong>{formatNumber(summary.avgPrompt)}</strong>
+                    <small>prefill</small>
                   </div>
                   <div>
-                    <strong>{formatPercent(summary.avgDecodeGap)}</strong>
-                    <small>llama</small>
+                    <strong>{formatNumber(summary.avgDecode)}</strong>
+                    <small>decode</small>
+                  </div>
+                  <div>
+                    <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                    <small>overall</small>
                   </div>
                 </div>
               </button>
@@ -615,7 +712,7 @@ const jsonLd = {
           const summary = scenarioSummary(target, scenarioId);
           const promptMax = maxMetric(rows, (row) => Math.max(promptValue(row.scenario) ?? 0, baselinePromptValue(row.scenario) ?? 0));
           const decodeMax = maxMetric(rows, (row) => Math.max(decodeValue(row.scenario) ?? 0, baselineDecodeValue(row.scenario) ?? 0));
-          const endToEndMax = maxMetric(rows, (row) => Math.max(endToEndValue(row.scenario) ?? 0, baselineEndToEndValue(row.scenario) ?? 0));
+          const overallMax = maxMetric(rows, (row) => Math.max(overallValue(row.scenario) ?? 0, baselineOverallValue(row.scenario) ?? 0));
 
           return (
             <section
@@ -634,12 +731,16 @@ const jsonLd = {
                     rows
                   </span>
                   <span class="info-chip">
+                    <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
+                    prefill
+                  </span>
+                  <span class="info-chip">
                     <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
                     decode
                   </span>
                   <span class="info-chip">
-                    <strong>{formatPercent(summary.avgDecodeGap)}</strong>
-                    llama
+                    <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                    overall
                   </span>
                 </div>
               </article>
@@ -648,12 +749,12 @@ const jsonLd = {
                 <article class="readout-card">
                   <span>Decode</span>
                   <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
-                  <small>{formatPercent(summary.avgDecodeGap)} of llama.cpp</small>
+                  <small>{formatPercent(summary.avgDecodeGap)} decode ratio</small>
                 </article>
                 <article class="readout-card">
                   <span>Prefill</span>
                   <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
-                  <small>{formatMetric(summary.avgPromptTokens, 'prompt tok', 0)}</small>
+                  <small>{formatPercent(summary.avgPromptGap)} prefill ratio · {formatMetric(summary.avgPromptTokens, 'prompt tok', 0)}</small>
                 </article>
                 <article class="readout-card">
                   <span>Fastest</span>
@@ -661,9 +762,9 @@ const jsonLd = {
                   <small>{formatMetric(summary.fastestDecode, 'tok/s')}</small>
                 </article>
                 <article class="readout-card">
-                  <span>Closest</span>
-                  <strong>{displayModelLabel(summary.closestModelLabel)}</strong>
-                  <small>{formatPercent(summary.closestRatio)}</small>
+                  <span>Overall</span>
+                  <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                  <small>best row: {displayModelLabel(summary.closestModelLabel)}</small>
                 </article>
               </div>
 
@@ -680,9 +781,13 @@ const jsonLd = {
 
                 <div class="decode-rank" aria-label="Model decode comparison">
                   {rows.map((row) => {
+                    const zincPrompt = promptValue(row.scenario);
+                    const baselinePrompt = baselinePromptValue(row.scenario);
                     const zincDecode = decodeValue(row.scenario);
                     const baselineDecode = baselineDecodeValue(row.scenario);
+                    const promptRatio = promptRatioValue(row.scenario);
                     const decodeRatio = decodeRatioValue(row.scenario);
+                    const overallRatio = overallRatioValue(row.scenario);
                     const rowStatus = scenarioStatus(row.scenario);
 
                     return (
@@ -694,24 +799,50 @@ const jsonLd = {
                           </div>
                         </div>
                         <div class="rank-bars">
-                          <div class="bar-line">
-                            <span>ZINC</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                          <div class="rank-metric-group">
+                            <div class="rank-metric-title">
+                              <span>Prefill</span>
+                              <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
                             </div>
-                            <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincPrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincPrompt, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselinePrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselinePrompt, 'tok/s')}</strong>
+                            </div>
                           </div>
-                          <div class="bar-line baseline">
-                            <span>llama</span>
-                            <div class="bar-track" aria-hidden="true">
-                              <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                          <div class="rank-metric-group">
+                            <div class="rank-metric-title">
+                              <span>Decode</span>
+                              <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
                             </div>
-                            <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            </div>
                           </div>
                         </div>
                         <div class="rank-ratio">
-                          <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
-                          <small>{formatSignedMetric(decodeDeltaValue(row.scenario), 'tok/s')}</small>
+                          <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
+                          <small>overall</small>
                         </div>
                       </article>
                     );
@@ -728,13 +859,13 @@ const jsonLd = {
                       const baselinePrompt = baselinePromptValue(row.scenario);
                       const zincDecode = decodeValue(row.scenario);
                       const baselineDecode = baselineDecodeValue(row.scenario);
-                      const zincEndToEnd = endToEndValue(row.scenario);
-                      const baselineEndToEnd = baselineEndToEndValue(row.scenario);
+                      const zincOverall = overallValue(row.scenario);
+                      const baselineOverall = baselineOverallValue(row.scenario);
                       const zincLatency = totalLatencyValue(row.scenario);
                       const baselineLatency = baselineTotalLatencyValue(row.scenario);
                       const promptRatio = promptRatioValue(row.scenario);
                       const decodeRatio = decodeRatioValue(row.scenario);
-                      const endToEndRatio = endToEndRatioValue(row.scenario);
+                      const overallRatio = overallRatioValue(row.scenario);
                       const rowStatus = scenarioStatus(row.scenario);
 
                       return (
@@ -792,23 +923,23 @@ const jsonLd = {
                           <div class="mobile-metric">
                             <div class="mobile-metric-head">
                               <span>Overall</span>
-                              <strong class:list={['ratio-pill', ratioTone(endToEndRatio)]}>{formatPercent(endToEndRatio)}</strong>
+                              <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
                             </div>
                             <div class="bar-line">
                               <span>ZINC</span>
                               <div class="bar-track" aria-hidden="true">
-                                <i class="bar-fill zinc" style={`width: ${barWidth(zincEndToEnd, endToEndMax)}%;`}></i>
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincOverall, overallMax)}%;`}></i>
                               </div>
-                              <strong>{formatMetric(zincEndToEnd, 'tok/s')}</strong>
+                              <strong>{formatMetric(zincOverall, 'tok/s')}</strong>
                             </div>
                             <div class="bar-line baseline">
                               <span>llama</span>
                               <div class="bar-track" aria-hidden="true">
-                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineEndToEnd, endToEndMax)}%;`}></i>
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineOverall, overallMax)}%;`}></i>
                               </div>
-                              <strong>{formatMetric(baselineEndToEnd, 'tok/s')}</strong>
+                              <strong>{formatMetric(baselineOverall, 'tok/s')}</strong>
                             </div>
-                            <small class="latency-note">Latency: ZINC {formatMetric(zincLatency, 'ms', 0)} · llama.cpp {formatMetric(baselineLatency, 'ms', 0)}</small>
+                            <small class="latency-note">Prompt+decode. Cold latency: ZINC {formatMetric(zincLatency, 'ms', 0)} · llama.cpp {formatMetric(baselineLatency, 'ms', 0)}</small>
                           </div>
                         </article>
                       );
@@ -836,13 +967,13 @@ const jsonLd = {
                         const baselinePrompt = baselinePromptValue(row.scenario);
                         const zincDecode = decodeValue(row.scenario);
                         const baselineDecode = baselineDecodeValue(row.scenario);
-                        const zincEndToEnd = endToEndValue(row.scenario);
-                        const baselineEndToEnd = baselineEndToEndValue(row.scenario);
+                        const zincOverall = overallValue(row.scenario);
+                        const baselineOverall = baselineOverallValue(row.scenario);
                         const zincLatency = totalLatencyValue(row.scenario);
                         const baselineLatency = baselineTotalLatencyValue(row.scenario);
                         const promptRatio = promptRatioValue(row.scenario);
                         const decodeRatio = decodeRatioValue(row.scenario);
-                        const endToEndRatio = endToEndRatioValue(row.scenario);
+                        const overallRatio = overallRatioValue(row.scenario);
                         const runCount = sampleCount(row.scenario?.zinc?.decode_tps) || sampleCount(row.scenario?.baseline?.decode_tps);
 
                         return (
@@ -928,26 +1059,26 @@ const jsonLd = {
                               )}
                             </td>
                             <td>
-                              {hasValue(zincEndToEnd) || hasValue(baselineEndToEnd) || hasValue(zincLatency) || hasValue(baselineLatency) ? (
+                              {hasValue(zincOverall) || hasValue(baselineOverall) || hasValue(zincLatency) || hasValue(baselineLatency) ? (
                                 <div class="metric-stack">
                                   <div class="backend-line">
                                     <span class="backend-pill zinc">Z</span>
                                     <div>
-                                      <strong>{formatMetric(zincEndToEnd, 'tok/s')}</strong>
-                                      <small>{formatMetric(zincLatency, 'ms', 0)}</small>
+                                      <strong>{formatMetric(zincOverall, 'tok/s')}</strong>
+                                      <small>prompt+decode</small>
                                     </div>
                                   </div>
                                   <div class="backend-line baseline">
                                     <span class="backend-pill baseline">L</span>
                                     <div>
-                                      <strong>{formatMetric(baselineEndToEnd, 'tok/s')}</strong>
-                                      <small>{formatMetric(baselineLatency, 'ms', 0)}</small>
+                                      <strong>{formatMetric(baselineOverall, 'tok/s')}</strong>
+                                      <small>prompt+decode</small>
                                     </div>
                                   </div>
-                                  {hasValue(endToEndRatio) ? (
+                                  {hasValue(overallRatio) ? (
                                     <div class="metric-footer compact">
-                                      <strong class:list={['ratio-pill', ratioTone(endToEndRatio)]}>{formatPercent(endToEndRatio)}</strong>
-                                      <small>{formatSignedMetric(endToEndDeltaValue(row.scenario), 'tok/s')}</small>
+                                      <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
+                                      <small>{formatSignedMetric(overallDeltaValue(row.scenario), 'tok/s')}</small>
                                       <small>{formatLatencyDelta(latencyDeltaValue(row.scenario))}</small>
                                     </div>
                                   ) : (
@@ -1521,7 +1652,7 @@ const jsonLd = {
 
   .rank-row {
     display: grid;
-    grid-template-columns: minmax(240px, 0.9fr) minmax(320px, 1.35fr) minmax(112px, auto);
+    grid-template-columns: minmax(240px, 0.8fr) minmax(420px, 1.55fr) minmax(112px, auto);
     gap: 0.9rem;
     align-items: center;
     padding: 0.72rem 0.78rem;
@@ -1554,8 +1685,36 @@ const jsonLd = {
 
   .rank-bars {
     display: grid;
-    gap: 0.36rem;
+    gap: 0.58rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     min-width: 0;
+  }
+
+  .rank-metric-group {
+    display: grid;
+    gap: 0.28rem;
+    min-width: 0;
+  }
+
+  .rank-metric-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+
+  .rank-metric-title span {
+    color: var(--color-text-muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .rank-metric-title .ratio-pill {
+    padding: 0.16rem 0.38rem;
+    font-size: 0.68rem;
   }
 
   .bar-line {
@@ -2066,7 +2225,11 @@ const jsonLd = {
     }
 
     .rank-row {
-      grid-template-columns: minmax(210px, 0.9fr) minmax(280px, 1.2fr) minmax(98px, auto);
+      grid-template-columns: minmax(210px, 0.85fr) minmax(320px, 1.25fr) minmax(98px, auto);
+    }
+
+    .rank-bars {
+      grid-template-columns: 1fr;
     }
 
     .hero-stats {
@@ -2127,6 +2290,10 @@ const jsonLd = {
     .rank-ratio {
       justify-items: start;
       text-align: left;
+    }
+
+    .rank-bars {
+      grid-template-columns: 1fr;
     }
 
     .bar-line {

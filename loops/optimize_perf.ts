@@ -96,6 +96,14 @@ const MODELS: Record<string, ModelTarget> = {
     coherencePromptMode: "chat",
     envVar: "ZINC_RDNA_QWEN36_35B_MODEL",
   },
+  qwen3627b: {
+    key: "qwen3627b",
+    name: "Qwen3.6-27B",
+    path: envOrDefault("ZINC_RDNA_QWEN36_27B_MODEL", "/root/models/Qwen3.6-27B-Q4_K_M.gguf"),
+    promptMode: "raw",
+    coherencePromptMode: "chat",
+    envVar: "ZINC_RDNA_QWEN36_27B_MODEL",
+  },
   qwen8b: {
     key: "qwen8b",
     name: "Qwen3-8B",
@@ -522,6 +530,44 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       {
         path: "/Users/stepan/Workspace/zinc/loops/efforts/EFFORT_14_NOTES.md",
         focus: "Running notes for this effort. Always read before proposing a change — it lists the three already-falsified hypotheses (command-buffer count, encoder-dispatch count, barrier count) and what is still open.",
+      },
+    ],
+  },
+  15: {
+    doc: "MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+    summary: "RDNA4 Qwen 3.6 27B dense-hybrid prefill/decode recovery",
+    metricMode: "prefill",
+    primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
+    benchmarkPrompt: PREFILL_BENCHMARK_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "long-context prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    knownFlatCategories: [
+      "Do not relax canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0 as a first step. A prior SSM batched prefill attempt caused QueueSubmitFailed / GPU resets and had a real hidden-state dependency bug.",
+      "Do not repeat the widened dense fused gate+up+SwiGLU path for inter_dim=17408. On Qwen3.6-27B it was mixed or negative across the four-scenario matrix.",
+      "Do not repeat Q6_K+Q4_K fused SSM qkv+z pair dispatch. It engaged but regressed the SSM projection bucket.",
+      "Do not flip ZINC_SSM_DELTA_COLS8=0 or retry ZINC_SSM_DELTA_NORMED_QK=1 without new evidence. Both were mixed or negative on the full 27B matrix.",
+      "Do not retry Q6_K K=17408 dense-down specialization or broad Q4/Q6 wide variants. They were flat or negative on the 27B matrix.",
+      "Do not widen the fused attention o-proj merge to hidden_dim=5120. It caused a severe long-context regression.",
+    ],
+    structuralSwingIdeas: [
+      "First build a default-off validation harness for Qwen3.6-27B layer-major prefill. Capture one layer/chunk from the current per-token path, then compare batched dense FFN intermediates: ffn_norm, gate, up, SwiGLU, down, post-FFN hidden.",
+      "Batch dense FFN prefill per layer after validation. The 27B dense FFN streams about 173 MB of weights per layer per token today; amortizing gate/up/down across a token chunk is the main prefill lever.",
+      "Only after dense FFN validation, batch SSM projections per layer and token chunk while keeping conv/delta recurrence exact. Compare wqkv, z, alpha, beta, delta_out, ssm_out, and post-SSM hidden against captures.",
+      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors.",
+      "If decode work is needed after prefill foundation, split dense gate/up/down and SSM projection profiling first. Try one flag-gated candidate at a time; prefer q5_k SSM out or a lower-register-pressure dense gate/up/SwiGLU shape, not the rejected wide fused variant.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Read canUseBatchedPrefillRdna, prefillBatchedImpl, prefillBatch, runSsmLayerGpu, dispatchProjectionBatched, dispatchDmmvAcc, and the dense_ffn profile phase before editing.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+        focus: "This effort's measured baselines, failed-attempt list, and staged plan. Follow Track 1 before any production SSM prefill change.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
+        focus: "Historical RDNA Qwen prefill attempts, especially dormant tiled-GEMM lessons and SSM capture/validation failures.",
       },
     ],
   },

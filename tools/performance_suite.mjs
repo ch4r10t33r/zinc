@@ -395,11 +395,36 @@ export function buildComparison(zincSummary, baselineSummary) {
   const baselineDecode = baselineSummary.decode_tps?.median ?? baselineSummary.decode_tps?.avg ?? null;
   const zincPrefill = zincSummary.prefill_tps?.median ?? zincSummary.prefill_tps?.avg ?? null;
   const baselinePrefill = baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null;
+  const promptTokens = zincSummary.prompt_tokens ?? baselineSummary.prompt_tokens ?? null;
+  const generatedTokens = zincSummary.generated_tokens ?? baselineSummary.generated_tokens ?? null;
   const zincLatency = zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null;
   const baselineLatency = baselineSummary.total_latency_ms?.median ?? baselineSummary.total_latency_ms?.avg ?? null;
   const zincEndToEnd = zincSummary.end_to_end_tps?.median ?? zincSummary.end_to_end_tps?.avg ?? null;
   const baselineEndToEnd = baselineSummary.end_to_end_tps?.median ?? baselineSummary.end_to_end_tps?.avg ?? null;
   if (!zincDecode || !baselineDecode) return null;
+
+  function phaseSeconds(prefillTps, decodeTps) {
+    const prompt = promptTokens ?? 0;
+    const generated = generatedTokens ?? 0;
+    if (prompt <= 0 && generated <= 0) return null;
+    let seconds = 0;
+    if (prompt > 0) {
+      if (!prefillTps || prefillTps <= 0) return null;
+      seconds += prompt / prefillTps;
+    }
+    if (generated > 0) {
+      if (!decodeTps || decodeTps <= 0) return null;
+      seconds += generated / decodeTps;
+    }
+    return seconds > 0 ? seconds : null;
+  }
+
+  const zincOverallSeconds = phaseSeconds(zincPrefill, zincDecode);
+  const baselineOverallSeconds = phaseSeconds(baselinePrefill, baselineDecode);
+  const totalPhaseTokens = (promptTokens ?? 0) + (generatedTokens ?? 0);
+  const zincOverall = zincOverallSeconds && totalPhaseTokens > 0 ? totalPhaseTokens / zincOverallSeconds : null;
+  const baselineOverall = baselineOverallSeconds && totalPhaseTokens > 0 ? totalPhaseTokens / baselineOverallSeconds : null;
+  const overallPct = zincOverallSeconds && baselineOverallSeconds ? (baselineOverallSeconds / zincOverallSeconds) * 100 : null;
 
   const pctOfBaseline = (zincDecode / baselineDecode) * 100;
   const gapTps = zincDecode - baselineDecode;
@@ -413,6 +438,8 @@ export function buildComparison(zincSummary, baselineSummary) {
     baseline_total_latency_ms: baselineLatency,
     zinc_end_to_end_tps: zincEndToEnd,
     baseline_end_to_end_tps: baselineEndToEnd,
+    zinc_overall_tps: zincOverall,
+    baseline_overall_tps: baselineOverall,
     pct_of_baseline: pctOfBaseline,
     delta_tps: gapTps,
     delta_pct: pctOfBaseline - 100,
@@ -422,6 +449,8 @@ export function buildComparison(zincSummary, baselineSummary) {
     latency_delta_ms: zincLatency != null && baselineLatency != null ? zincLatency - baselineLatency : null,
     end_to_end_pct_of_baseline: zincEndToEnd && baselineEndToEnd ? (zincEndToEnd / baselineEndToEnd) * 100 : null,
     end_to_end_delta_tps: zincEndToEnd != null && baselineEndToEnd != null ? zincEndToEnd - baselineEndToEnd : null,
+    overall_pct_of_baseline: overallPct,
+    overall_delta_tps: zincOverall != null && baselineOverall != null ? zincOverall - baselineOverall : null,
   };
 }
 
@@ -581,7 +610,7 @@ function targetSummary(models) {
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg))[0]
     : null;
-  const compared = models.filter((model) => model.comparison?.pct_of_baseline != null);
+  const compared = models.filter((model) => (model.comparison?.overall_pct_of_baseline ?? model.comparison?.pct_of_baseline) != null);
 
   return {
     fastest_model_id: fastest?.id ?? null,
@@ -594,7 +623,7 @@ function targetSummary(models) {
     average_end_to_end_tps: compactMean(successful.map((model) => model.zinc.end_to_end_tps?.median ?? model.zinc.end_to_end_tps?.avg ?? null)),
     average_total_latency_ms: compactMean(successful.map((model) => model.zinc.total_latency_ms?.median ?? model.zinc.total_latency_ms?.avg ?? null)),
     compared_models: compared.length,
-    average_pct_of_llama: mean(compared.map((model) => model.comparison.pct_of_baseline)),
+    average_pct_of_llama: mean(compared.map((model) => model.comparison.overall_pct_of_baseline ?? model.comparison.pct_of_baseline)),
   };
 }
 

@@ -371,6 +371,8 @@ test("buildComparison adds prompt and latency deltas", () => {
   const comparison = buildComparison(
     {
       name: "ZINC",
+      prompt_tokens: 10,
+      generated_tokens: 20,
       prefill_tps: { median: 50, avg: 50 },
       decode_tps: { median: 40, avg: 40 },
       total_latency_ms: { median: 2500, avg: 2500 },
@@ -378,6 +380,8 @@ test("buildComparison adds prompt and latency deltas", () => {
     },
     {
       name: "llama.cpp",
+      prompt_tokens: 10,
+      generated_tokens: 20,
       prefill_tps: { median: 100, avg: 100 },
       decode_tps: { median: 80, avg: 80 },
       total_latency_ms: { median: 2000, avg: 2000 },
@@ -391,6 +395,10 @@ test("buildComparison adds prompt and latency deltas", () => {
   expect(comparison?.latency_delta_ms).toBe(500);
   expect(comparison?.end_to_end_pct_of_baseline).toBe(50);
   expect(comparison?.end_to_end_delta_tps).toBe(-30);
+  expect(comparison?.overall_pct_of_baseline).toBe(50);
+  expect(comparison?.zinc_overall_tps).toBeCloseTo(42.857, 3);
+  expect(comparison?.baseline_overall_tps).toBeCloseTo(85.714, 3);
+  expect(comparison?.overall_delta_tps).toBeCloseTo(-42.857, 3);
 });
 
 test("mergeArtifacts replaces matching targets and preserves others", () => {
