@@ -3613,7 +3613,8 @@ pub const InferenceEngine = struct {
             .q8_0 => blk: {
                 const simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
                 if (self.device.chip == .apple9 and simd_width == 32) {
-                    if (self.config.architecture == .gpt_oss and tensor == self.lm_head and K <= 4096 and M >= 65536 and
+                    if ((self.config.architecture == .gpt_oss or self.config.architecture == .gemma) and
+                        tensor == self.lm_head and K <= 4096 and M >= 65536 and M % 2 == 0 and
                         self.dmmv_q8_0_lmhead_pipe.thread_execution_width == 32 and
                         self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
                     {
@@ -4759,7 +4760,9 @@ fn dispatchLmHeadWithInputOffset(
 }
 
 fn shouldCpuLmHeadFallbackForType(arch: config_mod.Architecture, quant_type: GGMLType) bool {
-    return arch == .gemma and quant_type == .q8_0;
+    _ = arch;
+    _ = quant_type;
+    return false;
 }
 
 fn shouldCpuLmHeadFallback(engine: *const InferenceEngine) bool {
@@ -13259,8 +13262,8 @@ test "gemma shared down q8 tensors stay GPU eligible" {
     try std.testing.expect(!shouldCpuQ8Fallback(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "gemma q8 lm head uses CPU fallback" {
-    try std.testing.expect(shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
+test "q8 lm head stays on GPU" {
+    try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q4_k));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
@@ -15277,6 +15280,78 @@ test "dmmv_q8_0_k2048 shader matches CPU reference (nr=2)" {
     const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     for (0..M) |row| {
         dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q8_0, &ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_lmhead shader matches Gemma 12B K2816 shape" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 64;
+    const K: usize = 2816;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 7)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 13 + 7) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
         var expected: f32 = 0;
         for (0..K) |i| expected += ref_row[i] * input_ptr[i];
         try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
