@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-17T17:47:21.654Z",
+  "generated_at": "2026-05-18T16:19:06.098Z",
   "targets": [
     {
       "id": "rdna",
@@ -2318,7 +2318,7 @@
       "id": "intel",
       "label": "Intel Arc",
       "description": "Intel Arc benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
-      "generated_at": "2026-05-17T05:41:49.788Z",
+      "generated_at": "2026-05-18T16:19:06.095Z",
       "source": "tools/performance_suite.mjs",
       "machine": {
         "label": "Intel Arc bench node",
@@ -2330,8 +2330,8 @@
       },
       "provenance": {
         "zinc": {
-          "version": "801ee39cadec",
-          "commit": "801ee39cadec119f2c41c0f48fc7931d21c42c7e"
+          "version": "ea8bc12729f1",
+          "commit": "ea8bc12729f1607d4f61654c707c3b0a4f370d2f"
         },
         "llama_cpp": {
           "binary": "llama-server",
@@ -2357,585 +2357,17 @@
       "summary": {
         "fastest_model_id": "qwen3-8b-q4k-m",
         "fastest_model_label": "Qwen 3 8B Q4_K_M",
-        "fastest_decode_tps": 43.05,
-        "benchmarked_models": 2,
+        "fastest_decode_tps": 43.26,
+        "benchmarked_models": 1,
         "successful_models": 1,
-        "average_decode_tps": 43.05,
-        "average_prompt_tps": 49.39,
-        "average_end_to_end_tps": 5.796054561635788,
-        "average_total_latency_ms": 2242.9050419999985,
+        "average_decode_tps": 43.26,
+        "average_prompt_tps": 49.41,
+        "average_end_to_end_tps": 5.830877963704916,
+        "average_total_latency_ms": 2229.5098749999997,
         "compared_models": 1,
-        "average_pct_of_llama": 82.99286624999999
+        "average_pct_of_llama": 115.0154496404395
       },
       "models": [
-        {
-          "id": "gemma4-12b-q4k-m",
-          "label": "Gemma4 12B Q4K M",
-          "family": "Gemma 4",
-          "quant": "Q4K_M",
-          "prompt_mode": "chat",
-          "prompt": "What is the capital of France? Answer in one word.",
-          "max_tokens": 8,
-          "notes": [
-            "Auto-discovered on the Intel benchmark node"
-          ],
-          "zinc": {
-            "name": "ZINC",
-            "unavailable_reason": "ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed"
-          },
-          "baseline": {
-            "name": "llama.cpp",
-            "prompt_tokens": 28,
-            "generated_tokens": 8,
-            "output_preview": "",
-            "prefill_ms": {
-              "min": 225.761,
-              "max": 230.15999999999997,
-              "avg": 227.39499999999998,
-              "median": 226.264,
-              "p95": 229.77039999999997,
-              "stddev": 1.9659045415957015,
-              "samples": [
-                230.15999999999997,
-                225.761,
-                226.264
-              ]
-            },
-            "prefill_tps": {
-              "min": 121.65450121654503,
-              "max": 124.0249644535593,
-              "avg": 123.14290477846009,
-              "median": 123.74924866527596,
-              "p95": 123.99739287473098,
-              "stddev": 1.0584623033181277,
-              "samples": [
-                121.65450121654503,
-                124.0249644535593,
-                123.74924866527596
-              ]
-            },
-            "decode_ms": {
-              "min": 188.38,
-              "max": 189.338,
-              "avg": 188.93999999999997,
-              "median": 189.102,
-              "p95": 189.31439999999998,
-              "stddev": 0.4075324117989478,
-              "samples": [
-                189.338,
-                189.102,
-                188.38
-              ]
-            },
-            "decode_tps": {
-              "min": 42.25247969240195,
-              "max": 42.46735322221043,
-              "avg": 42.34168128632348,
-              "median": 42.30521094435807,
-              "p95": 42.451138994425186,
-              "stddev": 0.09143384798273281,
-              "samples": [
-                42.25247969240195,
-                42.30521094435807,
-                42.46735322221043
-              ]
-            },
-            "ms_per_token": {
-              "min": 23.5475,
-              "max": 23.66725,
-              "avg": 23.617499999999996,
-              "median": 23.63775,
-              "p95": 23.664299999999997,
-              "stddev": 0.05094155147486847,
-              "samples": [
-                23.66725,
-                23.63775,
-                23.5475
-              ]
-            },
-            "total_latency_ms": {
-              "min": 727.0168749999721,
-              "max": 868.5609580000164,
-              "avg": 781.9681803333224,
-              "median": 750.3267079999787,
-              "p95": 856.7375330000126,
-              "stddev": 61.9654147442866,
-              "samples": [
-                750.3267079999787,
-                868.5609580000164,
-                727.0168749999721
-              ]
-            },
-            "end_to_end_tps": {
-              "min": 41.447868072374625,
-              "max": 49.51742007364187,
-              "avg": 46.31479597945708,
-              "median": 47.97909979235475,
-              "p95": 49.36358804551316,
-              "stddev": 3.498270788214119,
-              "samples": [
-                47.97909979235475,
-                41.447868072374625,
-                49.51742007364187
-              ]
-            }
-          },
-          "comparison": null,
-          "scenarios": [
-            {
-              "id": "core",
-              "label": "Core Prompt",
-              "short_label": "Core",
-              "prompt_mode": "chat",
-              "prompt": "What is the capital of France? Answer in one word.",
-              "max_tokens": 8,
-              "notes": [
-                "Single-turn reference prompt"
-              ],
-              "zinc": {
-                "name": "ZINC",
-                "unavailable_reason": "ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed"
-              },
-              "baseline": {
-                "name": "llama.cpp",
-                "prompt_tokens": 28,
-                "generated_tokens": 8,
-                "output_preview": "",
-                "prefill_ms": {
-                  "min": 225.761,
-                  "max": 230.15999999999997,
-                  "avg": 227.39499999999998,
-                  "median": 226.264,
-                  "p95": 229.77039999999997,
-                  "stddev": 1.9659045415957015,
-                  "samples": [
-                    230.15999999999997,
-                    225.761,
-                    226.264
-                  ]
-                },
-                "prefill_tps": {
-                  "min": 121.65450121654503,
-                  "max": 124.0249644535593,
-                  "avg": 123.14290477846009,
-                  "median": 123.74924866527596,
-                  "p95": 123.99739287473098,
-                  "stddev": 1.0584623033181277,
-                  "samples": [
-                    121.65450121654503,
-                    124.0249644535593,
-                    123.74924866527596
-                  ]
-                },
-                "decode_ms": {
-                  "min": 188.38,
-                  "max": 189.338,
-                  "avg": 188.93999999999997,
-                  "median": 189.102,
-                  "p95": 189.31439999999998,
-                  "stddev": 0.4075324117989478,
-                  "samples": [
-                    189.338,
-                    189.102,
-                    188.38
-                  ]
-                },
-                "decode_tps": {
-                  "min": 42.25247969240195,
-                  "max": 42.46735322221043,
-                  "avg": 42.34168128632348,
-                  "median": 42.30521094435807,
-                  "p95": 42.451138994425186,
-                  "stddev": 0.09143384798273281,
-                  "samples": [
-                    42.25247969240195,
-                    42.30521094435807,
-                    42.46735322221043
-                  ]
-                },
-                "ms_per_token": {
-                  "min": 23.5475,
-                  "max": 23.66725,
-                  "avg": 23.617499999999996,
-                  "median": 23.63775,
-                  "p95": 23.664299999999997,
-                  "stddev": 0.05094155147486847,
-                  "samples": [
-                    23.66725,
-                    23.63775,
-                    23.5475
-                  ]
-                },
-                "total_latency_ms": {
-                  "min": 727.0168749999721,
-                  "max": 868.5609580000164,
-                  "avg": 781.9681803333224,
-                  "median": 750.3267079999787,
-                  "p95": 856.7375330000126,
-                  "stddev": 61.9654147442866,
-                  "samples": [
-                    750.3267079999787,
-                    868.5609580000164,
-                    727.0168749999721
-                  ]
-                },
-                "end_to_end_tps": {
-                  "min": 41.447868072374625,
-                  "max": 49.51742007364187,
-                  "avg": 46.31479597945708,
-                  "median": 47.97909979235475,
-                  "p95": 49.36358804551316,
-                  "stddev": 3.498270788214119,
-                  "samples": [
-                    47.97909979235475,
-                    41.447868072374625,
-                    49.51742007364187
-                  ]
-                }
-              },
-              "comparison": null
-            },
-            {
-              "id": "context-medium",
-              "label": "Context Retrieval",
-              "short_label": "Context",
-              "prompt_mode": "chat",
-              "prompt": "Read the context below and answer the final question briefly.\n\nReference notes:\nParis is the capital of France.\nRome is the capital of Italy.\nMadrid is the capital of Spain.\nUse only the notes above.\n\nQuestion: What is the capital of France? Answer in one word.",
-              "max_tokens": 8,
-              "notes": [
-                "Short retrieval workload with explicit context"
-              ],
-              "zinc": {
-                "name": "ZINC",
-                "unavailable_reason": "ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed"
-              },
-              "baseline": {
-                "name": "llama.cpp",
-                "prompt_tokens": 77,
-                "generated_tokens": 8,
-                "output_preview": "",
-                "prefill_ms": {
-                  "min": 995.9949999999999,
-                  "max": 1047.7389999999998,
-                  "avg": 1023.7201333333333,
-                  "median": 1027.4264,
-                  "p95": 1045.7077399999998,
-                  "stddev": 21.28634450304282,
-                  "samples": [
-                    995.9949999999999,
-                    1027.4264,
-                    1047.7389999999998
-                  ]
-                },
-                "prefill_tps": {
-                  "min": 73.49158521349307,
-                  "max": 77.30962504831852,
-                  "avg": 75.24858376714742,
-                  "median": 74.94454103963068,
-                  "p95": 77.07311664744974,
-                  "stddev": 1.5734650785650046,
-                  "samples": [
-                    77.30962504831852,
-                    74.94454103963068,
-                    73.49158521349307
-                  ]
-                },
-                "decode_ms": {
-                  "min": 193.957,
-                  "max": 209.167,
-                  "avg": 199.3936666666667,
-                  "median": 195.057,
-                  "p95": 207.756,
-                  "stddev": 6.925365614094967,
-                  "samples": [
-                    193.957,
-                    209.167,
-                    195.057
-                  ]
-                },
-                "decode_tps": {
-                  "min": 38.2469510008749,
-                  "max": 41.246255613357604,
-                  "avg": 40.168953011260555,
-                  "median": 41.01365241954916,
-                  "p95": 41.222995293976766,
-                  "stddev": 1.3623741183163416,
-                  "samples": [
-                    41.246255613357604,
-                    38.2469510008749,
-                    41.01365241954916
-                  ]
-                },
-                "ms_per_token": {
-                  "min": 24.244624999999996,
-                  "max": 26.145875,
-                  "avg": 24.92420833333333,
-                  "median": 24.382125,
-                  "p95": 25.9695,
-                  "stddev": 0.8656707017618718,
-                  "samples": [
-                    24.244624999999996,
-                    26.145875,
-                    24.382125
-                  ]
-                },
-                "total_latency_ms": {
-                  "min": 503.593292000005,
-                  "max": 681.5335419999901,
-                  "avg": 563.6873333333255,
-                  "median": 505.9351659999811,
-                  "p95": 663.9737043999892,
-                  "stddev": 83.33533770771457,
-                  "samples": [
-                    503.593292000005,
-                    681.5335419999901,
-                    505.9351659999811
-                  ]
-                },
-                "end_to_end_tps": {
-                  "min": 124.71873321240179,
-                  "max": 168.7869980603299,
-                  "avg": 153.83714921384748,
-                  "median": 168.00571636881074,
-                  "p95": 168.70886989117798,
-                  "stddev": 20.592299743598527,
-                  "samples": [
-                    168.7869980603299,
-                    124.71873321240179,
-                    168.00571636881074
-                  ]
-                }
-              },
-              "comparison": null
-            },
-            {
-              "id": "context-long",
-              "label": "Long Context Retrieval",
-              "short_label": "Long ctx",
-              "prompt_mode": "chat",
-              "prompt": "Read the context below and answer the final question briefly.\n\nLong reference packet for benchmark purposes only:\n\nBenchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu.\n\nImportant fact near the end: Paris is the capital of France.\n\nIgnore unrelated filler and answer from the reference packet.\n\nQuestion: What is the capital of France? Answer in one word.",
-              "max_tokens": 8,
-              "notes": [
-                "Long prompt workload with the answer embedded near the end"
-              ],
-              "zinc": {
-                "name": "ZINC",
-                "unavailable_reason": "ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed"
-              },
-              "baseline": {
-                "name": "llama.cpp",
-                "prompt_tokens": 185,
-                "generated_tokens": 8,
-                "output_preview": "",
-                "prefill_ms": {
-                  "min": 2762.4570000000003,
-                  "max": 2882.4480000000003,
-                  "avg": 2808.719333333334,
-                  "median": 2781.253,
-                  "p95": 2872.3285,
-                  "stddev": 52.695727975699235,
-                  "samples": [
-                    2762.4570000000003,
-                    2781.253,
-                    2882.4480000000003
-                  ]
-                },
-                "prefill_tps": {
-                  "min": 64.18155678784144,
-                  "max": 66.96936821098029,
-                  "avg": 65.8892357276556,
-                  "median": 66.51678218414506,
-                  "p95": 66.92410960829677,
-                  "stddev": 1.2215656754169273,
-                  "samples": [
-                    66.96936821098029,
-                    66.51678218414506,
-                    64.18155678784144
-                  ]
-                },
-                "decode_ms": {
-                  "min": 194.91099999999997,
-                  "max": 240.21100000000004,
-                  "avg": 220.93666666666664,
-                  "median": 227.68799999999996,
-                  "p95": 238.95870000000005,
-                  "stddev": 19.099875677315016,
-                  "samples": [
-                    194.91099999999997,
-                    227.68799999999996,
-                    240.21100000000004
-                  ]
-                },
-                "decode_tps": {
-                  "min": 33.304053519614,
-                  "max": 41.04437409894773,
-                  "avg": 36.49474249501523,
-                  "median": 35.135799866483964,
-                  "p95": 40.45351667570135,
-                  "stddev": 3.3028456890428997,
-                  "samples": [
-                    41.04437409894773,
-                    35.135799866483964,
-                    33.304053519614
-                  ]
-                },
-                "ms_per_token": {
-                  "min": 24.363874999999997,
-                  "max": 30.026375000000005,
-                  "avg": 27.61708333333333,
-                  "median": 28.461,
-                  "p95": 29.869837500000006,
-                  "stddev": 2.3874844596643774,
-                  "samples": [
-                    24.363874999999997,
-                    28.461,
-                    30.026375000000005
-                  ]
-                },
-                "total_latency_ms": {
-                  "min": 511.6250830000499,
-                  "max": 607.9894999999669,
-                  "avg": 555.3234163333351,
-                  "median": 546.3556659999886,
-                  "p95": 601.8261165999692,
-                  "stddev": 39.84838453826706,
-                  "samples": [
-                    511.6250830000499,
-                    546.3556659999886,
-                    607.9894999999669
-                  ]
-                },
-                "end_to_end_tps": {
-                  "min": 317.4396926262879,
-                  "max": 377.22935487895376,
-                  "avg": 349.3062643552268,
-                  "median": 353.2497455604387,
-                  "p95": 374.83139394710224,
-                  "stddev": 24.567786646797718,
-                  "samples": [
-                    377.22935487895376,
-                    353.2497455604387,
-                    317.4396926262879
-                  ]
-                }
-              },
-              "comparison": null
-            },
-            {
-              "id": "decode-extended",
-              "label": "Long Decode",
-              "short_label": "Long decode",
-              "prompt_mode": "chat",
-              "prompt": "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.",
-              "max_tokens": 32,
-              "notes": [
-                "Longer generation target instead of a short factual completion"
-              ],
-              "zinc": {
-                "name": "ZINC",
-                "unavailable_reason": "ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed"
-              },
-              "baseline": {
-                "name": "llama.cpp",
-                "prompt_tokens": 37,
-                "generated_tokens": 32,
-                "output_preview": "",
-                "prefill_ms": {
-                  "min": 207.789,
-                  "max": 575.374,
-                  "avg": 350.8676666666667,
-                  "median": 269.43999999999994,
-                  "p95": 544.7806,
-                  "stddev": 160.73276316157686,
-                  "samples": [
-                    575.374,
-                    207.789,
-                    269.43999999999994
-                  ]
-                },
-                "prefill_tps": {
-                  "min": 64.305999228328,
-                  "max": 178.06524888227963,
-                  "avg": 126.5643669473997,
-                  "median": 137.32185273159146,
-                  "p95": 173.9909092672108,
-                  "stddev": 47.0608425038293,
-                  "samples": [
-                    64.305999228328,
-                    178.06524888227963,
-                    137.32185273159146
-                  ]
-                },
-                "decode_ms": {
-                  "min": 840.9450000000002,
-                  "max": 845.788,
-                  "avg": 843.7526666666666,
-                  "median": 844.5249999999999,
-                  "p95": 845.6617,
-                  "stddev": 2.051184427484568,
-                  "samples": [
-                    845.788,
-                    844.5249999999999,
-                    840.9450000000002
-                  ]
-                },
-                "decode_tps": {
-                  "min": 37.83454009751853,
-                  "max": 38.05242911248654,
-                  "avg": 37.92603047949223,
-                  "median": 37.89112222847163,
-                  "p95": 38.036298424085054,
-                  "stddev": 0.09231412027391808,
-                  "samples": [
-                    37.83454009751853,
-                    37.89112222847163,
-                    38.05242911248654
-                  ]
-                },
-                "ms_per_token": {
-                  "min": 26.279531250000005,
-                  "max": 26.430875,
-                  "avg": 26.367270833333333,
-                  "median": 26.391406249999996,
-                  "p95": 26.426928125,
-                  "stddev": 0.06409951335889275,
-                  "samples": [
-                    26.430875,
-                    26.391406249999996,
-                    26.279531250000005
-                  ]
-                },
-                "total_latency_ms": {
-                  "min": 1311.9930419999873,
-                  "max": 1997.1583329999703,
-                  "avg": 1662.0023193333182,
-                  "median": 1676.8555829999968,
-                  "p95": 1965.128057999973,
-                  "stddev": 279.91466982985696,
-                  "samples": [
-                    1676.8555829999968,
-                    1311.9930419999873,
-                    1997.1583329999703
-                  ]
-                },
-                "end_to_end_tps": {
-                  "min": 34.5490885023391,
-                  "max": 52.591742327243736,
-                  "avg": 42.76309199686253,
-                  "median": 41.14844516100474,
-                  "p95": 51.447412610619836,
-                  "stddev": 7.453842524262039,
-                  "samples": [
-                    41.14844516100474,
-                    52.591742327243736,
-                    34.5490885023391
-                  ]
-                }
-              },
-              "comparison": null
-            }
-          ]
-        },
         {
           "id": "qwen3-8b-q4k-m",
           "label": "Qwen 3 8B Q4_K_M",
@@ -2953,94 +2385,94 @@
             "generated_tokens": 8,
             "output_preview": "Paris. The capital of Italy is Rome",
             "prefill_ms": {
-              "min": 101.2,
-              "max": 101.5,
-              "avg": 101.3,
+              "min": 101.1,
+              "max": 101.3,
+              "avg": 101.2,
               "median": 101.2,
-              "p95": 101.47,
-              "stddev": 0.14142135623730817,
+              "p95": 101.28999999999999,
+              "stddev": 0.08164965809277376,
               "samples": [
+                101.1,
                 101.2,
-                101.5,
-                101.2
+                101.3
               ]
             },
             "prefill_tps": {
-              "min": 49.27,
-              "max": 49.43,
-              "avg": 49.36333333333334,
-              "median": 49.39,
-              "p95": 49.426,
-              "stddev": 0.06798692684790235,
+              "min": 49.35,
+              "max": 49.47,
+              "avg": 49.41,
+              "median": 49.41,
+              "p95": 49.464,
+              "stddev": 0.048989794855662516,
               "samples": [
-                49.39,
-                49.27,
-                49.43
+                49.47,
+                49.41,
+                49.35
               ]
             },
             "decode_ms": {
-              "min": 185.6,
-              "max": 186.1,
-              "avg": 185.83333333333334,
-              "median": 185.8,
-              "p95": 186.07,
-              "stddev": 0.20548046676563164,
+              "min": 183.8,
+              "max": 185.6,
+              "avg": 184.76666666666668,
+              "median": 184.9,
+              "p95": 185.53,
+              "stddev": 0.7408703590297555,
               "samples": [
                 185.6,
-                185.8,
-                186.1
+                183.8,
+                184.9
               ]
             },
             "decode_tps": {
-              "min": 42.99,
-              "max": 43.1,
-              "avg": 43.04666666666666,
-              "median": 43.05,
-              "p95": 43.095,
-              "stddev": 0.04496912521077313,
+              "min": 43.11,
+              "max": 43.52,
+              "avg": 43.296666666666674,
+              "median": 43.26,
+              "p95": 43.494,
+              "stddev": 0.16937794687883506,
               "samples": [
-                43.1,
-                43.05,
-                42.99
+                43.11,
+                43.52,
+                43.26
               ]
             },
             "ms_per_token": {
-              "min": 23.2,
-              "max": 23.3,
-              "avg": 23.233333333333334,
-              "median": 23.2,
-              "p95": 23.29,
-              "stddev": 0.04714045207910384,
+              "min": 23,
+              "max": 23.2,
+              "avg": 23.099999999999998,
+              "median": 23.1,
+              "p95": 23.19,
+              "stddev": 0.08164965809277232,
               "samples": [
                 23.2,
-                23.2,
-                23.3
+                23,
+                23.1
               ]
             },
             "total_latency_ms": {
-              "min": 2224.892458999995,
-              "max": 2345.6789160000044,
-              "avg": 2271.158805666666,
-              "median": 2242.9050419999985,
-              "p95": 2335.401528600004,
-              "stddev": 53.20431323149591,
+              "min": 2144.531041,
+              "max": 2250.200917,
+              "avg": 2208.080611,
+              "median": 2229.5098749999997,
+              "p95": 2248.1318128000003,
+              "stddev": 45.72337615232208,
               "samples": [
-                2345.6789160000044,
-                2224.892458999995,
-                2242.9050419999985
+                2144.531041,
+                2250.200917,
+                2229.5098749999997
               ]
             },
             "end_to_end_tps": {
-              "min": 5.542105490792576,
-              "max": 5.8429790381163,
-              "avg": 5.727046363514888,
-              "median": 5.796054561635788,
-              "p95": 5.8382865904682495,
-              "stddev": 0.13216863325744227,
+              "min": 5.777261888832481,
+              "max": 6.061931374021086,
+              "avg": 5.890023742186162,
+              "median": 5.830877963704916,
+              "p95": 6.038826032989468,
+              "stddev": 0.12351206765197938,
               "samples": [
-                5.542105490792576,
-                5.8429790381163,
-                5.796054561635788
+                6.061931374021086,
+                5.777261888832481,
+                5.830877963704916
               ]
             }
           },
@@ -3050,116 +2482,120 @@
             "generated_tokens": 8,
             "output_preview": "Paris. The capital of Italy is Rome",
             "prefill_ms": {
-              "min": 132.89,
-              "max": 139.17,
-              "avg": 136.21,
-              "median": 136.57,
-              "p95": 138.90999999999997,
-              "stddev": 2.5764057651438894,
+              "min": 171.395,
+              "max": 180.57500000000002,
+              "avg": 175.60833333333335,
+              "median": 174.855,
+              "p95": 180.00300000000004,
+              "stddev": 3.7853871077547123,
               "samples": [
-                136.57,
-                139.17,
-                132.89
+                171.395,
+                174.855,
+                180.57500000000002
               ]
             },
             "prefill_tps": {
-              "min": 35.92728317884602,
-              "max": 37.62510346903454,
-              "avg": 36.72121609065204,
-              "median": 36.61126162407557,
-              "p95": 37.52371928453865,
-              "stddev": 0.6974792340918587,
+              "min": 27.689325764917623,
+              "max": 29.172379591003235,
+              "avg": 28.485609009387858,
+              "median": 28.59512167224272,
+              "p95": 29.114653799127183,
+              "stddev": 0.6103861784482373,
               "samples": [
-                36.61126162407557,
-                35.92728317884602,
-                37.62510346903454
+                29.172379591003235,
+                28.59512167224272,
+                27.689325764917623
               ]
             },
             "decode_ms": {
-              "min": 153.784,
-              "max": 155.855,
-              "avg": 154.62166666666667,
-              "median": 154.226,
-              "p95": 155.69209999999998,
-              "stddev": 0.8905707283659275,
+              "min": 153.405,
+              "max": 154.331,
+              "avg": 153.98866666666666,
+              "median": 154.23000000000002,
+              "p95": 154.3209,
+              "stddev": 0.41476927990818646,
               "samples": [
-                153.784,
-                155.855,
-                154.226
+                154.331,
+                153.405,
+                154.23000000000002
               ]
             },
             "decode_tps": {
-              "min": 51.3297616374194,
-              "max": 52.02101649066223,
-              "avg": 51.74090211244433,
-              "median": 51.87192820925136,
-              "p95": 52.00610766252114,
-              "stddev": 0.29702322756119426,
+              "min": 51.83663683900189,
+              "max": 52.14953880251621,
+              "avg": 51.95225284573113,
+              "median": 51.87058289567529,
+              "p95": 52.121643211832115,
+              "stddev": 0.140188908856043,
               "samples": [
-                52.02101649066223,
-                51.3297616374194,
-                51.87192820925136
+                51.83663683900189,
+                52.14953880251621,
+                51.87058289567529
               ]
             },
             "ms_per_token": {
-              "min": 19.223,
-              "max": 19.481875,
-              "avg": 19.327708333333334,
-              "median": 19.27825,
-              "p95": 19.461512499999998,
-              "stddev": 0.11132134104574094,
+              "min": 19.175625,
+              "max": 19.291375,
+              "avg": 19.248583333333332,
+              "median": 19.27875,
+              "p95": 19.290112499999996,
+              "stddev": 0.051846159988522614,
               "samples": [
-                19.223,
-                19.481875,
-                19.27825
+                19.291375,
+                19.175625,
+                19.27875
               ]
             },
             "total_latency_ms": {
-              "min": 498.63287500001024,
-              "max": 849.0121250000084,
-              "avg": 645.0615136666844,
-              "median": 587.5395410000347,
-              "p95": 822.8648666000109,
-              "stddev": 148.71222256926833,
+              "min": 439.62279200000194,
+              "max": 451.7910000000047,
+              "avg": 445.8242500000003,
+              "median": 446.05895799999416,
+              "p95": 451.21779580000367,
+              "stddev": 4.970421670024838,
               "samples": [
-                849.0121250000084,
-                587.5395410000347,
-                498.63287500001024
+                439.62279200000194,
+                446.05895799999416,
+                451.7910000000047
               ]
             },
             "end_to_end_tps": {
-              "min": 15.311913242699417,
-              "max": 26.071285412137602,
-              "avg": 21.169789684432487,
-              "median": 22.126170398460438,
-              "p95": 25.676773910769885,
-              "stddev": 4.444248749619648,
+              "min": 28.77436690859239,
+              "max": 29.570805328036638,
+              "avg": 29.163100551535493,
+              "median": 29.144129417977453,
+              "p95": 29.52813773703072,
+              "stddev": 0.3254212315579816,
               "samples": [
-                15.311913242699417,
-                22.126170398460438,
-                26.071285412137602
+                29.570805328036638,
+                29.144129417977453,
+                28.77436690859239
               ]
             }
           },
           "comparison": {
             "baseline_name": "llama.cpp",
-            "zinc_prompt_tps": 49.39,
-            "baseline_prompt_tps": 36.61126162407557,
-            "zinc_decode_tps": 43.05,
-            "baseline_decode_tps": 51.87192820925136,
-            "zinc_total_latency_ms": 2242.9050419999985,
-            "baseline_total_latency_ms": 587.5395410000347,
-            "zinc_end_to_end_tps": 5.796054561635788,
-            "baseline_end_to_end_tps": 22.126170398460438,
-            "pct_of_baseline": 82.99286624999999,
-            "delta_tps": -8.821928209251361,
-            "delta_pct": -17.00713375000001,
+            "zinc_prompt_tps": 49.41,
+            "baseline_prompt_tps": 28.59512167224272,
+            "zinc_decode_tps": 43.26,
+            "baseline_decode_tps": 51.87058289567529,
+            "zinc_total_latency_ms": 2229.5098749999997,
+            "baseline_total_latency_ms": 446.05895799999416,
+            "zinc_end_to_end_tps": 5.830877963704916,
+            "baseline_end_to_end_tps": 29.144129417977453,
+            "zinc_overall_tps": 45.43509565388011,
+            "baseline_overall_tps": 39.50347174742088,
+            "pct_of_baseline": 83.3998725,
+            "delta_tps": -8.610582895675293,
+            "delta_pct": -16.6001275,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 134.90384600000002,
-            "latency_pct_of_baseline": 381.74537805275406,
-            "latency_delta_ms": 1655.3655009999638,
-            "end_to_end_pct_of_baseline": 26.195471051958837,
-            "end_to_end_delta_tps": -16.33011583682465
+            "prompt_pct_of_baseline": 172.79171099999996,
+            "latency_pct_of_baseline": 499.824033351221,
+            "latency_delta_ms": 1783.4509170000056,
+            "end_to_end_pct_of_baseline": 20.007041143964173,
+            "end_to_end_delta_tps": -23.31325145427254,
+            "overall_pct_of_baseline": 115.0154496404395,
+            "overall_delta_tps": 5.9316239064592295
           },
           "scenarios": [
             {
@@ -3178,94 +2614,94 @@
                 "generated_tokens": 8,
                 "output_preview": "Paris. The capital of Italy is Rome",
                 "prefill_ms": {
-                  "min": 101.2,
-                  "max": 101.5,
-                  "avg": 101.3,
+                  "min": 101.1,
+                  "max": 101.3,
+                  "avg": 101.2,
                   "median": 101.2,
-                  "p95": 101.47,
-                  "stddev": 0.14142135623730817,
+                  "p95": 101.28999999999999,
+                  "stddev": 0.08164965809277376,
                   "samples": [
+                    101.1,
                     101.2,
-                    101.5,
-                    101.2
+                    101.3
                   ]
                 },
                 "prefill_tps": {
-                  "min": 49.27,
-                  "max": 49.43,
-                  "avg": 49.36333333333334,
-                  "median": 49.39,
-                  "p95": 49.426,
-                  "stddev": 0.06798692684790235,
+                  "min": 49.35,
+                  "max": 49.47,
+                  "avg": 49.41,
+                  "median": 49.41,
+                  "p95": 49.464,
+                  "stddev": 0.048989794855662516,
                   "samples": [
-                    49.39,
-                    49.27,
-                    49.43
+                    49.47,
+                    49.41,
+                    49.35
                   ]
                 },
                 "decode_ms": {
-                  "min": 185.6,
-                  "max": 186.1,
-                  "avg": 185.83333333333334,
-                  "median": 185.8,
-                  "p95": 186.07,
-                  "stddev": 0.20548046676563164,
+                  "min": 183.8,
+                  "max": 185.6,
+                  "avg": 184.76666666666668,
+                  "median": 184.9,
+                  "p95": 185.53,
+                  "stddev": 0.7408703590297555,
                   "samples": [
                     185.6,
-                    185.8,
-                    186.1
+                    183.8,
+                    184.9
                   ]
                 },
                 "decode_tps": {
-                  "min": 42.99,
-                  "max": 43.1,
-                  "avg": 43.04666666666666,
-                  "median": 43.05,
-                  "p95": 43.095,
-                  "stddev": 0.04496912521077313,
+                  "min": 43.11,
+                  "max": 43.52,
+                  "avg": 43.296666666666674,
+                  "median": 43.26,
+                  "p95": 43.494,
+                  "stddev": 0.16937794687883506,
                   "samples": [
-                    43.1,
-                    43.05,
-                    42.99
+                    43.11,
+                    43.52,
+                    43.26
                   ]
                 },
                 "ms_per_token": {
-                  "min": 23.2,
-                  "max": 23.3,
-                  "avg": 23.233333333333334,
-                  "median": 23.2,
-                  "p95": 23.29,
-                  "stddev": 0.04714045207910384,
+                  "min": 23,
+                  "max": 23.2,
+                  "avg": 23.099999999999998,
+                  "median": 23.1,
+                  "p95": 23.19,
+                  "stddev": 0.08164965809277232,
                   "samples": [
                     23.2,
-                    23.2,
-                    23.3
+                    23,
+                    23.1
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 2224.892458999995,
-                  "max": 2345.6789160000044,
-                  "avg": 2271.158805666666,
-                  "median": 2242.9050419999985,
-                  "p95": 2335.401528600004,
-                  "stddev": 53.20431323149591,
+                  "min": 2144.531041,
+                  "max": 2250.200917,
+                  "avg": 2208.080611,
+                  "median": 2229.5098749999997,
+                  "p95": 2248.1318128000003,
+                  "stddev": 45.72337615232208,
                   "samples": [
-                    2345.6789160000044,
-                    2224.892458999995,
-                    2242.9050419999985
+                    2144.531041,
+                    2250.200917,
+                    2229.5098749999997
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 5.542105490792576,
-                  "max": 5.8429790381163,
-                  "avg": 5.727046363514888,
-                  "median": 5.796054561635788,
-                  "p95": 5.8382865904682495,
-                  "stddev": 0.13216863325744227,
+                  "min": 5.777261888832481,
+                  "max": 6.061931374021086,
+                  "avg": 5.890023742186162,
+                  "median": 5.830877963704916,
+                  "p95": 6.038826032989468,
+                  "stddev": 0.12351206765197938,
                   "samples": [
-                    5.542105490792576,
-                    5.8429790381163,
-                    5.796054561635788
+                    6.061931374021086,
+                    5.777261888832481,
+                    5.830877963704916
                   ]
                 }
               },
@@ -3275,116 +2711,120 @@
                 "generated_tokens": 8,
                 "output_preview": "Paris. The capital of Italy is Rome",
                 "prefill_ms": {
-                  "min": 132.89,
-                  "max": 139.17,
-                  "avg": 136.21,
-                  "median": 136.57,
-                  "p95": 138.90999999999997,
-                  "stddev": 2.5764057651438894,
+                  "min": 171.395,
+                  "max": 180.57500000000002,
+                  "avg": 175.60833333333335,
+                  "median": 174.855,
+                  "p95": 180.00300000000004,
+                  "stddev": 3.7853871077547123,
                   "samples": [
-                    136.57,
-                    139.17,
-                    132.89
+                    171.395,
+                    174.855,
+                    180.57500000000002
                   ]
                 },
                 "prefill_tps": {
-                  "min": 35.92728317884602,
-                  "max": 37.62510346903454,
-                  "avg": 36.72121609065204,
-                  "median": 36.61126162407557,
-                  "p95": 37.52371928453865,
-                  "stddev": 0.6974792340918587,
+                  "min": 27.689325764917623,
+                  "max": 29.172379591003235,
+                  "avg": 28.485609009387858,
+                  "median": 28.59512167224272,
+                  "p95": 29.114653799127183,
+                  "stddev": 0.6103861784482373,
                   "samples": [
-                    36.61126162407557,
-                    35.92728317884602,
-                    37.62510346903454
+                    29.172379591003235,
+                    28.59512167224272,
+                    27.689325764917623
                   ]
                 },
                 "decode_ms": {
-                  "min": 153.784,
-                  "max": 155.855,
-                  "avg": 154.62166666666667,
-                  "median": 154.226,
-                  "p95": 155.69209999999998,
-                  "stddev": 0.8905707283659275,
+                  "min": 153.405,
+                  "max": 154.331,
+                  "avg": 153.98866666666666,
+                  "median": 154.23000000000002,
+                  "p95": 154.3209,
+                  "stddev": 0.41476927990818646,
                   "samples": [
-                    153.784,
-                    155.855,
-                    154.226
+                    154.331,
+                    153.405,
+                    154.23000000000002
                   ]
                 },
                 "decode_tps": {
-                  "min": 51.3297616374194,
-                  "max": 52.02101649066223,
-                  "avg": 51.74090211244433,
-                  "median": 51.87192820925136,
-                  "p95": 52.00610766252114,
-                  "stddev": 0.29702322756119426,
+                  "min": 51.83663683900189,
+                  "max": 52.14953880251621,
+                  "avg": 51.95225284573113,
+                  "median": 51.87058289567529,
+                  "p95": 52.121643211832115,
+                  "stddev": 0.140188908856043,
                   "samples": [
-                    52.02101649066223,
-                    51.3297616374194,
-                    51.87192820925136
+                    51.83663683900189,
+                    52.14953880251621,
+                    51.87058289567529
                   ]
                 },
                 "ms_per_token": {
-                  "min": 19.223,
-                  "max": 19.481875,
-                  "avg": 19.327708333333334,
-                  "median": 19.27825,
-                  "p95": 19.461512499999998,
-                  "stddev": 0.11132134104574094,
+                  "min": 19.175625,
+                  "max": 19.291375,
+                  "avg": 19.248583333333332,
+                  "median": 19.27875,
+                  "p95": 19.290112499999996,
+                  "stddev": 0.051846159988522614,
                   "samples": [
-                    19.223,
-                    19.481875,
-                    19.27825
+                    19.291375,
+                    19.175625,
+                    19.27875
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 498.63287500001024,
-                  "max": 849.0121250000084,
-                  "avg": 645.0615136666844,
-                  "median": 587.5395410000347,
-                  "p95": 822.8648666000109,
-                  "stddev": 148.71222256926833,
+                  "min": 439.62279200000194,
+                  "max": 451.7910000000047,
+                  "avg": 445.8242500000003,
+                  "median": 446.05895799999416,
+                  "p95": 451.21779580000367,
+                  "stddev": 4.970421670024838,
                   "samples": [
-                    849.0121250000084,
-                    587.5395410000347,
-                    498.63287500001024
+                    439.62279200000194,
+                    446.05895799999416,
+                    451.7910000000047
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 15.311913242699417,
-                  "max": 26.071285412137602,
-                  "avg": 21.169789684432487,
-                  "median": 22.126170398460438,
-                  "p95": 25.676773910769885,
-                  "stddev": 4.444248749619648,
+                  "min": 28.77436690859239,
+                  "max": 29.570805328036638,
+                  "avg": 29.163100551535493,
+                  "median": 29.144129417977453,
+                  "p95": 29.52813773703072,
+                  "stddev": 0.3254212315579816,
                   "samples": [
-                    15.311913242699417,
-                    22.126170398460438,
-                    26.071285412137602
+                    29.570805328036638,
+                    29.144129417977453,
+                    28.77436690859239
                   ]
                 }
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 49.39,
-                "baseline_prompt_tps": 36.61126162407557,
-                "zinc_decode_tps": 43.05,
-                "baseline_decode_tps": 51.87192820925136,
-                "zinc_total_latency_ms": 2242.9050419999985,
-                "baseline_total_latency_ms": 587.5395410000347,
-                "zinc_end_to_end_tps": 5.796054561635788,
-                "baseline_end_to_end_tps": 22.126170398460438,
-                "pct_of_baseline": 82.99286624999999,
-                "delta_tps": -8.821928209251361,
-                "delta_pct": -17.00713375000001,
+                "zinc_prompt_tps": 49.41,
+                "baseline_prompt_tps": 28.59512167224272,
+                "zinc_decode_tps": 43.26,
+                "baseline_decode_tps": 51.87058289567529,
+                "zinc_total_latency_ms": 2229.5098749999997,
+                "baseline_total_latency_ms": 446.05895799999416,
+                "zinc_end_to_end_tps": 5.830877963704916,
+                "baseline_end_to_end_tps": 29.144129417977453,
+                "zinc_overall_tps": 45.43509565388011,
+                "baseline_overall_tps": 39.50347174742088,
+                "pct_of_baseline": 83.3998725,
+                "delta_tps": -8.610582895675293,
+                "delta_pct": -16.6001275,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 134.90384600000002,
-                "latency_pct_of_baseline": 381.74537805275406,
-                "latency_delta_ms": 1655.3655009999638,
-                "end_to_end_pct_of_baseline": 26.195471051958837,
-                "end_to_end_delta_tps": -16.33011583682465
+                "prompt_pct_of_baseline": 172.79171099999996,
+                "latency_pct_of_baseline": 499.824033351221,
+                "latency_delta_ms": 1783.4509170000056,
+                "end_to_end_pct_of_baseline": 20.007041143964173,
+                "end_to_end_delta_tps": -23.31325145427254,
+                "overall_pct_of_baseline": 115.0154496404395,
+                "overall_delta_tps": 5.9316239064592295
               }
             },
             {
@@ -3403,94 +2843,94 @@
                 "generated_tokens": 8,
                 "output_preview": ":\n\nOkay, let's see. The",
                 "prefill_ms": {
-                  "min": 907.6,
-                  "max": 908.3,
-                  "avg": 907.9,
-                  "median": 907.8,
-                  "p95": 908.25,
-                  "stddev": 0.2943920288775717,
+                  "min": 910,
+                  "max": 914.3,
+                  "avg": 912.3333333333334,
+                  "median": 912.7,
+                  "p95": 914.14,
+                  "stddev": 1.774510887227475,
                   "samples": [
-                    907.6,
-                    908.3,
-                    907.8
+                    912.7,
+                    910,
+                    914.3
                   ]
                 },
                 "prefill_tps": {
-                  "min": 52.85,
-                  "max": 52.88,
-                  "avg": 52.870000000000005,
-                  "median": 52.88,
-                  "p95": 52.88,
-                  "stddev": 0.014142135623731487,
+                  "min": 52.5,
+                  "max": 52.75,
+                  "avg": 52.61333333333334,
+                  "median": 52.59,
+                  "p95": 52.734,
+                  "stddev": 0.10338708279513856,
                   "samples": [
-                    52.88,
-                    52.85,
-                    52.88
+                    52.59,
+                    52.75,
+                    52.5
                   ]
                 },
                 "decode_ms": {
-                  "min": 187.6,
-                  "max": 188.2,
-                  "avg": 187.9,
-                  "median": 187.9,
-                  "p95": 188.17,
-                  "stddev": 0.2449489742783155,
+                  "min": 184.6,
+                  "max": 188.6,
+                  "avg": 186.29999999999998,
+                  "median": 185.7,
+                  "p95": 188.31,
+                  "stddev": 1.6872067646458357,
                   "samples": [
-                    187.6,
-                    187.9,
-                    188.2
+                    188.6,
+                    184.6,
+                    185.7
                   ]
                 },
                 "decode_tps": {
-                  "min": 42.52,
-                  "max": 42.65,
-                  "avg": 42.580000000000005,
-                  "median": 42.57,
-                  "p95": 42.642,
-                  "stddev": 0.05354126134736156,
+                  "min": 42.42,
+                  "max": 43.34,
+                  "avg": 42.946666666666665,
+                  "median": 43.08,
+                  "p95": 43.31400000000001,
+                  "stddev": 0.38724095283886967,
                   "samples": [
-                    42.65,
-                    42.57,
-                    42.52
+                    42.42,
+                    43.34,
+                    43.08
                   ]
                 },
                 "ms_per_token": {
-                  "min": 23.4,
-                  "max": 23.5,
-                  "avg": 23.46666666666667,
-                  "median": 23.5,
-                  "p95": 23.5,
-                  "stddev": 0.04714045207910384,
+                  "min": 23.1,
+                  "max": 23.6,
+                  "avg": 23.3,
+                  "median": 23.2,
+                  "p95": 23.560000000000002,
+                  "stddev": 0.216024689946929,
                   "samples": [
-                    23.4,
-                    23.5,
-                    23.5
+                    23.6,
+                    23.1,
+                    23.2
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 3003.1203749999986,
-                  "max": 3076.836458000005,
-                  "avg": 3042.294874666666,
-                  "median": 3046.9277909999946,
-                  "p95": 3073.8455913000043,
-                  "stddev": 30.272244256961223,
+                  "min": 3008.1816670000007,
+                  "max": 3443.4690410000003,
+                  "avg": 3167.5536806666664,
+                  "median": 3051.0103339999987,
+                  "p95": 3404.2231703,
+                  "stddev": 195.88353381563957,
                   "samples": [
-                    3046.9277909999946,
-                    3076.836458000005,
-                    3003.1203749999986
+                    3443.4690410000003,
+                    3008.1816670000007,
+                    3051.0103339999987
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 18.200512365353642,
-                  "max": 18.647271173737092,
-                  "avg": 18.408984092003596,
-                  "median": 18.37916873692006,
-                  "p95": 18.62046093005539,
-                  "stddev": 0.1836029679609748,
+                  "min": 16.26266980571933,
+                  "max": 18.615896976676837,
+                  "avg": 17.744380812510204,
+                  "median": 18.35457565513445,
+                  "p95": 18.5897648445226,
+                  "stddev": 1.05314539642194,
                   "samples": [
-                    18.37916873692006,
-                    18.200512365353642,
-                    18.647271173737092
+                    16.26266980571933,
+                    18.615896976676837,
+                    18.35457565513445
                   ]
                 }
               },
@@ -3500,116 +2940,120 @@
                 "generated_tokens": 8,
                 "output_preview": ":\n\nOkay, let's see. The",
                 "prefill_ms": {
-                  "min": 1187.316,
-                  "max": 1539.3570000000002,
-                  "avg": 1361.8386666666668,
-                  "median": 1358.843,
-                  "p95": 1521.3056000000001,
-                  "stddev": 143.7357458076762,
+                  "min": 1146.0790000000002,
+                  "max": 1679.8809999999999,
+                  "avg": 1451.4506666666666,
+                  "median": 1528.3919999999998,
+                  "p95": 1664.7321,
+                  "stddev": 224.6124371479805,
                   "samples": [
-                    1187.316,
-                    1539.3570000000002,
-                    1358.843
+                    1528.3919999999998,
+                    1679.8809999999999,
+                    1146.0790000000002
                   ]
                 },
                 "prefill_tps": {
-                  "min": 27.933741165954356,
-                  "max": 36.21613791105317,
-                  "avg": 31.931482428958102,
-                  "median": 31.644568209866776,
-                  "p95": 35.75898094093453,
-                  "stddev": 3.387355289666107,
+                  "min": 25.59705121969949,
+                  "max": 37.51922860465989,
+                  "avg": 30.416807807009434,
+                  "median": 28.13414359666892,
+                  "p95": 36.58072010386079,
+                  "stddev": 5.127864748768398,
                   "samples": [
-                    36.21613791105317,
-                    27.933741165954356,
-                    31.644568209866776
+                    28.13414359666892,
+                    25.59705121969949,
+                    37.51922860465989
                   ]
                 },
                 "decode_ms": {
-                  "min": 185.52899999999997,
-                  "max": 231.70000000000002,
-                  "avg": 203.98233333333334,
-                  "median": 194.71799999999996,
-                  "p95": 228.0018,
-                  "stddev": 19.955136587410852,
+                  "min": 155.421,
+                  "max": 157.128,
+                  "avg": 156.44166666666666,
+                  "median": 156.776,
+                  "p95": 157.09279999999998,
+                  "stddev": 0.7358878235769973,
                   "samples": [
-                    185.52899999999997,
-                    231.70000000000002,
-                    194.71799999999996
+                    157.128,
+                    156.776,
+                    155.421
                   ]
                 },
                 "decode_tps": {
-                  "min": 34.52740612861459,
-                  "max": 43.119943512874,
-                  "avg": 39.5774686597907,
-                  "median": 41.08505633788351,
-                  "p95": 42.91645479537495,
-                  "stddev": 3.6662915078070246,
+                  "min": 50.913904587342806,
+                  "max": 51.47309565631414,
+                  "avg": 51.138406282848486,
+                  "median": 51.0282186048885,
+                  "p95": 51.42860795117158,
+                  "stddev": 0.24121865072306817,
                   "samples": [
-                    43.119943512874,
-                    34.52740612861459,
-                    41.08505633788351
+                    50.913904587342806,
+                    51.0282186048885,
+                    51.47309565631414
                   ]
                 },
                 "ms_per_token": {
-                  "min": 23.191125,
-                  "max": 28.962500000000002,
-                  "avg": 25.497791666666668,
-                  "median": 24.33975,
-                  "p95": 28.500225,
-                  "stddev": 2.4943920734263547,
+                  "min": 19.427625,
+                  "max": 19.641,
+                  "avg": 19.555208333333333,
+                  "median": 19.597,
+                  "p95": 19.636599999999998,
+                  "stddev": 0.09198597794712467,
                   "samples": [
-                    23.191125,
-                    28.962500000000002,
-                    24.33975
+                    19.641,
+                    19.597,
+                    19.427625
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 536.5751670000027,
-                  "max": 658.0907080000034,
-                  "avg": 607.5348749999927,
-                  "median": 627.9387499999721,
-                  "p95": 655.0755122000002,
-                  "stddev": 51.66394785787472,
+                  "min": 399.89279199999874,
+                  "max": 451.93045799999527,
+                  "avg": 428.6015833333319,
+                  "median": 433.9815000000017,
+                  "p95": 450.1355621999959,
+                  "stddev": 21.582204060862,
                   "samples": [
-                    627.9387499999721,
-                    658.0907080000034,
-                    536.5751670000027
+                    433.9815000000017,
+                    451.93045799999527,
+                    399.89279199999874
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 77.49691551639374,
-                  "max": 95.04726110442554,
-                  "avg": 84.587429685384,
-                  "median": 81.2181124353327,
-                  "p95": 93.66434623751626,
-                  "stddev": 7.550623886516785,
+                  "min": 112.84922070908647,
+                  "max": 127.53418171138269,
+                  "avg": 119.29997750099074,
+                  "median": 117.51653008250307,
+                  "p95": 126.53241654849472,
+                  "stddev": 6.126311202815985,
                   "samples": [
-                    81.2181124353327,
-                    77.49691551639374,
-                    95.04726110442554
+                    117.51653008250307,
+                    112.84922070908647,
+                    127.53418171138269
                   ]
                 }
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 52.88,
-                "baseline_prompt_tps": 31.644568209866776,
-                "zinc_decode_tps": 42.57,
-                "baseline_decode_tps": 41.08505633788351,
-                "zinc_total_latency_ms": 3046.9277909999946,
-                "baseline_total_latency_ms": 627.9387499999721,
-                "zinc_end_to_end_tps": 18.37916873692006,
-                "baseline_end_to_end_tps": 81.2181124353327,
-                "pct_of_baseline": 103.61431575,
-                "delta_tps": 1.4849436621164926,
-                "delta_pct": 3.614315750000003,
-                "leader": "zinc",
-                "prompt_pct_of_baseline": 167.10608800000003,
-                "latency_pct_of_baseline": 485.2269096309362,
-                "latency_delta_ms": 2418.9890410000226,
-                "end_to_end_pct_of_baseline": 22.629396554314017,
-                "end_to_end_delta_tps": -62.838943698412635
+                "zinc_prompt_tps": 52.59,
+                "baseline_prompt_tps": 28.13414359666892,
+                "zinc_decode_tps": 43.08,
+                "baseline_decode_tps": 51.0282186048885,
+                "zinc_total_latency_ms": 3051.0103339999987,
+                "baseline_total_latency_ms": 433.9815000000017,
+                "zinc_end_to_end_tps": 18.35457565513445,
+                "baseline_end_to_end_tps": 117.51653008250307,
+                "zinc_overall_tps": 50.9822239367345,
+                "baseline_overall_tps": 30.060851752762378,
+                "pct_of_baseline": 84.42387599999999,
+                "delta_tps": -7.948218604888503,
+                "delta_pct": -15.576124000000007,
+                "leader": "baseline",
+                "prompt_pct_of_baseline": 186.925896,
+                "latency_pct_of_baseline": 703.0277405834089,
+                "latency_delta_ms": 2617.028833999997,
+                "end_to_end_pct_of_baseline": 15.618718185644632,
+                "end_to_end_delta_tps": -99.16195442736861,
+                "overall_pct_of_baseline": 169.59673783045616,
+                "overall_delta_tps": 20.92137218397212
               }
             },
             {
@@ -3628,94 +3072,94 @@
                 "generated_tokens": 8,
                 "output_preview": ":\n\nBased on the reference above, the",
                 "prefill_ms": {
-                  "min": 2936.1,
-                  "max": 2936.7,
-                  "avg": 2936.4666666666667,
-                  "median": 2936.6,
-                  "p95": 2936.69,
-                  "stddev": 0.26246692913370007,
+                  "min": 2964.4,
+                  "max": 3002.4,
+                  "avg": 2983.066666666667,
+                  "median": 2982.4,
+                  "p95": 3000.4,
+                  "stddev": 15.520595635763755,
                   "samples": [
-                    2936.1,
-                    2936.6,
-                    2936.7
+                    2964.4,
+                    3002.4,
+                    2982.4
                   ]
                 },
                 "prefill_tps": {
-                  "min": 52.44,
-                  "max": 52.45,
-                  "avg": 52.44333333333333,
-                  "median": 52.44,
-                  "p95": 52.449000000000005,
-                  "stddev": 0.004714045207912729,
+                  "min": 51.29,
+                  "max": 51.95,
+                  "avg": 51.626666666666665,
+                  "median": 51.64,
+                  "p95": 51.919,
+                  "stddev": 0.26960877005188405,
                   "samples": [
-                    52.45,
-                    52.44,
-                    52.44
+                    51.95,
+                    51.29,
+                    51.64
                   ]
                 },
                 "decode_ms": {
-                  "min": 188.7,
-                  "max": 189,
-                  "avg": 188.9,
-                  "median": 189,
-                  "p95": 189,
-                  "stddev": 0.14142135623731486,
+                  "min": 183.2,
+                  "max": 190.6,
+                  "avg": 186.63333333333333,
+                  "median": 186.1,
+                  "p95": 190.15,
+                  "stddev": 3.044484995674786,
                   "samples": [
-                    189,
-                    189,
-                    188.7
+                    183.2,
+                    190.6,
+                    186.1
                   ]
                 },
                 "decode_tps": {
-                  "min": 42.32,
-                  "max": 42.39,
-                  "avg": 42.343333333333334,
-                  "median": 42.32,
-                  "p95": 42.383,
-                  "stddev": 0.03299831645537235,
+                  "min": 41.97,
+                  "max": 43.67,
+                  "avg": 42.876666666666665,
+                  "median": 42.99,
+                  "p95": 43.602000000000004,
+                  "stddev": 0.6986335870031519,
                   "samples": [
-                    42.32,
-                    42.32,
-                    42.39
+                    43.67,
+                    41.97,
+                    42.99
                   ]
                 },
                 "ms_per_token": {
-                  "min": 23.6,
-                  "max": 23.6,
-                  "avg": 23.600000000000005,
-                  "median": 23.6,
-                  "p95": 23.6,
-                  "stddev": 3.552713678800501e-15,
+                  "min": 22.9,
+                  "max": 23.8,
+                  "avg": 23.333333333333332,
+                  "median": 23.3,
+                  "p95": 23.75,
+                  "stddev": 0.3681787005729095,
                   "samples": [
-                    23.6,
-                    23.6,
-                    23.6
+                    22.9,
+                    23.8,
+                    23.3
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 5117.9211249999935,
-                  "max": 6075.935125000018,
-                  "avg": 5541.240874999999,
-                  "median": 5429.866374999983,
-                  "p95": 6011.328250000015,
-                  "stddev": 398.9577383522402,
+                  "min": 5157.536541999998,
+                  "max": 5318.630040999997,
+                  "avg": 5217.712305333331,
+                  "median": 5176.9703329999975,
+                  "p95": 5304.464070199996,
+                  "stddev": 71.79930402273277,
                   "samples": [
-                    6075.935125000018,
-                    5117.9211249999935,
-                    5429.866374999983
+                    5157.536541999998,
+                    5176.9703329999975,
+                    5318.630040999997
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 26.66256249732415,
-                  "max": 31.65347727003124,
-                  "avg": 29.38367603665178,
-                  "median": 29.834988342599956,
-                  "p95": 31.47162837728811,
-                  "stddev": 2.0623723661892646,
+                  "min": 30.458971342466437,
+                  "max": 31.41034458617318,
+                  "avg": 31.053916484140927,
+                  "median": 31.292433523783163,
+                  "p95": 31.39855347993418,
+                  "stddev": 0.4234348008529332,
                   "samples": [
-                    26.66256249732415,
-                    31.65347727003124,
-                    29.834988342599956
+                    31.41034458617318,
+                    31.292433523783163,
+                    30.458971342466437
                   ]
                 }
               },
@@ -3725,116 +3169,120 @@
                 "generated_tokens": 8,
                 "output_preview": "Paris.\nBased on the reference above,",
                 "prefill_ms": {
-                  "min": 3530.9999999999995,
-                  "max": 4254.600000000001,
-                  "avg": 4001.4,
-                  "median": 4218.599999999999,
-                  "p95": 4251.000000000001,
-                  "stddev": 332.94756343905004,
+                  "min": 6296.099999999999,
+                  "max": 7233.900000000001,
+                  "avg": 6717.05,
+                  "median": 6621.15,
+                  "p95": 7172.625000000001,
+                  "stddev": 388.81428085912734,
                   "samples": [
-                    4254.600000000001,
-                    4218.599999999999,
-                    3530.9999999999995
+                    7233.900000000001,
+                    6296.099999999999,
+                    6621.15
                   ]
                 },
                 "prefill_tps": {
-                  "min": 35.25595825694542,
-                  "max": 42.48088360237893,
-                  "avg": 37.7645538857872,
-                  "median": 35.55681979803727,
-                  "p95": 41.78847722194477,
-                  "stddev": 3.3372098039561613,
+                  "min": 20.73570273296562,
+                  "max": 23.824272168485255,
+                  "avg": 22.40488323119808,
+                  "median": 22.65467479214336,
+                  "p95": 23.707312430851065,
+                  "stddev": 1.2732143463025982,
                   "samples": [
-                    35.25595825694542,
-                    35.55681979803727,
-                    42.48088360237893
+                    20.73570273296562,
+                    23.824272168485255,
+                    22.65467479214336
                   ]
                 },
                 "decode_ms": {
-                  "min": 155.937,
-                  "max": 157.343,
-                  "avg": 156.61433333333332,
-                  "median": 156.56300000000002,
-                  "p95": 157.265,
-                  "stddev": 0.5751436535529286,
+                  "min": 154.682,
+                  "max": 160.256,
+                  "avg": 156.85466666666665,
+                  "median": 155.626,
+                  "p95": 159.79299999999998,
+                  "stddev": 2.4357867084145326,
                   "samples": [
-                    156.56300000000002,
-                    157.343,
-                    155.937
+                    155.626,
+                    154.682,
+                    160.256
                   ]
                 },
                 "decode_tps": {
-                  "min": 50.844333716784355,
-                  "max": 51.30276970827962,
-                  "avg": 51.08158154340061,
-                  "median": 51.09764120513787,
-                  "p95": 51.28225685796545,
-                  "stddev": 0.18749990955712978,
+                  "min": 49.92012779552716,
+                  "max": 51.71901061532693,
+                  "avg": 51.01481019522783,
+                  "median": 51.4052921748294,
+                  "p95": 51.68763877127717,
+                  "stddev": 0.7845814094738098,
                   "samples": [
-                    51.09764120513787,
-                    50.844333716784355,
-                    51.30276970827962
+                    51.4052921748294,
+                    51.71901061532693,
+                    49.92012779552716
                   ]
                 },
                 "ms_per_token": {
-                  "min": 19.492125,
-                  "max": 19.667875,
-                  "avg": 19.576791666666665,
-                  "median": 19.570375,
-                  "p95": 19.658125,
-                  "stddev": 0.07189295669411618,
+                  "min": 19.33525,
+                  "max": 20.032,
+                  "avg": 19.60683333333333,
+                  "median": 19.45325,
+                  "p95": 19.974124999999997,
+                  "stddev": 0.3044733385518166,
                   "samples": [
-                    19.570375,
-                    19.667875,
-                    19.492125
+                    19.45325,
+                    19.33525,
+                    20.032
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 494.28095800004667,
-                  "max": 510.29429200000595,
-                  "avg": 499.9732916666932,
-                  "median": 495.344625000027,
-                  "p95": 508.79932530000804,
-                  "stddev": 7.310956744589731,
+                  "min": 452.3309580000059,
+                  "max": 603.0633330000128,
+                  "avg": 509.45055533333897,
+                  "median": 472.95737499999814,
+                  "p95": 590.0527372000113,
+                  "stddev": 66.72768728904553,
                   "samples": [
-                    494.28095800004667,
-                    495.344625000027,
-                    510.29429200000595
+                    603.0633330000128,
+                    452.3309580000059,
+                    472.95737499999814
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 309.6252544404282,
-                  "max": 319.65625509689386,
-                  "avg": 316.08378601812836,
-                  "median": 318.969848517063,
-                  "p95": 319.5876144389108,
-                  "stddev": 4.575460712927992,
+                  "min": 261.9956998778379,
+                  "max": 349.3017605927338,
+                  "avg": 315.1218734727969,
+                  "median": 334.068159947819,
+                  "p95": 347.7784005282423,
+                  "stddev": 38.077188164599505,
                   "samples": [
-                    319.65625509689386,
-                    318.969848517063,
-                    309.6252544404282
+                    261.9956998778379,
+                    349.3017605927338,
+                    334.068159947819
                   ]
                 }
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 52.44,
-                "baseline_prompt_tps": 35.55681979803727,
-                "zinc_decode_tps": 42.32,
-                "baseline_decode_tps": 51.09764120513787,
-                "zinc_total_latency_ms": 5429.866374999983,
-                "baseline_total_latency_ms": 495.344625000027,
-                "zinc_end_to_end_tps": 29.834988342599956,
-                "baseline_end_to_end_tps": 318.969848517063,
-                "pct_of_baseline": 82.821827,
-                "delta_tps": -8.777641205137868,
-                "delta_pct": -17.178173,
+                "zinc_prompt_tps": 51.64,
+                "baseline_prompt_tps": 22.65467479214336,
+                "zinc_decode_tps": 42.99,
+                "baseline_decode_tps": 51.4052921748294,
+                "zinc_total_latency_ms": 5176.9703329999975,
+                "baseline_total_latency_ms": 472.95737499999814,
+                "zinc_end_to_end_tps": 31.292433523783163,
+                "baseline_end_to_end_tps": 334.068159947819,
+                "zinc_overall_tps": 51.1319389556954,
+                "baseline_overall_tps": 23.298155994097804,
+                "pct_of_baseline": 83.62952175000001,
+                "delta_tps": -8.415292174829396,
+                "delta_pct": -16.37047824999999,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 147.48225599999998,
-                "latency_pct_of_baseline": 1096.1795285453409,
-                "latency_delta_ms": 4934.521749999956,
-                "end_to_end_pct_of_baseline": 9.353545007876807,
-                "end_to_end_delta_tps": -289.13486017446303
+                "prompt_pct_of_baseline": 227.94412399999996,
+                "latency_pct_of_baseline": 1094.595540031492,
+                "latency_delta_ms": 4704.012957999999,
+                "end_to_end_pct_of_baseline": 9.367080516943307,
+                "end_to_end_delta_tps": -302.77572642403584,
+                "overall_pct_of_baseline": 219.46775087542903,
+                "overall_delta_tps": 27.833782961597592
               }
             },
             {
@@ -3853,94 +3301,94 @@
                 "generated_tokens": 32,
                 "output_preview": "the prompt processing is not part of the model's inference time. 为什么？ 这个问题可能和模型的推理时间有关，比如，prompt processing",
                 "prefill_ms": {
-                  "min": 231.7,
-                  "max": 232.8,
-                  "avg": 232.33333333333334,
-                  "median": 232.5,
-                  "p95": 232.77,
-                  "stddev": 0.46427960923947964,
+                  "min": 234.1,
+                  "max": 235.1,
+                  "avg": 234.6,
+                  "median": 234.6,
+                  "p95": 235.04999999999998,
+                  "stddev": 0.408248290463863,
                   "samples": [
-                    231.7,
-                    232.8,
-                    232.5
+                    234.1,
+                    235.1,
+                    234.6
                   ]
                 },
                 "prefill_tps": {
-                  "min": 51.54,
-                  "max": 51.78,
-                  "avg": 51.64666666666667,
-                  "median": 51.62,
-                  "p95": 51.764,
-                  "stddev": 0.09977753031397281,
+                  "min": 51.04,
+                  "max": 51.26,
+                  "avg": 51.15,
+                  "median": 51.15,
+                  "p95": 51.248999999999995,
+                  "stddev": 0.0898146239020494,
                   "samples": [
-                    51.78,
-                    51.54,
-                    51.62
+                    51.26,
+                    51.04,
+                    51.15
                   ]
                 },
                 "decode_ms": {
-                  "min": 822.9,
-                  "max": 827.5,
-                  "avg": 825.6333333333333,
-                  "median": 826.5,
-                  "p95": 827.4,
-                  "stddev": 1.9754043186705508,
+                  "min": 822.7,
+                  "max": 832.9,
+                  "avg": 827.7666666666668,
+                  "median": 827.7,
+                  "p95": 832.38,
+                  "stddev": 4.164399383131016,
                   "samples": [
-                    822.9,
-                    827.5,
-                    826.5
+                    832.9,
+                    822.7,
+                    827.7
                   ]
                 },
                 "decode_tps": {
-                  "min": 38.67,
-                  "max": 38.89,
-                  "avg": 38.76,
-                  "median": 38.72,
-                  "p95": 38.873000000000005,
-                  "stddev": 0.09416297927883677,
+                  "min": 38.42,
+                  "max": 38.9,
+                  "avg": 38.66,
+                  "median": 38.66,
+                  "p95": 38.876000000000005,
+                  "stddev": 0.19595917942265295,
                   "samples": [
-                    38.89,
-                    38.67,
-                    38.72
+                    38.42,
+                    38.9,
+                    38.66
                   ]
                 },
                 "ms_per_token": {
                   "min": 25.7,
-                  "max": 25.9,
-                  "avg": 25.8,
-                  "median": 25.8,
-                  "p95": 25.889999999999997,
-                  "stddev": 0.08164965809277232,
+                  "max": 26,
+                  "avg": 25.866666666666664,
+                  "median": 25.9,
+                  "p95": 25.990000000000002,
+                  "stddev": 0.12472191289246491,
                   "samples": [
+                    26,
                     25.7,
-                    25.9,
-                    25.8
+                    25.9
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 3043.652291999955,
-                  "max": 3443.0445840000175,
-                  "avg": 3197.9906253333124,
-                  "median": 3107.274999999965,
-                  "p95": 3409.467625600012,
-                  "stddev": 175.21519005113106,
+                  "min": 2986.273583000002,
+                  "max": 3052.1454999999987,
+                  "avg": 3014.8257913333314,
+                  "median": 3006.058290999994,
+                  "p95": 3047.536779099998,
+                  "stddev": 27.597453492244796,
                   "samples": [
-                    3107.274999999965,
-                    3443.0445840000175,
-                    3043.652291999955
+                    3052.1454999999987,
+                    2986.273583000002,
+                    3006.058290999994
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 12.779387233168565,
-                  "max": 14.456316221025372,
-                  "avg": 13.798673591344075,
-                  "median": 14.160317319838281,
-                  "p95": 14.426716330906661,
-                  "stddev": 0.7308042817553858,
+                  "min": 14.416088617007288,
+                  "max": 14.734082051450132,
+                  "avg": 14.59575957171412,
+                  "median": 14.637108046684943,
+                  "p95": 14.724384650973613,
+                  "stddev": 0.13307198145865354,
                   "samples": [
-                    14.160317319838281,
-                    12.779387233168565,
-                    14.456316221025372
+                    14.416088617007288,
+                    14.734082051450132,
+                    14.637108046684943
                   ]
                 }
               },
@@ -3950,116 +3398,120 @@
                 "generated_tokens": 32,
                 "output_preview": "the prompt processing is not part of the model's inference time. 为什么？ 这个问题可能和模型的推理时间有关，比如，prompt processing",
                 "prefill_ms": {
-                  "min": 269.112,
-                  "max": 304.512,
-                  "avg": 282.40799999999996,
-                  "median": 273.6,
-                  "p95": 301.4208,
-                  "stddev": 15.736913039093775,
+                  "min": 413.66400000000004,
+                  "max": 518.7959999999999,
+                  "avg": 456.15599999999995,
+                  "median": 436.008,
+                  "p95": 510.51719999999995,
+                  "stddev": 45.222713938904604,
                   "samples": [
-                    273.6,
-                    269.112,
-                    304.512
+                    518.7959999999999,
+                    413.66400000000004,
+                    436.008
                   ]
                 },
                 "prefill_tps": {
-                  "min": 39.40731399747793,
-                  "max": 44.591099616516544,
-                  "avg": 42.6193542456005,
-                  "median": 43.859649122807014,
-                  "p95": 44.517954567145594,
-                  "stddev": 2.290801442415069,
+                  "min": 23.13047903222076,
+                  "max": 29.00905082385704,
+                  "avg": 26.553986879054793,
+                  "median": 27.522430781086584,
+                  "p95": 28.860388819579995,
+                  "stddev": 2.49570487984088,
                   "samples": [
-                    43.859649122807014,
-                    44.591099616516544,
-                    39.40731399747793
+                    23.13047903222076,
+                    29.00905082385704,
+                    27.522430781086584
                   ]
                 },
                 "decode_ms": {
-                  "min": 673.387,
-                  "max": 682.491,
-                  "avg": 677.9503333333333,
-                  "median": 677.973,
-                  "p95": 682.0391999999999,
-                  "stddev": 3.7167269950260917,
+                  "min": 676.967,
+                  "max": 685.902,
+                  "avg": 680.557,
+                  "median": 678.802,
+                  "p95": 685.192,
+                  "stddev": 3.853013971771558,
                   "samples": [
-                    673.387,
-                    677.973,
-                    682.491
+                    676.967,
+                    678.802,
+                    685.902
                   ]
                 },
                 "decode_tps": {
-                  "min": 46.88706517741626,
-                  "max": 47.520964913192564,
-                  "avg": 47.20251661183181,
-                  "median": 47.1995197448866,
-                  "p95": 47.48882039636197,
-                  "stddev": 0.25879715951935833,
+                  "min": 46.65389516286583,
+                  "max": 47.269660116371995,
+                  "avg": 47.02181056756717,
+                  "median": 47.14187642346369,
+                  "p95": 47.25688174708117,
+                  "stddev": 0.2653343510940305,
                   "samples": [
-                    47.520964913192564,
-                    47.1995197448866,
-                    46.88706517741626
+                    47.269660116371995,
+                    47.14187642346369,
+                    46.65389516286583
                   ]
                 },
                 "ms_per_token": {
-                  "min": 21.04334375,
-                  "max": 21.32784375,
-                  "avg": 21.185947916666667,
-                  "median": 21.18665625,
-                  "p95": 21.313724999999998,
-                  "stddev": 0.11614771859456537,
+                  "min": 21.15521875,
+                  "max": 21.4344375,
+                  "avg": 21.26740625,
+                  "median": 21.2125625,
+                  "p95": 21.41225,
+                  "stddev": 0.12040668661786119,
                   "samples": [
-                    21.04334375,
-                    21.18665625,
-                    21.32784375
+                    21.15521875,
+                    21.2125625,
+                    21.4344375
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 1088.0481670000008,
-                  "max": 1269.6982909999788,
-                  "avg": 1162.64866633331,
-                  "median": 1130.1995409999508,
-                  "p95": 1255.748415999976,
-                  "stddev": 77.62689048036935,
+                  "min": 965.4062919999997,
+                  "max": 1008.2700830000103,
+                  "avg": 982.1818610000046,
+                  "median": 972.8692080000037,
+                  "p95": 1004.7299955000096,
+                  "stddev": 18.697063479719088,
                   "samples": [
-                    1088.0481670000008,
-                    1269.6982909999788,
-                    1130.1995409999508
+                    1008.2700830000103,
+                    965.4062919999997,
+                    972.8692080000037
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 34.653901885105974,
-                  "max": 40.43938617287333,
-                  "avg": 38.008155498301484,
-                  "median": 38.931178436925165,
-                  "p95": 40.28856539927851,
-                  "stddev": 2.4504333793460353,
+                  "min": 43.63910101258012,
+                  "max": 45.57666587074617,
+                  "avg": 44.814270816450836,
+                  "median": 45.227045566026206,
+                  "p95": 45.541703840274174,
+                  "stddev": 0.8431396247815915,
                   "samples": [
-                    40.43938617287333,
-                    34.653901885105974,
-                    38.931178436925165
+                    43.63910101258012,
+                    45.57666587074617,
+                    45.227045566026206
                   ]
                 }
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 51.62,
-                "baseline_prompt_tps": 43.859649122807014,
-                "zinc_decode_tps": 38.72,
-                "baseline_decode_tps": 47.1995197448866,
-                "zinc_total_latency_ms": 3107.274999999965,
-                "baseline_total_latency_ms": 1130.1995409999508,
-                "zinc_end_to_end_tps": 14.160317319838281,
-                "baseline_end_to_end_tps": 38.931178436925165,
-                "pct_of_baseline": 82.03473299999999,
-                "delta_tps": -8.479519744886602,
-                "delta_pct": -17.96526700000001,
+                "zinc_prompt_tps": 51.15,
+                "baseline_prompt_tps": 27.522430781086584,
+                "zinc_decode_tps": 38.66,
+                "baseline_decode_tps": 47.14187642346369,
+                "zinc_total_latency_ms": 3006.058290999994,
+                "baseline_total_latency_ms": 972.8692080000037,
+                "zinc_end_to_end_tps": 14.637108046684943,
+                "baseline_end_to_end_tps": 45.227045566026206,
+                "zinc_overall_tps": 41.41827373471952,
+                "baseline_overall_tps": 39.468609000636874,
+                "pct_of_baseline": 82.00776662499999,
+                "delta_tps": -8.481876423463696,
+                "delta_pct": -17.992233375000012,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 117.6936,
-                "latency_pct_of_baseline": 274.93153972180744,
-                "latency_delta_ms": 1977.0754590000142,
-                "end_to_end_pct_of_baseline": 36.37269121657927,
-                "end_to_end_delta_tps": -24.770861117086884
+                "prompt_pct_of_baseline": 185.84841,
+                "latency_pct_of_baseline": 308.9889438663355,
+                "latency_delta_ms": 2033.1890829999902,
+                "end_to_end_pct_of_baseline": 32.3636175290656,
+                "end_to_end_delta_tps": -30.589937519341262,
+                "overall_pct_of_baseline": 104.93978577773335,
+                "overall_delta_tps": 1.9496647340826456
               }
             }
           ]
