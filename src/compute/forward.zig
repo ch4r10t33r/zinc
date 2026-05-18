@@ -2742,7 +2742,9 @@ pub const InferenceEngine = struct {
                 ssm_prefill_validate_beta_ref = try Buffer.initDeviceLocal(instance, ab_capture_bytes, usage_ref);
                 errdefer if (ssm_prefill_validate_beta_ref) |*b| b.deinit();
 
-                const staging_bytes = 2 * (qkv_capture_bytes + z_capture_bytes + 2 * ab_capture_bytes);
+                const staging_bytes = hidden_capture_bytes +
+                    2 * (qkv_capture_bytes + z_capture_bytes) +
+                    2 * ab_capture_bytes;
                 ssm_prefill_validate_staging = try Buffer.init(
                     instance,
                     staging_bytes,
@@ -2759,7 +2761,7 @@ pub const InferenceEngine = struct {
                     }
                 }
                 ssm_prefill_validate_enabled = true;
-                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM proj validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} staging={d} B", .{
+                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM proj validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} staging={d} B (batched qkv/z replay)", .{
                     dense_prefill_validate_layer,
                     dense_prefill_validate_max_tokens,
                     config.hidden_dim,
@@ -9409,30 +9411,44 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, dt_rank) *
             @sizeOf(f32);
-        const staging_needed = hidden_capture_bytes + qkv_total_bytes + z_total_bytes + 2 * ab_total_bytes;
+        const staging_needed = hidden_capture_bytes + 2 * (qkv_total_bytes + z_total_bytes) + 2 * ab_total_bytes;
         if (staging_needed > staging.size) return error.BufferTooSmall;
+
+        try self.ensureBatchedScratchCapacity(n_tokens);
+        const scratch_qkv = self.batched_scratch_gate orelse return error.BufferTooSmall;
+        const scratch_z = self.batched_scratch_up orelse return error.BufferTooSmall;
+        if (qkv_total_bytes > scratch_qkv.size or z_total_bytes > scratch_z.size) return error.BufferTooSmall;
 
         if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
-        self.decode_cmd.transferToTransferBarrier();
+        self.decode_cmd.transferToComputeBarrier();
+        try self.dispatchProjectionBatched(wqkv_t, norm_ref, scratch_qkv, conv_channels, hidden_dim, n_tokens);
+        try self.dispatchProjectionBatched(z_t, norm_ref, scratch_z, d_inner, hidden_dim, n_tokens);
+        self.decode_cmd.computeToTransferBarrier();
         const norm_ref_off: vk.c.VkDeviceSize = 0;
-        const qkv_ref_off = norm_ref_off + hidden_capture_bytes;
-        const z_ref_off = qkv_ref_off + qkv_total_bytes;
-        const alpha_ref_off = z_ref_off + z_total_bytes;
-        const beta_ref_off = alpha_ref_off + ab_total_bytes;
+        const qkv_ref_off: vk.c.VkDeviceSize = norm_ref_off + hidden_capture_bytes;
+        const z_ref_off: vk.c.VkDeviceSize = qkv_ref_off + qkv_total_bytes;
+        const alpha_ref_off: vk.c.VkDeviceSize = z_ref_off + z_total_bytes;
+        const beta_ref_off: vk.c.VkDeviceSize = alpha_ref_off + ab_total_bytes;
+        const qkv_batch_off: vk.c.VkDeviceSize = beta_ref_off + ab_total_bytes;
+        const z_batch_off: vk.c.VkDeviceSize = qkv_batch_off + qkv_total_bytes;
         const copies = [_]vk.c.VkBufferCopy{
             .{ .srcOffset = 0, .dstOffset = norm_ref_off, .size = hidden_capture_bytes },
             .{ .srcOffset = 0, .dstOffset = qkv_ref_off, .size = qkv_total_bytes },
             .{ .srcOffset = 0, .dstOffset = z_ref_off, .size = z_total_bytes },
             .{ .srcOffset = 0, .dstOffset = alpha_ref_off, .size = ab_total_bytes },
             .{ .srcOffset = 0, .dstOffset = beta_ref_off, .size = ab_total_bytes },
+            .{ .srcOffset = 0, .dstOffset = qkv_batch_off, .size = qkv_total_bytes },
+            .{ .srcOffset = 0, .dstOffset = z_batch_off, .size = z_total_bytes },
         };
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, norm_ref.handle, staging.handle, 1, &copies[0]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, qkv_ref.handle, staging.handle, 1, &copies[1]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, z_ref.handle, staging.handle, 1, &copies[2]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, alpha_ref.handle, staging.handle, 1, &copies[3]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, beta_ref.handle, staging.handle, 1, &copies[4]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_qkv.handle, staging.handle, 1, &copies[5]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_z.handle, staging.handle, 1, &copies[6]);
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
@@ -9459,6 +9475,8 @@ pub const InferenceEngine = struct {
         const z_ref_f = base[@intCast(z_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))];
         const alpha_ref_f = base[@intCast(alpha_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(ab_total_bytes / @sizeOf(f32)))];
         const beta_ref_f = base[@intCast(beta_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(ab_total_bytes / @sizeOf(f32)))];
+        const qkv_batch_f = base[@intCast(qkv_batch_off / @sizeOf(f32))..][0..@as(usize, @intCast(qkv_total_bytes / @sizeOf(f32)))];
+        const z_batch_f = base[@intCast(z_batch_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))];
 
         const mmap = self.model.mmap_data orelse return error.NoMmapData;
         const row_buf = try self.allocator.alloc(f32, hidden_dim);
@@ -9485,6 +9503,8 @@ pub const InferenceEngine = struct {
 
         var qkv_diff: DiffStats = .{};
         var z_diff: DiffStats = .{};
+        const qkv_batch_diff = DiffStats.compute(qkv_ref_f, qkv_batch_f);
+        const z_batch_diff = DiffStats.compute(z_ref_f, z_batch_f);
         var alpha_diff: DiffStats = .{};
         var beta_diff: DiffStats = .{};
         const qkv_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + wqkv_t.info.offset);
@@ -9526,13 +9546,17 @@ pub const InferenceEngine = struct {
                 UpdateDiff.run(&beta_diff, idx, @floatCast(dot), beta_ref_f[idx]);
             }
         }
-        const max_abs = @max(@max(qkv_diff.max_abs, z_diff.max_abs), @max(alpha_diff.max_abs, beta_diff.max_abs));
+        const max_abs = @max(@max(qkv_batch_diff.max_abs, z_batch_diff.max_abs), @max(@max(qkv_diff.max_abs, z_diff.max_abs), @max(alpha_diff.max_abs, beta_diff.max_abs)));
         const tol: f32 = 3e-3;
         const verdict: []const u8 = if (max_abs <= tol) "PASS" else "FAIL";
-        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm_proj sampled_cpu layer={d} tokens={d} verdict={s} max_abs qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} tol={e:.3}", .{
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm_proj batched_replay layer={d} tokens={d} verdict={s} max_abs batch_qkv={e:.6}@{d} batch_z={e:.6}@{d} sampled_cpu qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} tol={e:.3}", .{
             self.dense_prefill_validate_layer,
             n_tokens,
             verdict,
+            qkv_batch_diff.max_abs,
+            qkv_batch_diff.max_idx,
+            z_batch_diff.max_abs,
+            z_batch_diff.max_idx,
             qkv_diff.max_abs,
             qkv_diff.max_idx,
             z_diff.max_abs,
