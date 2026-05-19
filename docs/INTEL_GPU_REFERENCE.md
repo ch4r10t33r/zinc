@@ -111,27 +111,60 @@ The `2` is for K and V. GQA/MLA/MoE details change `kv_heads` and `head_dim`; KV
 
 ### Xe2 Xe-core Layout (B70)
 
+![Xe2 Xe-core Layout (B70 Battlemage)](/xe-core-b70.svg)
+
 The Xe core is the Battlemage scaling unit and the Intel counterpart to the AMD RDNA Compute Unit. On B70, 32 Xe cores are grouped into 8 render slices of 4 Xe cores each.
 
-Each Xe2-HPG Xe core contains:
+Each Xe2 Xe core contains:
 
-- **8 vector engines** (XVE) — SIMD execution units
-- **8 XMX engines** — systolic matrix arrays, one paired with each vector engine
+- **8 vector engines** (XVE) — SIMD execution units, the Intel analogue of an RDNA SIMD
+- **8 XMX engines** — systolic matrix arrays, paired one-to-one with the XVEs (DPAS dispatch)
 - **256 KB L1 cache** — shared across all vector engines in the Xe core
-- **128 KB SLM** (Shared Local Memory) — workgroup-managed scratchpad
+- **128 KB SLM** — workgroup-managed scratchpad, shared by the workgroup currently scheduled
+- **1 load/store unit** — message-routed (`send` family); coalescing and cache routing happen here
+- **Instruction cache** — shared across the Xe core's 8 XVEs
 
 Each vector engine has:
 
-- **8 hardware threads** — used to hide send/memory latency
-- **128 GRF registers per thread** in regular mode, or **256 GRFs** in large-GRF mode at the cost of halved thread count
-- **512-bit register width** — wider than Alchemist's 256-bit Xe-HPG entry in the oneAPI table
-- Native **SIMD16 and SIMD32** execution at the same compute width
+- **8 hardware threads** (regular GRF mode) or **4 hardware threads** (large GRF mode) — latency-hiding scheduling slots, the closest analogue of an RDNA wave slot
+- **128 GRF registers per thread** (regular) or **256 GRFs** (large) — one GRF is 64 bytes (512 bits)
+- **FPU pipe + Extended-Math pipe** — independent issue ports; FPU runs FMA32 / FMA16 / integer math, EM runs transcendentals (`exp`, `log`, `rcp`, `rsqrt`, sin / cos)
+- **XMX coprocessor** — fed through the XVE's instruction stream but issues DPAS to the paired matrix array
+- **Native SIMD16 and SIMD32 execution** at the same compute width — the compiler picks the SIMD size; the lane count is not a hardware-defined wave64
 
-B70 totals at 2280 MHz graphics clock:
+### RDNA CU ↔ Xe core Mapping
+
+For a reader already familiar with the [RDNA reference](/zinc/docs/gpu-reference/), this table maps the core concepts:
+
+| RDNA term | Intel Xe2 term | Notes |
+| --- | --- | --- |
+| Shader Engine | Render Slice | Coarse scheduling group; Navi 48 has 2 SEs, B70 has 8 render slices |
+| Compute Unit (CU) | Xe core | 1 CU ↔ 1 Xe core for shared L1/scratchpad scope |
+| WGP (2 CUs) | — | No equivalent on Battlemage; the Xe core is the indivisible unit |
+| SIMD (2 per CU) | XVE (8 per Xe core) | Intel has 4× more issue ports per core, each issuing a narrower vector |
+| Wave32 / Wave64 | SIMD16 / SIMD32 | Wave size is fixed in hardware on RDNA; subgroup size is compiler-chosen on Intel |
+| 16 wave slots per SIMD | 8 hw threads per XVE | RDNA's deeper slot count compensates for fewer issue lanes |
+| Matrix Core (WMMA) | XMX engine (DPAS) | Tile shapes differ — RDNA4 is 16×16×16; Intel tiles are driver-reported, commonly 8×16×16 |
+| VGPR file (192 KB per SIMD) | GRF (≈ 512 KB per Xe core) | Intel GRF is shared by all threads on a vector engine; per-thread 8 or 16 KB |
+| SGPR (32 KB per CU) | — | Intel has no separate scalar register file; uniform values live in the GRF |
+| LDS (64 KB per CU / 128 KB per WGP) | SLM (128 KB per Xe core) | Same scope and barrier model; banking differs |
+| L0 vector cache (32 KB per CU) | L1 (256 KB per Xe core) | Different naming; same role |
+| L2 (8 MB per SE on Navi 48) | L2 (GPU-wide, driver-reported) | Intel does not publish per-card L2 sizes as consistently |
+| Infinity Cache (64 MB on Navi 48) | — | No direct analogue on B70 |
+
+Two practical takeaways from the mapping:
+
+1. **An Intel subgroup is a compiler-vectorized SIMD thread**, commonly 16 or 32 work-items wide. A 64-thread workgroup on Intel is two or four subgroups, not one wave64. Ported shaders should treat subgroup size as a specialization input, not a compile-time constant inherited from RDNA.
+2. **The Xe core has 4× more issue ports than an RDNA CU (8 vs 2) but fewer thread slots per port (8 vs 16).** Total parallelism is similar; the latency-hiding strategy differs. Kernels that hit register pressure on RDNA may hit thread-count pressure on Intel and vice versa.
+
+### B70 Render Slice and Card Totals
+
+At the 2280 MHz graphics clock B70 ships at:
 
 | Property | B70 value | Inference consequence |
 | --- | ---: | --- |
-| Xe cores | 32 | Main scaling unit; render-slice grouped (8 × 4) |
+| Render slices | 8 | Coarse scheduling group |
+| Xe cores | 32 | 4 per render slice |
 | Vector engines | 256 | 32 Xe cores × 8 XVE per core |
 | XMX engines | 256 | 32 Xe cores × 8 XMX per core, one per XVE |
 | Hardware threads | 2048 | 256 XVE × 8 threads — drives latency hiding |
@@ -139,11 +172,16 @@ B70 totals at 2280 MHz graphics clock:
 | GRF per thread | 128 / 256 (regular / large) | Register pressure drives spills and occupancy |
 | Register width | 512 bits | One GRF is 64 bytes |
 | L1 per Xe core | 256 KB | Per-Xe-core, shared by vector engines |
+| L1 total | 8 MB | 32 × 256 KB across the GPU |
 | SLM per Xe core | 128 KB | Workgroup-scoped scratchpad |
+| SLM total | 4 MB | 32 × 128 KB across the GPU |
 | Max SLM per workgroup | 128 KB | Cap reduces residency to one workgroup per Xe core |
 | Max workgroup size | 1024 | API ceiling, not the optimal local size |
-
-The important mental-model shift from RDNA is that an Intel subgroup is a compiler-vectorized SIMD thread, commonly 16 or 32 work-items wide. A 64-thread workgroup on Intel is usually two or four subgroups, not one wave64. Ported shaders should treat subgroup size as a specialization input, not as a compile-time constant inherited from RDNA.
+| FP32 vector throughput | 22.94 TFLOPS | XVE FPU pipe path, no XMX |
+| FP16 / BF16 XMX throughput | ~184 TFLOPS | Half of INT8, derives from DPAS rate |
+| INT8 XMX throughput | 367 TOPS | DPAS engine peak |
+| VRAM | 32 GB GDDR6, 256-bit, 608 GB/s | Decode-bound workloads scale with bandwidth |
+| PCIe | 5.0 x16, ~64 GB/s/direction | Resizable BAR required for stable benchmarks |
 
 ### Subgroup Execution Model
 
@@ -199,7 +237,7 @@ Subgroup → SLM (128 KB/Xe core, workgroup-managed scratchpad)
   ↓
 Xe core → L1 cache (256 KB)
   ↓
-GPU → L3 cache (shared last-level GPU cache)
+GPU → L2 cache (shared last-level GPU cache, driver-reported size)
   ↓
 GPU → GDDR6 VRAM (32 GB, 256-bit, 608 GB/s)
   ↓
@@ -210,7 +248,7 @@ Host → PCIe 5.0 x16 (~64 GB/s per direction)
 
 - SLM is not coherent with global memory. Treat it as a load–barrier–compute–store scratchpad scoped to the workgroup.
 - L1 is per Xe core. Two workgroups on different Xe cores do not share L1 state even when accessing the same weights.
-- L3 is shared GPU-wide. Working sets that fit in L3 amplify effective bandwidth above the 608 GB/s VRAM spec.
+- L2 is shared GPU-wide. Working sets that fit in L2 amplify effective bandwidth above the 608 GB/s VRAM spec.
 - Memory operations are message-based (`send` / `sendc` / `sendsc` / `sends`). A load is a routed request with coalescing, cache, and response behavior; latency is hidden by hardware-thread occupancy, not ILP alone.
 - Block messages (`load_block2d`, `store_block2d`) carry more bytes per send and reduce instruction pressure on tiled kernels.
 - Resizable BAR is effectively mandatory for B-series benchmark nodes; without it, host-visible VRAM uploads stall.

@@ -114,7 +114,7 @@ test "Vulkan prefillBatched gates on env flag + canUseBatchedPrefillRdna" {
     try expectContains(src, "ZINC_BATCHED_PREFILL");
     try expectContains(src, "fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {");
     try expectContainsNear(src, fn_marker, "canUseBatchedPrefillRdna(self)", 2000);
-    try expectContainsNear(src, fn_marker, "ensureBatchedScratchCapacity", 2000);
+    try expectContainsNear(src, fn_marker, "ensureBatchedScratchCapacity", 3500);
 }
 
 test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
