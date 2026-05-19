@@ -324,6 +324,14 @@ fn readU32Env(env_name: [:0]const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
 }
 
+fn qwenMoeRoutePackValidateTokens() u32 {
+    const requested =
+        readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
+        readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS") orelse
+        qwen_moe_route_pack_validate_tokens;
+    return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
+}
+
 fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -4504,6 +4512,11 @@ pub const InferenceEngine = struct {
     fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
         const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
         try self.loadTokenEmbeddingInto(token_id, dst_buf, 0);
+        const validate_tokens = qwenMoeRoutePackValidateTokens();
+        if (self.qwen_prefill_validation_enabled and self.position < validate_tokens) {
+            const offset: usize = @as(usize, @intCast(self.position)) * @as(usize, @intCast(self.config.hidden_dim));
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, offset);
+        }
     }
 
     /// Get the DMMV pipeline, push constant buffer index, rows-per-workgroup, and block size.
@@ -10458,7 +10471,7 @@ fn ensureQwenMoeRoutePackValidationBuffers(
     k: u32,
     validate_shared: bool,
 ) !void {
-    const n: usize = @intCast(qwen_moe_route_pack_validate_tokens);
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens());
     const h: usize = @intCast(hidden_dim);
     const m: usize = @intCast(inter_dim);
     const sh: usize = @intCast(shexp_inter_dim);
@@ -10595,7 +10608,8 @@ fn validateQwenMoeRoutePackChunk(
     if (token_idx_u32 == 0) {
         engine.qwen_moe_route_validate_captured_tokens = 0;
     }
-    if (token_idx_u32 >= qwen_moe_route_pack_validate_tokens) return;
+    const validate_tokens = qwenMoeRoutePackValidateTokens();
+    if (token_idx_u32 >= validate_tokens) return;
 
     const k = cfg.n_experts_used;
     try ensureQwenMoeRoutePackValidationBuffers(engine, hidden_dim, inter_dim, shexp_inter_dim, k, can_validate_shared);
@@ -10667,9 +10681,9 @@ fn validateQwenMoeRoutePackChunk(
     }
 
     engine.qwen_moe_route_validate_captured_tokens = @max(engine.qwen_moe_route_validate_captured_tokens, token_idx_u32 + 1);
-    if (engine.qwen_moe_route_validate_captured_tokens < qwen_moe_route_pack_validate_tokens) return;
+    if (engine.qwen_moe_route_validate_captured_tokens < validate_tokens) return;
 
-    const n = qwen_moe_route_pack_validate_tokens;
+    const n = validate_tokens;
     const n_usize: usize = @intCast(n);
     const route_slots_u32 = n * k;
     const route_slots: usize = @intCast(route_slots_u32);
@@ -11214,7 +11228,7 @@ fn validateQwenRoutePackedSsmLayer0Prefix(
         return;
     }
 
-    const n = qwen_moe_route_pack_validate_tokens;
+    const n = qwenMoeRoutePackValidateTokens();
     const n_usize: usize = @intCast(n);
     const hidden_n: usize = @intCast(hidden_dim);
     const d_inner = cfg.ssm_d_inner;
