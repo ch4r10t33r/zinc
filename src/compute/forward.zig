@@ -4050,6 +4050,44 @@ pub const InferenceEngine = struct {
         try self.elementwise.recordRmsNorm(&self.decode_cmd, ds, hidden_dim, n_tokens, eps);
     }
 
+    fn dispatchRmsNormStoreHidden(
+        self: *InferenceEngine,
+        hidden_buf: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        weight_buf: vk.c.VkBuffer,
+        weight_size: vk.c.VkDeviceSize,
+        norm_out_buf: vk.c.VkBuffer,
+        norm_out_offset: vk.c.VkDeviceSize,
+        norm_out_size: vk.c.VkDeviceSize,
+        hidden_out_buf: vk.c.VkBuffer,
+        hidden_out_offset: vk.c.VkDeviceSize,
+        hidden_out_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        eps: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_rms_norm_store_hidden orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors or self.instance.push_descriptor_fn == null) return error.ShaderNotLoaded;
+        const push = RmsNormPush{
+            .N = hidden_dim,
+            .eps_bits = @bitCast(eps),
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = hidden_buf, .offset = 0, .range = hidden_size },
+            .{ .buffer = weight_buf, .offset = 0, .range = weight_size },
+            .{ .buffer = norm_out_buf, .offset = norm_out_offset, .range = norm_out_size },
+            .{ .buffer = hidden_out_buf, .offset = hidden_out_offset, .range = hidden_out_size },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            1,
+            1,
+            1,
+        );
+    }
+
     /// Fused RMS norm + f32 router DMMV. Reads `hidden_buf`, normalizes
     /// it once with `ffn_norm_w`, writes the normalized vector to
     /// `ffn_norm_buf` (so downstream MoE expert dispatches can consume
@@ -4983,6 +5021,7 @@ pub const InferenceEngine = struct {
             has_partial_hidden_in or
             has_partial_hidden_out or
             !self.partial_decode_advance_position;
+        var partial_hidden_out_written_by_stop = false;
 
         // Log MoE dimensions once (first decode)
         if (state.generated_tokens.items.len == 0 and is_moe) {
@@ -6563,6 +6602,31 @@ pub const InferenceEngine = struct {
                 lt.ffn_gate_inp_bias == null and
                 lt.ffn_gate_inp_scale == null and
                 (hidden_dim % 4) == 0;
+            const can_store_partial_stop = self.partial_decode_stop_after_ffn_norm and
+                !can_fuse_rms_router and
+                self.prefill_active and
+                self.qwen36DensePrefillPartialStoreEnabled() and
+                self.partial_decode_ffn_norm_out != null and
+                self.partial_decode_hidden_out != null and
+                (hidden_dim % 4) == 0;
+            if (can_store_partial_stop) {
+                try self.dispatchRmsNormStoreHidden(
+                    self.hidden_buf.handle,
+                    hidden_size,
+                    ffn_norm_tensor.gpu_buffer.handle,
+                    ffn_norm_tensor.gpu_buffer.size,
+                    self.partial_decode_ffn_norm_out.?,
+                    self.partial_decode_ffn_norm_out_offset,
+                    hidden_size,
+                    self.partial_decode_hidden_out.?,
+                    self.partial_decode_hidden_out_offset,
+                    hidden_size,
+                    hidden_dim,
+                    rms_norm_eps,
+                );
+                partial_hidden_out_written_by_stop = true;
+                break;
+            }
             if (!can_fuse_rms_router) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
@@ -8926,14 +8990,16 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.final_copy, final_copy_phase);
             self.endProfilePhase(.final_tail, final_tail_phase);
         }
-        if (self.partial_decode_hidden_out) |hidden_out| {
-            self.decode_cmd.computeToTransferBarrier();
-            const region = vk.c.VkBufferCopy{
-                .srcOffset = 0,
-                .dstOffset = self.partial_decode_hidden_out_offset,
-                .size = hidden_size,
-            };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &region);
+        if (!partial_hidden_out_written_by_stop) {
+            if (self.partial_decode_hidden_out) |hidden_out| {
+                self.decode_cmd.computeToTransferBarrier();
+                const region = vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = self.partial_decode_hidden_out_offset,
+                    .size = hidden_size,
+                };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &region);
+            }
         }
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
@@ -11835,6 +11901,14 @@ pub const InferenceEngine = struct {
             std.mem.eql(u8, mode, "z");
     }
 
+    fn qwen36DensePrefillPartialStoreEnabled(self: *const InferenceEngine) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return self.instance.push_descriptor_fn != null and
+            self.elementwise.pipeline_rms_norm_store_hidden != null;
+    }
+
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
         if (self.partial_ssm_preproj_layer != layer) return false;
         const has_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
@@ -12136,7 +12210,11 @@ pub const InferenceEngine = struct {
             try self.decode_cmd.beginOneTime();
             self.resetTimestamps();
             _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-            self.decode_cmd.transferToComputeBarrier();
+            if (self.qwen36DensePrefillPartialStoreEnabled()) {
+                self.decode_cmd.computeBarrier();
+            } else {
+                self.decode_cmd.transferToComputeBarrier();
+            }
             const dense_ffn_phase = self.beginProfilePhase();
             const dense_ffn_gateup_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);

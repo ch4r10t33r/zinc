@@ -1,83 +1,79 @@
 #version 460
-// Batched fused RMS normalization x SiLU gating for SSM layers.
+// ZINC — RMS norm plus hidden snapshot for Qwen3.6 27B prefix prefill.
 //
-// Grid:
-//   x = SSM head
-//   y = token index
+// This file intentionally occupies the previously-unwired
+// ssm_gated_norm_batched build slot. The runtime loads it as
+// pipeline_rms_norm_store_hidden.
 //
-// Buffer layout is token-major: [n_tok][d_inner]. The push-constant layout
-// intentionally matches ssm_gated_norm.comp so host code can reuse
-// SsmGatedNormPush when dispatching this with grid.y > 1.
+// Semantics for one token:
+//   norm_out[i] = weight[i] * hidden[i] * rsqrt(mean(hidden^2) + eps)
+//   hidden_out[i] = hidden[i]
+//
+// The prefix dense-FFN path stops each token after the layer branch and FFN
+// norm, then runs gate/up/down layer-major. This shader replaces
+// rms_norm_mul + two transfer copies (norm and hidden snapshot) with one
+// compute dispatch that writes both scratch slots directly.
+
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0) readonly buffer DeltaNetOutput {
-    float delta_net_output[];
-};
-
-layout(set = 0, binding = 1) readonly buffer ZGate {
-    float z_gate[];
-};
-
-layout(set = 0, binding = 2) readonly buffer NormWeights {
-    float norm_weight[];
-};
-
-layout(set = 0, binding = 3) writeonly buffer Output {
-    float out_buf[];
-};
+layout(set = 0, binding = 0) readonly  buffer Hidden    { vec4 hidden_v4[];     };
+layout(set = 0, binding = 1) readonly  buffer Weight    { vec4 weight_v4[];     };
+layout(set = 0, binding = 2) writeonly buffer NormOut   { vec4 norm_out_v4[];   };
+layout(set = 0, binding = 3) writeonly buffer HiddenOut { vec4 hidden_out_v4[]; };
 
 layout(push_constant) uniform PushConstants {
-    uint d_inner;
-    uint dt_rank;
-    uint head_v_dim;
-    uint d_state;
-    uint norm_per_head;
+    uint N;
+    float eps;
 };
 
+const uint MAX_PER_THREAD = 20u;
+
 shared float s_partial[64];
+shared float s_rms_inv;
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint h = gl_WorkGroupID.x;
-    uint tok = gl_WorkGroupID.y;
-    uint token_base = tok * d_inner;
-    uint head_base = token_base + h * head_v_dim;
+    uint N_v4 = N >> 2;
 
+    vec4 reg_x[MAX_PER_THREAD];
     float sum_sq = 0.0;
-    for (uint i = tid; i < head_v_dim; i += 64u) {
-        float val = delta_net_output[head_base + i];
-        sum_sq += val * val;
+    uint slot = 0u;
+    for (uint i_v4 = tid; i_v4 < N_v4; i_v4 += 64u) {
+        vec4 v = hidden_v4[i_v4];
+        if (slot < MAX_PER_THREAD) {
+            reg_x[slot] = v;
+        }
+        slot++;
+        sum_sq += dot(v, v);
     }
 
     sum_sq = subgroupAdd(sum_sq);
-
-    if (gl_SubgroupSize < 64u) {
-        s_partial[tid] = sum_sq;
-        barrier();
-        if (tid == 0u) {
-            float total = 0.0;
-            uint num_subgroups = (64u + gl_SubgroupSize - 1u) / gl_SubgroupSize;
-            for (uint s = 0u; s < num_subgroups; s++) {
-                total += s_partial[s * gl_SubgroupSize];
-            }
-            s_partial[0] = total;
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            s_partial[gl_SubgroupID] = sum_sq;
         }
         barrier();
-        sum_sq = s_partial[0];
+        if (tid == 0u) {
+            float merged = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+                merged += s_partial[sg];
+            }
+            s_rms_inv = inversesqrt(merged / float(N) + eps);
+        }
+        barrier();
+    } else if (tid == 0u) {
+        s_rms_inv = inversesqrt(sum_sq / float(N) + eps);
     }
+    barrier();
 
-    float rms_inv = inversesqrt(sum_sq / float(head_v_dim) + 1e-6);
-
-    for (uint i = tid; i < head_v_dim; i += 64u) {
-        uint idx = head_base + i;
-        float nv = delta_net_output[idx] * rms_inv;
-        uint norm_idx = (norm_per_head != 0u) ? (h * head_v_dim + i) : (i % d_state);
-        nv *= norm_weight[norm_idx];
-
-        float zv = z_gate[idx];
-        float gate = zv / (1.0 + exp(-zv));
-        out_buf[idx] = nv * gate;
+    float rms_inv = s_rms_inv;
+    slot = 0u;
+    for (uint i_v4 = tid; i_v4 < N_v4; i_v4 += 64u) {
+        vec4 v = (slot < MAX_PER_THREAD) ? reg_x[slot] : hidden_v4[i_v4];
+        slot++;
+        hidden_out_v4[i_v4] = v;
+        norm_out_v4[i_v4] = weight_v4[i_v4] * (v * rms_inv);
     }
 }

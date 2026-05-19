@@ -222,6 +222,8 @@ pub const QkNormRopeKvWritePush = extern struct {
 pub const ElementwiseDispatch = struct {
     /// RMS NORM pipeline, or null.
     pipeline_rms_norm: ?Pipeline,
+    /// RMS norm plus hidden-store pipeline for Qwen3.6 27B prefix partial decode.
+    pipeline_rms_norm_store_hidden: ?Pipeline,
     /// SWIGLU pipeline, or null.
     pipeline_swiglu: ?Pipeline,
     /// OAI SWIGLU pipeline (gpt-oss), or null.
@@ -347,6 +349,13 @@ pub const ElementwiseDispatch = struct {
         const rms_path = std.fmt.bufPrint(&path_buf, "{s}/rms_norm_mul.spv", .{shader_dir}) catch unreachable;
         const pipeline_rms_norm = pipeline_mod.createFromSpirvWithOptions(instance, rms_path, 3, @sizeOf(RmsNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
             log.warn("rms_norm_mul shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        // Reuses the previously-unwired ssm_gated_norm_batched shader slot so
+        // build.zig's existing shader manifest installs this prefix-only helper.
+        const rms_store_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_gated_norm_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_rms_norm_store_hidden = pipeline_mod.createFromSpirvWithOptions(instance, rms_store_path, 4, @sizeOf(RmsNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("rms_norm_store_hidden shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -582,6 +591,7 @@ pub const ElementwiseDispatch = struct {
 
         return ElementwiseDispatch{
             .pipeline_rms_norm = pipeline_rms_norm,
+            .pipeline_rms_norm_store_hidden = pipeline_rms_norm_store_hidden,
             .pipeline_swiglu = pipeline_swiglu,
             .pipeline_swiglu_oai = pipeline_swiglu_oai,
             .pipeline_geglu = pipeline_geglu,
@@ -997,6 +1007,7 @@ pub const ElementwiseDispatch = struct {
     /// @param self Dispatch wrapper to tear down in place.
     pub fn deinit(self: *ElementwiseDispatch) void {
         if (self.pipeline_rms_norm) |*p| p.deinit();
+        if (self.pipeline_rms_norm_store_hidden) |*p| p.deinit();
         if (self.pipeline_swiglu) |*p| p.deinit();
         if (self.pipeline_swiglu_oai) |*p| p.deinit();
         if (self.pipeline_geglu) |*p| p.deinit();
