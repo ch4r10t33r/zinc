@@ -6491,6 +6491,21 @@ fn dispatchGemmQ8_0OnCmd(
     K: u32,
     N: u32,
 ) void {
+    dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, weight, &weight.gpu_buffer, tensorPageOffset(engine.model, weight), input, output, M, K, N);
+}
+
+fn dispatchGemmQ8_0OnCmdWithWeightBuf(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    weight_buf: *const MetalBuffer,
+    weight_offset: u32,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
     std.debug.assert(K % 32 == 0);
     recordDmmvProfile(engine, weight, M, K);
     const push = GemmPush{
@@ -6504,9 +6519,9 @@ fn dispatchGemmQ8_0OnCmd(
         .nb12 = 0,
         .ne0 = @intCast(M),
         .ne1 = @intCast(N),
-        .src0_off = tensorPageOffset(engine.model, weight),
+        .src0_off = weight_offset,
     };
-    const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
+    const bufs = [_]*const MetalBuffer{ weight_buf, input, output };
     const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
     cmd.dispatchV2WithTgMem(&engine.gemm_q8_0_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
 }
@@ -7697,6 +7712,8 @@ fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx
     const lt = engine.layer_tensors[layer_idx];
     const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
     const router_t = lt.ffn_gate_inp orelse return false;
+    const ssm_out_t = lt.ssm_out orelse return false;
+    if (ssm_out_t.info.type_ != .q8_0) return false;
     if (!canUseRouterQ8Topk(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim)) return false;
     return canUseQwenRoutePackedPrefixMoeLayer(engine, lt, engine.config.hidden_dim, inter_dim);
 }
@@ -7880,21 +7897,20 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
     const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
 
-    // llama.cpp switches `mul_mat_id` to a batched matrix path once the routed
-    // batch is large enough; vLLM first groups top-k route slots by expert.
-    // Keep Qwen SSM recurrence token-ordered, but batch this layer's Q8
-    // projections and route-packed MoE over the full prompt slice.
+    // llama.cpp switches Metal matmul work to a batched matrix path once the
+    // row batch is large enough (`ggml_metal_op_mul_mat_id`). Keep Qwen SSM
+    // recurrence token-ordered, but batch this layer's Q8 input projections,
+    // SSM-out projection, and route-packed MoE over the full prompt slice.
     try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
 
     const hidden_dim_usize: usize = @intCast(hidden_dim);
+    const d_inner_usize: usize = @intCast(d_inner);
     const token_count: usize = @intCast(n_tokens);
     for (0..token_count) |i| {
         const token_index: u32 = @intCast(i);
-        const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
-        const token_routing_offset: u32 = @intCast(i * @as(usize, cfg.n_experts_used) * 2);
+        const token_ssm_offset: u32 = @intCast(i * d_inner_usize);
         engine.position = token_index;
 
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.hidden, &engine.hidden_buf, hidden_dim, token_hidden_offset, 0);
         dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank);
         profileBarrier(cmd, profile, .ssm);
 
@@ -7951,7 +7967,21 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         if (profile) |p| p.ssm_gated_norm_calls += 1;
         profileBarrier(cmd, profile, .ssm);
 
-        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &engine.swiglu_buf, &engine.down_buf, hidden_dim, d_inner, 0);
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.swiglu_buf, &scratch.swiglu, d_inner, 0, token_ssm_offset);
+    }
+    profileBarrier(cmd, profile, .ssm);
+
+    dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
+    profileBarrier(cmd, profile, .ssm);
+
+    for (0..token_count) |i| {
+        const token_index: u32 = @intCast(i);
+        const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
+        const token_routing_offset: u32 = @intCast(i * @as(usize, cfg.n_experts_used) * 2);
+        engine.position = token_index;
+
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.hidden, &engine.hidden_buf, hidden_dim, token_hidden_offset, 0);
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.down, &engine.down_buf, hidden_dim, token_hidden_offset, 0);
         profileBarrier(cmd, profile, .ssm);
         dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
         profileBarrier(cmd, profile, .router);
