@@ -23,12 +23,14 @@ ZINC currently targets:
 
 This list is intentionally narrow. It shows the exact GGUFs that have been validated end-to-end.
 
-| Model | Exact GGUF | Fits on |
-|------|------------|---------|
-| **OpenAI GPT-OSS 20B** | [openai_gpt-oss-20b-Q4_K_M.gguf](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF) | 16+ GB unified (Apple Silicon) |
-| **Qwen3 8B** | [Qwen3-8B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 16+ GB VRAM or unified |
-| **Qwen3.6 35B-A3B UD** | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified |
-| **Qwen3.6 27B Dense** | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified |
+| Model | Model ID (`zinc model pull <id>`) | Exact GGUF | Fits on | Status |
+|------|------|------------|---------|--------|
+| **OpenAI GPT-OSS 20B** | `gpt-oss-20b-q4k-m` | [openai_gpt-oss-20b-Q4_K_M.gguf](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF) | 16+ GB unified (Apple Silicon) | supported |
+| **Qwen3 8B** | `qwen3-8b-q4k-m` | [Qwen3-8B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 16+ GB VRAM or unified | supported |
+| **Gemma 4 12B** | `gemma4-12b-q4k-m` | Gemma4 12B Q4_K_M | 16+ GB VRAM or unified | experimental |
+| **Gemma 4 31B** | `gemma4-31b-q4k-m` | Gemma4 31B Q4_K_M | 24+ GB VRAM or unified | supported |
+| **Qwen3.6 27B Dense** | `qwen36-27b-q4k-m` | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified | experimental |
+| **Qwen3.6 35B-A3B UD** | `qwen36-35b-a3b-q4k-xl` | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified | supported |
 
 ## Install dependencies
 

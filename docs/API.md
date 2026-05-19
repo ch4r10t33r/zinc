@@ -498,9 +498,9 @@ Errors use an OpenAI-style envelope:
 
 - All endpoints include `Access-Control-Allow-Origin: *`.
 - `OPTIONS` requests return `200 {}` for CORS preflight.
-- Streaming responses use HTTP/1.1 chunked transfer encoding.
+- Streaming responses use HTTP/1.1 chunked transfer encoding (`Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`, `Transfer-Encoding: chunked`).
 - Client disconnection during streaming stops generation promptly.
-- Connections are closed after each response with `Connection: close`.
+- Non-streaming JSON responses send `Connection: close`. The HTML routes (`/`, `/chat`) also send `Connection: close`.
 
 ## Server Configuration
 

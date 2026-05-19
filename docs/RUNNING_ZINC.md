@@ -64,14 +64,14 @@ The model section is the most operationally useful one. It reports:
 
 - `Tensor upload`: exact device-local weight bytes derived from the GGUF tensors
 - `VRAM fit`: estimated device-local total against the selected GPU's VRAM
-- `KV cache`: current estimate for the active runtime, which is capped to a `4096` token context in today's engine
+- `KV cache`: current estimate for the active runtime; the engine picks an auto context from the VRAM budget (85% utilization, aligned to 512 tokens) with a `4096` minimum floor — pass `-c <tokens>` to override
 - `GPU SSM state`: persistent device-local SSM state when the architecture uses it
 - `host-visible staging`: mapped/readback buffers, reported separately from device-local VRAM
 
 Important assumptions behind the fit estimate:
 
 - it reflects the current single-GPU runtime, not multi-GPU sharding
-- it reflects the current engine's `4096` KV cap even if the GGUF advertises a much larger context window
+- the auto-context heuristic floors at `4096` tokens and aligns to 512; use `-c` to request a smaller or larger context within the GGUF's architectural ceiling and the device's VRAM budget
 - it excludes Vulkan allocation alignment, descriptor pools, query pools, and driver overhead
 
 Exit behavior:
