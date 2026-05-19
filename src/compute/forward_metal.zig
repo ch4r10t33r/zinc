@@ -31,7 +31,11 @@ const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 const qwen_moe_route_pack_validate_tokens: u32 = 4;
-const qwen_route_packed_prefix_layer_limit: usize = 12;
+// One Qwen3.6 full-attention interval beyond the previously validated prefix.
+// This extends the llama.cpp `ggml_metal_op_mul_mat_id` / vLLM route-packed
+// grouped-MoE prefill shape through layer 15 while preserving the per-layer
+// support checks before each layer is recorded.
+const qwen_route_packed_prefix_layer_limit: usize = 16;
 const moe_route_block_cols: u32 = 4;
 
 /// Runtime state for the decode loop.
