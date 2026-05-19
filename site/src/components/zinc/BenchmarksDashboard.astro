@@ -343,12 +343,55 @@ function compactReason(reason: string | null | undefined) {
   return reason;
 }
 
+function outputQualityStatus(scenario: any) {
+  const preview = `${scenario?.zinc?.output_preview ?? ''}`.trim();
+  const generatedTokens = scenario?.zinc?.generated_tokens ?? null;
+  if (!preview) {
+    return {
+      tone: 'neutral',
+      label: 'No Preview',
+      note: 'No output preview was captured for this workload.',
+    };
+  }
+
+  if (/^<\|(?:im_end|endoftext|end)\|>$/.test(preview) || (generatedTokens != null && generatedTokens <= 4 && preview.includes('<|im_end|>'))) {
+    return {
+      tone: 'caution',
+      label: 'Review Output',
+      note: 'ZINC completed numerically, but the preview is only a stop token.',
+    };
+  }
+
+  if (/(?:^|[\s:])(?:\d+\.){12,}/.test(preview)) {
+    return {
+      tone: 'caution',
+      label: 'Review Output',
+      note: 'ZINC completed numerically, but the preview shows a repeated numeric pattern.',
+    };
+  }
+
+  return {
+    tone: 'positive',
+    label: 'Preview OK',
+    note: 'The captured preview does not show an obvious stop-token or repetition failure.',
+  };
+}
+
 function scenarioStatus(scenario: any) {
   const zincOk = promptValue(scenario) != null || decodeValue(scenario) != null || endToEndValue(scenario) != null;
   const baselineOk = baselinePromptValue(scenario) != null || baselineDecodeValue(scenario) != null;
   const reason = compactReason(warningText(scenario));
+  const quality = outputQualityStatus(scenario);
 
   if (zincOk && baselineOk) {
+    if (quality.tone === 'caution') {
+      return {
+        tone: 'caution',
+        label: quality.label,
+        note: quality.note,
+      };
+    }
+
     return {
       tone: 'positive',
       label: 'Compared',
@@ -527,6 +570,7 @@ function scenarioSummary(target: any, scenarioId: string) {
     avgDecodeGap: mean(rows.map((row) => decodeRatioValue(row.scenario))),
     avgOverall: mean(rows.map((row) => overallValue(row.scenario))),
     avgOverallGap: mean(rows.map((row) => overallRatioValue(row.scenario))),
+    reviewCount: rows.filter((row) => outputQualityStatus(row.scenario).tone === 'caution').length,
     fastestModelLabel: fastestRow?.model?.label ?? null,
     fastestDecode: fastestRow ? decodeValue(fastestRow.scenario) : null,
     closestModelLabel: closestRow?.model?.label ?? null,
@@ -805,6 +849,10 @@ const jsonLd = {
                     <strong>{formatPercent(summary.avgOverallGap)}</strong>
                     overall
                   </span>
+                  <span class:list={['info-chip', summary.reviewCount > 0 ? 'caution' : 'positive']}>
+                    <strong>{summary.reviewCount}</strong>
+                    output review
+                  </span>
                 </div>
               </article>
 
@@ -858,7 +906,8 @@ const jsonLd = {
                         <div class="rank-model">
                           <div>
                             <strong>{displayModelLabel(row.model)}</strong>
-                            <small>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
+                            <small title={rowStatus.note}>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
+                            <span class:list={['status-pill', 'rank-status', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
                           </div>
                         </div>
                         <div class="rank-bars">
@@ -938,7 +987,7 @@ const jsonLd = {
                               <strong>{displayModelLabel(row.model)}</strong>
                               <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
                             </div>
-                            <span class:list={['status-pill', rowStatus.tone]}>{rowStatus.label}</span>
+                            <span class:list={['status-pill', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
                           </header>
 
                           <div class="mobile-metric">
@@ -1038,6 +1087,7 @@ const jsonLd = {
                         const decodeRatio = decodeRatioValue(row.scenario);
                         const overallRatio = overallRatioValue(row.scenario);
                         const runCount = sampleCount(row.scenario?.zinc?.decode_tps) || sampleCount(row.scenario?.baseline?.decode_tps);
+                        const rowStatus = scenarioStatus(row.scenario);
 
                         return (
                           <tr>
@@ -1045,7 +1095,7 @@ const jsonLd = {
                               <div class="model-row">
                                 <div>
                                   <strong>{displayModelLabel(row.model)}</strong>
-                                  <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {runCount || 0} runs</small>
+                                  <small title={rowStatus.note}>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {runCount || 0} runs · {rowStatus.label}</small>
                                 </div>
                               </div>
                             </th>
@@ -1805,6 +1855,10 @@ const jsonLd = {
     display: block;
     color: var(--color-text-muted);
     line-height: 1.35;
+  }
+
+  .rank-status {
+    display: none;
   }
 
   .rank-bars {
@@ -3116,6 +3170,11 @@ const jsonLd = {
 
     .rank-model small {
       display: none;
+    }
+
+    .rank-status {
+      display: inline-flex;
+      margin-top: 0.42rem;
     }
 
     .rank-ratio {
