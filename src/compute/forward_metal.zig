@@ -1852,10 +1852,10 @@ pub const InferenceEngine = struct {
     argmax_pipe: MetalPipeline,
 
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
-    // Only loaded when the model has Q4_K / Q6_K weights; other quants stay
-    // on the DMMV path until GEMM kernels are ported.
+    // Q8_0 is currently wired only into the Qwen36 SSM projection validator.
     gemm_q4k_pipe: MetalPipeline,
     gemm_q6k_pipe: MetalPipeline,
+    gemm_q8_0_pipe: MetalPipeline,
     // Batched flash attention for prefill — handles N queries with causal masking.
     // `_q8` variant reads K/V from a Q8_0-quantized cache; default reads f32.
     flash_attn_batched_pipe: MetalPipeline,
@@ -2238,6 +2238,7 @@ pub const InferenceEngine = struct {
         self.argmax_pipe = try loadShaderPipeline(ctx, "argmax");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
+        self.gemm_q8_0_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
         self.flash_attn_batched_pipe = try loadShaderPipeline(ctx, "flash_attn_batched");
         self.flash_attn_batched_q8_pipe = try loadShaderPipeline(ctx, "flash_attn_batched_q8");
         self.rope_batched_pipe = try loadShaderPipeline(ctx, "rope_batched");
@@ -2954,6 +2955,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.argmax_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q8_0_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_q8_pipe);
         metal_pipeline.freePipeline(&self.rope_batched_pipe);
@@ -5699,6 +5701,40 @@ fn dispatchGemmQ6KOnCmd(
     cmd.dispatchV2WithTgMem(&engine.gemm_q6k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
 }
 
+/// Dispatch a Q8_0 x f32 batched matmul.
+///
+/// Computes `output[N x M] = weight[M x K] x input[N x K]` and stores output
+/// token-major, matching the existing batched prefill GEMM layout.
+fn dispatchGemmQ8_0OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 32 == 0);
+    recordDmmvProfile(engine, weight, M, K);
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 32) * 34,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = tensorPageOffset(engine.model, weight),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q8_0_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
 /// Dispatch batched RoPE for N tokens at consecutive positions.
 /// rope_batched.metal: buffer(0)=push, buffer(1)=in, buffer(2)=out, buffer(3)=inv_freq.
 fn dispatchRopeBatchedOnCmd(
@@ -7781,6 +7817,107 @@ fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize
         layer_idx == 0;
 }
 
+fn shouldValidateQwenSsmProjection(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    using_local_cmd: bool,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        cfg.architecture == .qwen2_moe and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < 4 and
+        layer_idx == 0 and
+        wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        engine.gemm_q8_0_pipe.handle != null;
+}
+
+fn logQwenSsmProjectionValidationDiff(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    tensor_name: []const u8,
+    diff: SliceDiff,
+    ref_value: f32,
+    candidate_value: f32,
+    tol: f32,
+) void {
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+}
+
+fn validateQwenSsmProjectionBatchKernel(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    hidden_dim: u32,
+) !void {
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.norm_buf, &engine.swiglu_buf, conv_channels, hidden_dim, 1);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.norm_buf, &engine.expert_gate_batch_buf, d_inner, hidden_dim, 1);
+    commitAndWaitProfiled(&cmd, profile);
+
+    const ref_wqkv: [*]const f32 = @ptrCast(@alignCast(engine.attn_out_buf.cpu_ptr.?));
+    const got_wqkv: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
+    const wqkv_diff = diffF32Slices(ref_wqkv[0..conv_channels], got_wqkv[0..conv_channels]);
+    logQwenSsmProjectionValidationDiff(
+        engine,
+        layer_idx,
+        "ssm_qkv_gemm_q8_0",
+        wqkv_diff,
+        ref_wqkv[wqkv_diff.max_idx],
+        got_wqkv[wqkv_diff.max_idx],
+        2.0,
+    );
+
+    const ref_z: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+    const got_z: [*]const f32 = @ptrCast(@alignCast(engine.expert_gate_batch_buf.cpu_ptr.?));
+    const z_diff = diffF32Slices(ref_z[0..d_inner], got_z[0..d_inner]);
+    logQwenSsmProjectionValidationDiff(
+        engine,
+        layer_idx,
+        "ssm_z_gemm_q8_0",
+        z_diff,
+        ref_z[z_diff.max_idx],
+        got_z[z_diff.max_idx],
+        2.0,
+    );
+}
+
 fn logQwenPrefillValidationDiff(
     engine: *const InferenceEngine,
     layer_idx: usize,
@@ -9464,6 +9601,14 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
             }
             profileBarrier(cmd, profile, .ssm);
+            if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t)) {
+                commitAndWaitProfiled(cmd, profile);
+                const validation_start = profileStart(profile != null);
+                try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, conv_channels, d_inner, hidden_dim);
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+                local_cmd_storage = try beginProfiledCommand(engine, profile);
+                cmd = &local_cmd_storage;
+            }
 
             // Conv1d: attn_out_buf → swiglu_buf
             {
@@ -13916,6 +14061,88 @@ test "dmmv_q8_0 shader matches CPU reference across many workgroups" {
     const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     for (0..M) |row| {
         try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.05);
+    }
+}
+
+test "gemm_q8_0 shader matches CPU reference for batched tokens" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 70;
+    const K: usize = 64;
+    const N: usize = 5;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 3)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = K * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2WithTgMem(&pipe, .{ @intCast((N + 31) / 32), @intCast((M + 63) / 64), 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        const token_input = input_ptr[token * K .. (token + 1) * K];
+        for (0..M) |row| {
+            dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+            var expected: f32 = 0;
+            for (0..K) |i| expected += ref_row[i] * token_input[i];
+            try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.1);
+        }
     }
 }
 
