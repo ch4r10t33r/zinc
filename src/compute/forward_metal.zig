@@ -3738,18 +3738,42 @@ pub const InferenceEngine = struct {
         }
 
         var route_packed_start_layer: usize = 1;
+        var route_packed_prefix_ssm_layers: u32 = 0;
+        var route_packed_prefix_attn_layers: u32 = 0;
         while (route_packed_start_layer < qwen_route_packed_prefix_layer_limit) {
             if (canUseQwenRoutePackedPrefixSsmLayer(self, route_packed_start_layer, prompt_tokens.len)) {
                 try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
                 route_packed_start_layer += 1;
+                route_packed_prefix_ssm_layers += 1;
                 continue;
             }
             if (canUseQwenRoutePackedPrefixAttentionLayer(self, route_packed_start_layer, prompt_tokens.len)) {
                 try recordQwenRoutePackedPrefixAttentionLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
                 route_packed_start_layer += 1;
+                route_packed_prefix_attn_layers += 1;
                 continue;
             }
             break;
+        }
+        if (profile != null) {
+            const stop_reason: []const u8 = if (route_packed_start_layer >= self.layer_tensors.len)
+                "model_end"
+            else if (route_packed_start_layer >= qwen_route_packed_prefix_layer_limit)
+                "limit"
+            else if (isFullAttentionLayer(cfg, route_packed_start_layer))
+                "attention_guard"
+            else
+                "ssm_guard";
+            const prefix_last_layer = if (route_packed_start_layer == 0) 0 else route_packed_start_layer - 1;
+            log.info("Metal profile: Qwen route-packed prefill prefix active layers=0..{d} total={d} ssm={d} attn={d} prompt_tokens={d} stop_layer={d} stop={s}", .{
+                prefix_last_layer,
+                route_packed_start_layer,
+                route_packed_prefix_ssm_layers + 1,
+                route_packed_prefix_attn_layers,
+                n_tokens,
+                route_packed_start_layer,
+                stop_reason,
+            });
         }
 
         commitAsyncProfiled(&layer0_cmd, profile);
