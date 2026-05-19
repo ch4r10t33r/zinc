@@ -155,6 +155,8 @@ const ProfilePhase = enum(u8) {
     // outer dense_ffn bucket; the GPU timestamps are independent so the
     // sub-bucket sums won't double-count the outer total.
     dense_ffn_gateup,
+    dense_ffn_gate,
+    dense_ffn_up,
     dense_ffn_down,
     final_tail,
     final_norm,
@@ -193,6 +195,8 @@ const ProfilePhase = enum(u8) {
             .shared_gate_acc => "shared_gate",
             .dense_ffn => "dense_ffn",
             .dense_ffn_gateup => "dense_ffn_gateup",
+            .dense_ffn_gate => "dense_ffn_gate",
+            .dense_ffn_up => "dense_ffn_up",
             .dense_ffn_down => "dense_ffn_down",
             .final_tail => "tail",
             .final_norm => "tail_norm",
@@ -8501,8 +8505,12 @@ pub const InferenceEngine = struct {
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else {
+                    const dense_ffn_gate_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(gate_tensor, self.ffn_norm_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
+                    const dense_ffn_up_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(up_tensor, self.ffn_norm_buf, hidden_size, self.up_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
                     const dense_gateup_ranges = [_]CommandBuffer.BufferRange{
                         .{ .buffer = self.gate_buf.handle, .size = self.gate_buf.size },
                         .{ .buffer = self.up_buf.handle, .size = self.up_buf.size },
@@ -12217,8 +12225,12 @@ pub const InferenceEngine = struct {
             }
             const dense_ffn_phase = self.beginProfilePhase();
             const dense_ffn_gateup_phase = self.beginProfilePhase();
+            const dense_ffn_gate_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
+            const dense_ffn_up_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
             self.decode_cmd.computeBarrier();
             try self.dispatchFfnActivation(
                 scratch_gate.handle,
@@ -14256,11 +14268,15 @@ pub fn generate(
                 },
             );
             const dense_gateup_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup)];
+            const dense_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gate)];
+            const dense_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_up)];
             const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
             log.info(
-                "Prefill dense_ffn subphases totals: gateup={d:.1} down={d:.1} ms",
+                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} ms",
                 .{
                     to_ms(dense_gateup_ns),
+                    to_ms(dense_gate_ns),
+                    to_ms(dense_up_ns),
                     to_ms(dense_down_ns),
                 },
             );
@@ -14412,8 +14428,10 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.shared_down),
                 engine.avgProfilePhaseMs(.shared_gate_acc),
             });
-            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms down={d:.2} ms", .{
+            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.dense_ffn_gateup),
+                engine.avgProfilePhaseMs(.dense_ffn_gate),
+                engine.avgProfilePhaseMs(.dense_ffn_up),
                 engine.avgProfilePhaseMs(.dense_ffn_down),
             });
             log.info("PROFILE: avg tail subphases norm={d:.2} ms lm_head={d:.2} ms argmax={d:.2} ms copy={d:.2} ms", .{
