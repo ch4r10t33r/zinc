@@ -29,24 +29,30 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
+    const uint expert_id = tid;
+    if (expert_id >= p.n_experts) {
+        return;
+    }
+
     const uint total_routes = p.n_tokens * p.k;
-    for (uint route = tid; route < total_routes; route += 256u) {
+    uint count = 0u;
+    for (uint route = 0u; route < total_routes; route++) {
         const uint token = route / p.k;
         const uint slot = route - token * p.k;
-        const uint expert_id = routing[token * p.routing_stride + slot];
-        if (expert_id >= p.n_experts) {
+        const uint route_expert = routing[token * p.routing_stride + slot];
+        if (route_expert != expert_id) {
             continue;
         }
 
-        const uint packed_index = atomic_fetch_add_explicit(counts + expert_id, 1u, memory_order_relaxed);
-        if (packed_index >= p.ids_stride) {
-            continue;
+        if (count < p.ids_stride) {
+            ids[expert_id * p.ids_stride + count] = route;
+            if ((count % NUM_COLS) == 0u) {
+                const uint block_id = atomic_fetch_add_explicit(active_block_count, 1u, memory_order_relaxed);
+                active_blocks[block_id] = expert_id | ((count / NUM_COLS) << 16u);
+            }
         }
-
-        ids[expert_id * p.ids_stride + packed_index] = route;
-        if ((packed_index % NUM_COLS) == 0u) {
-            const uint block_id = atomic_fetch_add_explicit(active_block_count, 1u, memory_order_relaxed);
-            active_blocks[block_id] = expert_id | ((packed_index / NUM_COLS) << 16u);
-        }
+        count++;
     }
+
+    atomic_store_explicit(counts + expert_id, count, memory_order_relaxed);
 }
