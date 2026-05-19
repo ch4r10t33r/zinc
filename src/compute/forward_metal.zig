@@ -8272,8 +8272,15 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
             cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
-        profileBarrier(cmd, profile, .ssm);
     }
+
+    // Adapt llama.cpp's Metal encoder barrier discipline
+    // (`ggml_metal_encoder_memory_barrier`): the token-ordered delta kernels
+    // write independent rows in scratch.attn_out, but nothing reads those rows
+    // until the batched gated norm below. The per-token conv barrier before
+    // each following delta is enough to make the recurrent SSM state visible,
+    // so one barrier here replaces N post-delta barriers for this prefix layer.
+    profileBarrier(cmd, profile, .ssm);
 
     dispatchSsmGatedNormBatchedOffsetsWithPipe(
         cmd,
