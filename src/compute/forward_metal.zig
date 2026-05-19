@@ -1917,6 +1917,7 @@ pub const InferenceEngine = struct {
     profile_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
+    qwen_prefill_validation_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
     kv_cache_q8: bool,
@@ -2017,7 +2018,12 @@ pub const InferenceEngine = struct {
         self.profile_enabled = options.profile_enabled;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
-        self.private_decode_buffers = if (options.debug_validation_enabled or self.gemma_moe_validation_enabled)
+        self.qwen_prefill_validation_enabled =
+            (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
+            (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.private_decode_buffers = if (options.debug_validation_enabled or
+            self.gemma_moe_validation_enabled or
+            self.qwen_prefill_validation_enabled)
             false
         else
             options.private_decode_buffers_override orelse
@@ -7721,6 +7727,277 @@ fn shouldValidateGemmaMoe(engine: *const InferenceEngine, layer_idx: usize) bool
         layer_idx == 0;
 }
 
+const QwenPrefillMoeValidationRef = struct {
+    hidden_before: []f32,
+    moe_delta_ref: []f32,
+    expert_ids: [16]u32,
+    expert_weights: [16]f32,
+    n_used: usize,
+    shared_gate: f32,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.hidden_before);
+        allocator.free(self.moe_delta_ref);
+        self.* = undefined;
+    }
+};
+
+fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize, use_standard_gpu_routed_moe: bool, using_local_cmd: bool) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        use_standard_gpu_routed_moe and
+        cfg.architecture != .gemma and
+        cfg.architecture != .gpt_oss and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < 4 and
+        layer_idx == 0;
+}
+
+fn logQwenPrefillValidationDiff(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    tensor_name: []const u8,
+    diff: SliceDiff,
+    ref_value: f32,
+    candidate_value: f32,
+    tol: f32,
+) void {
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+}
+
+fn prepareQwenPrefillMoeValidation(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+) !QwenPrefillMoeValidationRef {
+    const cfg = engine.config;
+    if (cfg.n_experts_used > 16) return error.TooManyExpertsForValidation;
+
+    const allocator = engine.allocator;
+    const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+    const tdo = engine.model.gguf_file.tensor_data_offset;
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp;
+    const up_shexp = lt.ffn_up_shexp;
+    const down_shexp = lt.ffn_down_shexp;
+    const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
+
+    var validation = QwenPrefillMoeValidationRef{
+        .hidden_before = try allocator.alloc(f32, hidden_dim),
+        .moe_delta_ref = try allocator.alloc(f32, hidden_dim),
+        .expert_ids = undefined,
+        .expert_weights = undefined,
+        .n_used = @intCast(cfg.n_experts_used),
+        .shared_gate = 1.0,
+    };
+    errdefer validation.deinit(allocator);
+    @memset(validation.moe_delta_ref, 0);
+
+    const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
+    const router_ptr: [*]const f32 = @ptrCast(@alignCast(engine.router_logits_buf.cpu_ptr.?));
+    @memcpy(validation.hidden_before, hidden_ptr[0..hidden_dim]);
+
+    const norm_ref = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(norm_ref);
+    const ffn_norm_weight: [*]const f32 = @ptrCast(@alignCast(engine.ffn_norm_bufs[layer_idx].cpu_ptr.?));
+    cpuRmsNormMul(hidden_ptr, ffn_norm_weight[0..hidden_dim], norm_ref.ptr, hidden_dim, 1, cfg.rms_norm_eps);
+    const norm_diff = diffF32Slices(norm_ref, norm_ptr[0..hidden_dim]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "ffn_norm",
+        norm_diff,
+        norm_ref[norm_diff.max_idx],
+        norm_ptr[norm_diff.max_idx],
+        1e-3,
+    );
+
+    const router_ref = try allocator.alloc(f32, cfg.n_experts);
+    defer allocator.free(router_ref);
+    try cpuDmmvFallback(mmap, router_t, tdo, norm_ptr, router_ref.ptr, cfg.n_experts, hidden_dim, 0, allocator);
+    const router_diff = diffF32Slices(router_ref, router_ptr[0..cfg.n_experts]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "router_logits",
+        router_diff,
+        router_ref[router_diff.max_idx],
+        router_ptr[router_diff.max_idx],
+        2e-2,
+    );
+
+    topKSoftmax(router_ref, cfg.n_experts_used, validation.expert_ids[0..validation.n_used], validation.expert_weights[0..validation.n_used]);
+
+    const gate_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(gate_tmp);
+    const up_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(up_tmp);
+    const act_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(act_tmp);
+    const down_tmp = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(down_tmp);
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    for (validation.expert_ids[0..validation.n_used], validation.expert_weights[0..validation.n_used]) |eid, weight| {
+        try cpuDmmvFallback(mmap, gate_exps, tdo, norm_ptr, gate_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.gateOffset(eid), allocator);
+        try cpuDmmvFallback(mmap, up_exps, tdo, norm_ptr, up_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.upOffset(eid), allocator);
+        cpuSwiGLU(gate_tmp.ptr, up_tmp.ptr, act_tmp.ptr, inter_dim);
+        try cpuDmmvFallback(mmap, down_exps, tdo, act_tmp.ptr, down_tmp.ptr, hidden_dim, inter_dim, eid * expert_down_bytes, allocator);
+        for (0..hidden_dim) |i| validation.moe_delta_ref[i] += weight * down_tmp[i];
+    }
+
+    if (has_shexp) {
+        const gate_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(gate_sh);
+        const up_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(up_sh);
+        const act_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(act_sh);
+        const down_sh = try allocator.alloc(f32, hidden_dim);
+        defer allocator.free(down_sh);
+        try cpuDmmvFallback(mmap, gate_shexp.?, tdo, norm_ptr, gate_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        try cpuDmmvFallback(mmap, up_shexp.?, tdo, norm_ptr, up_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        cpuSwiGLU(gate_sh.ptr, up_sh.ptr, act_sh.ptr, shexp_inter_dim);
+        try cpuDmmvFallback(mmap, down_shexp.?, tdo, act_sh.ptr, down_sh.ptr, hidden_dim, shexp_inter_dim, 0, allocator);
+        if (lt.ffn_gate_inp_shexp) |gate_t| {
+            var gate_value: [1]f32 = undefined;
+            try cpuDmmvFallback(mmap, gate_t, tdo, norm_ptr, gate_value[0..].ptr, 1, hidden_dim, 0, allocator);
+            validation.shared_gate = 1.0 / (1.0 + @exp(-gate_value[0]));
+        }
+        for (0..hidden_dim) |i| validation.moe_delta_ref[i] += validation.shared_gate * down_sh[i];
+    }
+
+    return validation;
+}
+
+fn finishQwenPrefillMoeValidation(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    validation: *const QwenPrefillMoeValidationRef,
+    hidden_dim: u32,
+) !void {
+    const allocator = engine.allocator;
+    const hidden_after: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const routing: [*]const u32 = @ptrCast(@alignCast(engine.router_output_buf.cpu_ptr.?));
+
+    var first_id_mismatch_slot: usize = 0;
+    var id_mismatches: u32 = 0;
+    var max_weight_diff: f32 = 0;
+    var max_weight_slot: usize = 0;
+    for (0..validation.n_used) |slot| {
+        const gpu_id = routing[slot];
+        if (gpu_id != validation.expert_ids[slot]) {
+            if (id_mismatches == 0) first_id_mismatch_slot = slot;
+            id_mismatches += 1;
+        }
+        const gpu_weight: f32 = @bitCast(routing[validation.n_used + slot]);
+        const weight_diff = @abs(gpu_weight - validation.expert_weights[slot]);
+        if (weight_diff > max_weight_diff) {
+            max_weight_diff = weight_diff;
+            max_weight_slot = slot;
+        }
+    }
+    const route_ok = id_mismatches == 0 and max_weight_diff <= 1e-4;
+    const route_verdict: []const u8 = if (route_ok) "ok" else "failed";
+    const mismatch_ref = validation.expert_ids[first_id_mismatch_slot];
+    const mismatch_gpu = routing[first_id_mismatch_slot];
+    if (route_ok) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor=router_topk id_mismatches={d} first_mismatch_slot={d} ref_id={d} candidate_id={d} max_weight_abs_diff={d:.6} weight_slot={d} shared_gate={d:.6}", .{
+            route_verdict,
+            engine.position,
+            layer_idx,
+            id_mismatches,
+            first_id_mismatch_slot,
+            mismatch_ref,
+            mismatch_gpu,
+            max_weight_diff,
+            max_weight_slot,
+            validation.shared_gate,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor=router_topk id_mismatches={d} first_mismatch_slot={d} ref_id={d} candidate_id={d} max_weight_abs_diff={d:.6} weight_slot={d} shared_gate={d:.6}", .{
+            route_verdict,
+            engine.position,
+            layer_idx,
+            id_mismatches,
+            first_id_mismatch_slot,
+            mismatch_ref,
+            mismatch_gpu,
+            max_weight_diff,
+            max_weight_slot,
+            validation.shared_gate,
+        });
+    }
+
+    const actual_delta = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(actual_delta);
+    const expected_hidden = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(expected_hidden);
+    for (0..hidden_dim) |i| {
+        actual_delta[i] = hidden_after[i] - validation.hidden_before[i];
+        expected_hidden[i] = validation.hidden_before[i] + validation.moe_delta_ref[i];
+    }
+
+    const delta_diff = diffF32Slices(validation.moe_delta_ref, actual_delta);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "moe_delta",
+        delta_diff,
+        validation.moe_delta_ref[delta_diff.max_idx],
+        actual_delta[delta_diff.max_idx],
+        5e-2,
+    );
+
+    const hidden_diff = diffF32Slices(expected_hidden, hidden_after[0..hidden_dim]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "post_layer_hidden",
+        hidden_diff,
+        expected_hidden[hidden_diff.max_idx],
+        hidden_after[hidden_diff.max_idx],
+        5e-2,
+    );
+}
+
 fn validateGemmaMoePostVector(
     engine: *InferenceEngine,
     layer_idx: usize,
@@ -8869,7 +9146,10 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
     // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
     // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
     const dense_cmd_group_layers: usize = 30;
-    const use_single_gpu_cmd = !engine.debug_validation_enabled and !engine.gemma_moe_validation_enabled and is_moe and blk: {
+    const use_single_gpu_cmd = !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        is_moe and blk: {
         for (engine.layer_tensors, 0..) |lt, layer_idx| {
             if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
             if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
@@ -8953,6 +9233,8 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
             var using_local_cmd = false;
             var cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
             const layer_record_start = profileStart(profile != null);
+            var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
+            defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
             if (prev_fused_attn_norm) {
                 // Previous layer's residual_rms_norm already wrote norm_buf using
                 // attn_norm_bufs[layer_idx]; its trailing barrier (or the implicit
@@ -9059,6 +9341,12 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
+                    if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
+                        commitAndWaitProfiled(cmd, profile);
+                        qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                        local_cmd_storage = try beginProfiledCommand(engine, profile);
+                        cmd = &local_cmd_storage;
+                    }
                     if (use_standard_gpu_routed_moe) {
                         try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                     } else {
@@ -9072,6 +9360,11 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
             if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (qwen_moe_validation_ref) |*validation| {
+                const validation_start = profileStart(profile != null);
+                try finishQwenPrefillMoeValidation(engine, layer_idx, validation, hidden_dim);
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+            }
         } else {
             if (profile) |p| p.ssm_layers += 1;
             // ===== SSM: fused batch 1 + recurrent body + batch 2 =====
@@ -9079,6 +9372,8 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
             var using_local_cmd = false;
             var cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
             const layer_record_start = profileStart(profile != null);
+            var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
+            defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
             const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
             const z_t = lt.attn_gate orelse return error.MissingTensor;
             const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
@@ -9275,6 +9570,12 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
+                    if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
+                        commitAndWaitProfiled(cmd, profile);
+                        qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                        local_cmd_storage = try beginProfiledCommand(engine, profile);
+                        cmd = &local_cmd_storage;
+                    }
                     if (use_standard_gpu_routed_moe) {
                         try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                     } else {
@@ -9288,6 +9589,11 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
             if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (qwen_moe_validation_ref) |*validation| {
+                const validation_start = profileStart(profile != null);
+                try finishQwenPrefillMoeValidation(engine, layer_idx, validation, hidden_dim);
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+            }
         }
 
         if (engine.debug_validation_enabled and engine.position == 0) {
