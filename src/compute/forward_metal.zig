@@ -879,6 +879,15 @@ const RouterF32TopkBiasPush = extern struct {
     bias_offset: u32,
 };
 
+const RouterF32TopkBatchedPush = extern struct {
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    input_stride: u32,
+    output_stride: u32,
+};
+
 const RouterQ8TopkPush = extern struct {
     n_experts: u32,
     K: u32,
@@ -1986,6 +1995,7 @@ pub const InferenceEngine = struct {
     softmax_topk_scaled_pipe: MetalPipeline,
     softmax_topk_weight_bias_pipe: MetalPipeline,
     router_f32_topk_bias_pipe: MetalPipeline,
+    router_f32_topk_batched_pipe: MetalPipeline,
     router_q8_0_topk_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
@@ -2439,6 +2449,7 @@ pub const InferenceEngine = struct {
         self.softmax_topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
         self.softmax_topk_weight_bias_pipe = try loadShaderPipeline(ctx, "softmax_topk_weight_bias");
         self.router_f32_topk_bias_pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
+        self.router_f32_topk_batched_pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
         self.router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
@@ -3188,6 +3199,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.softmax_topk_scaled_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_weight_bias_pipe);
         metal_pipeline.freePipeline(&self.router_f32_topk_bias_pipe);
+        metal_pipeline.freePipeline(&self.router_f32_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
@@ -3491,7 +3503,7 @@ pub const InferenceEngine = struct {
         const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, self.config.hidden_dim) catch return false;
         const down_exps = lt.ffn_down_exps orelse return false;
         const router_t = lt.ffn_gate_inp orelse return false;
-        if (!canUseRouterQ8Topk(self, router_t, self.config.n_experts, self.config.n_experts_used, self.config.hidden_dim)) return false;
+        if (!canUseQwenRoutePackedPrefixRouter(self, router_t, prompt_len)) return false;
         if (!supportsQwenMoeRoutePackCols(self, gate_up_layout.gate_tensor.info.type_) or
             !supportsQwenMoeRoutePackCols(self, gate_up_layout.up_tensor.info.type_) or
             !supportsQwenMoeRoutePackCols(self, down_exps.info.type_))
@@ -3618,6 +3630,7 @@ pub const InferenceEngine = struct {
         const beta_t = lt.ssm_beta orelse return error.MissingTensor;
         const alpha_batched = canBatchQwenSsmProjectionTail(alpha_t);
         const beta_batched = canBatchQwenSsmProjectionTail(beta_t);
+        const use_batched_f32_router = canUseRouterF32TopkBatched(self, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim, n_tokens);
 
         // Adapt llama.cpp `ggml_metal_op_encode_impl`/`ggml_metal_op_concurrency_reset`:
         // keep the layer-0 projection precompute inside the same command encoder
@@ -3720,12 +3733,19 @@ pub const InferenceEngine = struct {
             profileBarrier(&layer0_cmd, profile, .ssm);
             dispatchResidualRmsNormOnCmd(self, &layer0_cmd, &self.hidden_buf, &self.down_buf, &self.norm_buf, &self.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             profileBarrier(&layer0_cmd, profile, .router);
-            dispatchRouterQ8TopkOnCmd(self, &layer0_cmd, router_t, &self.norm_buf, &self.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
-            profileBarrier(&layer0_cmd, profile, .router);
+            if (!use_batched_f32_router) {
+                dispatchRouterQ8TopkOnCmd(self, &layer0_cmd, router_t, &self.norm_buf, &self.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                profileBarrier(&layer0_cmd, profile, .router);
+            }
 
             dispatchCopyF32OffsetOnCmd(self, &layer0_cmd, &self.hidden_buf, &scratch.hidden, hidden_dim, 0, token_hidden_offset);
             dispatchCopyF32OffsetOnCmd(self, &layer0_cmd, &self.norm_buf, &scratch.norm, hidden_dim, 0, token_hidden_offset);
-            dispatchCopyU32OnCmd(self, &layer0_cmd, &self.router_output_buf, &scratch.moe_routing, cfg.n_experts_used * 2, 0, token_routing_offset);
+            if (!use_batched_f32_router) {
+                dispatchCopyU32OnCmd(self, &layer0_cmd, &self.router_output_buf, &scratch.moe_routing, cfg.n_experts_used * 2, 0, token_routing_offset);
+            }
+        }
+        if (use_batched_f32_router) {
+            dispatchRouterF32TopkBatchedOnCmd(self, &layer0_cmd, router_t, &scratch.norm, &scratch.moe_routing, cfg.n_experts, cfg.n_experts_used, hidden_dim, n_tokens);
         }
         profileBarrier(&layer0_cmd, profile, .gpu_routed_moe);
 
@@ -7093,6 +7113,49 @@ fn dispatchRouterF32TopkBiasOnCmd(
     cmd.dispatchV2(&engine.router_f32_topk_bias_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBiasPush), 1);
 }
 
+fn canUseRouterF32TopkBatched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32, n_tokens: u32) bool {
+    return !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        tensor.info.type_ == .f32 and
+        n_experts <= 256 and
+        n_experts % 2 == 0 and
+        k <= 16 and
+        hidden_dim > 0 and
+        hidden_dim <= 4096 and
+        hidden_dim % 4 == 0 and
+        n_tokens > 0 and
+        n_tokens <= queued_prefill_embed_tokens and
+        engine.router_f32_topk_batched_pipe.handle != null and
+        engine.router_f32_topk_batched_pipe.thread_execution_width == 32 and
+        engine.router_f32_topk_batched_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchRouterF32TopkBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    const push = RouterF32TopkBatchedPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .input_stride = hidden_dim,
+        .output_stride = k * 2,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
+    cmd.dispatchV2(&engine.router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+}
+
 fn canUseRouterQ8Topk(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32) bool {
     return !engine.debug_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
@@ -7830,6 +7893,38 @@ fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: Layer
     return true;
 }
 
+fn canUseQwenRoutePackedPrefixRouter(engine: *const InferenceEngine, router_t: *const metal_loader.LoadedTensor, prompt_len: usize) bool {
+    const n_tokens: u32 = @intCast(@min(prompt_len, queued_prefill_embed_tokens));
+    const can_q8_router = canUseRouterQ8Topk(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim) and
+        engine.gemm_q8_0_pipe.handle != null and
+        engine.softmax_topk_batched_pipe.handle != null;
+    return can_q8_router or
+        canUseRouterF32TopkBatched(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens);
+}
+
+fn recordQwenRoutePackedRouterOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    router_t: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    logits_scratch: *const MetalBuffer,
+    routing_output: *const MetalBuffer,
+    n_tokens: u32,
+) !void {
+    if (canUseRouterF32TopkBatched(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens)) {
+        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, input, routing_output, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens);
+        return;
+    }
+    if (router_t.info.type_ == .q8_0 and engine.gemm_q8_0_pipe.handle != null) {
+        dispatchGemmQ8_0OnCmd(engine, cmd, router_t, input, logits_scratch, engine.config.n_experts, engine.config.hidden_dim, n_tokens);
+        profileBarrier(cmd, profile, .router);
+        dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, logits_scratch, routing_output, n_tokens, engine.config.n_experts, engine.config.n_experts_used);
+        return;
+    }
+    return error.UnsupportedQwenRoutePackedRouter;
+}
+
 fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
     if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
@@ -7879,7 +7974,7 @@ fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, lay
     }
 
     const router_t = lt.ffn_gate_inp orelse return false;
-    return router_t.info.type_ == .q8_0 and engine.gemm_q8_0_pipe.handle != null;
+    return canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len);
 }
 
 fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
@@ -7900,7 +7995,7 @@ fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx
     const router_t = lt.ffn_gate_inp orelse return false;
     const ssm_out_t = lt.ssm_out orelse return false;
     if (ssm_out_t.info.type_ != .q8_0) return false;
-    if (!canUseRouterQ8Topk(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim)) return false;
+    if (!canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len)) return false;
     return canUseQwenRoutePackedPrefixMoeLayer(engine, lt, engine.config.hidden_dim, inter_dim);
 }
 
@@ -8054,9 +8149,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
     profileBarrier(cmd, profile, .router);
 
     const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
-    dispatchGemmQ8_0OnCmd(engine, cmd, router_t, &scratch.norm, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
-    profileBarrier(cmd, profile, .router);
-    dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    try recordQwenRoutePackedRouterOnCmd(engine, cmd, profile, router_t, &scratch.norm, &scratch.gate, &scratch.moe_routing, n_tokens);
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     const moe_record_start = profileStart(profile != null);
@@ -8217,9 +8310,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     }
     profileBarrier(cmd, profile, .router);
 
-    dispatchGemmQ8_0OnCmd(engine, cmd, router_t, &scratch.norm, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
-    profileBarrier(cmd, profile, .router);
-    dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    try recordQwenRoutePackedRouterOnCmd(engine, cmd, profile, router_t, &scratch.norm, &scratch.gate, &scratch.moe_routing, n_tokens);
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     const moe_record_start = profileStart(profile != null);
@@ -18685,6 +18776,101 @@ test "router_f32_topk_bias shader matches CPU top-k softmax reference" {
         try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
         const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
         try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+    }
+}
+
+test "router_f32_topk_batched shader routes each prompt token" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 512) return error.SkipZigTest;
+
+    const n_tokens: usize = 3;
+    const n_experts: usize = 96;
+    const K: usize = 64;
+    const k: usize = 4;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..n_tokens) |token| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((token * 11 + i * 7 + 3) % 23);
+            input_ptr[token * K + i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+    for (0..n_experts) |expert| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((expert * 13 + i * 17 + 5) % 31);
+            weight_ptr[expert * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+        }
+    }
+
+    const push = RouterF32TopkBatchedPush{
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = 0,
+        .input_stride = @intCast(K),
+        .output_stride = @intCast(k * 2),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_tokens) |token| {
+        var logits: [n_experts]f32 = undefined;
+        for (0..n_experts) |expert| {
+            var dot: f32 = 0.0;
+            for (0..K) |i| dot += weight_ptr[expert * K + i] * input_ptr[token * K + i];
+            logits[expert] = dot;
+        }
+
+        var expected_ids: [k]u32 = undefined;
+        var selected_vals: [k]f32 = undefined;
+        for (0..k) |slot| {
+            var best_val = -std.math.inf(f32);
+            var best_idx: usize = 0;
+            for (0..n_experts) |expert| {
+                if (logits[expert] > best_val) {
+                    best_val = logits[expert];
+                    best_idx = expert;
+                }
+            }
+            expected_ids[slot] = @intCast(best_idx);
+            selected_vals[slot] = best_val;
+            logits[best_idx] = -std.math.inf(f32);
+        }
+        var max_sel = -std.math.inf(f32);
+        for (selected_vals) |v| max_sel = @max(max_sel, v);
+        var sum: f32 = 0.0;
+        var expected_weights: [k]f32 = undefined;
+        for (0..k) |slot| {
+            expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+            sum += expected_weights[slot];
+        }
+        for (&expected_weights) |*w| w.* /= sum;
+
+        const out = output_ptr[token * k * 2 .. token * k * 2 + k * 2];
+        for (0..k) |slot| {
+            try std.testing.expectEqual(expected_ids[slot], out[slot]);
+            const actual_weight: f32 = @bitCast(out[k + slot]);
+            try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+        }
     }
 }
 
