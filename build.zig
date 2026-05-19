@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         "ssm_delta_net_cols8",
         "ssm_delta_net_cols8_normed",
         "ssm_gated_norm",
+        "ssm_gated_norm_batched",
         "dmmv_mxfp4",
         "dmmv_q5_0",
         "dmmv_q5_1",

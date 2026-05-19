@@ -162,6 +162,35 @@ const PREFILL_BENCHMARK_PROMPT = [
   "Based on the reference above, the capital of France is",
 ].join("\n");
 
+const CODING_REVIEW_SNIPPET = [
+  "File: src/cache.ts",
+  "```ts",
+  "const cache = new Map<string, string>();",
+  "const pending = new Map<string, Promise<string>>();",
+  "",
+  "export async function getValue(key: string, load: () => Promise<string>) {",
+  "  if (cache.has(key)) return cache.get(key)!;",
+  "  if (pending.has(key)) return cache.get(key)!;",
+  "",
+  "  const task = load().then((value) => {",
+  "    cache.set(key, value);",
+  "    pending.delete(key);",
+  "    return value;",
+  "  });",
+  "  pending.set(key, task);",
+  "  return task;",
+  "}",
+  "```",
+].join("\n");
+
+const QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT = [
+  "Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
+  "",
+  CODING_REVIEW_SNIPPET,
+  "",
+  "Review:",
+].join("\n");
+
 // Long-context decode benchmark for Effort 11. The prompt is a single
 // English narrative excerpt designed to tokenize to ~1500 tokens on
 // Qwen 3 8B (no chat-template overhead, no list/code tokenizer
@@ -195,6 +224,7 @@ type EffortSpec = {
   benchmarkPrompt: string;
   benchmarkMaxTokens: number;
   benchmarkMethod: string;
+  defaultModel?: string;
   // Optional per-effort controller hints. These are rendered into the agent
   // prompt so the loop can encode knowledge the base plan document doesn't
   // (or shouldn't) encode itself.
@@ -538,10 +568,12 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     summary: "RDNA4 Qwen 3.6 27B dense-hybrid prefill/decode recovery",
     metricMode: "prefill",
     primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
-    benchmarkPrompt: PREFILL_BENCHMARK_PROMPT,
+    defaultModel: "qwen3627b",
+    benchmarkPrompt: QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT,
     benchmarkMaxTokens: 8,
-    benchmarkMethod: "long-context prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    benchmarkMethod: "site-aligned context-medium Coding Review prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
     knownFlatCategories: [
+      "Do not optimize against the old synthetic Paris prefill prompt for effort 15. It reported ~148 tok/s but does not match the site context-medium workload that exposes the real ~29 tok/s 27B prefill gap.",
       "Do not relax canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0 as a first step. A prior SSM batched prefill attempt caused QueueSubmitFailed / GPU resets and had a real hidden-state dependency bug.",
       "Do not repeat the widened dense fused gate+up+SwiGLU path for inter_dim=17408. On Qwen3.6-27B it was mixed or negative across the four-scenario matrix.",
       "Do not repeat Q6_K+Q4_K fused SSM qkv+z pair dispatch. It engaged but regressed the SSM projection bucket.",
@@ -695,6 +727,10 @@ const BLOCKED_GIT_OPS = [
 // Directories the agent may change (used for selective revert)
 const REVERTABLE_PATHS = ["src/"];
 
+function isPrefillMetricLabel(label: string | undefined): boolean {
+  return /\bprefill\b/i.test(label ?? "");
+}
+
 // -- CLI parsing -------------------------------------------------------------
 
 type AgentType = "claude" | "codex";
@@ -705,6 +741,7 @@ function parseArgs() {
   let cycles = 20;
   let dryRun = false;
   let model = "qwen36b";
+  let modelExplicit = false;
   let resume = false;
   let agent: AgentType = "codex";
   let analyze = false;
@@ -715,7 +752,10 @@ function parseArgs() {
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--resume") resume = true;
     else if (args[i] === "--analyze") analyze = true;
-    else if (args[i] === "--model" && args[i + 1]) model = args[++i];
+    else if (args[i] === "--model" && args[i + 1]) {
+      model = args[++i];
+      modelExplicit = true;
+    }
     else if (args[i] === "--agent" && args[i + 1]) agent = args[++i] as AgentType;
   }
   if (!effort || !getEffortSpec(effort)) {
@@ -725,7 +765,7 @@ function parseArgs() {
     console.error("Options:");
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
-    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen36b)`);
+    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: effort-specific, else qwen36b)`);
     console.error("  --agent claude|codex     AI agent to use (default: codex)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
@@ -745,7 +785,7 @@ function parseArgs() {
     console.error(`Unknown model: ${model}. Use one of: ${MODEL_KEYS}.`);
     process.exit(1);
   }
-  return { effort, cycles, dryRun, model, resume, agent, analyze };
+  return { effort, cycles, dryRun, model, modelExplicit, resume, agent, analyze };
 }
 
 // -- Display helpers ---------------------------------------------------------
@@ -1582,7 +1622,7 @@ export function buildAgentPrompt(
       ? "HARVEST"
       : "ADVANCE";
 
-  const phaseBudgetBlock = options.primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
 
@@ -1635,7 +1675,7 @@ ${plan}
 ## Current Checked-Out Code (build on this code)
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(currentBest.bandwidthUtil, currentBest.bandwidthSamples, "%", 1)}
-- output: "${currentBest.outputText}" (coherence tested with 3 prompts on 7 models after every change)
+- output: "${currentBest.outputText}" (coherence tested with ${COHERENCE_CHECKS.length} prompts on ${COHERENCE_MODELS.length} models after every change)
 - This is the performance of the code currently checked out in the worktree.
 
 ## Best Accepted Performance Checkpoint
@@ -1771,7 +1811,7 @@ export function buildPivotPrompt(
         })
         .join("\n") || "  (none)"
     : "  (state unavailable)";
-  const phaseBudgetBlock = primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
   const knownFlatBlock = options.knownFlatCategories?.length
@@ -2738,12 +2778,13 @@ async function revertAgentChanges(): Promise<void> {
 // -- Main loop ---------------------------------------------------------------
 
 async function main() {
-  const { effort, cycles, dryRun, model, resume, agent, analyze } = parseArgs();
-  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
+  const { effort, cycles, dryRun, model: requestedModel, modelExplicit, resume, agent, analyze } = parseArgs();
   const effortSpec = getEffortSpec(effort);
   if (!effortSpec) {
     throw new Error(`Unknown effort: ${effort}`);
   }
+  const model = modelExplicit ? requestedModel : (effortSpec.defaultModel ?? requestedModel);
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const effortFile = effortSpec.doc;
   const plan = await readFile(join(EFFORTS_DIR, effortFile), "utf8");
 

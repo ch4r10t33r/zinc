@@ -426,6 +426,7 @@ describe("controller helpers", () => {
     expect(prompt).toContain("37.28 tok/s [37.00, 37.30, 37.40]");
     expect(prompt).toContain("must beat the best accepted performance checkpoint");
     expect(prompt).toContain("Failed Approaches");
+    expect(prompt).toContain("coherence tested with 3 prompts on 6 models");
     expect(prompt).toContain("@@@DESCRIPTION:");
   });
 
@@ -472,6 +473,18 @@ describe("controller helpers", () => {
     expect(spec?.primaryMetricLabel).toBe("prefill tok/s");
     expect(spec?.summary).toContain("RDNA Qwen36 prefill");
     expect(spec?.benchmarkMethod).toContain("Qwen3.6-35B flagship workload");
+  });
+
+  test("RDNA Qwen36 27B effort uses the site context-medium benchmark contract", () => {
+    const spec = getEffortSpec(15);
+    expect(spec).not.toBeNull();
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md");
+    expect(spec?.primaryMetricLabel).toBe("Qwen3.6-27B prefill tok/s");
+    expect(spec?.defaultModel).toBe("qwen3627b");
+    expect(spec?.benchmarkMethod).toContain("context-medium Coding Review");
+    expect(spec?.benchmarkPrompt).toContain("Code review request");
+    expect(spec?.benchmarkPrompt).toContain("src/cache.ts");
+    expect(spec?.benchmarkPrompt).not.toContain("capital of France");
   });
 
   test("resume compatibility rejects state from older benchmark regimes", () => {
@@ -990,7 +1003,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
         phaseBudgetCycle: 20,
       },
       {
-        primaryMetricLabel: "prefill tok/s",
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         knownFlatCategories: ["narrowing compute→compute barriers is flat on RDNA4"],
         structuralSwingIdeas: ["wire recordBatchDispatch into SSM proj with num_cols=2"],
@@ -1711,9 +1724,17 @@ describe("buildAgentPrompt pivot mode", () => {
         consecutiveFoundationKeeps: 1,
         reviewSummary: null,
         bestPerf: null,
+        phaseBudget: {
+          perTokenMs: { attn: 4.5, ssm: 11.8 },
+          totalsMs: { attn: 693, ssm: 1817.2 },
+          moeTotalsMs: {},
+          ssmTotalsMs: { proj: 1300 },
+          biggestBucket: { name: "ssm", totalMs: 1817.2 },
+        },
+        phaseBudgetCycle: 8,
       },
       {
-        primaryMetricLabel: "prefill tok/s",
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         knownFlatCategories: ["barrier narrowing is flat"],
         structuralSwingIdeas: ["port llama.cpp 8-variant DMMV"],
@@ -1727,6 +1748,8 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("Dead-end audit");
     expect(prompt).toContain("Pivot proposal");
     expect(prompt).toContain("Committed Foundations");
+    expect(prompt).toContain("Current Prefill Phase Budget");
+    expect(prompt).toContain("Biggest top-level bucket: ssm");
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
