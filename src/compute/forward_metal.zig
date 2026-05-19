@@ -3644,6 +3644,11 @@ pub const InferenceEngine = struct {
             dispatchScaleInPlaceOnCmd(self, &layer0_cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
         }
 
+        var route_packed_start_layer: usize = 1;
+        while (route_packed_start_layer < 3 and canUseQwenRoutePackedPrefixSsmLayer(self, route_packed_start_layer, prompt_tokens.len)) : (route_packed_start_layer += 1) {
+            try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+        }
+
         commitAsyncProfiled(&layer0_cmd, profile);
         var layer0_pending = layer0_cmd;
         layer0_cmd = .{
@@ -3671,7 +3676,7 @@ pub const InferenceEngine = struct {
             errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
             for (prompt_tokens[0..split_token], 0..) |_, i| {
                 const hidden_offset: u32 = @intCast(i * hidden_dim_usize);
-                try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &first_prompt_cmd, 1);
+                try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &first_prompt_cmd, route_packed_start_layer);
             }
             commitAsyncProfiled(&first_prompt_cmd, profile);
         }
@@ -3680,10 +3685,10 @@ pub const InferenceEngine = struct {
         errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
         for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
             const hidden_offset: u32 = @intCast(i * hidden_dim_usize);
-            try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &prompt_cmd, 1);
+            try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &prompt_cmd, route_packed_start_layer);
         }
         const final_hidden_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
-        try runDecodeStep(self, true, &scratch.hidden, final_hidden_offset, null, &prompt_cmd, 1);
+        try runDecodeStep(self, true, &scratch.hidden, final_hidden_offset, null, &prompt_cmd, route_packed_start_layer);
         commitAndWaitProfiled(&prompt_cmd, profile);
         waitCommandProfiled(&layer0_pending, profile);
         state.position = self.position;
@@ -7380,6 +7385,225 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     const res_bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
     cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
     cmd.barrier();
+}
+
+fn canUseQwenSsmBatchedProjectionLayer(engine: *const InferenceEngine, layer_idx: usize) bool {
+    if (engine.gemm_q8_0_pipe.handle == null) return false;
+    if (layer_idx >= engine.layer_tensors.len) return false;
+    if (isFullAttentionLayer(engine.config, layer_idx)) return false;
+
+    const lt = engine.layer_tensors[layer_idx];
+    const wqkv_t = lt.attn_qkv orelse return false;
+    const z_t = lt.attn_gate orelse return false;
+    const alpha_t = lt.ssm_alpha orelse return false;
+    const beta_t = lt.ssm_beta orelse return false;
+    return wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        alpha_t.info.type_ == .q8_0 and
+        beta_t.info.type_ == .q8_0;
+}
+
+fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
+    if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.config.architecture != .qwen2_moe or
+        engine.config.hidden_dim != 2048 or
+        engine.config.ssm_d_inner != 4096 or
+        engine.config.n_experts != 256 or
+        engine.config.n_experts_used != 8)
+    {
+        return false;
+    }
+    if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return false;
+
+    const lt = engine.layer_tensors[layer_idx];
+    if (!canUseGpuRoutedBatchedMoe(engine, lt)) return false;
+    const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
+    const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, engine.config.hidden_dim) catch return false;
+    const down_exps = lt.ffn_down_exps orelse return false;
+    const router_t = lt.ffn_gate_inp orelse return false;
+    if (!canUseRouterQ8Topk(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim)) return false;
+    if (!supportsQwenMoeRoutePackCols(engine, gate_up_layout.gate_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, gate_up_layout.up_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, down_exps.info.type_))
+    {
+        return false;
+    }
+    if (engine.moe_route_pack_pipe.handle == null or
+        engine.moe_route_gather_pipe.handle == null or
+        engine.moe_route_scatter_pipe.handle == null or
+        engine.swiglu_batched_pipe.handle == null or
+        engine.scale_acc_pipe.handle == null)
+    {
+        return false;
+    }
+    if (lt.ffn_gate_shexp) |gate| {
+        const up = lt.ffn_up_shexp orelse return false;
+        const down = lt.ffn_down_shexp orelse return false;
+        if (!canUseQwenSharedBatchedGemm(engine, gate.info.type_) or
+            !canUseQwenSharedBatchedGemm(engine, up.info.type_) or
+            !canUseQwenSharedBatchedGemm(engine, down.info.type_))
+        {
+            return false;
+        }
+        if (lt.ffn_gate_inp_shexp) |gate_inp| {
+            if (!canUseQwenSharedBatchedGemm(engine, gate_inp.info.type_)) return false;
+        }
+    }
+    return true;
+}
+
+fn recordQwenSsmProjectionChunkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    input: *const MetalBuffer,
+    hidden_dim: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    conv_channels: u32,
+    n_tokens: u32,
+) !void {
+    const lt = engine.layer_tensors[layer_idx];
+    const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
+    const z_t = lt.attn_gate orelse return error.MissingTensor;
+    const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
+    const beta_t = lt.ssm_beta orelse return error.MissingTensor;
+
+    dispatchRmsNormOnCmd(engine, cmd, input, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+    profileBarrier(cmd, profile, .ssm);
+    dispatchGemmQ8_0OnCmd(engine, cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
+    profileBarrier(cmd, profile, .ssm);
+}
+
+fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    scratch: *BatchedPrefillScratch,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    const cfg = engine.config;
+    const lt = engine.layer_tensors[layer_idx];
+    const d_inner = cfg.ssm_d_inner;
+    const d_state = cfg.ssm_d_state;
+    const n_group = cfg.ssm_n_group;
+    const dt_rank = cfg.ssm_dt_rank;
+    const d_conv = cfg.ssm_d_conv;
+    const head_v_dim = d_inner / @max(dt_rank, 1);
+    const conv_channels = d_inner + 2 * n_group * d_state;
+    const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
+    const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+        (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
+    else
+        &ssm_out_t.gpu_buffer;
+    const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+
+    // llama.cpp switches `mul_mat_id` to a batched matrix path once the routed
+    // batch is large enough; vLLM first groups top-k route slots by expert.
+    // Keep Qwen SSM recurrence token-ordered, but batch this layer's Q8
+    // projections and route-packed MoE over the full prompt slice.
+    try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
+
+    const hidden_dim_usize: usize = @intCast(hidden_dim);
+    const token_count: usize = @intCast(n_tokens);
+    for (0..token_count) |i| {
+        const token_index: u32 = @intCast(i);
+        const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
+        const token_routing_offset: u32 = @intCast(i * @as(usize, cfg.n_experts_used) * 2);
+        engine.position = token_index;
+
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.hidden, &engine.hidden_buf, hidden_dim, token_hidden_offset, 0);
+        dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank);
+        profileBarrier(cmd, profile, .ssm);
+
+        dispatchSsmConv1dWithPipe(
+            cmd,
+            &engine.ssm_conv1d_pipe,
+            &engine.ssm_conv_kernel_bufs.?[layer_idx],
+            &engine.ssm_conv_state_bufs.?[layer_idx],
+            &engine.attn_out_buf,
+            &engine.swiglu_buf,
+            conv_channels,
+            d_conv,
+            false,
+        );
+        if (profile) |p| p.ssm_conv_calls += 1;
+        profileBarrier(cmd, profile, .ssm);
+
+        {
+            const push = SsmDeltaNetPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = d_state,
+                .n_group = n_group,
+                .ssm_a_is_f16 = 0,
+                .dt_bias_is_f16 = 0,
+                .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+                .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            };
+            const dn_bufs = [_]*const MetalBuffer{
+                &engine.swiglu_buf,                    &engine.router_logits_buf,
+                &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
+                &engine.down_buf,                      &engine.ssm_state_bufs.?[layer_idx],
+                &engine.attn_out_buf,
+            };
+            cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
+            if (profile) |p| p.ssm_delta_calls += 1;
+        }
+        profileBarrier(cmd, profile, .ssm);
+
+        dispatchSsmGatedNormWithPipe(
+            cmd,
+            &engine.ssm_gated_norm_pipe,
+            &engine.attn_out_buf,
+            &engine.ssm_norm_weight_bufs.?[layer_idx],
+            &engine.gate_buf,
+            &engine.swiglu_buf,
+            d_inner,
+            dt_rank,
+            head_v_dim,
+            d_state,
+            engine.ssm_norm_per_head.?[layer_idx],
+        );
+        if (profile) |p| p.ssm_gated_norm_calls += 1;
+        profileBarrier(cmd, profile, .ssm);
+
+        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &engine.swiglu_buf, &engine.down_buf, hidden_dim, d_inner, 0);
+        profileBarrier(cmd, profile, .ssm);
+        dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
+        profileBarrier(cmd, profile, .router);
+        dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, &engine.norm_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+        profileBarrier(cmd, profile, .router);
+
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.hidden_buf, &scratch.hidden, hidden_dim, 0, token_hidden_offset);
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.norm_buf, &scratch.norm, hidden_dim, 0, token_hidden_offset);
+        dispatchCopyU32OnCmd(engine, cmd, &engine.router_output_buf, &scratch.moe_routing, cfg.n_experts_used * 2, 0, token_routing_offset);
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    const moe_record_start = profileStart(profile != null);
+    try recordQwenRoutePackedLayerMoeOnCmd(engine, cmd, profile, lt, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+    if (profile) |p| {
+        p.ssm_layers += n_tokens;
+        p.gpu_routed_moe_layers += n_tokens;
+        p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
+    }
+
+    const layer_output_scale = engine.layer_output_scales[layer_idx];
+    if (layer_output_scale != 1.0) {
+        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
+    }
 }
 
 fn recordQwenRoutePackedLayerMoeOnCmd(
