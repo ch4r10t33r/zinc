@@ -3596,15 +3596,6 @@ pub const InferenceEngine = struct {
         var scratch = try BatchedPrefillScratch.init(self, n_tokens, first_attn_dims.max_q_dim, first_attn_dims.max_kv_dim, inter_dim);
         defer scratch.deinit();
 
-        var precompute_cmd = MetalCommand{
-            .handle = null,
-            .dispatch_count = 0,
-            .barrier_count = 0,
-            .barrier_enabled = false,
-        };
-        defer if (precompute_cmd.handle != null) precompute_cmd.wait();
-        _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
-
         var layer0_cmd = try beginProfiledCommand(self, profile);
         errdefer if (layer0_cmd.handle != null) layer0_cmd.wait();
 
@@ -3628,6 +3619,17 @@ pub const InferenceEngine = struct {
         const beta_t = lt.ssm_beta orelse return error.MissingTensor;
         const alpha_batched = canBatchQwenSsmProjectionTail(alpha_t);
         const beta_batched = canBatchQwenSsmProjectionTail(beta_t);
+
+        // Adapt llama.cpp `ggml_metal_op_encode_impl`/`ggml_metal_op_concurrency_reset`:
+        // keep the layer-0 projection precompute inside the same command encoder
+        // as its consumers, using in-encoder barriers instead of a separate
+        // command buffer boundary. The math is the existing validated projection
+        // chunk; only the submission shape changes.
+        self.qwen_ssm_prefill_proj_active_tokens = n_tokens;
+        try recordQwenSsmProjectionChunkOnCmd(self, &layer0_cmd, profile, layer_idx, &self.prefill_embed_buf, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
+        if (self.profile_enabled) {
+            log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async=false inlined=true alpha_batched={} beta_batched={}", .{ n_tokens, alpha_batched, beta_batched });
+        }
 
         for (0..prompt_tokens.len) |i| {
             const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
