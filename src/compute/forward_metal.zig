@@ -325,12 +325,28 @@ fn readU32Env(env_name: [:0]const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
 }
 
-fn qwenMoeRoutePackValidateTokens() u32 {
-    const requested =
-        readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
-        readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS") orelse
-        qwen_moe_route_pack_validate_tokens;
+fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
+    return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
+        readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
+}
+
+fn clampQwenMoeRoutePackValidateTokens(requested: u32) u32 {
     return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
+}
+
+fn qwenMoeRoutePackValidateTokensForPrompt(prompt_len: usize) u32 {
+    const requested = qwenMoeRoutePackRequestedValidateTokens() orelse
+        @as(u32, @intCast(@min(prompt_len, @as(usize, qwen_ssm_projection_prefill_max_tokens))));
+    return clampQwenMoeRoutePackValidateTokens(requested);
+}
+
+fn qwenMoeRoutePackValidateTokens(engine: *const InferenceEngine) u32 {
+    const requested = qwenMoeRoutePackRequestedValidateTokens() orelse
+        if (engine.qwen_moe_route_validate_target_tokens > 0)
+            engine.qwen_moe_route_validate_target_tokens
+        else
+            qwen_moe_route_pack_validate_tokens;
+    return clampQwenMoeRoutePackValidateTokens(requested);
 }
 
 fn qwenMoeRoutePackValidateLayer(engine: *const InferenceEngine) usize {
@@ -2272,6 +2288,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_proj_validate_alpha_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
     qwen_moe_route_validate_captured_tokens: u32,
+    qwen_moe_route_validate_target_tokens: u32,
     qwen_moe_route_validate_layer_input_ref_buf: MetalBuffer,
     qwen_moe_route_validate_norm_buf: MetalBuffer,
     qwen_moe_route_validate_routing_buf: MetalBuffer,
@@ -2417,6 +2434,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_alpha_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_captured_tokens = 0;
+        self.qwen_moe_route_validate_target_tokens = 0;
         self.qwen_moe_route_validate_layer_input_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_routing_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3546,6 +3564,7 @@ pub const InferenceEngine = struct {
         self.prefill_profile.reset();
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
+        self.qwen_moe_route_validate_target_tokens = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -3589,6 +3608,10 @@ pub const InferenceEngine = struct {
         } else if (state.position != self.position) {
             return error.KvStateNotAvailable;
         }
+        self.qwen_moe_route_validate_target_tokens = if (self.qwen_prefill_validation_enabled)
+            qwenMoeRoutePackValidateTokensForPrompt(prompt_tokens.len)
+        else
+            0;
 
         if (self.canUseQueuedTokenMajorPrefill(prompt_tokens.len)) {
             return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
@@ -4549,7 +4572,7 @@ pub const InferenceEngine = struct {
     fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
         const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
         try self.loadTokenEmbeddingInto(token_id, dst_buf, 0);
-        const validate_tokens = qwenMoeRoutePackValidateTokens();
+        const validate_tokens = qwenMoeRoutePackValidateTokens(self);
         if (self.qwen_prefill_validation_enabled and self.position < validate_tokens) {
             const offset: usize = @as(usize, @intCast(self.position)) * @as(usize, @intCast(self.config.hidden_dim));
             try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, offset);
@@ -10337,7 +10360,7 @@ fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize
         cfg.architecture != .gpt_oss and
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
-        engine.position < qwenMoeRoutePackValidateTokens() and
+        engine.position < qwenMoeRoutePackValidateTokens(engine) and
         layer_idx == qwenMoeRoutePackValidateLayer(engine);
 }
 
@@ -10348,12 +10371,12 @@ fn shouldCaptureQwenRoutePackedLayerInput(engine: *const InferenceEngine, layer_
         cfg.architecture == .qwen2_moe and
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
-        engine.position < qwenMoeRoutePackValidateTokens() and
+        engine.position < qwenMoeRoutePackValidateTokens(engine) and
         layer_idx == qwenMoeRoutePackValidateLayer(engine);
 }
 
 fn captureQwenRoutePackedLayerInput(engine: *InferenceEngine, hidden_dim: u32) !void {
-    const n: usize = @intCast(qwenMoeRoutePackValidateTokens());
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens(engine));
     const h: usize = @intCast(hidden_dim);
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * h * @sizeOf(f32));
 
@@ -10553,7 +10576,7 @@ fn ensureQwenMoeRoutePackValidationBuffers(
     k: u32,
     validate_shared: bool,
 ) !void {
-    const n: usize = @intCast(qwenMoeRoutePackValidateTokens());
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens(engine));
     const h: usize = @intCast(hidden_dim);
     const m: usize = @intCast(inter_dim);
     const sh: usize = @intCast(shexp_inter_dim);
@@ -10691,7 +10714,7 @@ fn validateQwenMoeRoutePackChunk(
     if (token_idx_u32 == 0) {
         engine.qwen_moe_route_validate_captured_tokens = 0;
     }
-    const validate_tokens = qwenMoeRoutePackValidateTokens();
+    const validate_tokens = qwenMoeRoutePackValidateTokens(engine);
     if (token_idx_u32 >= validate_tokens) return;
 
     const k = cfg.n_experts_used;
@@ -11316,7 +11339,7 @@ fn validateQwenRoutePackedSsmPrefix(
         return;
     }
 
-    const n = qwenMoeRoutePackValidateTokens();
+    const n = qwenMoeRoutePackValidateTokens(engine);
     const n_usize: usize = @intCast(n);
     const hidden_n: usize = @intCast(hidden_dim);
     const d_inner = cfg.ssm_d_inner;
