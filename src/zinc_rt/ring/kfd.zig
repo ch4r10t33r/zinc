@@ -28,9 +28,16 @@ const packet = @import("packet.zig");
 
 const linux = std.os.linux;
 
+/// Default DRM render node used when the caller does not supply one. The
+/// renderD128 minor is the standard single-GPU choice on AMD Linux systems.
 pub const default_render_node = "/dev/dri/renderD128";
+/// Path to the KFD compute device used for every AMDKFD_IOC_* ioctl.
 pub const kfd_device_node = "/dev/kfd";
+/// Sysfs root that enumerates KFD topology nodes (one subdirectory per node,
+/// each carrying `gpu_id` and a `properties` file that drives queue sizing).
 pub const topology_nodes_dir = "/sys/devices/virtual/kfd/kfd/topology/nodes";
+/// Minimum KFD ABI major version required for the PM4 compute path; the
+/// bring-up fails fast with `kfd_version_too_old` below this number.
 pub const min_kfd_major: u32 = 1;
 
 const kfd_ioctl_base: u8 = 'K';
@@ -47,30 +54,49 @@ const kfd_ioc_map_memory_to_gpu_nr: u8 = 0x18;
 const kfd_ioc_unmap_memory_from_gpu_nr: u8 = 0x19;
 
 // KFD_IOC_ALLOC_MEM_FLAGS_*.
+/// Allocate the BO out of device VRAM (local frame buffer).
 pub const ALLOC_MEM_FLAGS_VRAM: u32 = 1 << 0;
+/// Allocate the BO out of system GTT memory (the path used by every smoke BO).
 pub const ALLOC_MEM_FLAGS_GTT: u32 = 1 << 1;
+/// Pin a userptr range as the BO backing; not used by the bring-up smoke path.
 pub const ALLOC_MEM_FLAGS_USERPTR: u32 = 1 << 2;
+/// Allocate a doorbell page so a userspace queue can ring its wptr doorbell.
 pub const ALLOC_MEM_FLAGS_DOORBELL: u32 = 1 << 3;
+/// Request a CPU-coherent BO (snooped on x86); needed by ring/wptr/rptr BOs.
 pub const ALLOC_MEM_FLAGS_COHERENT: u32 = 1 << 26;
+/// Mark the BO as PCIe-visible / exportable to peer devices.
 pub const ALLOC_MEM_FLAGS_PUBLIC: u32 = 1 << 29;
+/// Mark the BO as containing GPU-executable code (shader binaries).
 pub const ALLOC_MEM_FLAGS_EXECUTABLE: u32 = 1 << 30;
+/// Map the BO with write permission on the GPU side (default for smoke BOs).
 pub const ALLOC_MEM_FLAGS_WRITABLE: u32 = 1 << 31;
 
 // KFD_IOC_QUEUE_TYPE_*.
+/// PM4 compute queue type passed to `AMDKFD_IOC_CREATE_QUEUE` for MEC pipes.
 pub const QUEUE_TYPE_COMPUTE: u32 = 0x0;
+/// SDMA queue type; copy engine queue, not used by the PM4 compute bring-up.
 pub const QUEUE_TYPE_SDMA: u32 = 0x1;
+/// AQL compute queue type (HSA packet processor format) used by ROCm/HSA.
 pub const QUEUE_TYPE_COMPUTE_AQL: u32 = 0x2;
 
+/// `AMDKFD_IOC_GET_VERSION` ioctl args — the KFD ABI version reported by the
+/// running kernel. Matches `struct kfd_ioctl_get_version_args` from uapi.
 pub const GetVersionArgs = extern struct {
     major_version: u32,
     minor_version: u32,
 };
 
+/// `AMDKFD_IOC_ACQUIRE_VM` ioctl args — binds the calling process's GPUVM to
+/// the DRM render node fd so subsequent allocations land in the right address
+/// space.
 pub const AcquireVmArgs = extern struct {
     drm_fd: u32,
     gpu_id: u32,
 };
 
+/// One device aperture entry returned by `GET_PROCESS_APERTURES_NEW`: the LDS,
+/// scratch, and GPUVM windows that this process is allowed to use on the
+/// indicated `gpu_id`. The bring-up only consumes `gpuvm_base/limit`.
 pub const ProcessDeviceApertures = extern struct {
     lds_base: u64,
     lds_limit: u64,
@@ -82,12 +108,18 @@ pub const ProcessDeviceApertures = extern struct {
     _pad: u32,
 };
 
+/// `AMDKFD_IOC_GET_PROCESS_APERTURES_NEW` ioctl args — caller supplies a
+/// pointer to an array of `ProcessDeviceApertures` plus its length; the kernel
+/// fills the array and updates `num_of_nodes` with the actual count.
 pub const GetProcessAperturesNewArgs = extern struct {
     kfd_process_device_apertures_ptr: u64,
     num_of_nodes: u32,
     _pad: u32,
 };
 
+/// `AMDKFD_IOC_ALLOC_MEMORY_OF_GPU` ioctl args. The caller chooses the GPU VA
+/// (`va_addr`) and the kernel returns a BO `handle` plus an `mmap_offset` for
+/// the DRM render node so the BO can be CPU-mapped.
 pub const AllocMemoryOfGpuArgs = extern struct {
     va_addr: u64,
     size: u64,
@@ -97,10 +129,15 @@ pub const AllocMemoryOfGpuArgs = extern struct {
     flags: u32,
 };
 
+/// `AMDKFD_IOC_FREE_MEMORY_OF_GPU` ioctl args — release the BO referenced by
+/// `handle` (must already be unmapped from every GPU it was mapped to).
 pub const FreeMemoryOfGpuArgs = extern struct {
     handle: u64,
 };
 
+/// `AMDKFD_IOC_MAP_MEMORY_TO_GPU` / `UNMAP_MEMORY_FROM_GPU` ioctl args. Same
+/// layout for both directions; the kernel updates `n_success` with the number
+/// of devices the BO was successfully (un)mapped on.
 pub const MapMemoryToGpuArgs = extern struct {
     handle: u64,
     device_ids_array_ptr: u64,
@@ -108,6 +145,9 @@ pub const MapMemoryToGpuArgs = extern struct {
     n_success: u32,
 };
 
+/// `AMDKFD_IOC_CREATE_QUEUE` ioctl args — describes the PM4 compute queue the
+/// kernel should map onto the MEC. Every BO address (ring/wptr/rptr/EOP/CWSR)
+/// must already be allocated and mapped to the same GPU before the ioctl.
 pub const CreateQueueArgs = extern struct {
     ring_base_address: u64,
     write_pointer_address: u64,
@@ -126,6 +166,8 @@ pub const CreateQueueArgs = extern struct {
     ctl_stack_size: u32,
 };
 
+/// `AMDKFD_IOC_DESTROY_QUEUE` ioctl args — release the queue identified by
+/// `queue_id` (the value the kernel returned from `CREATE_QUEUE`).
 pub const DestroyQueueArgs = extern struct {
     queue_id: u32,
     _pad: u32,
@@ -141,6 +183,10 @@ const ioc_unmap_memory_from_gpu = linux.IOCTL.IOWR(kfd_ioctl_base, kfd_ioc_unmap
 const ioc_create_queue = linux.IOCTL.IOWR(kfd_ioctl_base, kfd_ioc_create_queue_nr, CreateQueueArgs);
 const ioc_destroy_queue = linux.IOCTL.IOWR(kfd_ioctl_base, kfd_ioc_destroy_queue_nr, DestroyQueueArgs);
 
+/// One GPU topology node parsed from `topology_nodes_dir`. Carries the values
+/// the queue bring-up needs to validate `CREATE_QUEUE`: `gpu_id`, the GFX IP
+/// target version, CU/SIMD counts that drive CWSR sizing, and the canonical
+/// `cwsr_size` / `ctl_stack_size` advertised by the kernel.
 pub const TopologyNode = struct {
     node_index: u32,
     gpu_id: u32,
@@ -153,6 +199,9 @@ pub const TopologyNode = struct {
     drm_render_minor: u32 = 0,
 };
 
+/// Outcome categories for `bringUpPath`. Every non-`ok` value identifies the
+/// exact bring-up step that failed (open, version check, aperture lookup, VA
+/// reservation, alloc, map, mmap, CPU round-trip, unmap, free).
 pub const BringUpStatus = enum {
     ok,
     unsupported_os,
@@ -176,6 +225,10 @@ pub const BringUpStatus = enum {
     free_failed,
 };
 
+/// Full bring-up report produced by `bringUpPath`. Captures the status plus
+/// every observable value the smoke run collected (KFD ABI version, topology
+/// info, the GPUVM window, the reserved VA, and the errno of the last failing
+/// ioctl when applicable) so callers can render diagnostics without rerunning.
 pub const BringUpResult = struct {
     status: BringUpStatus,
     render_node: []const u8 = default_render_node,
@@ -191,6 +244,7 @@ pub const BringUpResult = struct {
     scratch_va: u64 = 0,
     errno: ?linux.E = null,
 
+    /// True when every bring-up step succeeded (`status == .ok`).
     pub fn ok(self: BringUpResult) bool {
         return self.status == .ok;
     }
@@ -198,6 +252,8 @@ pub const BringUpResult = struct {
 
 var last_ioctl_errno: ?linux.E = null;
 
+/// Returns the errno of the most recent failing ioctl, or `null` if the last
+/// ioctl succeeded. Cleared at the start of each `ioctlChecked` call.
 pub fn lastErrno() ?linux.E {
     return last_ioctl_errno;
 }
@@ -290,10 +346,24 @@ pub fn reachable() bool {
     return node.gpu_id != 0;
 }
 
+/// Run `bringUpPath` against `default_render_node` ("/dev/dri/renderD128").
+/// @returns Status + diagnostics for the GPUVM round-trip.
 pub fn bringUpDefault() BringUpResult {
     return bringUpPath(default_render_node);
 }
 
+/// End-to-end KFD bring-up: open `/dev/kfd` and the supplied render node,
+/// check the ABI version, acquire the GPUVM, look up the matching topology
+/// aperture, reserve a 64 KiB VA window inside it, allocate + mmap +
+/// MAP_MEMORY_TO_GPU a 4 KiB GTT scratch BO, write/read a magic value to
+/// verify the round-trip, then unmap and free everything. Every failure point
+/// is captured in the returned `BringUpResult` (status + last errno) so a
+/// non-Linux caller or a partial-permissions environment can still get a
+/// useful diagnostic without panicking.
+/// @param render_node Path to the DRM render node (e.g. `/dev/dri/renderD128`).
+/// @returns A populated `BringUpResult`; `.ok()` is true only on a clean
+/// round-trip.
+/// @note Off Linux this short-circuits to `unsupported_os` and performs no IO.
 pub fn bringUpPath(render_node: []const u8) BringUpResult {
     if (builtin.os.tag != .linux) {
         return .{ .status = .unsupported_os, .render_node = render_node };
@@ -461,6 +531,9 @@ fn failErrno(base: BringUpResult, status: BringUpStatus) BringUpResult {
 // and tears everything down. Decode still runs on T-CPU after admission.
 // ===========================================================================
 
+/// Outcome categories for the PM4 compute-queue smoke path. Each non-`ok`
+/// value identifies a specific failure step (BO allocation, map,
+/// `CREATE_QUEUE`, `DESTROY_QUEUE`) so callers can render bring-up reports.
 pub const ComputeQueueSmokeStatus = enum {
     ok,
     unsupported_os,
@@ -479,6 +552,10 @@ pub const ComputeQueueSmokeStatus = enum {
     destroy_queue_failed,
 };
 
+/// Full report for the PM4 compute-queue smoke run. Captures the status plus
+/// every observable value the run produced (BO VAs, queue id, doorbell offset,
+/// initial wptr/rptr, number of PM4 NOP dwords staged, and the errno of the
+/// last failing ioctl) so a higher-level CLI can render bring-up output.
 pub const ComputeQueueSmokeResult = struct {
     status: ComputeQueueSmokeStatus,
     render_node: []const u8 = default_render_node,
@@ -503,6 +580,8 @@ pub const ComputeQueueSmokeResult = struct {
     errno: ?linux.E = null,
     destroy_errno: ?linux.E = null,
 
+    /// True when the queue was created, NOPs staged, and the queue destroyed
+    /// without any ioctl failure.
     pub fn ok(self: ComputeQueueSmokeResult) bool {
         return self.status == .ok;
     }
@@ -511,6 +590,11 @@ pub const ComputeQueueSmokeResult = struct {
 const page_size: usize = 4096;
 const default_ring_size: usize = 0x10000;
 
+/// Round `value` up to the next multiple of `alignment`. Returns `value`
+/// unchanged when `alignment` is zero or `value` is already aligned.
+/// @param value Number to be rounded up.
+/// @param alignment Power-of-two (or any non-zero) boundary to align to.
+/// @returns Smallest multiple of `alignment` that is `>= value`.
 pub fn alignUp(value: u64, alignment: u64) u64 {
     if (alignment == 0) return value;
     const rem = value % alignment;
@@ -653,10 +737,22 @@ fn cqFromAllocErr(base: ComputeQueueSmokeResult, err: BoAllocError) ComputeQueue
     };
 }
 
+/// Run `createComputeQueueSmokePath` against `default_render_node`.
+/// @returns The compute-queue smoke result; `.ok()` is true on a clean run.
 pub fn createComputeQueueSmokeDefault() ComputeQueueSmokeResult {
     return createComputeQueueSmokePath(default_render_node);
 }
 
+/// Stand up a PM4 compute queue end-to-end on the given render node. Allocates
+/// the ring / wptr / rptr / EOP / CWSR buffer objects with the sizing rules
+/// `kfd_queue_acquire_buffers` validates, calls `AMDKFD_IOC_CREATE_QUEUE`,
+/// stages a couple of PM4 NOP packets into the ring (no doorbell yet), then
+/// destroys the queue and tears everything down. Every BO and ioctl failure
+/// is captured in the returned report so the bring-up smoke test can render
+/// the exact step that failed.
+/// @param render_node DRM render node backing the target GPU.
+/// @returns The full smoke report; `.ok()` is true on a clean create/destroy.
+/// @note Off Linux this short-circuits to `unsupported_os` without IO.
 pub fn createComputeQueueSmokePath(render_node: []const u8) ComputeQueueSmokeResult {
     if (builtin.os.tag != .linux) {
         return .{ .status = .unsupported_os, .render_node = render_node };

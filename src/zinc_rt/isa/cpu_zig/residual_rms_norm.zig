@@ -3,6 +3,12 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Inputs and outputs for one fused residual-add + RMS-norm call.
+/// @param x Hidden state to normalize after residual addition.
+/// @param residual Residual contribution added element-wise to `x` before normalization.
+/// @param weight Per-channel learned scale applied after RMS normalization.
+/// @param output Destination hidden state of length `>= x.len`.
+/// @param eps Small constant added inside the square root to keep division numerically stable.
 pub const Params = struct {
     x: []const f32,
     residual: []const f32,
@@ -11,6 +17,12 @@ pub const Params = struct {
     eps: f32,
 };
 
+/// Compute `output = weight * (x + residual) / sqrt(mean((x + residual)^2) + eps)`.
+/// Fuses the post-attention/post-MLP residual add with the RMS norm so the sum lives only in
+/// registers; matches the GPU kernel that the Vulkan path uses on the decode hot loop.
+/// @param params Inputs, residual, learned scale, output slice, and `eps`; see `Params`.
+/// @returns `error.EmptyInput` when inputs are zero-length, `error.ShapeMismatch` when any
+/// companion slice is shorter than `x`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.x.len == 0 or params.output.len == 0) return error.EmptyInput;
     if (params.output.len < params.x.len) return error.ShapeMismatch;

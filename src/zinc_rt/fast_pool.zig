@@ -1,4 +1,5 @@
 //! Low-overhead worker pool for the T-CPU decode matvec fan-out.
+//! @section Inference Runtime
 //!
 //! Replaces std.Thread.Pool's spawnWg/waitAndWork pattern for the matvec hot
 //! path. Each dispatch posts up to N typed tasks to per-worker atomic slots
@@ -19,6 +20,10 @@
 
 const std = @import("std");
 
+/// Upper bound on worker threads supported by a single `FastPool`.
+/// The slot table is sized to this constant so dispatches stay branch-free
+/// and cache-friendly; eight covers the decode matvec fan-out on every
+/// targeted host CPU.
 pub const max_workers: usize = 8;
 
 const Slot = struct {
@@ -35,11 +40,18 @@ const Slot = struct {
     done_seq: std.atomic.Value(u64) align(64),
 };
 
+/// Single unit of work posted into the pool.
+/// `fn_` is invoked with `ctx` on either the calling thread (task 0) or a
+/// worker thread (tasks 1..). The caller owns the storage `ctx` points at
+/// and must keep it alive until `dispatchAndRun` returns.
 pub const Task = struct {
     fn_: *const fn (*anyopaque) void,
     ctx: *anyopaque,
 };
 
+/// Persistent worker pool that fans matvec barriers out across N threads.
+/// Slots are cache-line aligned and communicated via release/acquire atomics;
+/// see the module doc for the rationale and benchmark numbers.
 pub const FastPool = struct {
     const Self = @This();
 
@@ -49,6 +61,14 @@ pub const FastPool = struct {
     slots: [max_workers]Slot align(64),
     shutdown: std.atomic.Value(bool) align(64),
 
+    /// Spawn `n_workers` persistent worker threads bound to this pool.
+    /// Initializes the slot table, then launches each worker on `workerMain`.
+    /// @param self Pool storage; written in place so callers can keep it on
+    /// the stack.
+    /// @param allocator Used for the `threads` array only.
+    /// @param n_workers Worker thread count; must be in `1..=max_workers`.
+    /// @returns `error.InvalidWorkerCount` when `n_workers` is out of range,
+    /// or a spawn error from `std.Thread.spawn`.
     pub fn init(self: *Self, allocator: std.mem.Allocator, n_workers: usize) !void {
         if (n_workers == 0 or n_workers > max_workers) return error.InvalidWorkerCount;
         self.* = .{
@@ -80,6 +100,9 @@ pub const FastPool = struct {
         }
     }
 
+    /// Signal shutdown, wake every worker, join all threads, and free state.
+    /// Bumps each slot's `seq` after raising the shutdown flag so workers
+    /// observing a spin-loop step out and exit promptly.
     pub fn deinit(self: *Self) void {
         self.shutdown.store(true, .release);
         // Bump every slot's seq so workers that are spinning notice and

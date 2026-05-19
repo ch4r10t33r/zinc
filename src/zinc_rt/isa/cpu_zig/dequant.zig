@@ -17,6 +17,19 @@ fn getScaleMinK4(j: usize, scales: []const u8) struct { sc: u8, m: u8 } {
     };
 }
 
+/// Dequantize one row of a GGML tensor into f32 lanes.
+/// Dispatches on `tensor_type` and writes the first `cols` entries of `output`. Supports the
+/// formats used by ZINC weights today: `.f32`, `.f16`, `.bf16`, `.q8_0`, `.q4_0`, `.q4_k`,
+/// `.q5_k`, `.q6_k`, and `.mxfp4`.
+/// @param raw_data Raw tensor bytes for the full matrix.
+/// @param row_index Zero-based row to materialize.
+/// @param cols Number of columns per row; quantized formats require this to be a multiple of
+/// their block size (32 for q4_0/q8_0/mxfp4, 256 for q4_k/q5_k/q6_k).
+/// @param tensor_type GGML quantization tag selecting the decode path.
+/// @param output Destination slice; must be at least `cols` long.
+/// @returns `error.OutputTooSmall` when `output.len < cols`, `error.EmptyInput` when `cols == 0`,
+/// `error.InputTooSmall` when the row would overrun `raw_data`, `error.UnsupportedShape` on bad
+/// alignment, or `error.UnsupportedTensorType` for formats not handled here.
 pub fn row(raw_data: []const u8, row_index: u32, cols: u32, tensor_type: GGMLType, output: []f32) !void {
     if (output.len < cols) return error.OutputTooSmall;
     if (cols == 0) return error.EmptyInput;
@@ -242,6 +255,17 @@ pub fn row(raw_data: []const u8, row_index: u32, cols: u32, tensor_type: GGMLTyp
     }
 }
 
+/// Dot one quantized row against an f32 input vector, dispatching on tensor type.
+/// Hot formats (`f32`, `f16`, `bf16`, `q4_0`, `q8_0`, `q4_k`, `q5_k`, `q6_k`) take a fused vectorized
+/// path that streams weights and folds the dequant scales into the FMAs. Every other format falls
+/// back to dequantizing into `scratch` first and then dotting.
+/// @param raw_data Raw tensor bytes for the full matrix.
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns per row; subject to the same block-alignment constraints as `row`.
+/// @param tensor_type GGML quantization tag selecting the decode path.
+/// @param input f32 input vector of length `>= cols`.
+/// @param scratch Caller-owned scratch of length `>= cols`; only consumed on the fallback path.
+/// @returns The f32 dot product, or an error matching `row`'s shape and size diagnostics.
 pub fn dotRow(
     raw_data: []const u8,
     row_index: u32,
@@ -271,6 +295,13 @@ pub fn dotRow(
     };
 }
 
+/// Dot one f32-packed row against `input` using a 16-wide AVX-512-friendly inner loop.
+/// Uses four independent accumulators driven by a 4-way unroll so the FP-add chain stays short.
+/// @param raw_data Raw f32 row-major tensor bytes.
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of f32 columns in the row.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.InputTooSmall` when `input` or `raw_data` is shorter than expected.
 pub fn dotF32Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (input.len < cols) return error.InputTooSmall;
 
@@ -328,6 +359,12 @@ pub fn dotF32Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const
     return acc;
 }
 
+/// Dot one f16-packed row against an f32 input vector, promoting each weight to f32 on the fly.
+/// @param raw_data Raw f16 row-major tensor bytes.
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of f16 columns in the row.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.InputTooSmall` when the input or row bytes are too short.
 pub fn dotF16Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (input.len < cols) return error.InputTooSmall;
 
@@ -344,6 +381,12 @@ pub fn dotF16Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const
     return acc;
 }
 
+/// Dot one bf16-packed row against an f32 input vector by zero-extending each weight into f32.
+/// @param raw_data Raw bf16 row-major tensor bytes.
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of bf16 columns in the row.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.InputTooSmall` when the input or row bytes are too short.
 pub fn dotBf16Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (input.len < cols) return error.InputTooSmall;
 
@@ -360,6 +403,14 @@ pub fn dotBf16Row(raw_data: []const u8, row_index: u32, cols: u32, input: []cons
     return acc;
 }
 
+/// Dot one Q8_0-packed row against an f32 input vector.
+/// Q8_0 stores 32 signed-int8 weights per block with one f16 scale; this entry point validates
+/// block alignment and bounds, then delegates to the unchecked vectorized inner loop.
+/// @param raw_data Raw Q8_0 tensor bytes (34 bytes per 32-element block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a multiple of 32.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.UnsupportedShape` / `error.InputTooSmall` on misuse.
 pub fn dotQ8_0Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (cols % 32 != 0) return error.UnsupportedShape;
     if (input.len < cols) return error.InputTooSmall;
@@ -423,6 +474,14 @@ pub inline fn dotQ8_0RowUnchecked(raw_data: []const u8, row_index: u32, cols: u3
     return @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
 }
 
+/// Dot one Q4_0-packed row against an f32 input vector.
+/// Q4_0 stores 32 nibble weights with a `-8` bias per block plus an f16 scale; this entry point
+/// validates block alignment and bounds, then delegates to the unchecked vectorized inner loop.
+/// @param raw_data Raw Q4_0 tensor bytes (18 bytes per 32-element block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a multiple of 32.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.UnsupportedShape` / `error.InputTooSmall` on misuse.
 pub fn dotQ4_0Row(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (cols % 32 != 0) return error.UnsupportedShape;
     if (input.len < cols) return error.InputTooSmall;
@@ -733,6 +792,15 @@ pub fn quantizeRowToQ8_0(src: []const f32, dst: []u8) void {
     }
 }
 
+/// Dot one Q4_K-packed row against an f32 input vector.
+/// Q4_K stores 256 weights per super-block as 8 sub-blocks of 32 nibbles, each with its own 6-bit
+/// scale and min packed into a 12-byte header (plus block-level f16 `d`/`dmin`); validates block
+/// alignment and bounds, then delegates to the unchecked vectorized inner loop.
+/// @param raw_data Raw Q4_K tensor bytes (144 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.UnsupportedShape` / `error.InputTooSmall` on misuse.
 pub fn dotQ4KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (cols % 256 != 0) return error.UnsupportedShape;
     if (input.len < cols) return error.InputTooSmall;
@@ -810,6 +878,11 @@ pub inline fn dotQ4KRowUnchecked(raw_data: []const u8, row_index: u32, cols: u32
     return @reduce(.Add, (acc_lo0 + acc_hi0) + (acc_lo1 + acc_hi1));
 }
 
+/// Precompute per-32-element sums of an input vector for the `WithSum32` Q4_K/Q5_K dot paths.
+/// Those paths fold the asymmetric min subtraction `-m * sum(x_block)` out of the inner loop, so the
+/// caller fills `sums[i] = sum(input[i*32 .. (i+1)*32])` once and reuses it across many rows.
+/// @param input Input vector whose length must be a positive multiple of 32.
+/// @param sums Destination of length `>= input.len / 32`; lane `i` receives the sum of input block `i`.
 pub fn fillInputSum32(input: []const f32, sums: []f32) void {
     std.debug.assert(input.len % 32 == 0);
     std.debug.assert(sums.len >= input.len / 32);
@@ -893,6 +966,15 @@ pub inline fn dotQ4KRowWithSum32Unchecked(
     return @reduce(.Add, (acc_lo0 + acc_hi0) + (acc_lo1 + acc_hi1)) + min_acc;
 }
 
+/// Dot one Q5_K-packed row against an f32 input vector.
+/// Q5_K extends Q4_K with a 5th high-bit plane stored as 32 bytes (one bit per weight, eight 32-element
+/// sub-blocks); validates block alignment and bounds, then delegates to the unchecked vectorized
+/// inner loop.
+/// @param raw_data Raw Q5_K tensor bytes (176 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.UnsupportedShape` / `error.InputTooSmall` on misuse.
 pub fn dotQ5KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (cols % 256 != 0) return error.UnsupportedShape;
     if (input.len < cols) return error.InputTooSmall;
@@ -1043,6 +1125,15 @@ pub inline fn dotQ5KRowWithSum32Unchecked(
     return @reduce(.Add, (acc_lo0 + acc_hi0) + (acc_lo1 + acc_hi1)) + min_acc;
 }
 
+/// Dot one Q6_K-packed row against an f32 input vector.
+/// Q6_K packs 256 6-bit weights as a low-nibble plane plus a 2-bit-per-weight high plane, with one
+/// f16 super-block scale and eight signed-int8 per-32 sub-scales; weights are recentered by `-32`.
+/// Validates block alignment and bounds, then delegates to the unchecked vectorized inner loop.
+/// @param raw_data Raw Q6_K tensor bytes (210 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product, or `error.UnsupportedShape` / `error.InputTooSmall` on misuse.
 pub fn dotQ6KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) !f32 {
     if (cols % 256 != 0) return error.UnsupportedShape;
     if (input.len < cols) return error.InputTooSmall;

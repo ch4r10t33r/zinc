@@ -4,12 +4,22 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Inputs and outputs for one sigmoid-gated multiply.
+/// @param gate Pre-activation gate values; sigmoid is applied element-wise.
+/// @param x Companion values multiplied by the sigmoid of `gate`.
+/// @param output Destination vector of length `>= gate.len`.
 pub const Params = struct {
     gate: []const f32,
     x: []const f32,
     output: []f32,
 };
 
+/// Compute `output[i] = sigmoid(gate[i]) * x[i]` for every gate element.
+/// Used by attention Q-gating and SSM gated-norm paths where a learned scalar selects how much of
+/// `x` to pass through.
+/// @param params Gate, value, and output slices; see `Params`.
+/// @returns `error.EmptyInput` when `gate` is empty, `error.ShapeMismatch` when `output` or `x`
+/// is shorter than `gate`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.gate.len == 0) return error.EmptyInput;
     if (params.output.len < params.gate.len) return error.ShapeMismatch;

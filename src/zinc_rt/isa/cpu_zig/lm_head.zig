@@ -5,6 +5,12 @@ const std = @import("std");
 const dequant = @import("dequant.zig");
 const gguf = @import("gguf");
 
+/// Inputs and outputs for one LM_HEAD call.
+/// @param raw_data Raw GGUF tensor bytes for the output matrix `[vocab_size, hidden_dim]`.
+/// @param tensor_type GGML quantization format of `raw_data` (forwarded to `dequant.row`).
+/// @param hidden Final hidden state of length `hidden_dim`.
+/// @param row_scratch Caller-owned scratch buffer of length exactly `hidden_dim` for one dequantized row.
+/// @param logits Destination vector of length `vocab_size`; row `i` of the matrix maps to `logits[i]`.
 pub const Params = struct {
     raw_data: []const u8,
     tensor_type: gguf.GGMLType,
@@ -13,6 +19,11 @@ pub const Params = struct {
     logits: []f32,
 };
 
+/// Project the hidden state through every row of the GGUF output matrix to produce vocab logits.
+/// Rows are dequantized one at a time into `row_scratch` and dot-multiplied with `hidden`.
+/// @param params Tensor data, hidden state, scratch row, and logits slice; see `Params`.
+/// @returns `error.EmptyInput` when either `hidden` or `logits` is empty, `error.ShapeMismatch` when
+/// `row_scratch` is not exactly `hidden.len`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.hidden.len == 0 or params.logits.len == 0) return error.EmptyInput;
     if (params.row_scratch.len != params.hidden.len) return error.ShapeMismatch;

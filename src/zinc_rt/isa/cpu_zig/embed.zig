@@ -4,6 +4,13 @@
 const dequant = @import("dequant.zig");
 const gguf = @import("gguf");
 
+/// Inputs and outputs for one EMBED call.
+/// @param raw_data Raw GGUF tensor bytes for the embedding matrix `[vocab_size, hidden_dim]`.
+/// @param tensor_type GGML quantization format of `raw_data` (forwarded to `dequant.row`).
+/// @param token_id Row index to fetch; must be `< vocab_size`.
+/// @param hidden_dim Number of columns per row; also the required length of `output`.
+/// @param vocab_size Number of embedding rows in `raw_data`.
+/// @param output Destination hidden-state slice of length exactly `hidden_dim`.
 pub const Params = struct {
     raw_data: []const u8,
     tensor_type: gguf.GGMLType,
@@ -13,6 +20,11 @@ pub const Params = struct {
     output: []f32,
 };
 
+/// Dequantize the row at `params.token_id` of the embedding matrix into `params.output`.
+/// Thin wrapper over `dequant.row` that validates the token index and output shape.
+/// @param params Token id, matrix shape, and destination slice; see `Params`.
+/// @returns `error.TokenOutOfRange` when the token id is past `vocab_size`, `error.ShapeMismatch` when
+/// the output slice does not match `hidden_dim`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.token_id >= params.vocab_size) return error.TokenOutOfRange;
     if (params.output.len != params.hidden_dim) return error.ShapeMismatch;

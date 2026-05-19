@@ -4,6 +4,11 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Inputs and outputs for one RMS_NORM call.
+/// @param input Vector to normalize.
+/// @param weight Per-channel learned scale; must match `input` in length.
+/// @param output Destination vector; must match `input` in length.
+/// @param eps Small constant added inside the square root to keep division numerically stable.
 pub const Params = struct {
     input: []const f32,
     weight: []const f32,
@@ -11,6 +16,11 @@ pub const Params = struct {
     eps: f32,
 };
 
+/// Compute `output[i] = weight[i] * input[i] / sqrt(mean(input^2) + eps)`.
+/// Scalar reference implementation; favors readable shape checks and bit-stable math over throughput.
+/// @param params Input, learned scale, output slice, and `eps`; see `Params`.
+/// @returns `error.EmptyInput` when `input` is zero-length, `error.ShapeMismatch` when `weight` or
+/// `output` do not exactly match `input.len`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.input.len == 0) return error.EmptyInput;
     if (params.weight.len != params.input.len or params.output.len != params.input.len) {

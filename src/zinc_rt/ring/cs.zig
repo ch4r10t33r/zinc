@@ -33,25 +33,36 @@ const packet = @import("packet.zig");
 
 const linux = std.os.linux;
 
+/// Default DRM render node used by the CS bring-up gate when no path is provided.
 pub const default_render_node = "/dev/dri/renderD128";
 
 // HW IP block ids (uapi/drm/amdgpu_drm.h).
+/// amdgpu HW IP block id for the graphics ring (uapi/drm/amdgpu_drm.h).
 pub const AMDGPU_HW_IP_GFX: u32 = 0;
+/// amdgpu HW IP block id for the async compute ring used by ZINC submissions.
 pub const AMDGPU_HW_IP_COMPUTE: u32 = 1;
 
 // Context ops.
+/// `DRM_AMDGPU_CTX` op selector for allocating a new submission context.
 pub const AMDGPU_CTX_OP_ALLOC_CTX: u32 = 1;
+/// `DRM_AMDGPU_CTX` op selector for releasing a previously allocated context.
 pub const AMDGPU_CTX_OP_FREE_CTX: u32 = 2;
 
 // BO-list ops.
+/// `DRM_AMDGPU_BO_LIST` op selector to create a residency BO list handle.
 pub const AMDGPU_BO_LIST_OP_CREATE: u32 = 0;
+/// `DRM_AMDGPU_BO_LIST` op selector to destroy a previously created BO list.
 pub const AMDGPU_BO_LIST_OP_DESTROY: u32 = 1;
 
 // CS chunk ids.
+/// CS chunk id for an indirect-buffer descriptor (`DrmAmdgpuCsChunkIb`).
 pub const AMDGPU_CHUNK_ID_IB: u32 = 0x01;
+/// CS chunk id for an inline BO-handles list, an alternative to a pre-created BO list.
 pub const AMDGPU_CHUNK_ID_BO_HANDLES: u32 = 0x06;
 
 // IB flags.
+/// IB flag instructing the kernel to emit a memory-sync packet around the IB
+/// so writes from the BO list reach DRAM before/after the dispatch.
 pub const AMDGPU_IB_FLAG_EMIT_MEM_SYNC: u32 = 1 << 6;
 
 const drm_ioctl_base: u8 = 'd';
@@ -61,6 +72,8 @@ const drm_amdgpu_bo_list_nr: u8 = 0x03;
 const drm_amdgpu_cs_nr: u8 = 0x04;
 const drm_amdgpu_wait_cs_nr: u8 = 0x09;
 
+/// Input payload of `DRM_IOCTL_AMDGPU_CTX`: selects an op and carries the
+/// caller-supplied `ctx_id` and submission priority for that op.
 pub const DrmAmdgpuCtxIn = extern struct {
     op: u32,
     flags: u32,
@@ -68,23 +81,32 @@ pub const DrmAmdgpuCtxIn = extern struct {
     priority: i32,
 };
 
+/// Output payload of `AMDGPU_CTX_OP_ALLOC_CTX`: the kernel-assigned context id
+/// returned in the same `DrmAmdgpuCtx` union after a successful allocation.
 pub const DrmAmdgpuCtxOutAlloc = extern struct {
     ctx_id: u32,
     _pad: u32,
 };
 
+/// Output payload of the `AMDGPU_CTX_OP_QUERY_STATE` op: GPU reset state and
+/// hang counter for the queried context (unused on the bring-up path).
 pub const DrmAmdgpuCtxOutState = extern struct {
     flags: u64,
     hangs: u32,
     reset_status: u32,
 };
 
+/// Tagged union passed to `DRM_IOCTL_AMDGPU_CTX` covering the input request
+/// and the two output shapes (alloc / query-state).
 pub const DrmAmdgpuCtx = extern union {
     in: DrmAmdgpuCtxIn,
     out_alloc: DrmAmdgpuCtxOutAlloc,
     out_state: DrmAmdgpuCtxOutState,
 };
 
+/// Input payload of `DRM_IOCTL_AMDGPU_BO_LIST`: op selector plus a pointer to
+/// an array of `DrmAmdgpuBoListEntry` describing the BOs the submission must
+/// keep resident.
 pub const DrmAmdgpuBoListIn = extern struct {
     operation: u32,
     list_handle: u32,
@@ -93,27 +115,36 @@ pub const DrmAmdgpuBoListIn = extern struct {
     bo_info_ptr: u64,
 };
 
+/// Output payload of `AMDGPU_BO_LIST_OP_CREATE`: the kernel-assigned BO list
+/// handle referenced from subsequent CS submissions.
 pub const DrmAmdgpuBoListOut = extern struct {
     list_handle: u32,
     _pad: u32,
 };
 
+/// Tagged union passed to `DRM_IOCTL_AMDGPU_BO_LIST` covering input and output.
 pub const DrmAmdgpuBoList = extern union {
     in: DrmAmdgpuBoListIn,
     out: DrmAmdgpuBoListOut,
 };
 
+/// Single residency entry inside a BO list: the GEM handle to make resident
+/// and a kernel-visible priority hint for eviction.
 pub const DrmAmdgpuBoListEntry = extern struct {
     bo_handle: u32,
     bo_priority: u32,
 };
 
+/// One chunk inside a `DRM_IOCTL_AMDGPU_CS` submission: a typed sub-payload
+/// (`chunk_id`, length in dwords, pointer to the chunk data).
 pub const DrmAmdgpuCsChunk = extern struct {
     chunk_id: u32,
     length_dw: u32,
     chunk_data: u64,
 };
 
+/// Input payload of `DRM_IOCTL_AMDGPU_CS`: binds a context, BO list and an
+/// array of typed chunks (the IB descriptor lives in one of those chunks).
 pub const DrmAmdgpuCsIn = extern struct {
     ctx_id: u32,
     bo_list_handle: u32,
@@ -122,15 +153,21 @@ pub const DrmAmdgpuCsIn = extern struct {
     chunks: u64,
 };
 
+/// Output payload of `DRM_IOCTL_AMDGPU_CS`: the fence handle the caller waits
+/// on via `DRM_IOCTL_AMDGPU_WAIT_CS` for the submission to retire.
 pub const DrmAmdgpuCsOut = extern struct {
     handle: u64,
 };
 
+/// Tagged union passed to `DRM_IOCTL_AMDGPU_CS` covering input and output.
 pub const DrmAmdgpuCs = extern union {
     in: DrmAmdgpuCsIn,
     out: DrmAmdgpuCsOut,
 };
 
+/// Chunk payload for `AMDGPU_CHUNK_ID_IB`: describes the indirect-buffer VA,
+/// its size in bytes, the target IP type/ring, and submission flags such as
+/// `AMDGPU_IB_FLAG_EMIT_MEM_SYNC`.
 pub const DrmAmdgpuCsChunkIb = extern struct {
     _pad: u32,
     flags: u32,
@@ -141,6 +178,8 @@ pub const DrmAmdgpuCsChunkIb = extern struct {
     ring: u32,
 };
 
+/// Input payload of `DRM_IOCTL_AMDGPU_WAIT_CS`: identifies the fence to wait
+/// on (by `handle`/`ctx_id` against a specific IP/ring) and the timeout.
 pub const DrmAmdgpuWaitCsIn = extern struct {
     handle: u64,
     timeout: u64,
@@ -150,10 +189,13 @@ pub const DrmAmdgpuWaitCsIn = extern struct {
     ctx_id: u32,
 };
 
+/// Output payload of `DRM_IOCTL_AMDGPU_WAIT_CS`: zero on successful retirement,
+/// nonzero on timeout or fence error.
 pub const DrmAmdgpuWaitCsOut = extern struct {
     status: u64,
 };
 
+/// Tagged union passed to `DRM_IOCTL_AMDGPU_WAIT_CS` covering input and output.
 pub const DrmAmdgpuWaitCs = extern union {
     in: DrmAmdgpuWaitCsIn,
     out: DrmAmdgpuWaitCsOut,
@@ -260,6 +302,10 @@ const dmmv_f32_row_range_gfx1201 = [_]u32{
     0xbfb00000, // s_endpgm
 };
 
+/// Outcome classification for the CS bring-up smoke gate.
+/// Each variant maps to a specific failure point in the open → submit → wait
+/// pipeline, so the benchmark UI can attribute a regression to render-node
+/// access, kernel ABI mismatch, BO/VA setup, submission, or fence retirement.
 pub const SmokeStatus = enum {
     ok,
     unsupported_os,
@@ -281,6 +327,10 @@ pub const SmokeStatus = enum {
     signal_check_failed,
 };
 
+/// Structured result returned by the CS bring-up smoke gate.
+/// Captures the rendezvous addresses, kernel-assigned handles, observed signal
+/// value, fence handles, and the final `SmokeStatus` so benchmark output can
+/// surface a precise failure mode without re-running the path.
 pub const SmokeResult = struct {
     status: SmokeStatus,
     render_node: []const u8 = default_render_node,
@@ -298,11 +348,20 @@ pub const SmokeResult = struct {
     wait_status: u64 = 0,
     errno: ?linux.E = null,
 
+    /// Returns true when both PM4 submissions retired and the signal BO read
+    /// back the expected sentinel value.
     pub fn ok(self: SmokeResult) bool {
         return self.status == .ok;
     }
 };
 
+/// Per-token CS submission context for the PM4 bring-up tiers.
+///
+/// Owns the long-lived amdgpu context, BO list, and the GPU-mapped indirect-
+/// buffer / input / output / signal / shader buffers used by the
+/// `copyU32`, `argmaxTop2`, `rmsNormElement0` and `dmmvF32RowRange` dispatches.
+/// Reused across many submissions so each decode step only re-records PM4 into
+/// the existing IB and re-submits via `DRM_IOCTL_AMDGPU_CS`.
 pub const TokenBoundary = struct {
     file: std.fs.File,
     ctx_id: u32,
@@ -324,10 +383,24 @@ pub const TokenBoundary = struct {
     last_wait_status: u64 = 0,
     last_ib_bytes: u32 = 0,
 
+    /// Open the canonical render node (`default_render_node`) and finish the
+    /// full CS bring-up: context, BO list, IB / input / output / signal /
+    /// shader buffers, all mapped into a low GPU VA range.
+    /// @returns A ready `TokenBoundary` whose `builder` can record PM4 immediately.
     pub fn initDefault() !TokenBoundary {
         return initPath(default_render_node);
     }
 
+    /// Open the given render node and bring up the full CS submission state.
+    ///
+    /// Allocates an amdgpu context, creates GTT-backed BOs for the indirect
+    /// buffer, input scratch (~2 MiB), output, signal and shader pages, maps
+    /// each into a fixed low GPU VA so the kernel does not need to re-bind
+    /// them per submission, uploads the three gfx1201 PM4 kernels into the
+    /// shader page, and creates a persistent BO list referencing all five BOs.
+    /// @param render_node Absolute path to the amdgpu DRM render node (e.g. `/dev/dri/renderD128`).
+    /// @returns A ready `TokenBoundary` on success; the relevant `error.*Failed` variant otherwise.
+    /// @note Linux-only; returns `error.UnsupportedOs` on other platforms.
     pub fn initPath(render_node: []const u8) !TokenBoundary {
         if (builtin.os.tag != .linux) return error.UnsupportedOs;
 
@@ -426,6 +499,10 @@ pub const TokenBoundary = struct {
         };
     }
 
+    /// Tear down every kernel resource the `init*` paths created: destroy the
+    /// BO list, free the amdgpu context, `munmap` each CPU mapping, and close
+    /// the render-node file descriptor.
+    /// @note Leaves the struct in an `undefined` state; do not reuse it.
     pub fn deinit(self: *TokenBoundary) void {
         destroyBoList(self.file, self.bo_list_handle);
         freeContext(self.file, self.ctx_id);
@@ -438,6 +515,12 @@ pub const TokenBoundary = struct {
         self.* = undefined;
     }
 
+    /// Round-trip one `u32` through the GPU as the simplest end-to-end gate:
+    /// PM4 `COPY_DATA` from the input page to the output page, plus a
+    /// `WRITE_DATA` of a per-submission sentinel into the signal page.
+    /// @param value 32-bit payload to copy.
+    /// @returns The value the GPU wrote into `output_map[0]`.
+    /// @note Returns `error.SignalMismatch` if the post-fence signal value does not match the expected sentinel.
     pub fn copyU32(self: *TokenBoundary, value: u32) !u32 {
         const input_words: [*]volatile u32 = @ptrCast(@alignCast(self.input_map.ptr));
         const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
@@ -488,10 +571,27 @@ pub const TokenBoundary = struct {
         return output_words[0];
     }
 
+    /// Alias for `copyU32` framed as the per-token decode pulse: prove the
+    /// GPU produced a token by round-tripping its id through a real PM4
+    /// submission and fence wait.
+    /// @param token_id Token id to round-trip through the GPU.
+    /// @returns The id the GPU echoed back into the output page.
     pub fn produceToken(self: *TokenBoundary, token_id: u32) !u32 {
         return self.copyU32(token_id);
     }
 
+    /// Dispatch the gfx1201 top-2 argmax kernel and return the selected token.
+    ///
+    /// Loads the argmax program into the compute SGPRs, packs the output VA
+    /// and the two `(score, token)` pairs into `compute_user_data_0..7`, fires
+    /// one workgroup, then waits on the signal sentinel before reading the
+    /// kernel-chosen token from the output page.
+    /// @param token0 First candidate token id.
+    /// @param score0 Logit/score for `token0` (compared via ordered f32 bits).
+    /// @param token1 Second candidate token id.
+    /// @param score1 Logit/score for `token1`.
+    /// @returns Whichever of `token0`/`token1` the kernel selected.
+    /// @note Returns `error.SignalMismatch` on fence mismatch or `error.ArgmaxTop2InvalidToken` if the kernel writes anything else.
     pub fn argmaxTop2(
         self: *TokenBoundary,
         token0: u32,
@@ -577,6 +677,16 @@ pub const TokenBoundary = struct {
         return selected;
     }
 
+    /// Dispatch the single-element gfx1201 final-RMS-norm kernel.
+    ///
+    /// Stores `hidden0 * inv_rms * weight0` into `output_map[0]` via a real
+    /// PM4 dispatch on the compute ring, with a signal sentinel verifying
+    /// retirement.
+    /// @param hidden0 First hidden-state element.
+    /// @param inv_rms Pre-computed inverse RMS scale.
+    /// @param weight0 First RMS-norm weight.
+    /// @returns The fused `hidden0 * inv_rms * weight0` value the GPU produced.
+    /// @note Returns `error.SignalMismatch` if the signal sentinel does not match the expected per-submission value.
     pub fn rmsNormElement0(
         self: *TokenBoundary,
         hidden0: f32,
@@ -666,6 +776,21 @@ pub const TokenBoundary = struct {
         return @bitCast(output_words[0]);
     }
 
+    /// Dispatch the gfx1201 row-range f32 dense matrix-vector kernel.
+    ///
+    /// Copies the input vector and the row-major f32 weight block into the
+    /// shared input page (64-byte aligned), records PM4 that points the
+    /// kernel at the input/weights/output pages and the `rows`/`cols`
+    /// arguments, and waits on the signal sentinel before reading `output`.
+    /// This is the first row-oriented dense compute kernel the CS path runs;
+    /// `cols` must be a multiple of 64 and `output` must hold at least `rows`
+    /// elements.
+    /// @param input Input activation vector of length `cols`.
+    /// @param weights_f32 Row-major weight bytes; must hold at least `rows*cols*4` bytes.
+    /// @param rows Number of output rows to compute.
+    /// @param cols Inner dimension; must be a multiple of 64.
+    /// @param output Output slice receiving `rows` f32 values.
+    /// @note Returns `error.ShapeMismatch`, `error.InputTooLarge`, `error.OutputTooLarge`, or `error.SignalMismatch` on invalid shapes or signal-readback failure.
     pub fn dmmvF32RowRange(
         self: *TokenBoundary,
         input: []const f32,
@@ -779,22 +904,42 @@ fn orderedF32(value: f32) u32 {
 
 var last_errno: ?linux.E = null;
 
+/// Errno captured from the most recent `ioctl` issued by this module, or null
+/// if the call succeeded. Useful for surfacing a precise reason after a
+/// `SmokeResult.status` indicates a kernel-side failure.
+/// @returns The latest captured `linux.E` value, or null when there was no error.
 pub fn lastErrno() ?linux.E {
     return last_errno;
 }
 
+/// Run the bring-up smoke gate against `default_render_node`.
+/// @returns A `SmokeResult` summarizing whether the two PM4 submissions retired and the signal sentinel matched.
 pub fn setupSmokeDefault() SmokeResult {
     return submitNopSmokePath(default_render_node);
 }
 
+/// Run the bring-up smoke gate against the given DRM render node path.
+/// @param render_node Absolute path to the amdgpu DRM render node to test.
+/// @returns A `SmokeResult` describing the open → submit → wait outcome.
 pub fn setupSmokePath(render_node: []const u8) SmokeResult {
     return submitNopSmokePath(render_node);
 }
 
+/// Backwards-compatible alias for `setupSmokeDefault` named for the underlying
+/// PM4 NOP+WRITE_DATA stream that exercises the CS path.
+/// @returns A `SmokeResult` describing the bring-up outcome on `default_render_node`.
 pub fn submitNopSmokeDefault() SmokeResult {
     return submitNopSmokePath(default_render_node);
 }
 
+/// Full bring-up smoke implementation: open the render node, query compute IP,
+/// allocate a context, create GTT-backed IB + signal BOs and map them at fixed
+/// low GPU VAs, build a PM4 NOP + `WRITE_DATA` stream, submit it twice through
+/// `DRM_IOCTL_AMDGPU_CS`, and verify each fence retires with the expected
+/// signal sentinel in the signal BO.
+/// @param render_node Absolute path to the amdgpu DRM render node to exercise.
+/// @returns A `SmokeResult` whose `status` pinpoints the failure stage, or `.ok` on success.
+/// @note Returns `.unsupported_os` immediately on non-Linux hosts; never throws.
 pub fn submitNopSmokePath(render_node: []const u8) SmokeResult {
     if (builtin.os.tag != .linux) return .{ .status = .unsupported_os, .render_node = render_node };
 

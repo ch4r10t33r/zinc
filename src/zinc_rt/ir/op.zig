@@ -4,12 +4,19 @@
 //! @section Decode Planning
 const std = @import("std");
 
+/// Which inference stage an opcode participates in.
+/// `decode` ops run during single-token autoregressive steps, `prefill`
+/// ops run during the batched prompt-ingestion phase, and `both` ops are
+/// shared between the two paths (e.g. RMS norm, RoPE).
 pub const Stage = enum {
     decode,
     prefill,
     both,
 };
 
+/// Roadmap milestone in which the opcode becomes mandatory.
+/// `m0` is the minimum viable decode set; later milestones add fused
+/// kernels, prefill batching, request-state I/O, and verification ops.
 pub const Milestone = enum {
     m0,
     m2,
@@ -18,6 +25,9 @@ pub const Milestone = enum {
     m6,
 };
 
+/// ZINC_RT IR opcode table.
+/// Each variant maps onto Appendix B of the runtime design; metadata such
+/// as the human-readable name, stage, and milestone live in `info`.
 pub const Opcode = enum(u8) {
     embed,
     rms_norm,
@@ -49,12 +59,19 @@ pub const Opcode = enum(u8) {
     verify_k,
 };
 
+/// Static metadata for an opcode.
+/// Pairs the IR enum with its canonical printable name, the stage it
+/// targets, and the milestone in which it must be implemented.
 pub const Info = struct {
     name: []const u8,
     stage: Stage,
     milestone: Milestone,
 };
 
+/// Look up the static metadata record for an opcode.
+/// @param opcode IR opcode to describe.
+/// @returns The matching `Info` entry; the switch is exhaustive so this
+/// never traps at runtime.
 pub fn info(opcode: Opcode) Info {
     return switch (opcode) {
         .embed => .{ .name = "EMBED", .stage = .decode, .milestone = .m0 },
@@ -88,10 +105,19 @@ pub fn info(opcode: Opcode) Info {
     };
 }
 
+/// Canonical printable name for an opcode (e.g. `"FLASH_ATTN"`).
+/// @param opcode IR opcode to name.
+/// @returns The `Info.name` string, suitable for logging and golden traces.
 pub fn name(opcode: Opcode) []const u8 {
     return info(opcode).name;
 }
 
+/// Parse an opcode from its canonical name or Zig identifier.
+/// Accepts either the printable `Info.name` (case-sensitive) or the Zig
+/// enum field name (case-insensitive), so both `"FLASH_ATTN"` and
+/// `"flash_attn"` resolve to `Opcode.flash_attn`.
+/// @param value Candidate opcode spelling.
+/// @returns The matching opcode, or `null` when no variant matches.
 pub fn fromName(value: []const u8) ?Opcode {
     inline for (@typeInfo(Opcode).@"enum".fields) |field| {
         const opcode: Opcode = @enumFromInt(field.value);
@@ -102,6 +128,9 @@ pub fn fromName(value: []const u8) ?Opcode {
     return null;
 }
 
+/// Check whether an opcode is part of the M0 minimum-viable decode set.
+/// @param opcode IR opcode to query.
+/// @returns `true` when `info(opcode).milestone == .m0`.
 pub fn isM0(opcode: Opcode) bool {
     return info(opcode).milestone == .m0;
 }

@@ -9,6 +9,9 @@ const builtin = @import("builtin");
 
 const linux = std.os.linux;
 
+/// Outcome of probing the AMDGPU render node for compute user-queue support.
+/// Each variant maps to a specific failure mode when discovering whether the
+/// kernel exposes the UMQ surface ZINC_RT tier 2 needs.
 pub const QueryStatus = enum {
     available,
     unsupported_os,
@@ -20,12 +23,18 @@ pub const QueryStatus = enum {
     invalid_fw_metadata,
 };
 
+/// Compute user-queue capability metadata reported by the kernel.
+/// Captures the slot count and the EOP (end-of-pipe) scratch buffer sizing the
+/// driver requires when creating a compute UMQ.
 pub const ComputeUserqInfo = struct {
     userq_slots: u32,
     eop_size: u32,
     eop_alignment: u32,
 };
 
+/// Combined result returned by `queryComputeUserq`.
+/// Carries the discovery status plus optional capability info and the errno
+/// captured from the failing ioctl, when applicable.
 pub const QueryResult = struct {
     status: QueryStatus,
     info: ?ComputeUserqInfo = null,
@@ -35,24 +44,40 @@ pub const QueryResult = struct {
 const drm_ioctl_base: u8 = 'd';
 const drm_command_base: u8 = 0x40;
 
+/// AMDGPU HW IP type selector for the compute pipe used by `AMDGPU_INFO` queries.
 pub const AMDGPU_HW_IP_COMPUTE: u32 = 1;
+/// `AMDGPU_INFO` sub-query that returns `DrmAmdgpuInfoHwIp` for a given HW IP.
 pub const AMDGPU_INFO_HW_IP_INFO: u32 = 0x02;
+/// `AMDGPU_INFO` sub-query that returns user-queue firmware area metadata (`DrmAmdgpuInfoUqMetadata`).
 pub const AMDGPU_INFO_UQ_FW_AREAS: u32 = 0x24;
+/// `DRM_AMDGPU_USERQ` op code that allocates a new user-mode queue.
 pub const AMDGPU_USERQ_OP_CREATE: u32 = 1;
+/// `DRM_AMDGPU_USERQ` op code that releases a previously created user-mode queue.
 pub const AMDGPU_USERQ_OP_FREE: u32 = 2;
 
+/// GEM domain flag requesting allocation in system GTT memory.
 pub const AMDGPU_GEM_DOMAIN_GTT: u64 = 0x2;
+/// GEM domain flag requesting allocation in device VRAM.
 pub const AMDGPU_GEM_DOMAIN_VRAM: u64 = 0x4;
+/// GEM domain flag requesting allocation in the MMIO doorbell aperture.
 pub const AMDGPU_GEM_DOMAIN_DOORBELL: u64 = 0x40;
 
+/// GEM creation flag asking the kernel to map GTT memory as CPU write-combined for fast streaming writes.
 pub const AMDGPU_GEM_CREATE_CPU_GTT_USWC: u64 = 1 << 2;
+/// GEM creation flag asking the kernel to zero-fill VRAM allocations before returning the BO.
 pub const AMDGPU_GEM_CREATE_VRAM_CLEARED: u64 = 1 << 3;
+/// GEM creation flag keeping the BO permanently mapped in the device VM so it never needs revalidation.
 pub const AMDGPU_GEM_CREATE_VM_ALWAYS_VALID: u64 = 1 << 6;
 
+/// `DRM_AMDGPU_GEM_VA` operation that binds a BO into the device virtual address space.
 pub const AMDGPU_VA_OP_MAP: u32 = 1;
+/// VA mapping flag granting GPU read access to the mapped range.
 pub const AMDGPU_VM_PAGE_READABLE: u32 = 1 << 1;
+/// VA mapping flag granting GPU write access to the mapped range.
 pub const AMDGPU_VM_PAGE_WRITEABLE: u32 = 1 << 2;
+/// VA mapping flag granting GPU shader-execute access to the mapped range.
 pub const AMDGPU_VM_PAGE_EXECUTABLE: u32 = 1 << 3;
+/// VA mapping flag selecting the default memory type (MTYPE) for the GPU page table entry.
 pub const AMDGPU_VM_MTYPE_DEFAULT: u32 = 0 << 5;
 
 const drm_amdgpu_gem_create_nr: u8 = 0x00;
@@ -61,6 +86,8 @@ const drm_amdgpu_info_nr: u8 = 0x05;
 const drm_amdgpu_gem_va_nr: u8 = 0x08;
 const drm_amdgpu_userq_nr: u8 = 0x16;
 
+/// Input layout for the `DRM_IOCTL_AMDGPU_GEM_CREATE` ioctl.
+/// Mirrors the kernel UAPI struct describing the requested buffer size, alignment, domain mask, and creation flags.
 pub const DrmAmdgpuGemCreateIn = extern struct {
     bo_size: u64,
     alignment: u64,
@@ -68,30 +95,37 @@ pub const DrmAmdgpuGemCreateIn = extern struct {
     domain_flags: u64,
 };
 
+/// Output layout returned by `DRM_IOCTL_AMDGPU_GEM_CREATE`, holding the freshly allocated BO handle.
 pub const DrmAmdgpuGemCreateOut = extern struct {
     handle: u32,
     _pad: u32,
 };
 
+/// Tagged union packing the in/out forms of the GEM-create ioctl into the same buffer the kernel reads and writes.
 pub const DrmAmdgpuGemCreate = extern union {
     in: DrmAmdgpuGemCreateIn,
     out: DrmAmdgpuGemCreateOut,
 };
 
+/// Input layout for `DRM_IOCTL_AMDGPU_GEM_MMAP`, identifying the BO to expose to userspace.
 pub const DrmAmdgpuGemMmapIn = extern struct {
     handle: u32,
     _pad: u32,
 };
 
+/// Output layout returned by `DRM_IOCTL_AMDGPU_GEM_MMAP` with the file offset to pass to `mmap`.
 pub const DrmAmdgpuGemMmapOut = extern struct {
     addr_ptr: u64,
 };
 
+/// Tagged union packing the in/out forms of the GEM-mmap ioctl into one shared buffer.
 pub const DrmAmdgpuGemMmap = extern union {
     in: DrmAmdgpuGemMmapIn,
     out: DrmAmdgpuGemMmapOut,
 };
 
+/// Argument layout for `DRM_IOCTL_AMDGPU_GEM_VA`, the ioctl that maps a BO into the GPU virtual address space.
+/// Encodes the BO handle, VA operation, page-permission flags, target VA range, and any syncobj fence handles.
 pub const DrmAmdgpuGemVa = extern struct {
     handle: u32,
     _pad: u32,
@@ -106,6 +140,8 @@ pub const DrmAmdgpuGemVa = extern struct {
     input_fence_syncobj_handles: u64,
 };
 
+/// Argument layout for `DRM_IOCTL_AMDGPU_INFO`, the generic info-query ioctl.
+/// `return_pointer`/`return_size` describe a userspace output buffer; `query` selects a sub-query whose discriminator-specific parameters live in `query_data`.
 pub const DrmAmdgpuInfo = extern struct {
     return_pointer: u64,
     return_size: u32,
@@ -144,6 +180,8 @@ pub const DrmAmdgpuInfo = extern struct {
     },
 };
 
+/// Output buffer for `AMDGPU_INFO_HW_IP_INFO`.
+/// Reports the HW IP version and capabilities, ring-buffer alignment requirements, the bitmask of available kernel rings, and the count of user-queue slots — the last field is what tier 2 reads to confirm UMQ support.
 pub const DrmAmdgpuInfoHwIp = extern struct {
     hw_ip_version_major: u32,
     hw_ip_version_minor: u32,
@@ -155,6 +193,8 @@ pub const DrmAmdgpuInfoHwIp = extern struct {
     userq_num_slots: u32,
 };
 
+/// Output buffer for `AMDGPU_INFO_UQ_FW_AREAS`, sized per IP type.
+/// Reports the per-queue scratch buffers the firmware needs: shadow/CSA areas for GFX, the EOP buffer for compute, and the CSA area for SDMA.
 pub const DrmAmdgpuInfoUqMetadata = extern union {
     gfx: extern struct {
         shadow_size: u32,
@@ -172,6 +212,8 @@ pub const DrmAmdgpuInfoUqMetadata = extern union {
     },
 };
 
+/// Input layout for the `DRM_IOCTL_AMDGPU_USERQ` ioctl.
+/// Describes the create/free op, the target IP (compute, gfx, sdma), the doorbell BO and offset to ring, the VA ranges of the queue ring buffer plus its read/write pointers, and a pointer to the IP-specific MQD blob.
 pub const DrmAmdgpuUserqIn = extern struct {
     op: u32,
     queue_id: u32,
@@ -187,20 +229,26 @@ pub const DrmAmdgpuUserqIn = extern struct {
     mqd_size: u64,
 };
 
+/// Output layout returned by a successful `AMDGPU_USERQ_OP_CREATE`, containing the kernel-assigned queue id used by subsequent ioctls.
 pub const DrmAmdgpuUserqOut = extern struct {
     queue_id: u32,
     _pad: u32,
 };
 
+/// Tagged union packing the in/out forms of the user-queue ioctl into the same buffer.
 pub const DrmAmdgpuUserq = extern union {
     in: DrmAmdgpuUserqIn,
     out: DrmAmdgpuUserqOut,
 };
 
+/// GFX11 compute MQD payload pointed at by `DrmAmdgpuUserqIn.mqd`.
+/// Currently only the EOP scratch VA is required; matches the kernel's `drm_amdgpu_userq_mqd_compute_gfx11` layout.
 pub const DrmAmdgpuUserqMqdComputeGfx11 = extern struct {
     eop_va: u64,
 };
 
+/// Thin handle for a kernel-managed GEM buffer object.
+/// Pairs the kernel GEM handle with the allocation size so callers can re-issue ioctls (mmap, VA map) without re-querying the size.
 pub const Bo = struct {
     handle: u32,
     size: u64,
@@ -236,6 +284,11 @@ const drm_ioctl_amdgpu_userq = linux.IOCTL.IOWR(
     DrmAmdgpuUserq,
 );
 
+/// Probe an AMDGPU render node to decide whether the compute user-mode-queue surface is usable.
+/// Opens the render node, asks the kernel for compute HW IP info plus user-queue firmware areas, and validates that the queue slots and EOP buffer parameters look sane.
+/// @param render_node Absolute path to the DRI render node (e.g. `/dev/dri/renderD128`).
+/// @returns A `QueryResult` whose `status` field identifies the precise failure mode or `.available` on success, with `info` populated when compute UMQ is ready to use.
+/// @note Returns `.unsupported_os` immediately on non-Linux builds without opening any file.
 pub fn queryComputeUserq(render_node: []const u8) QueryResult {
     if (builtin.os.tag != .linux) {
         return .{ .status = .unsupported_os };
@@ -281,6 +334,11 @@ pub fn queryComputeUserq(render_node: []const u8) QueryResult {
     };
 }
 
+/// Issue `AMDGPU_INFO_HW_IP_INFO` for the given HW IP type on an open render-node file.
+/// @param file Open file handle for the AMDGPU render node.
+/// @param ip_type IP selector constant such as `AMDGPU_HW_IP_COMPUTE`.
+/// @returns The kernel-filled `DrmAmdgpuInfoHwIp` for IP instance 0.
+/// @note Returns `error.IoctlFailed` on failure; inspect `lastErrno()` for the captured errno.
 pub fn queryHwIp(file: std.fs.File, ip_type: u32) !DrmAmdgpuInfoHwIp {
     var out: DrmAmdgpuInfoHwIp = std.mem.zeroes(DrmAmdgpuInfoHwIp);
     var query: DrmAmdgpuInfo = std.mem.zeroes(DrmAmdgpuInfo);
@@ -309,6 +367,13 @@ fn queryUqMetadataCompute(file: std.fs.File) !DrmAmdgpuInfoUqMetadata {
     return out;
 }
 
+/// Allocate a GEM buffer object via `DRM_IOCTL_AMDGPU_GEM_CREATE`.
+/// @param file Open file handle for the AMDGPU render node.
+/// @param size Buffer size in bytes.
+/// @param alignment Required base alignment in bytes.
+/// @param domains Bitmask of `AMDGPU_GEM_DOMAIN_*` constants selecting GTT, VRAM, or doorbell aperture.
+/// @param flags Bitmask of `AMDGPU_GEM_CREATE_*` creation flags (e.g. USWC, VRAM-cleared, always-valid).
+/// @returns A `Bo` wrapping the kernel GEM handle and the requested size for later mmap or VA-map calls.
 pub fn createGem(file: std.fs.File, size: u64, alignment: u64, domains: u64, flags: u64) !Bo {
     var create: DrmAmdgpuGemCreate = std.mem.zeroes(DrmAmdgpuGemCreate);
     create.in = .{
@@ -324,6 +389,12 @@ pub fn createGem(file: std.fs.File, size: u64, alignment: u64, domains: u64, fla
     };
 }
 
+/// Map a previously created GEM BO into the calling process's address space.
+/// First queries the kernel for the BO's mmap offset, then issues a shared `mmap` against the render-node fd at that offset.
+/// @param file Open file handle for the AMDGPU render node that owns the BO.
+/// @param bo The buffer object handle and size returned by `createGem`.
+/// @param prot Standard POSIX `PROT_*` page-protection flags.
+/// @returns A page-aligned byte slice covering the BO; the slice length equals `bo.size`.
 pub fn mmapGem(file: std.fs.File, bo: Bo, prot: u32) ![]align(std.heap.page_size_min) u8 {
     var mmap_args: DrmAmdgpuGemMmap = std.mem.zeroes(DrmAmdgpuGemMmap);
     mmap_args.in = .{
@@ -342,6 +413,12 @@ pub fn mmapGem(file: std.fs.File, bo: Bo, prot: u32) ![]align(std.heap.page_size
     );
 }
 
+/// Bind a GEM BO into the device virtual address space at a caller-chosen VA.
+/// Performs an `AMDGPU_VA_OP_MAP` over the full BO size starting at offset 0.
+/// @param file Open file handle for the AMDGPU render node that owns the BO.
+/// @param bo The buffer object handle and size returned by `createGem`.
+/// @param va Target GPU virtual address; must satisfy the page alignment the kernel enforces.
+/// @param flags Bitmask of `AMDGPU_VM_PAGE_*` and `AMDGPU_VM_MTYPE_*` permission/cache flags.
 pub fn mapGemVa(file: std.fs.File, bo: Bo, va: u64, flags: u32) !void {
     var args: DrmAmdgpuGemVa = std.mem.zeroes(DrmAmdgpuGemVa);
     args.handle = bo.handle;
@@ -353,6 +430,18 @@ pub fn mapGemVa(file: std.fs.File, bo: Bo, va: u64, flags: u32) !void {
     try ioctlRaw(file, drm_ioctl_amdgpu_gem_va, @intFromPtr(&args));
 }
 
+/// Create a compute user-mode queue via `DRM_IOCTL_AMDGPU_USERQ`.
+/// Builds a GFX11 compute MQD pointing at the caller-supplied EOP scratch VA and submits an `AMDGPU_USERQ_OP_CREATE`.
+/// @param file Open file handle for the AMDGPU render node.
+/// @param doorbell_handle GEM handle of the doorbell BO the kernel will use to wake this queue.
+/// @param doorbell_offset Doorbell slot offset within the doorbell BO assigned to this queue.
+/// @param queue_va Device VA of the ring buffer backing the queue.
+/// @param queue_size Ring buffer size in bytes.
+/// @param rptr_va Device VA of the queue read-pointer word.
+/// @param wptr_va Device VA of the queue write-pointer word.
+/// @param eop_va Device VA of the end-of-pipe scratch buffer required by GFX11 compute firmware.
+/// @param flags Driver-specific creation flags forwarded as-is to the kernel.
+/// @returns The kernel-assigned queue id used in later doorbell rings and the matching `freeUserq` call.
 pub fn createComputeUserq(
     file: std.fs.File,
     doorbell_handle: u32,
@@ -384,6 +473,9 @@ pub fn createComputeUserq(
     return args.out.queue_id;
 }
 
+/// Release a user-mode queue previously returned by `createComputeUserq` via `AMDGPU_USERQ_OP_FREE`.
+/// @param file Open file handle for the AMDGPU render node that owns the queue.
+/// @param queue_id Kernel-assigned queue id to free.
 pub fn freeUserq(file: std.fs.File, queue_id: u32) !void {
     var args: DrmAmdgpuUserq = std.mem.zeroes(DrmAmdgpuUserq);
     args.in = .{
@@ -407,6 +499,9 @@ const IoctlError = error{IoctlFailed};
 
 var last_ioctl_errno: ?linux.E = null;
 
+/// Return the errno captured by the most recent ioctl performed through this module.
+/// @returns The captured `linux.E` value, or `null` if the previous call succeeded or no call has been made yet.
+/// @note The module clears the saved errno at the start of every ioctl, so the value is only meaningful immediately after an `error.IoctlFailed`.
 pub fn lastErrno() ?linux.E {
     return last_ioctl_errno;
 }

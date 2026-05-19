@@ -8,6 +8,7 @@ const gguf = @import("gguf");
 
 const max_experts = 256;
 
+/// Selection rule applied after the router projection to convert logits into expert weights.
 pub const RoutingRule = enum {
     /// Qwen/Gemma-style routing: softmax over all experts, select top-k,
     /// then renormalize the selected expert probabilities to sum to 1.
@@ -16,6 +17,16 @@ pub const RoutingRule = enum {
     softmax_selected,
 };
 
+/// Inputs and outputs for one MoE gate + top-k call.
+/// @param raw_data Raw GGUF tensor bytes for the router matrix `[num_experts, hidden_dim]`.
+/// @param tensor_type GGML quantization format of `raw_data` (forwarded to `dequant.row`).
+/// @param hidden Hidden state of length `hidden_dim`.
+/// @param row_scratch Caller-owned scratch of length `>= hidden_dim` for one dequantized router row.
+/// @param logits Destination router logits of length `num_experts`; capped at 256 experts.
+/// @param k Number of experts to select; must satisfy `1 <= k <= logits.len`.
+/// @param output_ids Destination expert indices of length `>= k`.
+/// @param output_weights Destination per-expert weights of length `>= k`, summing to 1 after the call.
+/// @param rule Routing rule that decides how the top-k weights are computed (see `RoutingRule`).
 pub const Params = struct {
     raw_data: []const u8,
     tensor_type: gguf.GGMLType,
@@ -28,6 +39,14 @@ pub const Params = struct {
     rule: RoutingRule = .softmax_all,
 };
 
+/// Project the hidden state through the router matrix, then select and normalize the top-k experts.
+/// First fills `logits` row by row (matvec via `dequant.row`), then dispatches on `rule` to either
+/// `softmax_all` (softmax across all experts, pick top-k, renormalize) or `softmax_selected`
+/// (pick top-k by raw logit, softmax across that subset).
+/// @param params Router weights, hidden state, scratch buffers, selection size, and outputs; see `Params`.
+/// @returns `error.EmptyInput` for empty inputs, `error.TooManyExperts` when `logits.len > 256`,
+/// `error.InvalidTopK` when `k` is zero or larger than the expert count, `error.ShapeMismatch` when
+/// scratch or output slices are too small, otherwise void.
 pub fn run(params: Params) !void {
     if (params.hidden.len == 0 or params.logits.len == 0) return error.EmptyInput;
     if (params.logits.len > max_experts) return error.TooManyExperts;

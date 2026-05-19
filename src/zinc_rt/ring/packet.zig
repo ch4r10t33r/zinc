@@ -7,8 +7,14 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Failure modes returned by `PacketBuilder` operations.
+/// `OutOfSpace` means the caller-provided dword buffer cannot fit another
+/// PM4 packet without overrunning its bounds.
 pub const Error = error{OutOfSpace};
 
+/// PM4 type-3 opcodes used by the direct ZINC_RT submission paths.
+/// Each value matches the raw hardware opcode the command processor expects
+/// in the PKT3 header field.
 pub const Opcode = enum(u8) {
     nop = 0x10,
     dispatch_direct = 0x15,
@@ -24,30 +30,56 @@ pub const Opcode = enum(u8) {
 
 // SH register offsets, expressed as `(byte_addr - 0xB000) >> 2`.
 // The direct CS path programs these before a raw DISPATCH_DIRECT.
+/// SH register offset for `COMPUTE_NUM_THREAD_X` (workgroup X dimension).
 pub const sh_reg_num_thread_x: u32 = 0x207;
+/// SH register offset for `COMPUTE_PGM_LO` (low 32 bits of the shader address).
 pub const sh_reg_pgm_lo: u32 = 0x20c;
+/// SH register offset for `COMPUTE_PGM_RSRC1` (VGPR/SGPR counts and float mode).
 pub const sh_reg_pgm_rsrc1: u32 = 0x212;
+/// SH register offset for `COMPUTE_RESOURCE_LIMITS` (waves-per-CU and locking).
 pub const sh_reg_resource_limits: u32 = 0x215;
+/// SH register offset for `COMPUTE_PGM_RSRC3` (extra GFX11+ shader resource bits).
 pub const sh_reg_pgm_rsrc3: u32 = 0x228;
+/// SH register offset for `COMPUTE_USER_DATA_0`; subsequent slots are
+/// contiguous and used to pass kernel argument pointers.
 pub const compute_user_data_0: u32 = 0x240;
+/// Default `DISPATCH_INITIATOR` value enabling the compute pipeline.
 pub const dispatch_initiator_compute: u32 = 5;
 
+/// Cursor-style writer that emits PM4 type-3 packets into a caller-owned
+/// dword buffer.
+/// The builder is allocation-free and stateless beyond a write cursor, so
+/// callers can reuse the same backing buffer across submissions by calling
+/// `reset`.
 pub const PacketBuilder = struct {
     words: []u32,
     len: usize = 0,
 
+    /// Wrap a pre-allocated dword buffer.
+    /// @param words Backing storage; the builder writes packets starting at
+    ///     index 0 and never grows the slice.
+    /// @returns A builder pointing at `words` with an empty write cursor.
     pub fn init(words: []u32) PacketBuilder {
         return .{ .words = words };
     }
 
+    /// Rewind the write cursor without touching the backing buffer.
+    /// @param self Builder to reset; subsequent writes overwrite previous bytes.
     pub fn reset(self: *PacketBuilder) void {
         self.len = 0;
     }
 
+    /// Borrowed view of the dwords emitted so far.
+    /// @param self Builder to inspect.
+    /// @returns Slice of finalized packet words, ready to copy into a ring.
     pub fn written(self: *const PacketBuilder) []const u32 {
         return self.words[0..self.len];
     }
 
+    /// Emit a PM4 `NOP` packet that consumes `payload_dwords` body dwords.
+    /// @param self Builder to append to.
+    /// @param payload_dwords Number of zero payload dwords; clamped to a
+    ///     minimum of 1 to satisfy the PKT3 body-size encoding.
     pub fn writeNop(self: *PacketBuilder, payload_dwords: u32) Error!void {
         const body_dwords = @max(payload_dwords, 1);
         const start = try self.reservePacket(body_dwords);
@@ -55,6 +87,10 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .nop, body_dwords);
     }
 
+    /// Emit `SET_SH_REG` writing `values` into consecutive SH register slots.
+    /// @param self Builder to append to.
+    /// @param reg_offset Starting SH register offset (dword units from 0xB000).
+    /// @param values Register values written in order; an empty slice is a no-op.
     pub fn setShReg(self: *PacketBuilder, reg_offset: u32, values: []const u32) Error!void {
         if (values.len == 0) return;
         const body_dwords: u32 = @intCast(values.len + 1);
@@ -64,20 +100,42 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .set_sh_reg, body_dwords);
     }
 
+    /// Convenience helper that writes a single SH register.
+    /// @param self Builder to append to.
+    /// @param reg_offset SH register offset.
+    /// @param value Value to write into that register.
     pub fn setShRegOne(self: *PacketBuilder, reg_offset: u32, value: u32) Error!void {
         const values = [_]u32{value};
         try self.setShReg(reg_offset, &values);
     }
 
+    /// Write a 64-bit value into a pair of contiguous `COMPUTE_USER_DATA_*`
+    /// slots, little-endian (low dword first).
+    /// @param self Builder to append to.
+    /// @param slot Zero-based index added to `compute_user_data_0`.
+    /// @param value 64-bit kernel argument (typically a GPU virtual address).
     pub fn setUserData64(self: *PacketBuilder, slot: u32, value: u64) Error!void {
         const values = [_]u32{ lo32(value), hi32(value) };
         try self.setShReg(compute_user_data_0 + slot, &values);
     }
 
+    /// Emit `DISPATCH_DIRECT` with the default compute dispatch initiator.
+    /// @param self Builder to append to.
+    /// @param dim_x Workgroup count on X.
+    /// @param dim_y Workgroup count on Y.
+    /// @param dim_z Workgroup count on Z.
     pub fn dispatchDirect(self: *PacketBuilder, dim_x: u32, dim_y: u32, dim_z: u32) Error!void {
         try self.dispatchDirectInitiator(dim_x, dim_y, dim_z, 0);
     }
 
+    /// Emit `DISPATCH_DIRECT` with a caller-supplied dispatch initiator value.
+    /// @param self Builder to append to.
+    /// @param dim_x Workgroup count on X.
+    /// @param dim_y Workgroup count on Y.
+    /// @param dim_z Workgroup count on Z.
+    /// @param dispatch_initiator Raw `COMPUTE_DISPATCH_INITIATOR` bits; pass 0
+    ///     to take the firmware default or use `dispatch_initiator_compute`
+    ///     to force-enable the compute pipeline.
     pub fn dispatchDirectInitiator(
         self: *PacketBuilder,
         dim_x: u32,
@@ -93,6 +151,13 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .dispatch_direct, 4);
     }
 
+    /// Emit a minimal `RELEASE_MEM` fence that writes `value` to `gpu_addr`.
+    /// @param self Builder to append to.
+    /// @param gpu_addr 64-bit GPU virtual address to receive the fence value.
+    /// @param value Fence payload (typically a monotonically increasing seqno).
+    /// @note The event/data selector fields are zeroed; this is only intended
+    ///     for the bring-up gate, with real kernel validation deferred to the
+    ///     UMQ smoke path.
     pub fn releaseMemSignal(self: *PacketBuilder, gpu_addr: u64, value: u64) Error!void {
         // Minimal fence signal packet shape used by the bring-up gate. The
         // event/data selectors are intentionally conservative placeholders;
@@ -107,6 +172,14 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .release_mem, 6);
     }
 
+    /// Emit `WRITE_DATA` that stores `value` (64 bits) at `gpu_addr` via the
+    /// ME (micro-engine) with WR_CONFIRM set.
+    /// @param self Builder to append to.
+    /// @param gpu_addr Destination GPU virtual address.
+    /// @param value 64-bit payload written little-endian.
+    /// @note Used as the simplest in-band memory scribble for validating
+    ///     CS-submitted fence and output-ring writes before real kernels are
+    ///     wired up.
     pub fn writeData64(self: *PacketBuilder, gpu_addr: u64, value: u64) Error!void {
         // PKT3_WRITE_DATA, dst_sel=5 (memory async/direct), WR_CONFIRM=1,
         // engine_sel=0 (ME). This is the simplest in-band memory scribble for
@@ -123,6 +196,13 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .write_data, 5);
     }
 
+    /// Emit `COPY_DATA` that copies a single 32-bit dword from one GPU memory
+    /// address to another with WR_CONFIRM set.
+    /// @param self Builder to append to.
+    /// @param src_gpu_addr Source GPU virtual address.
+    /// @param dst_gpu_addr Destination GPU virtual address.
+    /// @note Provides the smallest command-processor dataflow primitive that
+    ///     is available before shader-dispatch lowering is wired.
     pub fn copyData32(self: *PacketBuilder, src_gpu_addr: u64, dst_gpu_addr: u64) Error!void {
         // PKT3_COPY_DATA, src_sel=1 (memory), dst_sel=5 (memory),
         // count_sel=0 (32 bits), WR_CONFIRM=1. This is the smallest
@@ -141,6 +221,12 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .copy_data, 5);
     }
 
+    /// Pad the buffer with `NOP` packets until the current write cursor is a
+    /// multiple of `dword_alignment` dwords.
+    /// @param self Builder to pad.
+    /// @param dword_alignment Required alignment in dwords (0 is a no-op).
+    /// @note Each emitted NOP carries enough payload to land on the alignment
+    ///     in a single packet rather than spinning out many minimum-size NOPs.
     pub fn padToAlignment(self: *PacketBuilder, dword_alignment: usize) Error!void {
         if (dword_alignment == 0) return;
         while (self.len % dword_alignment != 0) {
@@ -168,10 +254,16 @@ pub const PacketBuilder = struct {
     }
 };
 
+/// Extract the low 32 bits of a 64-bit value for little-endian dword writes.
+/// @param value 64-bit input.
+/// @returns Bits [31:0] of `value`.
 pub fn lo32(value: u64) u32 {
     return @truncate(value);
 }
 
+/// Extract the high 32 bits of a 64-bit value for little-endian dword writes.
+/// @param value 64-bit input.
+/// @returns Bits [63:32] of `value`.
 pub fn hi32(value: u64) u32 {
     return @truncate(value >> 32);
 }

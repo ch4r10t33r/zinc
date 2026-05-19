@@ -13,6 +13,10 @@ const dequant = zinc_rt.kernels.dequant;
 
 const log = std.log.scoped(.zinc_rt_forward);
 
+/// Decode-token budget used by the M0 smoke tail and by benchmarks that want a
+/// short, bounded run on the scalar reference path. The full M1 forward respects
+/// the caller-supplied `max_tokens` and uses this only as a hard ceiling when no
+/// other budget is in scope.
 pub const m0_max_decode_tokens: u32 = 8;
 
 const WeightView = struct {
@@ -20,6 +24,13 @@ const WeightView = struct {
     type_: gguf.GGMLType,
 };
 
+/// Loaded GGUF model plus all the load-time scratch derived from it.
+/// Owns the mmap'd file, the resolved per-layer tensor table, the cached F32
+/// dequants of small norm/SSM-side tensors, and the re-quantized weight blobs
+/// the decode path streams in place of the larger source-format weights. A
+/// `Model` is built once with `load` and consumed by `generate` /
+/// `generateWithOptions`; the GPU rings get the same handle so they can read
+/// the underlying bytes too.
 pub const Model = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
@@ -75,6 +86,17 @@ pub const Model = struct {
     has_ssm: bool,
     rms_norm_eps: f32,
 
+    /// Memory-map a GGUF model file, parse its metadata, and pre-build the
+    /// load-time caches the scalar decode path relies on (small F32 norm/SSM
+    /// tensors, Q8_0→Q4_0 and F32→Q8_0 re-quantizations of the heavier
+    /// per-token weight streams, RoPE inverse-frequency table, attention sinks,
+    /// SSM conv1d kernels). The returned handle must eventually be released
+    /// with `deinit`.
+    /// @param path Filesystem path to the GGUF model.
+    /// @param allocator Owns every secondary allocation reachable from `Model`.
+    /// @returns A fully-initialised `Model`, or an error if the file is
+    /// unreadable, the tensors don't match the expected shapes, or the GGUF
+    /// metadata is malformed.
     pub fn load(path: []const u8, allocator: std.mem.Allocator) !Model {
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
@@ -306,6 +328,10 @@ pub const Model = struct {
         };
     }
 
+    /// Release every allocation reachable from `Model`: the re-quantized
+    /// weight blobs, the small-tensor F32 cache, the SSM/RoPE/attention-sink
+    /// scratch, the GGUF parse state, the mmap, and the file handle. Poisons
+    /// `self`; the handle must not be reused afterwards.
     pub fn deinit(self: *Model) void {
         if (self.lm_head_q4_0) |buf| self.allocator.free(buf);
         {
@@ -373,6 +399,14 @@ pub const Model = struct {
         return self.requantOrRaw(info);
     }
 
+    /// Emit the per-token decode IR for this model's shape and run the
+    /// validator on it, returning a node/layer count summary the caller can
+    /// log or assert against. Used as an admission gate before a real decode
+    /// run so a malformed graph fails loud and early instead of corrupting the
+    /// scalar kernels mid-token.
+    /// @param allocator Used for the throwaway IR graph; released before
+    /// return.
+    /// @returns Summary of the emitted-and-validated decode graph.
     pub fn validateDecodeGraph(self: *const Model, allocator: std.mem.Allocator) !DecodeGraphSummary {
         return emitDecodeGraphForShape(
             allocator,
@@ -870,6 +904,9 @@ fn buildSmallTensorF32Cache(
     return cache;
 }
 
+/// Counts produced by `Model.validateDecodeGraph` — how many IR nodes were
+/// emitted, and how the per-layer mix (full attention, SSM, MoE) breaks down.
+/// Useful for asserting the lowered graph matches the model's expected shape.
 pub const DecodeGraphSummary = struct {
     nodes: u32,
     layers: u32,
@@ -878,6 +915,11 @@ pub const DecodeGraphSummary = struct {
     moe_layers: u32,
 };
 
+/// Tag identifying which direct-compute shortcut the active tier executed for
+/// the current decode step. `none` means the scalar host path retired the
+/// token; the other variants name the kernel the GPU ring actually ran (a
+/// first-element RMSNorm, an argmax, an argmax composed with that RMSNorm, or
+/// a row-range dequantized matvec).
 pub const DirectComputeKind = enum {
     none,
     rms_norm_elem0,
@@ -886,16 +928,28 @@ pub const DirectComputeKind = enum {
     dmmv_row_range,
 };
 
+/// Flags marking which benchmark-only fast-paths influenced the run. The
+/// performance suite consults these to decide whether a number is comparable
+/// to the reference scalar path or whether a measurement-only shortcut was in
+/// effect (top-k forced to zero, LM-head row count capped, decode budget
+/// clamped).
 pub const BenchmarkShortcutFlags = struct {
     decode_moe_topk_zero: bool = false,
     lm_head_rows_capped: bool = false,
     decode_budget_clamped: bool = false,
 
+    /// True if any benchmark shortcut was applied during the run.
     pub fn any(self: BenchmarkShortcutFlags) bool {
         return self.decode_moe_topk_zero or self.lm_head_rows_capped or self.decode_budget_clamped;
     }
 };
 
+/// Output of a `generate` / `generateWithOptions` call: the produced token
+/// stream, prefill / decode wall-clock splits, the originally-requested and
+/// effective decode budgets, and a set of direct-tier instrumentation
+/// counters that report how much of the per-token work was actually retired
+/// by the GPU ring versus by the scalar fallback.
+/// The token slice is allocator-owned and must be released with `deinit`.
 pub const GenerateResult = struct {
     tokens: []u32,
     prefill_ns: u64,
@@ -915,12 +969,17 @@ pub const GenerateResult = struct {
     direct_model_value_bits: u32 = 0,
     benchmark_shortcuts: BenchmarkShortcutFlags = .{},
 
+    /// Free the produced token slice and poison the handle.
+    /// @param allocator Same allocator that was passed to `generate`.
     pub fn deinit(self: *GenerateResult, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
         self.* = undefined;
     }
 };
 
+/// Knobs threaded through to `generateWithOptions`. Lets callers opt out of
+/// the per-token direct-tier admission validation when they only want the
+/// scalar reference numbers.
 pub const GenerateOptions = struct {
     /// Validate that the selected direct tier can retire the current
     /// token-boundary COPY_DATA packet. This is a one-shot admission gate; until
@@ -929,6 +988,17 @@ pub const GenerateOptions = struct {
     enable_direct_token_boundary: bool = true,
 };
 
+/// Run the full ZINC_RT forward pass against `model` with default
+/// `GenerateOptions`: prefill the prompt, validate the per-token decode IR,
+/// and decode at most `max_tokens` tokens (stopping early on `eos_token_id`).
+/// Falls back to a no-layer smoke tail for models the scalar hybrid path
+/// cannot run. Equivalent to `generateWithOptions(..., .{})`.
+/// @param model Loaded GGUF model.
+/// @param prompt_tokens Tokenised prompt; must be non-empty.
+/// @param max_tokens Upper bound on tokens to produce after prefill.
+/// @param eos_token_id Stop-token id; honoured by the scalar hybrid path.
+/// @param allocator Owns the returned `GenerateResult.tokens`.
+/// @returns A `GenerateResult` the caller must release via its `deinit`.
 pub fn generate(
     model: *const Model,
     prompt_tokens: []const u32,
@@ -939,6 +1009,20 @@ pub fn generate(
     return generateWithOptions(model, prompt_tokens, max_tokens, eos_token_id, allocator, .{});
 }
 
+/// Full ZINC_RT forward pass with caller-supplied `GenerateOptions`. Logs the
+/// validated decode-graph summary, then picks between the scalar hybrid
+/// MoE+SSM path (for Qwen 3.6-shaped models whose tensors fully resolve) and
+/// the no-layer smoke tail (everything else). The scalar hybrid path is the
+/// one that consumes the GPU ring's direct-compute results; the smoke tail is
+/// CPU-only and only retires the embedding / final-norm boundary.
+/// @param model Loaded GGUF model.
+/// @param prompt_tokens Tokenised prompt; must be non-empty.
+/// @param max_tokens Upper bound on tokens to produce after prefill.
+/// @param eos_token_id Stop-token id.
+/// @param allocator Owns the returned `GenerateResult.tokens` and the
+/// throwaway decode IR.
+/// @param options Per-call configuration; see `GenerateOptions`.
+/// @returns A `GenerateResult` the caller must release via its `deinit`.
 pub fn generateWithOptions(
     model: *const Model,
     prompt_tokens: []const u32,
@@ -4837,16 +4921,32 @@ fn expertSliceBytes(tensor_type: gguf.GGMLType, rows: u32, cols: u32) u32 {
     return rows * (cols / bs) * bpb;
 }
 
+/// Build a `Tokenizer` from `model`'s GGUF vocab metadata. Convenience
+/// wrapper around `Tokenizer.init` so callers don't have to reach into the
+/// `Model`'s parse state.
+/// @param model Loaded GGUF model whose vocab table is consulted.
+/// @param allocator Owns the resulting tokenizer's vocab and id table.
+/// @returns A ready-to-use `Tokenizer`.
 pub fn initTokenizer(model: *const Model, allocator: std.mem.Allocator) !Tokenizer {
     return Tokenizer.init(&model.gguf_file, allocator);
 }
 
+/// Minimal longest-match BPE-ish tokenizer that reads the vocab and EOS id
+/// straight out of a GGUF file. Encodes prompts via the GPT-2 byte-to-unicode
+/// mapping and falls back to byte 0 on misses so the scalar M1 forward path
+/// always sees a well-formed token stream.
 pub const Tokenizer = struct {
     allocator: std.mem.Allocator,
     vocab: []const []const u8,
     token_to_id: std.StringHashMapUnmanaged(u32),
     eos_id: u32,
 
+    /// Build a tokenizer by reading `tokenizer.ggml.tokens` and
+    /// `tokenizer.ggml.eos_token_id` out of `gf`. Defaults the EOS id to `2`
+    /// when the metadata key is missing.
+    /// @param gf GGUF file whose tokenizer metadata is consulted.
+    /// @param allocator Owns the vocab slice and the id hash table.
+    /// @returns A `Tokenizer` ready for `encodePrompt` / `decodeToken`.
     pub fn init(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator) !Tokenizer {
         const tokens_val = gf.metadata.get("tokenizer.ggml.tokens") orelse return error.NoTokenizerVocab;
         const tokens_array = switch (tokens_val) {
@@ -4875,16 +4975,24 @@ pub const Tokenizer = struct {
         };
     }
 
+    /// Release the vocab slice and the id hash table, then poison the handle.
     pub fn deinit(self: *Tokenizer) void {
         self.token_to_id.deinit(self.allocator);
         self.allocator.free(self.vocab);
         self.* = undefined;
     }
 
+    /// Return the stop token id the caller should pass to `generate`.
     pub fn eosId(self: *const Tokenizer) u32 {
         return self.eos_id;
     }
 
+    /// Encode `text` into a token id stream using a longest-match scan over
+    /// the GPT-2 byte-to-unicode mapping. Unmatched single bytes fall back to
+    /// token id 0 so the output is always well-formed.
+    /// @param text Raw UTF-8 prompt bytes.
+    /// @param allocator Owns the returned token slice.
+    /// @returns Token ids ready to feed into `generate`.
     pub fn encodePrompt(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
         var encoded: std.ArrayList(u8) = .{};
         defer encoded.deinit(allocator);
@@ -4920,6 +5028,12 @@ pub const Tokenizer = struct {
         return tokens.toOwnedSlice(allocator);
     }
 
+    /// Render one token id back to its UTF-8 byte form into `buf`, reversing
+    /// the GPT-2 byte-to-unicode mapping. Truncates instead of erroring when
+    /// `buf` is too small; returns an empty slice for out-of-range ids.
+    /// @param token_id Token id produced by `generate` or `encodePrompt`.
+    /// @param buf Scratch buffer the decoded bytes are written into.
+    /// @returns The prefix of `buf` containing the decoded bytes.
     pub fn decodeToken(self: *const Tokenizer, token_id: u32, buf: []u8) []const u8 {
         if (token_id >= self.vocab.len) return "";
         const token = self.vocab[token_id];

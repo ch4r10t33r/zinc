@@ -3,6 +3,18 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Inputs and outputs for one single-query flash attention call.
+/// @param q Query vector packed `[n_heads, head_dim]` for the current decode token.
+/// @param kv_k Key cache packed `[seq_len, n_kv_heads, head_dim]`.
+/// @param kv_v Value cache packed `[seq_len, n_kv_heads, head_dim]`.
+/// @param output Attention output packed `[n_heads, head_dim]`.
+/// @param n_heads Number of query heads.
+/// @param n_kv_heads Number of key/value heads (GQA: `n_heads / n_kv_heads` queries share each KV head).
+/// @param head_dim Per-head feature dimension.
+/// @param seq_len Number of cached key/value positions to attend over.
+/// @param attn_sinks Per-head sink logits added to the softmax denominator; NaN disables a head's sink.
+/// @param scratch_scores Caller-owned scratch of length `>= seq_len` for raw scores.
+/// @param scratch_probs Caller-owned scratch of length `>= seq_len` for exponentiated weights.
 pub const Params = struct {
     q: []const f32,
     kv_k: []const f32,
@@ -17,6 +29,13 @@ pub const Params = struct {
     scratch_probs: []f32,
 };
 
+/// Compute single-query scaled dot-product attention with optional per-head softmax sinks.
+/// For each query head: dots `q` against the cached keys, applies a `1/sqrt(head_dim)` scale,
+/// max-subtracted softmax (folding in the sink if finite), then writes the value-weighted sum
+/// to the matching slot of `output`. GQA is supported via `q_per_kv = n_heads / n_kv_heads`.
+/// @param params Query, KV cache, attention sinks, scratch buffers, and output slice; see `Params`.
+/// @returns `error.EmptyInput` when query or output is empty, `error.ShapeMismatch` when scratch
+/// slots are smaller than `seq_len` or `head_dim` is zero, otherwise void.
 pub fn run(params: Params) !void {
     if (params.q.len == 0 or params.output.len == 0) return error.EmptyInput;
     if (params.head_dim == 0) return error.ShapeMismatch;

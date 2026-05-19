@@ -11,11 +11,17 @@ const kmd = @import("../kmd.zig");
 
 const linux = std.os.linux;
 
+/// Lowest Linux major version that exposes the AMDGPU user-queue ABI used by T2.
 pub const min_linux_major: u32 = 6;
+/// Lowest Linux minor version paired with `min_linux_major` for UMQ admission.
 pub const min_linux_minor: u32 = 16;
+/// Default render node opened when no caller-supplied path is provided.
 pub const default_render_node = "/dev/dri/renderD128";
+/// Sysfs path exposing the `amdgpu.user_queue` module parameter that gates UMQ.
 pub const user_queue_param_path = "/sys/module/amdgpu/parameters/user_queue";
 
+/// Outcome of the cheap UMQ preflight check; ordered from success to specific
+/// failure modes so callers can report actionable diagnostics.
 pub const ProbeStatus = enum {
     preflight_ok,
     unsupported_os,
@@ -25,23 +31,31 @@ pub const ProbeStatus = enum {
     user_queue_disabled,
 };
 
+/// Parsed Linux kernel release triple used to compare against `min_linux_*`.
 pub const KernelVersion = struct {
     major: u32,
     minor: u32,
     patch: u32 = 0,
 };
 
+/// Aggregate output of `probePath` carrying both the verdict and the evidence
+/// (kernel version, render node tried, user-queue mode value) used to reach it.
 pub const ProbeResult = struct {
     status: ProbeStatus,
     kernel: ?KernelVersion = null,
     render_node: []const u8 = default_render_node,
     user_queue_mode: ?i32 = null,
 
+    /// Whether the preflight succeeded and the host is eligible for T2 UMQ.
+    /// @param self Result to inspect.
+    /// @returns True only when `status == .preflight_ok`.
     pub fn preflightOk(self: ProbeResult) bool {
         return self.status == .preflight_ok;
     }
 };
 
+/// Outcome of the full create/free smoke gate that exercises the real
+/// GEM/VA/USERQ ioctl path required before T2 lowering can run.
 pub const SmokeStatus = enum {
     passed,
     unsupported_os,
@@ -55,6 +69,11 @@ pub const SmokeStatus = enum {
     userq_free_failed,
 };
 
+/// Aggregate output of the UMQ create/free smoke test.
+/// Carries the verdict, the queue id returned by `USERQ_CREATE` when one was
+/// obtained, the upstream errno on ioctl failures, and the firmware-reported
+/// metadata (queue slots and EOP buffer requirements) needed to size resources
+/// on subsequent runs.
 pub const SmokeResult = struct {
     status: SmokeStatus,
     queue_id: ?u32 = null,
@@ -65,15 +84,24 @@ pub const SmokeResult = struct {
     eop_size: u32 = 0,
     eop_alignment: u32 = 0,
 
+    /// True when the smoke gate reached `USERQ_FREE` cleanly.
+    /// @param self Smoke result to inspect.
+    /// @returns True only when `status == .passed`.
     pub fn ok(self: SmokeResult) bool {
         return self.status == .passed;
     }
 };
 
+/// Run the cheap UMQ preflight against the default render node.
+/// @returns A `ProbeResult` describing whether T2 admission is plausible.
 pub fn probeDefault() ProbeResult {
     return probePath(default_render_node);
 }
 
+/// One-shot admission helper combining the preflight and the
+/// `kmd.queryComputeUserq` capability query.
+/// @returns True only when the host both passes preflight and reports an
+///     `available` compute user-queue capability.
 pub fn admissionProbeDefault() bool {
     const preflight = probeDefault();
     if (!preflight.preflightOk()) return false;
@@ -82,10 +110,18 @@ pub fn admissionProbeDefault() bool {
     return query.status == .available;
 }
 
+/// Run the full create/free smoke gate against the default render node.
+/// @returns A `SmokeResult` recording every step that succeeded or failed.
 pub fn createFreeSmokeDefault() SmokeResult {
     return createFreeSmokePath(default_render_node);
 }
 
+/// Run the full create/free smoke gate against an explicit render node path.
+/// Performs preflight, queries the compute user-queue capability, allocates
+/// the GEM buffers required by `USERQ_CREATE`, maps their VAs, creates a
+/// compute queue, and finally frees it.
+/// @param render_node Absolute path to a DRM render node (e.g. `/dev/dri/renderD128`).
+/// @returns A `SmokeResult`; inspect `status` and `errno` to localize failures.
 pub fn createFreeSmokePath(render_node: []const u8) SmokeResult {
     if (builtin.os.tag != .linux) {
         return .{ .status = .unsupported_os };
@@ -111,6 +147,11 @@ pub fn createFreeSmokePath(render_node: []const u8) SmokeResult {
     return createFreeSmokeWithInfo(render_node, query.info.?);
 }
 
+/// Cheap preflight that walks the OS, kernel-version, render-node, and
+/// `user_queue` module-parameter checks without issuing any ioctls.
+/// @param render_node Path to the DRM render node that would be opened later.
+/// @returns A `ProbeResult` whose `status` pinpoints the earliest failing
+///     check, or `preflight_ok` when every check passed.
 pub fn probePath(render_node: []const u8) ProbeResult {
     if (builtin.os.tag != .linux) {
         return .{ .status = .unsupported_os, .render_node = render_node };
@@ -268,11 +309,19 @@ fn alignUp(value: u64, alignment: u64) u64 {
     return if (rem == 0) value else value + (alignment - rem);
 }
 
+/// Whether the parsed kernel version meets the minimum required for UMQ.
+/// @param version Kernel version produced by `parseKernelRelease`.
+/// @returns True when `version >= 6.16`.
 pub fn kernelSupportsUmq(version: KernelVersion) bool {
     return version.major > min_linux_major or
         (version.major == min_linux_major and version.minor >= min_linux_minor);
 }
 
+/// Parse a `uname -r` style release string into a `KernelVersion`.
+/// Distro suffixes and `-rc` tags after the numeric components are tolerated;
+/// the patch component defaults to 0 when absent.
+/// @param release Release string such as `6.16.0-24-generic` or `6.16-rc4`.
+/// @returns The parsed triple, or null when the leading components are not numeric.
 pub fn parseKernelRelease(release: []const u8) ?KernelVersion {
     var it = std.mem.splitScalar(u8, release, '.');
     const major_raw = it.next() orelse return null;
@@ -302,6 +351,10 @@ fn readUserQueueMode() !i32 {
     return parseLeadingI32(value) orelse error.InvalidUserQueueMode;
 }
 
+/// Whether the `amdgpu.user_queue` module-parameter value enables UMQ
+/// admission.
+/// @param mode Integer read from `/sys/module/amdgpu/parameters/user_queue`.
+/// @returns True for `-1` (auto), `1` (enabled), or `2` (forced); false otherwise.
 pub fn userQueueModeEnablesUmq(mode: i32) bool {
     return mode == -1 or mode == 1 or mode == 2;
 }

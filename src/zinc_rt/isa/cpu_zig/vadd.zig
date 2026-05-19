@@ -3,12 +3,21 @@
 //! @section Inference Runtime
 const std = @import("std");
 
+/// Inputs and outputs for one element-wise vector addition.
+/// @param a First operand vector.
+/// @param b Second operand vector of length `>= a.len`.
+/// @param output Destination vector of length `>= a.len`.
 pub const Params = struct {
     a: []const f32,
     b: []const f32,
     output: []f32,
 };
 
+/// Compute `output[i] = a[i] + b[i]` for the first `a.len` elements.
+/// Trailing elements of `b` and `output` are ignored, so callers may pass over-sized buffers.
+/// @param params Operand and destination slices; see `Params`.
+/// @returns `error.EmptyInput` when `a` is empty, `error.ShapeMismatch` when `output` or `b`
+/// is shorter than `a`, otherwise void.
 pub fn run(params: Params) !void {
     if (params.a.len == 0) return error.EmptyInput;
     if (params.output.len < params.a.len) return error.ShapeMismatch;

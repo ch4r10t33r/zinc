@@ -1,6 +1,9 @@
 //! ZINC_RT backend entrypoint.
+//! @section CLI & Entrypoints
 //! The M0 binary is intentionally small: it brings up tier selection and the
-//! T-CPU packet runner without linking the Vulkan backend.
+//! T-CPU packet runner without linking the Vulkan backend. Pass `--prompt`
+//! to drive the host-assisted forward path, or `--probe-tier` to report
+//! tier admission status without running a model.
 const std = @import("std");
 const zinc_rt = @import("zinc_rt");
 const engine = zinc_rt.engine;
@@ -8,6 +11,9 @@ const ring = zinc_rt.ring;
 const cpu_ring_mod = zinc_rt.cpu_ring;
 const forward_zinc_rt = @import("forward_zinc_rt");
 
+/// Zig standard library log configuration for the zinc_rt binary.
+/// Lowering this to `.debug` keeps the M0 trace prints visible without an
+/// extra build flag; the engine itself respects `ZINC_RT_LOG_LEVEL`.
 pub const std_options = std.Options{
     .log_level = .debug,
 };
@@ -20,6 +26,11 @@ const CliOptions = struct {
     max_tokens: u32 = 256,
 };
 
+/// Process entrypoint for the `zinc` binary built with `-Dbackend=zinc_rt`.
+/// Parses CLI flags, selects the runtime tier from `ZINC_RT_TIER`, and
+/// dispatches to the help, probe, prompt, or T-CPU smoke path.
+/// @returns Propagates any allocation, argument, or runtime error; exits
+/// with status 1 on argument or tier-parse failures.
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
