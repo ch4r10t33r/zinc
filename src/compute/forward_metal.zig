@@ -1162,6 +1162,26 @@ const SsmDeltaNetOffsetPush = extern struct {
     conv_offset: u32,
 };
 
+/// Push constants for prompt-prefill SSM delta-net over a token chunk.
+const SsmDeltaNetPrefillPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    n_tokens: u32,
+    alpha_stride: u32,
+    beta_stride: u32,
+    conv_stride: u32,
+    output_stride: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    conv_offset: u32,
+    output_offset: u32,
+};
+
 /// Push constants for SSM gated norm dispatch (SPIRV-Cross: buffer(0)).
 const SsmGatedNormPush = extern struct {
     d_inner: u32,
@@ -2083,6 +2103,7 @@ pub const InferenceEngine = struct {
     ssm_conv1d_prefill_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
     ssm_delta_net_offset_pipe: MetalPipeline,
+    ssm_delta_net_prefill_pipe: MetalPipeline,
     ssm_gated_norm_pipe: MetalPipeline,
 
     // SSM state (Metal buffers — GPU-resident, persistent across tokens)
@@ -2642,6 +2663,7 @@ pub const InferenceEngine = struct {
         self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
         self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
+        self.ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
         self.ssm_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_gated_norm");
 
         // SSM state + constants as Metal buffers (GPU-resident via UMA)
@@ -3289,6 +3311,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_gated_norm_pipe);
 
         if (self.ssm_conv_state_bufs) |bufs| {
@@ -5701,6 +5724,36 @@ fn dispatchDmmvOnCmdWithInputOffset(
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
+/// DMMV with explicit byte offsets into both input and output buffers.
+fn dispatchDmmvOnCmdWithInputOutputOffset(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, tensor, M, K);
+    const pip = engine.dmmvPipelineForType(tensor, M, K) orelse {
+        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @intFromEnum(tensor.info.type_), tensor.info.name });
+        return;
+    };
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
+    const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
+}
+
 /// Dispatch a single DMMV and wait for completion.
 fn dispatchDmmvAndWait(
     engine: *InferenceEngine,
@@ -7955,6 +8008,7 @@ fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx
     if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return false;
     if (engine.ssm_conv1d_prefill_pipe.handle == null or
         engine.ssm_delta_net_offset_pipe.handle == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
         engine.config.ssm_d_conv > 8 or
         engine.config.ssm_d_state > 128 or
         engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1) > 128)
@@ -8192,64 +8246,80 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     if (profile) |p| p.ssm_conv_calls += n_tokens;
     profileBarrier(cmd, profile, .ssm);
 
-    const d_inner_usize: usize = @intCast(d_inner);
-    const conv_channels_usize: usize = @intCast(conv_channels);
     const dt_rank_usize: usize = @intCast(dt_rank);
     const hidden_dim_usize: usize = @intCast(hidden_dim);
     const token_count: usize = @intCast(n_tokens);
-    for (0..token_count) |i| {
-        const token_index: u32 = @intCast(i);
-        const token_ssm_offset: u32 = @intCast(i * d_inner_usize);
-        const token_conv_offset: u32 = @intCast(i * conv_channels_usize);
-        const token_dt_offset: u32 = @intCast(i * dt_rank_usize);
-        engine.position = token_index;
-
-        if (!alpha_batched or !beta_batched) {
-            const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
-            dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, token_hidden_offset, 0);
-            profileBarrier(cmd, profile, .ssm);
+    if (!alpha_batched or !beta_batched) {
+        for (0..token_count) |i| {
+            const token_hidden_offset_bytes: u32 = @intCast(i * hidden_dim_usize * @sizeOf(f32));
+            const token_dt_offset_bytes: u32 = @intCast(i * dt_rank_usize * @sizeOf(f32));
             if (!alpha_batched) {
-                dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    cmd,
+                    alpha_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_alpha_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
             }
             if (!beta_batched) {
-                dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    cmd,
+                    beta_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_beta_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
             }
-            profileBarrier(cmd, profile, .ssm);
-        }
-
-        {
-            const alpha_buf: *const MetalBuffer = if (alpha_batched) &engine.qwen_ssm_prefill_proj_alpha_buf else &engine.router_logits_buf;
-            const beta_buf: *const MetalBuffer = if (beta_batched) &engine.qwen_ssm_prefill_proj_beta_buf else &engine.down_buf;
-            const push = SsmDeltaNetOffsetPush{
-                .d_inner = d_inner,
-                .dt_rank = dt_rank,
-                .head_v_dim = head_v_dim,
-                .d_state = d_state,
-                .n_group = n_group,
-                .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
-                .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
-                .alpha_offset = if (alpha_batched) token_dt_offset else 0,
-                .beta_offset = if (beta_batched) token_dt_offset else 0,
-                .output_offset = token_ssm_offset,
-                .conv_offset = token_conv_offset,
-            };
-            const dn_bufs = [_]*const MetalBuffer{
-                &engine.qwen_ssm_prefill_proj_qkv_buf, alpha_buf,
-                &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
-                beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
-                &scratch.attn_out,
-            };
-            cmd.dispatchV2(&engine.ssm_delta_net_offset_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetOffsetPush), 0);
-            if (profile) |p| p.ssm_delta_calls += 1;
         }
         profileBarrier(cmd, profile, .ssm);
     }
 
+    {
+        const push = SsmDeltaNetPrefillPush{
+            .d_inner = d_inner,
+            .dt_rank = dt_rank,
+            .head_v_dim = head_v_dim,
+            .d_state = d_state,
+            .n_group = n_group,
+            .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+            .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            .n_tokens = n_tokens,
+            .alpha_stride = dt_rank,
+            .beta_stride = dt_rank,
+            .conv_stride = conv_channels,
+            .output_stride = d_inner,
+            .alpha_offset = 0,
+            .beta_offset = 0,
+            .conv_offset = 0,
+            .output_offset = 0,
+        };
+        const dn_bufs = [_]*const MetalBuffer{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,  &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.ssm_dt_bias_bufs.?[layer_idx],  &engine.ssm_a_bufs.?[layer_idx],
+            &engine.qwen_ssm_prefill_proj_beta_buf, &engine.ssm_state_bufs.?[layer_idx],
+            &scratch.attn_out,
+        };
+        cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+        if (profile) |p| p.ssm_delta_calls += n_tokens;
+        engine.position = n_tokens - 1;
+        profileBarrier(cmd, profile, .ssm);
+    }
+
     // Adapt llama.cpp's Metal encoder barrier discipline
-    // (`ggml_metal_encoder_memory_barrier`): the token-ordered delta kernels
-    // write independent rows in scratch.attn_out, but nothing reads those rows
-    // until the batched gated norm below. The delta barrier in the token loop
-    // is for the recurrent SSM state; the final iteration also orders this read.
+    // (`ggml_metal_op_concurrency_reset` plus the graph encoder path): keep
+    // the recurrent state update token-ordered inside one layer-major dispatch,
+    // then expose only one ordered scratch.attn_out read to the gated norm below.
 
     dispatchSsmGatedNormBatchedOffsetsWithPipe(
         cmd,
@@ -14929,6 +14999,133 @@ test "ssm_delta_net_offset shader matches CPU reference with row offsets" {
     }
 }
 
+test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: u32 = 3;
+    const dt_rank: u32 = 2;
+    const head_v_dim: u32 = 4;
+    const d_state: u32 = 2;
+    const n_group: u32 = 1;
+    const d_inner: u32 = dt_rank * head_v_dim;
+    const qk_dim: u32 = d_state * n_group;
+    const conv_len: u32 = 2 * qk_dim + d_inner;
+    const state_len: u32 = dt_rank * head_v_dim * head_v_dim;
+    const token_count: usize = @intCast(n_tokens);
+    const dt_rank_usize: usize = @intCast(dt_rank);
+    const d_inner_usize: usize = @intCast(d_inner);
+    const conv_len_usize: usize = @intCast(conv_len);
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..token_count) |t| {
+        for (0..conv_len_usize) |j| {
+            const pattern: i32 = @intCast((t * 13 + j * 5) % 17);
+            conv_ptr[t * conv_len_usize + j] = @as(f32, @floatFromInt(pattern - 8)) * 0.125 + @as(f32, @floatFromInt(t)) * 0.05;
+        }
+        for (0..dt_rank_usize) |h| {
+            const idx = t * dt_rank_usize + h;
+            alpha_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(t)) - @as(i32, @intCast(h)))) * 0.17;
+            beta_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(t + h)))) * -0.11 + 0.25;
+        }
+    }
+    dt_bias_ptr[0] = 0.3;
+    dt_bias_ptr[1] = -0.1;
+    ssm_a_ptr[0] = 0.5;
+    ssm_a_ptr[1] = -0.75;
+    for (0..state_len) |i| {
+        state_ptr[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.07;
+    }
+    @memset(output_ptr[0 .. n_tokens * d_inner], 0);
+
+    var ref_state: [32]f32 = undefined;
+    var ref_output: [24]f32 = [_]f32{0} ** 24;
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    for (0..token_count) |t| {
+        const conv_base = t * conv_len_usize;
+        const dt_base = t * dt_rank_usize;
+        const out_base = t * d_inner_usize;
+        refRunSsmDeltaNet(
+            conv_ptr[conv_base .. conv_base + conv_len_usize],
+            alpha_ptr[dt_base .. dt_base + dt_rank_usize],
+            dt_bias_ptr[0..dt_rank],
+            beta_ptr[dt_base .. dt_base + dt_rank_usize],
+            ssm_a_ptr[0..dt_rank],
+            ref_state[0..state_len],
+            ref_output[out_base .. out_base + d_inner_usize],
+            dt_rank,
+            head_v_dim,
+            d_state,
+            n_group,
+        );
+    }
+
+    const push = SsmDeltaNetPrefillPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .has_dt_bias = 1,
+        .has_ssm_a = 1,
+        .n_tokens = n_tokens,
+        .alpha_stride = dt_rank,
+        .beta_stride = dt_rank,
+        .conv_stride = conv_len,
+        .output_stride = d_inner,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .conv_offset = 0,
+        .output_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+    cmd.commitAndWait();
+
+    for (0..token_count * d_inner_usize) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
+    }
+}
+
 test "ssm_conv1d shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -17608,6 +17805,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&moe_weighted_acc_pipe);
     var moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
     defer metal_pipeline.freePipeline(&moe_weighted_acc_scaled_pipe);
+    var ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
@@ -17652,6 +17851,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(sigmoid_scale_acc_batched_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_scaled_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
 }
 
 test "deinterleave shader splits block-interleaved Q and gate" {
