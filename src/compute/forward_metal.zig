@@ -3724,6 +3724,7 @@ pub const InferenceEngine = struct {
         }
         if (!canUseQwenRoutePackedPrefixSsmLayer(self, 0, prompt_len)) {
             log.info("Metal profile: Qwen route-packed prefill disabled: layer0 route-packed SSM layer guard failed", .{});
+            logQwenRoutePackedPrefixSsmLayerBlocker(self, 0, prompt_len, false);
             return;
         }
         log.info("Metal profile: Qwen route-packed prefill disabled: unknown guard mismatch", .{});
@@ -3856,6 +3857,9 @@ pub const InferenceEngine = struct {
                 route_packed_start_layer,
                 stop_reason,
             });
+            if (route_packed_start_layer < self.layer_tensors.len and !isFullAttentionLayer(cfg, route_packed_start_layer)) {
+                logQwenRoutePackedPrefixSsmLayerBlocker(self, route_packed_start_layer, prompt_tokens.len, false);
+            }
         }
 
         commitAsyncProfiled(&layer0_cmd, profile);
@@ -8243,6 +8247,121 @@ fn canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(
 
 fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
     return canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(engine, layer_idx, prompt_len, false);
+}
+
+fn logQwenRoutePackedPrefixSsmLayerBlocker(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    prompt_len: usize,
+    allow_f32_shared_gate_input: bool,
+) void {
+    if (!engine.profile_enabled) return;
+
+    if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: prompt_len={d} outside [32,{d}]", .{ layer_idx, prompt_len, queued_prefill_embed_tokens });
+        return;
+    }
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: validation mode active debug={} gemma={} qwen={}", .{
+            layer_idx,
+            engine.debug_validation_enabled,
+            engine.gemma_moe_validation_enabled,
+            engine.qwen_prefill_validation_enabled,
+        });
+        return;
+    }
+    if (engine.config.architecture != .qwen2_moe or
+        engine.config.hidden_dim != 2048 or
+        engine.config.ssm_d_inner != 4096 or
+        engine.config.n_experts != 256 or
+        engine.config.n_experts_used != 8)
+    {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: model shape arch={s} hidden={d} ssm_d_inner={d} experts={d} used={d}", .{
+            layer_idx,
+            @tagName(engine.config.architecture),
+            engine.config.hidden_dim,
+            engine.config.ssm_d_inner,
+            engine.config.n_experts,
+            engine.config.n_experts_used,
+        });
+        return;
+    }
+    if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) {
+        const lt = if (layer_idx < engine.layer_tensors.len) engine.layer_tensors[layer_idx] else null;
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: batched projection unsupported qkv={s} z={s} alpha={s} beta={s}", .{
+            layer_idx,
+            if (lt) |layer| if (layer.attn_qkv) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.attn_gate) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.ssm_alpha) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.ssm_beta) |t| @tagName(t.info.type_) else "-" else "-",
+        });
+        return;
+    }
+    if (engine.ssm_conv1d_prefill_pipe.handle == null or
+        engine.ssm_delta_net_offset_pipe.handle == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.config.ssm_d_conv > 8 or
+        engine.config.ssm_d_state > 128 or
+        engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1) > 128)
+    {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: SSM prefill shader/shape conv_pipe={} delta_offset_pipe={} delta_prefill_pipe={} d_conv={d} d_state={d} head_v_dim={d}", .{
+            layer_idx,
+            engine.ssm_conv1d_prefill_pipe.handle != null,
+            engine.ssm_delta_net_offset_pipe.handle != null,
+            engine.ssm_delta_net_prefill_pipe.handle != null,
+            engine.config.ssm_d_conv,
+            engine.config.ssm_d_state,
+            engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1),
+        });
+        return;
+    }
+    if (layer_idx >= engine.layer_tensors.len) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: layer index outside tensor table len={d}", .{ layer_idx, engine.layer_tensors.len });
+        return;
+    }
+
+    const lt = engine.layer_tensors[layer_idx];
+    const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
+    const router_t = lt.ffn_gate_inp orelse {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: router tensor missing", .{layer_idx});
+        return;
+    };
+    const ssm_out_t = lt.ssm_out orelse {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: ssm_out tensor missing", .{layer_idx});
+        return;
+    };
+    if (ssm_out_t.info.type_ != .q8_0) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: ssm_out type {s} unsupported", .{ layer_idx, @tagName(ssm_out_t.info.type_) });
+        return;
+    }
+    if (!canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len)) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: router batched top-k unsupported type={s}", .{ layer_idx, @tagName(router_t.info.type_) });
+        return;
+    }
+    if (!canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, engine.config.hidden_dim, inter_dim, allow_f32_shared_gate_input)) {
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, engine.config.hidden_dim) catch {
+            log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: MoE gate/up tensors missing", .{layer_idx});
+            return;
+        };
+        const down_exps = lt.ffn_down_exps;
+        const gate_inp_shexp = lt.ffn_gate_inp_shexp;
+        const f32_gate_supported = if (gate_inp_shexp) |gate_t|
+            canUseQwenSharedGateInputF32(engine, gate_t, engine.config.hidden_dim)
+        else
+            false;
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: MoE unsupported gate={s} up={s} down={s} shared_gate_inp={s} allow_f32_shared_gate={} f32_shared_gate_supported={}", .{
+            layer_idx,
+            @tagName(gate_up_layout.gate_tensor.info.type_),
+            @tagName(gate_up_layout.up_tensor.info.type_),
+            if (down_exps) |t| @tagName(t.info.type_) else "-",
+            if (gate_inp_shexp) |t| @tagName(t.info.type_) else "-",
+            allow_f32_shared_gate_input,
+            f32_gate_supported,
+        });
+        return;
+    }
+
+    log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: unknown mismatch", .{layer_idx});
 }
 
 fn recordQwenSsmProjectionChunkOnCmd(
