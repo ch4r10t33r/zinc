@@ -3760,6 +3760,11 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn queuedTokenMajorEarlyCommitTokens(prompt_len: usize) usize {
+        if (prompt_len < 64) return 0;
+        return @min(prompt_len / 2, 16);
+    }
+
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
         if (!self.profile_enabled) return;
 
@@ -3877,8 +3882,8 @@ pub const InferenceEngine = struct {
         // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
         // path, so long prompt graphs can be queued in a small number of ordered
         // command buffers. llama.cpp's ggml_metal_graph_compute reports 1-2
-        // command buffers as the practical sweet spot; split large prompts once
-        // so the GPU can start the first half while the CPU records the second.
+        // command buffers as the practical sweet spot; submit a small leading
+        // chunk so the GPU starts while the CPU records the long tail.
         const hidden_dim = self.config.hidden_dim;
         const hidden_dim_usize: usize = @intCast(hidden_dim);
         for (prompt_tokens, 0..) |token_id, i| {
@@ -3901,7 +3906,7 @@ pub const InferenceEngine = struct {
 
         const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
         const pending_token_count = prompt_tokens.len - 1;
-        const split_token: usize = if (prompt_tokens.len >= 64) prompt_tokens.len / 2 else 0;
+        const split_token: usize = queuedTokenMajorEarlyCommitTokens(prompt_tokens.len);
         var first_prompt_cmd = MetalCommand{
             .handle = null,
             .dispatch_count = 0,
@@ -4059,7 +4064,7 @@ pub const InferenceEngine = struct {
 
         self.position = 0;
         const pending_token_count = prompt_tokens.len - 1;
-        const split_token: usize = if (prompt_tokens.len >= 64) prompt_tokens.len / 2 else 0;
+        const split_token: usize = queuedTokenMajorEarlyCommitTokens(prompt_tokens.len);
 
         var first_prompt_cmd = MetalCommand{
             .handle = null,
