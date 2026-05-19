@@ -2,7 +2,18 @@
 
 > This guide mixes general RDNA4 platform findings, driver/toolchain notes, and external baseline measurements. Treat it as tuning context, not as the current ZINC benchmark leaderboard.
 
-Findings from extensive profiling of LLM inference on AMD Radeon AI PRO R9700 (RDNA4, gfx1201).
+Findings from extensive profiling of LLM inference on AMD Radeon AI PRO R9700 (RDNA4, gfx1201). The guide covers two backend paths: the **Vulkan backend** through Mesa RADV (current production, `-Dbackend=vulkan`), and the **ZINC_RT backend** built on direct PM4 submission through `amdgpu` (M0 scaffolding in tree, `-Dbackend=zinc_rt`). Every firmware, kernel, and driver setting documented below applies to both backends, because both sit on top of the same `amdgpu` kernel driver.
+
+## Current measured peak (Vulkan backend, Qwen3.6-35B-A3B Q4_K_XL)
+
+| Metric | ZINC (Vulkan + RADV) | llama.cpp (Vulkan) | Ratio |
+|---|---:|---:|---:|
+| Decode tok/s | 117.07 | 104.47 | 1.12x |
+| Prefill tok/s | 88.08 | 181.95 | 0.48x |
+| Bandwidth utilization (decode) | 31% of 576 GB/s | ~28% | — |
+| Per-token weight traffic | ~1.57 GiB | ~1.57 GiB | — |
+
+Decode beats llama.cpp by 12%. Prefill still trails — the hybrid MoE plus SSM architecture exposes more parallelism than the current dispatcher exploits, and the work to close that gap lives in `docs/RDNA4_BATCHED_PREFILL_2X.md` and the ZINC_RT chunked-prefill plan in `docs/ZINC_RT_DESIGN.md` §18.7. The 31% bandwidth utilization at peak decode is the headroom number to watch — the theoretical ceiling at 100% BW is ~365 tok/s, and the path to closing the gap is no longer one missing fused kernel.
 
 ## Hardware Specifications
 - **GPU**: 64 CUs, wave64, 32KB L0 vector cache/CU, 8MB L2
@@ -54,6 +65,10 @@ Profiled with `GGML_VK_PERF_LOGGER=1` on Qwen3.6-35B-A3B (Q4_K_XL, SSM+attention
 
 Large matmuls are near bandwidth-optimal. Small matmuls can't saturate the memory subsystem.
 
+### Q5_K DMMV row packing (recent)
+
+The Q5_K dequantize-matmul-vector shader was rebuilt to pack two output rows per workgroup. On a 32-row Q5_K matmul this halves the workgroup count, doubles the per-WG accumulator footprint, and reuses the same dequantized block across both rows. Net effect on decode is a measurable few percent on Q5_K-heavy models like Qwen3-8B, with no correctness changes. The pattern is documented in `src/shaders/dmmv_q5k.comp`; the same row-packing idea is the next candidate for Q3_K and Q6_K, both of which currently dispatch one row per WG.
+
 ### Non-Matmul Ops (per token)
 | Op | Dispatches | Total Time |
 |----|-----------|------------|
@@ -94,7 +109,7 @@ Raw Vulkan dispatch cost measured on RDNA4:
 | 1 | 110 | 110 |
 | 4 | 108 | 432 |
 
-Linear scaling — the GPU is not saturated by a single decode request.
+Linear scaling — the GPU is not saturated by a single decode request. Aggregate scaling beyond four slots requires paged KV (the current Vulkan backend's flat KV cache OOMs at sixteen concurrent slots on Qwen3.6-35B-A3B). The paged KV v2 layout in `docs/ZINC_RT_DESIGN.md` §19 targets ~2 100 aggregate tok/s at sixteen slots on the same R9700.
 
 ## What Doesn't Help
 
@@ -127,3 +142,34 @@ The newer glslc adds `NonWritable`/`NonReadable` decorations and different contr
 Kernel 6.17 has SMU driver IF v0x2e, while RDNA4 firmware expects v0x32. This mismatch limits max GPU clock to 2200 MHz instead of 2350 MHz.
 
 Kernel 6.14 or earlier may have a compatible SMU driver version.
+
+## Mesa Version Sensitivity
+
+The RADV ACO compiler in Mesa is the SPIR-V to PM4 path. Two version cliffs are documented:
+
+| Mesa version | Status on R9700 | Notes |
+|---|---|---|
+| 25.0.7 | Recommended | Current bench-node version |
+| 25.2.8 | **~14% RADV regression** | Avoid until upstream ACO regressions are reverted |
+
+The regression manifests on the Q4_K DMMV path most strongly. We pin Mesa via the system package manager and do not auto-upgrade the bench node.
+
+## Load-time Q4_0 Re-quantization
+
+GGUF models commonly ship Q8_0 for tensors the publisher considered precision-sensitive: SSM in-projection (`attn_qkv`), SSM out-projection, attention gate, and sometimes the router. On Qwen3.6-35B-A3B the SSM `attn_qkv` is `[8192, 2048]` per layer in Q8_0, ~17 MiB, streamed every decode token. Across 30 SSM layers that is ~510 MiB of Q8_0 weights traversed per token, well past L3.
+
+On the T-CPU autopilot path, adding `attn_qkv` to the Q8_0 → Q4_0 re-quantize-at-load list moved decode from 32.8 to 37.6 tok/s and prefill from 28.5 to 32.7 tok/s on the 9800X3D bench, with output staying coherent. The model is already Q4_K everywhere else; per-weight noise on the SSM in-proj is averaged out by the L2-normalized delta-net recurrence one layer downstream. The same lever applies on RDNA4 wherever a tensor is loaded Q8_0 by default and the kernel has a Q4_0 variant. See `forward_zinc_rt.zig`'s `q4_candidates` list for the current set.
+
+## ZINC_RT, this guide, and what changes
+
+The Vulkan-specific advice above is about driver, firmware, and toolchain. **All of it still applies under ZINC_RT** because ZINC_RT uses the same `amdgpu` kernel driver. Disable GECC. Stay on Mesa 25.0.7 (when running anything that links libvulkan, including dev tooling and CI shader compilation). Stay on kernel 6.14 if you can. Pin shaderc 2023.8.
+
+What ZINC_RT changes is the userspace layer above the kernel driver. The Vulkan tax this guide measures — 33 µs per `vkQueueSubmit` plus fence, 80 µs command-buffer re-record on a 1500-node graph, the 5x glslc regression risk — does not apply to ZINC_RT's PM4-direct path. ZINC_RT submits via a ring-buffer write plus a doorbell MMIO store, total CPU-to-CP latency around 150-500 ns. The trade is that ZINC_RT is at M0 today (T1 KFD smoke dispatch verified on R9700; full IR lowering is M2). The Vulkan path is the production target until ZINC_RT clears its M1 gate at 140 tok/s decode.
+
+For the long-form story of why ZINC_RT exists at all, the head-to-head architectural comparison vs ROCm and Vulkan, the multitenant batching architecture, and the falsification criteria, see:
+
+- `docs/ZINC_RT_DESIGN.md` — the canonical ZINC_RT design
+- The blog post "ROCm vs Vulkan vs ZINC_RT: inside the decision to write our own GPU runtime for local LLM inference on AMD RDNA4" at `/blog/inside-the-decision-to-write-our-own-gpu-runtime-for-local-llm-inference`
+- `docs/RDNA4_PERFORMANCE_JOURNEY.md` — the historical 11 → 117 tok/s sequence of fixes and wins
+
+The two backends will both ship indefinitely. The cross-backend logit-equality test in CI is what keeps them honest.
