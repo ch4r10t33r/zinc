@@ -285,6 +285,11 @@ fn readBoolEnv(env_name: [:0]const u8) ?bool {
     return null;
 }
 
+fn readU32Env(env_name: [:0]const u8) ?u32 {
+    const raw = std.posix.getenv(env_name) orelse return null;
+    return std.fmt.parseUnsigned(u32, raw, 10) catch null;
+}
+
 const DmmvPathClass = enum(u8) {
     other,
     ssm,
@@ -1933,6 +1938,7 @@ pub const InferenceEngine = struct {
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
+    qwen_ssm_proj_validate_layer: u32,
     qwen_ssm_proj_validate_norm_buf: MetalBuffer,
     qwen_ssm_proj_validate_qkv_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_z_ref_buf: MetalBuffer,
@@ -2032,6 +2038,12 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.qwen_ssm_proj_validate_layer =
+            readU32Env("ZINC_QWEN36_35B_SSM_PROJ_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_SSM_PROJ_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_LAYER") orelse
+            0;
         self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse true;
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
@@ -7930,7 +7942,7 @@ fn shouldValidateQwenSsmProjection(
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
         engine.position < qwen_ssm_projection_validate_tokens and
-        layer_idx == 0 and
+        layer_idx == @as(usize, @intCast(engine.qwen_ssm_proj_validate_layer)) and
         wqkv_t.info.type_ == .q8_0 and
         z_t.info.type_ == .q8_0 and
         alpha_t.info.type_ == .q8_0 and
