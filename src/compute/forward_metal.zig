@@ -1918,6 +1918,7 @@ pub const InferenceEngine = struct {
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
+    fused_ssm_norm_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
     kv_cache_q8: bool,
@@ -2021,6 +2022,7 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse true;
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
             self.qwen_prefill_validation_enabled)
@@ -4271,6 +4273,30 @@ fn canUseFusedNormDualQ8Dmmv(
         engine.dmmv_q8_0_dual_fused_norm_pipe.max_threads_per_threadgroup >= block_size;
 }
 
+fn canUseQwenSsmFusedNormProjections(
+    engine: *const InferenceEngine,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) bool {
+    if (!engine.fused_ssm_norm_enabled) return false;
+    if (engine.debug_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.config.architecture != .qwen2_moe or engine.config.ssm_d_inner == 0) return false;
+
+    // Keep this first production use pinned to the Effort 16 Qwen3.6 35B-A3B
+    // SSM projection shape. Broaden only after exact-shape evidence.
+    if (hidden_dim != 2048 or conv_channels != 8192 or d_inner != 4096 or dt_rank != 32) return false;
+
+    return canUseFusedNormDualQ8Dmmv(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim) and
+        canUseFusedNormQ8Dmmv(engine, alpha_t, hidden_dim) and
+        canUseFusedNormQ8Dmmv(engine, beta_t, hidden_dim);
+}
+
 fn canUseDualQ8Dmmv(
     engine: *const InferenceEngine,
     tensor0: *const metal_loader.LoadedTensor,
@@ -4695,7 +4721,7 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     const total_rows = M0 + M1;
     const block_size = engine.q8_dual_tg_override orelse 1024;
     const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width else @as(u32, 32);
-    const rows_per_wg: u32 = block_size / simd_width;
+    const rows_per_wg: u32 = (block_size / simd_width) * 2;
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
 }
 
@@ -9389,9 +9415,21 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
 
-            // Fused RMSNorm + DMMV path: all consumers compute norm inline from L1-cached
-            // hidden state, eliminating the separate RMSNorm dispatch and barrier.
-            const use_fused_norm = false;
+            // Fused RMSNorm + DMMV path: all SSM pre-projection consumers
+            // compute norm inline from L1-cached hidden state, eliminating the
+            // separate RMSNorm dispatch/barrier while preserving token-serial
+            // conv/delta recurrence.
+            const use_fused_norm = canUseQwenSsmFusedNormProjections(
+                engine,
+                wqkv_t,
+                z_t,
+                alpha_t,
+                beta_t,
+                conv_channels,
+                d_inner,
+                dt_rank,
+                hidden_dim,
+            );
 
             if (use_fused_norm) {
                 dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);

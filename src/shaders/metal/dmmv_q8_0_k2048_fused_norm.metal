@@ -61,13 +61,12 @@ kernel void main0(
         #pragma unroll
         for (uint vi = 0u; vi < 8u; ++vi) {
             const char4 q = char4(quants[vi]);
-            const half4 q_half = half4(q);
             const uint idx = x_base + (vi << 2);
             // Inline RMSNorm: x[i] = norm_weight[i] * (hidden[i] * rms_inv)
             const float4 h4 = *(device const float4*)(h + idx);
             const float4 nw4 = *(device const float4*)(norm_weight + idx);
-            const half4 x = half4(nw4 * (h4 * rms_inv));
-            acc = fma(scale, float(dot(q_half, x)), acc);
+            const float4 x = nw4 * (h4 * rms_inv);
+            acc = fma(scale, dot(float4(q), x), acc);
         }
     }
 
