@@ -853,6 +853,7 @@ describe("config", () => {
     expect(src).toContain("ZINC_PORT");
     expect(src).toContain("ZINC_USER");
     expect(src).toContain("ZINC_RDNA_QWEN36_35B_MODEL");
+    expect(src).toContain("ZINC_RDNA_QWEN36_27B_MODEL");
     expect(src).toContain("ZINC_RDNA_QWEN3_8B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_31B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_12B_MODEL");
@@ -866,9 +867,10 @@ describe("config", () => {
     expect(src).toContain("first four planets");
   });
 
-  test("all five models are listed for coherence", async () => {
+  test("all six models are listed for coherence", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
     expect(src).toContain("Qwen3.6-35B");
+    expect(src).toContain("Qwen3.6-27B");
     expect(src).toContain("Qwen3-8B");
     expect(src).toContain("Gemma4-31B");
     expect(src).toContain("Gemma4-12B");

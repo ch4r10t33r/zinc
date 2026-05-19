@@ -11417,21 +11417,17 @@ pub const InferenceEngine = struct {
         const prebatch_ssm_z = std.mem.eql(u8, ssm_preproj_mode, "1") or
             std.mem.eql(u8, ssm_preproj_mode, "both") or
             std.mem.eql(u8, ssm_preproj_mode, "z");
-        var embeddings_copied_to_scratch = false;
-        if (use_ssm_preproj) {
-            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-            try self.decode_cmd.reset();
-            try self.decode_cmd.beginOneTime();
-            const region = vk.c.VkBufferCopy{
-                .srcOffset = 0,
-                .dstOffset = 0,
-                .size = total_embed_bytes,
-            };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &region);
-            try self.decode_cmd.end();
-            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-            embeddings_copied_to_scratch = true;
-        }
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        const embed_region = vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_embed_bytes,
+        };
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &embed_region);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
         self.prefill_token_samples = 0;
         self.prefill_cpu_embed_ns = 0;
@@ -11513,7 +11509,7 @@ pub const InferenceEngine = struct {
                     if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
                     try self.decode_cmd.reset();
                     try self.decode_cmd.beginOneTime();
-                    if (layer == 0 and embeddings_copied_to_scratch) {
+                    if (layer == 0) {
                         self.decode_cmd.transferToComputeBarrier();
                     } else {
                         self.decode_cmd.computeBarrier();
@@ -11562,7 +11558,7 @@ pub const InferenceEngine = struct {
                 state.position = base_token + tok_idx;
                 self.partial_decode_start_layer = layer;
                 self.partial_decode_end_layer = layer + 1;
-                self.partial_decode_hidden_in = if (layer == 0 and !embeddings_copied_to_scratch) self.prefill_embed_big.?.handle else scratch_hidden.handle;
+                self.partial_decode_hidden_in = scratch_hidden.handle;
                 self.partial_decode_hidden_in_offset = hidden_offset;
                 self.partial_decode_hidden_out = scratch_hidden.handle;
                 self.partial_decode_hidden_out_offset = hidden_offset;

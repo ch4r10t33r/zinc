@@ -658,6 +658,7 @@ const COHERENCE_CHECKS: CoherenceCheck[] = [
 // The primary model (--model flag) is benchmarked; these are correctness-only.
 const COHERENCE_MODELS: ModelTarget[] = [
   MODELS.qwen36b,
+  MODELS.qwen3627b,
   MODELS.qwen8b,
   MODELS.gemma431b,
   MODELS.gemma412b,
