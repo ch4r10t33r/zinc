@@ -302,6 +302,11 @@ pub const DmmvDispatch = struct {
     /// barrier per layer (gate+up → swiglu), and reads the shared input
     /// once per block. Same DmmvPushConstants layout as pipeline_q4k.
     pipeline_q4k_fused_gate_up_swiglu: ?Pipeline,
+    /// Same shader as pipeline_q4k_fused_gate_up_swiglu with NUM_ROWS=1 via
+    /// specialization constant. Targets Qwen3.6-27B's wide dense FFN gate/up
+    /// shape where the regular NUM_ROWS=2 fused path was register-pressure
+    /// sensitive.
+    pipeline_q4k_fused_gate_up_swiglu_row1: ?Pipeline,
     /// Gemma CPU-routed MoE expert front-end fusion. Gemma packs expert
     /// gate/up rows into one Q4_K tensor, so this takes independent byte
     /// offsets into that tensor and writes GEGLU(gate, up) directly.
@@ -668,6 +673,11 @@ pub const DmmvDispatch = struct {
             log.warn("Q4_K dense fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q4k_fused_gate_up_swiglu_row1_spec = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 1 }};
+        const pipeline_q4k_fused_gate_up_swiglu_row1 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_swiglu_path, 4, push_size, &q4k_fused_gate_up_swiglu_row1_spec, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K dense fused gate+up+SwiGLU row1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const q4k_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
         const gate_up_geglu_push_size = @sizeOf(DmmvGateUpGegluPushConstants);
@@ -861,6 +871,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_q4k_fused_gate_up_swiglu_moe,
             .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
             .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
+            .pipeline_q4k_fused_gate_up_swiglu_row1 = pipeline_q4k_fused_gate_up_swiglu_row1,
             .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
             .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
@@ -1339,6 +1350,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_row1) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();

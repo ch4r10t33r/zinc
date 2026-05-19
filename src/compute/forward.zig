@@ -1106,6 +1106,11 @@ pub const InferenceEngine = struct {
     // the SwiGLU fold which removes the gate_buf/up_buf write+read pair
     // entirely, a structurally distinct change.
     use_fused_dense_ffn: bool = false,
+    // Default-on only for Qwen3.6-27B's wide dense FFN shape. Uses the
+    // NUM_ROWS=1 specialization of the fused gate+up+SwiGLU Q4_K shader
+    // instead of widening the regular NUM_ROWS=2 path that previously
+    // regressed this target. Disable with ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0.
+    use_qwen36_dense_fused_row1: bool = false,
     // Effort-11 cycle-17: fused split-K flash attention merge + o_proj
     // DMMV-acc. When ZINC_FUSED_OPROJ_MERGE=1 (and split-K is active), the
     // o_proj dispatch site uses a single dmmv_q4k_o_proj_merge dispatch
@@ -2280,6 +2285,17 @@ pub const InferenceEngine = struct {
         } else if (fused_dense_ffn_explicitly_off) {
             log.info("Fused dense gate+up+SwiGLU DISABLED via ZINC_FUSED_DENSE_FFN=0", .{});
         }
+        const qwen36_dense_row1_env = std.posix.getenv("ZINC_QWEN36_27B_DENSE_FUSED_ROW1");
+        const qwen36_dense_row1_explicitly_off = qwen36_dense_row1_env != null and
+            std.mem.eql(u8, qwen36_dense_row1_env.?, "0");
+        const qwen36_dense_row1_enabled = !qwen36_dense_row1_explicitly_off and
+            dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_dense_row1_enabled) {
+            log.info("Qwen3.6-27B dense fused gate+up+SwiGLU row1 path ENABLED (default for matching shape, set ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0 to disable)", .{});
+        } else if (qwen36_dense_row1_explicitly_off) {
+            log.info("Qwen3.6-27B dense fused gate+up+SwiGLU row1 path DISABLED via ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0", .{});
+        }
 
         // Fused split-K merge + o_proj DMMV-acc (effort-11 cycle 17). When
         // ZINC_FUSED_OPROJ_MERGE=1 AND split-K is active, the o_proj site
@@ -2897,6 +2913,7 @@ pub const InferenceEngine = struct {
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
             .use_ssm_delta_normed_qk = ssm_delta_normed_qk_enabled,
             .use_fused_dense_ffn = fused_dense_ffn_enabled,
+            .use_qwen36_dense_fused_row1 = qwen36_dense_row1_enabled,
             .use_fused_oproj_merge = fused_oproj_merge_enabled,
             .use_fused_qk_kv = fused_qk_kv_enabled,
             .fa_profile_layer = fa_profile_layer_enabled,
@@ -8489,6 +8506,11 @@ pub const InferenceEngine = struct {
                     self.dense_prefill_validate_captured_tokens = @max(self.dense_prefill_validate_captured_tokens, tok_idx + 1);
                 }
 
+                const qwen36_row1_dense_eligible = self.use_qwen36_dense_fused_row1 and
+                    self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null and
+                    self.isQwen36DenseHybrid27B() and
+                    hidden_dim == 5120 and
+                    inter_dim == 17408;
                 const fused_dense_ffn_eligible = self.use_fused_dense_ffn and
                     self.dmmv.pipeline_q4k_fused_gate_up_swiglu != null and
                     config.architecture != .gemma and
@@ -8496,7 +8518,7 @@ pub const InferenceEngine = struct {
                     !dense_prefill_validate_capture and
                     gate_tensor.info.type_ == .q4_k and
                     up_tensor.info.type_ == .q4_k and
-                    inter_dim <= 12288 and
+                    (inter_dim <= 12288 or qwen36_row1_dense_eligible) and
                     (hidden_dim % 4) == 0 and
                     (hidden_dim % 256) == 0;
 
@@ -10165,7 +10187,15 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
     ) !void {
-        const pip = &(self.dmmv.pipeline_q4k_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
+        const use_row1 = self.use_qwen36_dense_fused_row1 and
+            self.isQwen36DenseHybrid27B() and
+            M == 17408 and
+            K == 5120 and
+            self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null;
+        const pip = if (use_row1)
+            if (self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1) |*p| p else return error.ShaderNotLoaded
+        else
+            &(self.dmmv.pipeline_q4k_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
         const push = DmmvPushConstants{
             .M = M,
             .K = K,
@@ -10174,8 +10204,7 @@ pub const InferenceEngine = struct {
             .y_offset = 0,
             .acc_mode = 0,
         };
-        // NUM_ROWS=2 in the shader; one workgroup per row pair.
-        const wg_x: u32 = (M + 1) / 2;
+        const wg_x: u32 = if (use_row1) M else (M + 1) / 2;
         self.pushDispatch4(
             pip,
             std.mem.asBytes(&push),

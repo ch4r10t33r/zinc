@@ -59,7 +59,7 @@ layout(set = 0, binding = 1) readonly buffer MatrixAUp   { uint a_up_u32[];   };
 layout(set = 0, binding = 2) readonly buffer VectorX     { vec4 x_v4[];       };
 layout(set = 0, binding = 3) writeonly buffer Swiglu     { float swiglu[];    };
 
-const uint NUM_ROWS = 2u;
+layout(constant_id = 0) const uint NUM_ROWS = 2u;
 const uint Q4K_BLOCK_U32 = 36u;  // 144 bytes / 4
 
 shared float s_sg_gate[4];
