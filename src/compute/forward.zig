@@ -2692,7 +2692,7 @@ pub const InferenceEngine = struct {
             inter_val > 0)
         {
             const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
-            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 8 else 8;
+            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 16 else 16;
             dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), @as(u32, 16));
             const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
             const parsed_layer = if (raw_layer) |raw| std.fmt.parseInt(u32, raw, 10) catch 0 else 0;
@@ -2741,7 +2741,7 @@ pub const InferenceEngine = struct {
                 }
             }
             dense_prefill_validate_enabled = true;
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B", .{
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B (replays chunks 4/8/16 when captured)", .{
                 dense_prefill_validate_layer,
                 dense_prefill_validate_max_tokens,
                 config.hidden_dim,
@@ -2862,7 +2862,7 @@ pub const InferenceEngine = struct {
                     }
                 }
                 ssm_prefill_validate_enabled = true;
-                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} delta_replay={} output_replay={} staging={d} B (batched qkv/z/delta/ssm_out replay)", .{
+                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} delta_replay={} output_replay={} staging={d} B (batched qkv/z/delta/ssm_out replay, chunks 4/8/16 when captured)", .{
                     dense_prefill_validate_layer,
                     dense_prefill_validate_max_tokens,
                     config.hidden_dim,
@@ -13030,15 +13030,37 @@ pub const InferenceEngine = struct {
 
         if (self.use_qwen36_dense_prefill_validate and self.dense_prefill_validate_captured_tokens > 0) {
             const n_validate = @min(self.dense_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
-            self.validateDensePrefillFfnChunk(n_validate) catch |err| {
-                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay skipped: {s}", .{@errorName(err)});
-            };
+            const validate_chunks = [_]u32{ 4, 8, 16 };
+            var ran_exact_chunk = false;
+            for (validate_chunks) |chunk| {
+                if (chunk > n_validate) continue;
+                if (chunk == n_validate) ran_exact_chunk = true;
+                self.validateDensePrefillFfnChunk(chunk) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+                };
+            }
+            if (!ran_exact_chunk) {
+                self.validateDensePrefillFfnChunk(n_validate) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
+                };
+            }
         }
         if (self.use_qwen36_ssm_prefill_validate and self.ssm_prefill_validate_captured_tokens > 0) {
             const n_validate = @min(self.ssm_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
-            self.validateSsmPrefillProjectionChunk(n_validate) catch |err| {
-                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay skipped: {s}", .{@errorName(err)});
-            };
+            const validate_chunks = [_]u32{ 4, 8, 16 };
+            var ran_exact_chunk = false;
+            for (validate_chunks) |chunk| {
+                if (chunk > n_validate) continue;
+                if (chunk == n_validate) ran_exact_chunk = true;
+                self.validateSsmPrefillProjectionChunk(chunk) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+                };
+            }
+            if (!ran_exact_chunk) {
+                self.validateSsmPrefillProjectionChunk(n_validate) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
+                };
+            }
         }
 
         // Effort-6 cycle 123 (A3b all-layer extension): batched
