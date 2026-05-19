@@ -10062,8 +10062,16 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         try dispatchDmmvMoeOnCmd(engine, cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_up_bytes, 0, 0);
     }
     if (has_shexp) {
-        dispatchDmmvOnCmd(engine, cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
-        dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+        // Qwen3.6 shared expert gate/up are equal-shape Q8_0 projections. Use
+        // the paired Q8 row kernel (llama.cpp-style rowwise mul_mv with shared
+        // X-vector loads) for the production path now that the Qwen shared
+        // batched validator covers gate/up/down diffs.
+        if (canUsePairedQ8Dmmv(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim);
+        } else {
+            dispatchDmmvOnCmd(engine, cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
+            dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+        }
         if (gate_inp_shexp) |tensor| {
             dispatchDmmvOnCmd(engine, cmd, tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
         }
