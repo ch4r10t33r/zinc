@@ -3640,6 +3640,10 @@ pub const InferenceEngine = struct {
     }
 
     fn canUseQwenLayer0RoutePackedPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        const force_f32_shared_gate = if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
+            std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")
+        else
+            false;
         if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
             if (std.mem.eql(u8, raw, "0")) return false;
         }
@@ -3655,7 +3659,7 @@ pub const InferenceEngine = struct {
         }
         if (self.layer_tensors.len == 0 or isFullAttentionLayer(self.config, 0)) return false;
         if (!canUseQwenSsmPrefillProjectionChunk(self, prompt_len)) return false;
-        if (!canUseQwenRoutePackedPrefixSsmLayer(self, 0, prompt_len)) return false;
+        if (!canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, force_f32_shared_gate)) return false;
 
         const lt = self.layer_tensors[0];
         if (!canUseGpuRoutedBatchedMoe(self, lt)) return false;
@@ -3692,7 +3696,7 @@ pub const InferenceEngine = struct {
                 if (!canUseQwenSharedGateInputBatched(self, gate_inp, self.config.hidden_dim)) return false;
             }
         }
-        return canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, true);
+        return true;
     }
 
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
@@ -3800,6 +3804,9 @@ pub const InferenceEngine = struct {
         if (!canUseQwenRoutePackedPrefixSsmLayer(self, 0, prompt_len)) {
             log.info("Metal profile: Qwen route-packed prefill disabled: layer0 route-packed SSM layer guard failed", .{});
             logQwenRoutePackedPrefixSsmLayerBlocker(self, 0, prompt_len, false);
+            if (canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, true)) {
+                log.info("Metal profile: Qwen route-packed prefill candidate available behind ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 (F32 shared-gate path)", .{});
+            }
             return;
         }
         log.info("Metal profile: Qwen route-packed prefill disabled: unknown guard mismatch", .{});
