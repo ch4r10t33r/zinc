@@ -1,0 +1,83 @@
+#version 460
+// Batched fused RMS normalization x SiLU gating for SSM layers.
+//
+// Grid:
+//   x = SSM head
+//   y = token index
+//
+// Buffer layout is token-major: [n_tok][d_inner]. The push-constant layout
+// intentionally matches ssm_gated_norm.comp so host code can reuse
+// SsmGatedNormPush when dispatching this with grid.y > 1.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer DeltaNetOutput {
+    float delta_net_output[];
+};
+
+layout(set = 0, binding = 1) readonly buffer ZGate {
+    float z_gate[];
+};
+
+layout(set = 0, binding = 2) readonly buffer NormWeights {
+    float norm_weight[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer Output {
+    float out_buf[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint d_inner;
+    uint dt_rank;
+    uint head_v_dim;
+    uint d_state;
+    uint norm_per_head;
+};
+
+shared float s_partial[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint token_base = tok * d_inner;
+    uint head_base = token_base + h * head_v_dim;
+
+    float sum_sq = 0.0;
+    for (uint i = tid; i < head_v_dim; i += 64u) {
+        float val = delta_net_output[head_base + i];
+        sum_sq += val * val;
+    }
+
+    sum_sq = subgroupAdd(sum_sq);
+
+    if (gl_SubgroupSize < 64u) {
+        s_partial[tid] = sum_sq;
+        barrier();
+        if (tid == 0u) {
+            float total = 0.0;
+            uint num_subgroups = (64u + gl_SubgroupSize - 1u) / gl_SubgroupSize;
+            for (uint s = 0u; s < num_subgroups; s++) {
+                total += s_partial[s * gl_SubgroupSize];
+            }
+            s_partial[0] = total;
+        }
+        barrier();
+        sum_sq = s_partial[0];
+    }
+
+    float rms_inv = inversesqrt(sum_sq / float(head_v_dim) + 1e-6);
+
+    for (uint i = tid; i < head_v_dim; i += 64u) {
+        uint idx = head_base + i;
+        float nv = delta_net_output[idx] * rms_inv;
+        uint norm_idx = (norm_per_head != 0u) ? (h * head_v_dim + i) : (i % d_state);
+        nv *= norm_weight[norm_idx];
+
+        float zv = z_gate[idx];
+        float gate = zv / (1.0 + exp(-zv));
+        out_buf[idx] = nv * gate;
+    }
+}
