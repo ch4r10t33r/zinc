@@ -3312,9 +3312,10 @@ pub const InferenceEngine = struct {
 
     fn prefillBatchQueuedTokenMajorSingleCommand(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
-        // path, so the whole token-major prompt can live in one ordered command
-        // buffer. This keeps exact token order while avoiding one command-buffer
-        // submission per prompt token.
+        // path, so long prompt graphs can be queued in a small number of ordered
+        // command buffers. llama.cpp's ggml_metal_graph_compute reports 1-2
+        // command buffers as the practical sweet spot; split large prompts once
+        // so the GPU can start the first half while the CPU records the second.
         const hidden_dim = self.config.hidden_dim;
         const hidden_dim_usize: usize = @intCast(hidden_dim);
         for (prompt_tokens, 0..) |token_id, i| {
@@ -3330,18 +3331,37 @@ pub const InferenceEngine = struct {
         defer if (precompute_cmd.handle != null) precompute_cmd.wait();
         _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
 
-        var prompt_cmd = try beginProfiledCommand(self, if (self.profile_enabled) &self.request_profile else null);
+        const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
+        const pending_token_count = prompt_tokens.len - 1;
+        const split_token: usize = if (prompt_tokens.len >= 64) prompt_tokens.len / 2 else 0;
+        var first_prompt_cmd = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+
+        if (split_token > 0) {
+            first_prompt_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+            for (prompt_tokens[0..split_token], 0..) |_, i| {
+                const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+                try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, null, &first_prompt_cmd);
+            }
+            commitAsyncProfiled(&first_prompt_cmd, profile);
+        }
+
+        var prompt_cmd = try beginProfiledCommand(self, profile);
         errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
 
-        const pending_token_count = prompt_tokens.len - 1;
-        for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
+        for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
             const embed_offset: u32 = @intCast(i * hidden_dim_usize);
             try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, null, &prompt_cmd);
         }
-
         const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
         try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null, &prompt_cmd);
-        commitAndWaitProfiled(&prompt_cmd, if (self.profile_enabled) &self.request_profile else null);
+        commitAndWaitProfiled(&prompt_cmd, profile);
         state.position = self.position;
     }
 
