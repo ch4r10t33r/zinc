@@ -27,28 +27,28 @@ const scenarioOrder = ['core', 'context-medium', 'context-long', 'decode-extende
 const hiddenBenchmarkModels = new Set<string>();
 const scenarioMeta: Record<string, { label: string; short: string; eyebrow: string; description: string }> = {
   core: {
-    label: 'Quick',
+    label: 'Quick Chat',
     short: 'Quick',
-    eyebrow: 'Short prompt',
-    description: 'Headline workload for a short answer with minimal prompt overhead.',
+    eyebrow: 'Chat',
+    description: 'A short assistant turn with enough decode budget to avoid one-token screenshot rates.',
   },
   'context-medium': {
-    label: 'Context',
-    short: 'Context',
-    eyebrow: 'Retrieval',
-    description: 'A retrieval-style prompt with explicit context so prompt throughput becomes visible.',
+    label: 'Coding Review',
+    short: 'Coding',
+    eyebrow: 'Code',
+    description: 'A small TypeScript review task that asks for the bug, cause, and corrected implementation.',
   },
   'context-long': {
-    label: 'Long ctx',
-    short: 'Long ctx',
-    eyebrow: 'Prefill-heavy',
-    description: 'A long prompt with the answer embedded near the end to expose prefill bottlenecks.',
+    label: 'Incident Context',
+    short: 'Context',
+    eyebrow: 'Support',
+    description: 'A support-style incident packet that exposes prefill behavior and prompt+decode latency.',
   },
   'decode-extended': {
-    label: 'Long Decode',
-    short: 'Long decode',
+    label: 'Long Coding Draft',
+    short: 'Long draft',
     eyebrow: 'Generation',
-    description: 'A longer generation target that stresses steady-state decode instead of a short factual completion.',
+    description: 'A longer engineering-plan generation task that stresses sustained decode.',
   },
 };
 

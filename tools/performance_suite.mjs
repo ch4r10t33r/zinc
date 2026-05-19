@@ -1378,7 +1378,7 @@ export function defaultMetalCases(modelRoot) {
       quant: "Q4_K_M",
       model_path: modelPath(modelRoot, "gpt-oss-20b-q4k-m"),
       prompt_mode: "chat",
-      prompt: "What is the capital of France? Answer in one word.",
+      prompt: defaultPromptForModelId("gpt-oss-20b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("gpt-oss-20b-q4k-m"),
       notes: ["Harmony chat-template path on local Metal", "Uses a larger decode budget so the final answer channel is reached"],
     },
@@ -1390,7 +1390,7 @@ export function defaultMetalCases(modelRoot) {
       quant: "Q4_K_M",
       model_path: modelPath(modelRoot, "gemma4-12b-q4k-m"),
       prompt_mode: "chat",
-      prompt: "What is the capital of France? Answer in one word.",
+      prompt: defaultPromptForModelId("gemma4-12b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("gemma4-12b-q4k-m"),
       notes: ["ISWA / MoE Metal path"],
     },
@@ -1402,7 +1402,7 @@ export function defaultMetalCases(modelRoot) {
       quant: "Q4_K_M",
       model_path: modelPath(modelRoot, "gemma4-31b-q4k-m"),
       prompt_mode: "chat",
-      prompt: "What is the capital of France? Answer in one word.",
+      prompt: defaultPromptForModelId("gemma4-31b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("gemma4-31b-q4k-m"),
       notes: ["Large-model Metal path"],
     },
@@ -1414,7 +1414,7 @@ export function defaultMetalCases(modelRoot) {
       quant: "Q4_K_M",
       model_path: modelPath(modelRoot, "qwen3-8b-q4k-m"),
       prompt_mode: "raw",
-      prompt: "The capital of France is",
+      prompt: defaultPromptForModelId("qwen3-8b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("qwen3-8b-q4k-m"),
       notes: ["Raw decode path to avoid visible think blocks in CLI output"],
     },
@@ -1501,99 +1501,140 @@ export function prefersChatPrompt(id) {
 
 export function defaultPromptForModelId(id) {
   return prefersChatPrompt(id)
-    ? "What is the capital of France? Answer in one word."
-    : "The capital of France is";
+    ? "A teammate sent two local LLM benchmark screenshots with different tok/s numbers for the same model. Explain the likely causes in two short paragraphs, then give one concrete measurement rule."
+    : "Developer question: two local LLM benchmark screenshots show different tok/s values for the same model. A useful answer explains likely causes and gives one fair measurement rule.\n\nAnswer:";
 }
 
 export function defaultMaxTokensForModelId(id) {
-  return id.startsWith("gpt-oss") ? 48 : 8;
+  return id.startsWith("gpt-oss") ? 128 : 96;
 }
 
-const BENCHMARK_CONTEXT_SENTENCE =
-  "Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu.";
+const CODING_REVIEW_SNIPPET = [
+  "File: src/cache.ts",
+  "```ts",
+  "const cache = new Map<string, string>();",
+  "const pending = new Map<string, Promise<string>>();",
+  "",
+  "export async function getValue(key: string, load: () => Promise<string>) {",
+  "  if (cache.has(key)) return cache.get(key)!;",
+  "  if (pending.has(key)) return cache.get(key)!;",
+  "",
+  "  const task = load().then((value) => {",
+  "    cache.set(key, value);",
+  "    pending.delete(key);",
+  "    return value;",
+  "  });",
+  "  pending.set(key, task);",
+  "  return task;",
+  "}",
+  "```",
+].join("\n");
 
-function repeatContext(lines) {
-  return Array.from({ length: lines }, () => BENCHMARK_CONTEXT_SENTENCE).join(" ");
-}
+const INCIDENT_CONTEXT = [
+  "Incident notes from a local inference service:",
+  "- 09:14: A developer compared two screenshots and saw 49 tok/s in one run and 37 tok/s in another.",
+  "- 09:18: The faster run generated one token after a short chat prompt. The slower run generated 160 tokens after a pasted support ticket.",
+  "- 09:22: The CLI output reports separate lines for prefill throughput and generated-token throughput.",
+  "- 09:27: The team sometimes runs with --profile, which adds per-dispatch accounting and changes CPU-side overhead.",
+  "- 09:33: The llama.cpp baseline is measured through a persistent server, while some ZINC checks were one-off CLI runs.",
+  "- 09:41: A background video export was active during one Apple Silicon run.",
+  "- 09:48: The benchmark dashboard now computes an overall prompt+decode score from prompt tokens, generated tokens, prefill speed, and decode speed.",
+  "",
+  "Relevant policy:",
+  "- Publish medians from repeated warm runs, not screenshots.",
+  "- Keep the same model file, prompt mode, output cap, and backend residency for both engines.",
+  "- Treat one-token completions as coherence smoke tests, not sustained throughput measurements.",
+  "- Report prefill, decode, total latency, and prompt+decode throughput together.",
+  "",
+  "Question: summarize the measurement mistake and propose the benchmark protocol the team should use next.",
+].join("\n");
+
+const LONG_CODING_PLAN_PROMPT =
+  "Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.";
 
 function contextualizePrompt(promptMode, basePrompt, variant) {
   if (variant === "core") return basePrompt;
 
-  if (promptMode === "chat" && variant === "decode-extended") {
-    return "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.";
+  if (variant === "context-medium") {
+    if (promptMode === "chat") {
+      return [
+        "You are reviewing a small TypeScript helper in a production service.",
+        "Identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
+        "",
+        CODING_REVIEW_SNIPPET,
+      ].join("\n");
+    }
+    return [
+      "Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
+      "",
+      CODING_REVIEW_SNIPPET,
+      "",
+      "Review:",
+    ].join("\n");
   }
 
-  if (promptMode === "raw" && variant === "decode-extended") {
-    return "LLM benchmark reports should separate prompt processing from token generation because";
+  if (variant === "context-long") {
+    if (promptMode === "chat") {
+      return `Read the incident context and answer the final question with concrete engineering guidance.\n\n${INCIDENT_CONTEXT}`;
+    }
+    return `${INCIDENT_CONTEXT}\n\nEngineering guidance:`;
   }
 
-  const context = variant === "context-medium"
-    ? [
-      "Reference notes:",
-      "Paris is the capital of France.",
-      "Rome is the capital of Italy.",
-      "Madrid is the capital of Spain.",
-      "Use only the notes above.",
-    ].join("\n")
-    : [
-      "Long reference packet for benchmark purposes only:",
-      repeatContext(6),
-      "Important fact near the end: Paris is the capital of France.",
-      "Ignore unrelated filler and answer from the reference packet.",
-    ].join("\n\n");
-
-  if (promptMode === "chat") {
-    return `Read the context below and answer the final question briefly.\n\n${context}\n\nQuestion: What is the capital of France? Answer in one word.`;
+  if (variant === "decode-extended") {
+    if (promptMode === "chat") return LONG_CODING_PLAN_PROMPT;
+    return `${LONG_CODING_PLAN_PROMPT}\n\nPlan:\n1.`;
   }
-  return `${context}\n\nBased on the reference above, the capital of France is`;
+
+  return basePrompt;
 }
 
 function scenarioMaxTokens(modelId, scenarioId) {
-  const base = defaultMaxTokensForModelId(modelId);
-  if (scenarioId === "decode-extended") {
-    if (modelId.startsWith("gpt-oss")) return 96;
-    return Math.max(base, 32);
-  }
-  return base;
+  const caps = {
+    core: defaultMaxTokensForModelId(modelId),
+    "context-medium": 160,
+    "context-long": 128,
+    "decode-extended": 256,
+  };
+  return caps[scenarioId] ?? defaultMaxTokensForModelId(modelId);
 }
 
 export function defaultScenarioDefsForModel(modelId, promptMode, basePrompt) {
   return [
     {
       id: "core",
-      label: "Core Prompt",
+      label: "Quick Chat",
       short_label: "Core",
       prompt_mode: promptMode,
       prompt: contextualizePrompt(promptMode, basePrompt, "core"),
       max_tokens: scenarioMaxTokens(modelId, "core"),
-      notes: ["Single-turn reference prompt"],
+      notes: ["Short real-world assistant turn with enough decode budget to avoid one-token rates"],
     },
     {
       id: "context-medium",
-      label: "Context Retrieval",
-      short_label: "Context",
+      label: "Coding Review",
+      short_label: "Coding",
       prompt_mode: promptMode,
       prompt: contextualizePrompt(promptMode, basePrompt, "context-medium"),
       max_tokens: scenarioMaxTokens(modelId, "context-medium"),
-      notes: ["Short retrieval workload with explicit context"],
+      notes: ["Small code-review workload with a realistic TypeScript snippet"],
     },
     {
       id: "context-long",
-      label: "Long Context Retrieval",
-      short_label: "Long ctx",
+      label: "Incident Context",
+      short_label: "Context",
       prompt_mode: promptMode,
       prompt: contextualizePrompt(promptMode, basePrompt, "context-long"),
       max_tokens: scenarioMaxTokens(modelId, "context-long"),
-      notes: ["Long prompt workload with the answer embedded near the end"],
+      notes: ["Support-style incident context that makes prefill visible"],
     },
     {
       id: "decode-extended",
-      label: "Long Decode",
-      short_label: "Long decode",
+      label: "Long Coding Draft",
+      short_label: "Long draft",
       prompt_mode: promptMode,
       prompt: contextualizePrompt(promptMode, basePrompt, "decode-extended"),
       max_tokens: scenarioMaxTokens(modelId, "decode-extended"),
-      notes: ["Longer generation target instead of a short factual completion"],
+      notes: ["Longer coding-plan generation to measure sustained decode"],
     },
   ];
 }
@@ -1652,8 +1693,8 @@ export function defaultRdnaCases(modelRoot) {
       quant: "Q4_K_XL",
       model_path: path.join(modelRoot, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
       prompt_mode: "raw",
-      prompt: "The capital of France is",
-      max_tokens: 128,
+      prompt: defaultPromptForModelId("qwen36-35b-a3b-q4k-xl"),
+      max_tokens: defaultMaxTokensForModelId("qwen36-35b-a3b-q4k-xl"),
       notes: ["RDNA4 flagship comparison against llama.cpp server"],
     },
     {
@@ -1663,8 +1704,8 @@ export function defaultRdnaCases(modelRoot) {
       quant: "Q4_K_M",
       model_path: path.join(modelRoot, "Qwen3.6-27B-Q4_K_M.gguf"),
       prompt_mode: "raw",
-      prompt: "The capital of France is",
-      max_tokens: 128,
+      prompt: defaultPromptForModelId("qwen36-27b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen36-27b-q4k-m"),
       notes: ["RDNA4 dense Qwen 3.6 comparison against llama.cpp server"],
     },
   ];
@@ -2049,7 +2090,7 @@ async function runMetalTarget(args) {
         "Hardware: the local Apple Silicon target shown above. ZINC and llama.cpp run on the same machine and use the same GGUF file for each model.",
         "ZINC path: build the current workspace with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
-        "Scenarios: Core Prompt, Context Retrieval, Long Context Retrieval, and Long Decode. Long Decode raises the generation cap to measure sustained decode rather than only short completions.",
+        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
         "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
         "Model resolution: managed catalog models are loaded from the ZINC model cache when available; explicit GGUF paths are preserved when provided.",
         "Run hygiene: published local runs assume no competing workload is saturating CPU, memory bandwidth, or GPU.",
@@ -2302,7 +2343,7 @@ async function runRdnaTarget(args) {
         "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
         "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI with RADV cooperative matrix support enabled.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
-        "Scenarios: Core Prompt, Context Retrieval, Long Context Retrieval, and Long Decode. Long Decode raises the generation cap to measure sustained decode rather than only short completions.",
+        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
         "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
         "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
         "Run hygiene: published RDNA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
@@ -2489,7 +2530,7 @@ async function runIntelTarget(args) {
         "Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
         "ZINC path: optionally sync the current source tree to the Intel node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.",
-        "Scenarios: Core Prompt, Context Retrieval, Long Context Retrieval, and Long Decode. Long Decode raises the generation cap to measure sustained decode rather than only short completions.",
+        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
         "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
         "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
         "Run hygiene: published Intel runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",

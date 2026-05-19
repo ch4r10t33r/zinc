@@ -4,7 +4,7 @@ How to reproduce ZINC's published numbers, run an ad-hoc llama.cpp baseline, and
 
 ## Published benchmarks (the canonical numbers)
 
-The site at [zolotukhin.ai/zinc/performance](https://zolotukhin.ai/zinc/performance) is generated from `tools/performance_suite.mjs`. Every published run pairs ZINC against llama.cpp on the same hardware, same model file, and the same four-scenario matrix (`core`, `context-medium`, `context-long`, `decode-extended`). The full run is what gets pushed to `site/src/data/zinc-performance.json` and Cloudflare Pages picks it up on every push to `main`.
+The site at [zolotukhin.ai/zinc/performance](https://zolotukhin.ai/zinc/performance) is generated from `tools/performance_suite.mjs`. Every published run pairs ZINC against llama.cpp on the same hardware, same model file, and the same four-scenario matrix (`core`, `context-medium`, `context-long`, `decode-extended`). Those scenarios are real workload prompts: quick chat, coding review, incident-context QA, and longer coding-plan generation. The full run is what gets pushed to `site/src/data/zinc-performance.json` and Cloudflare Pages picks it up on every push to `main`.
 
 ```bash
 # Metal target (Apple Silicon, runs locally)
