@@ -61,6 +61,7 @@ const MoeColsDmmvPush = extern struct {
     y_offset: u32,
     ids_stride: u32,
     x_route_divisor: u32,
+    use_active_blocks: u32,
 };
 
 const MoeRoutePackPush = extern struct {
@@ -1032,9 +1033,10 @@ fn runMoeColsDispatchBatch(
         .y_offset = 0,
         .ids_stride = n_tokens,
         .x_route_divisor = 1,
+        .use_active_blocks = 0,
     };
     const route_bufs = [_]*const MetalBuffer{ routing_buf, counts_buf, packed_ids_buf };
-    const dmmv_bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf };
+    const dmmv_bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf, packed_ids_buf, counts_buf };
     const cols_per_wg: u32 = 4;
 
     var cmd = try metal_command.beginCommand(ctx);

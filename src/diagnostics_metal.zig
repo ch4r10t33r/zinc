@@ -178,6 +178,7 @@ const required_shader_files = [_][]const u8{
     "softmax_topk.metal",
     "softmax_topk_batched.metal",
     "moe_route_pack.metal",
+    "moe_route_pack_blocks.metal",
     "sigmoid_scale_acc.metal",
     "moe_weighted_acc.metal",
     "ssm_conv1d.metal",

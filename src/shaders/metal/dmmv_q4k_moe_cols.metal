@@ -19,6 +19,7 @@ struct MoeColsDmmvPush {
     uint y_offset;
     uint ids_stride;
     uint x_route_divisor;
+    uint use_active_blocks;
 };
 
 inline float2 get_scale_min_k4(uint j, device const uchar* sc) {
@@ -41,17 +42,24 @@ kernel void main0(
     device float* Y                           [[buffer(3)]],
     device const uint* counts                 [[buffer(4)]],
     device const uint* packed_ids             [[buffer(5)]],
+    device const uint* active_blocks          [[buffer(6)]],
+    device const uint* active_block_count     [[buffer(7)]],
     uint3 tg_pos                              [[threadgroup_position_in_grid]],
     uint tid                                  [[thread_index_in_simdgroup]],
     uint sgid                                 [[simdgroup_index_in_threadgroup]]
 ) {
-    const uint expert_id = tg_pos.y;
+    if (p.use_active_blocks != 0u && tg_pos.y >= active_block_count[0]) {
+        return;
+    }
+
+    const uint block_entry = (p.use_active_blocks != 0u) ? active_blocks[tg_pos.y] : 0u;
+    const uint expert_id = (p.use_active_blocks != 0u) ? (block_entry & 0xFFFFu) : tg_pos.y;
     const uint row = tg_pos.x * ROWS_PER_TG + sgid;
     if (row >= p.M) {
         return;
     }
 
-    const uint packed_base = tg_pos.z * NUM_COLS;
+    const uint packed_base = (p.use_active_blocks != 0u) ? ((block_entry >> 16u) * NUM_COLS) : (tg_pos.z * NUM_COLS);
     const uint count = counts[expert_id];
     if (packed_base >= count) {
         return;

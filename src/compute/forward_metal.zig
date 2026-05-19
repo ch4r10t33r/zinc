@@ -767,6 +767,7 @@ const MoeColsDmmvPush = extern struct {
     y_offset: u32,
     ids_stride: u32,
     x_route_divisor: u32,
+    use_active_blocks: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -1613,6 +1614,8 @@ const BatchedPrefillScratch = struct {
     moe_routing: MetalBuffer,
     moe_expert_counts: MetalBuffer,
     moe_packed_ids: MetalBuffer,
+    moe_active_blocks: MetalBuffer,
+    moe_active_block_count: MetalBuffer,
     moe_route_input: MetalBuffer,
     moe_expert_gate: MetalBuffer,
     moe_expert_up: MetalBuffer,
@@ -1698,6 +1701,16 @@ const BatchedPrefillScratch = struct {
             var mut = packed_ids;
             metal_buffer.freeBuffer(&mut);
         }
+        const active_blocks = try metal_buffer.createBuffer(ctx, @max(route_slots * u32_sz, 4));
+        errdefer {
+            var mut = active_blocks;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const active_block_count = try metal_buffer.createBuffer(ctx, u32_sz);
+        errdefer {
+            var mut = active_block_count;
+            metal_buffer.freeBuffer(&mut);
+        }
         const moe_input = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
         errdefer {
             var mut = moe_input;
@@ -1734,6 +1747,8 @@ const BatchedPrefillScratch = struct {
             .moe_routing = routing,
             .moe_expert_counts = counts,
             .moe_packed_ids = packed_ids,
+            .moe_active_blocks = active_blocks,
+            .moe_active_block_count = active_block_count,
             .moe_route_input = moe_input,
             .moe_expert_gate = moe_gate,
             .moe_expert_up = moe_up,
@@ -1757,6 +1772,8 @@ const BatchedPrefillScratch = struct {
         metal_buffer.freeBuffer(&self.moe_routing);
         metal_buffer.freeBuffer(&self.moe_expert_counts);
         metal_buffer.freeBuffer(&self.moe_packed_ids);
+        metal_buffer.freeBuffer(&self.moe_active_blocks);
+        metal_buffer.freeBuffer(&self.moe_active_block_count);
         metal_buffer.freeBuffer(&self.moe_route_input);
         metal_buffer.freeBuffer(&self.moe_expert_gate);
         metal_buffer.freeBuffer(&self.moe_expert_up);
@@ -1936,6 +1953,7 @@ pub const InferenceEngine = struct {
     router_q8_0_topk_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
+    moe_route_pack_blocks_pipe: MetalPipeline,
     moe_route_ids_pipe: MetalPipeline,
     moe_route_gather_pipe: MetalPipeline,
     moe_route_scatter_pipe: MetalPipeline,
@@ -2386,6 +2404,7 @@ pub const InferenceEngine = struct {
         self.router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
+        self.moe_route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
         self.moe_route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
         self.moe_route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
         self.moe_route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
@@ -3132,6 +3151,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_pack_blocks_pipe);
         metal_pipeline.freePipeline(&self.moe_route_ids_pipe);
         metal_pipeline.freePipeline(&self.moe_route_gather_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_pipe);
@@ -6135,13 +6155,78 @@ fn dispatchDmmvMoeColsOnCmd(
         .y_offset = y_byte_offset,
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
+        .use_active_blocks = 0,
     };
-    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf, packed_ids_buf, counts_buf };
     const rows_per_wg: u32 = 8;
     const cols_per_wg: u32 = 4;
     cmd.dispatchV2(
         pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, n_experts, (route_blocks + cols_per_wg - 1) / cols_per_wg },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeColsDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeColsActiveBlocksOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    active_blocks_buf: *const MetalBuffer,
+    active_block_count_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    active_block_upper_bound: u32,
+) !void {
+    const route_blocks = @max(active_block_upper_bound, 1);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
+
+    const pipe: *const MetalPipeline = switch (tensor.info.type_) {
+        .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
+        .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
+        .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
+        else => return error.UnsupportedQuantType,
+    };
+    if (pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeColsDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
+        .ids_stride = ids_stride,
+        .x_route_divisor = @max(x_route_divisor, 1),
+        .use_active_blocks = 1,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_blocks_buf,
+        active_block_count_buf,
+    };
+    const rows_per_wg: u32 = 8;
+    cmd.dispatchV2(
+        pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
         .{ 256, 1, 1 },
         &bufs,
         &push,
@@ -7065,6 +7150,29 @@ fn dispatchMoeRoutePackOnCmd(
     cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
 }
 
+fn dispatchMoeRoutePackBlocksOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    active_block_count: *const MetalBuffer,
+    active_blocks: *const MetalBuffer,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+    };
+    const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
+    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+}
+
 fn dispatchMoeRouteIdsOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -7834,51 +7942,110 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
     const total_hidden = n_tokens * hidden_dim;
     const route_slots = n_tokens * cfg.n_experts_used;
+    const use_active_blocks = engine.moe_route_pack_blocks_pipe.handle != null;
 
-    dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    if (use_active_blocks) {
+        dispatchMoeRoutePackBlocksOnCmd(
+            engine,
+            cmd,
+            &scratch.moe_routing,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_block_count,
+            &scratch.moe_active_blocks,
+            n_tokens,
+            cfg.n_experts,
+            cfg.n_experts_used,
+        );
+    } else {
+        dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     // Adapt llama.cpp `ggml_metal_op_mul_mat_id` source indexing: packed IDs
     // already encode token*k+slot, so gate/up can read token-ordered norms
     // directly instead of materializing a duplicated route-slot input buffer.
-    try dispatchDmmvMoeColsOnCmd(
-        engine,
-        cmd,
-        gate_up_layout.gate_tensor,
-        &scratch.norm,
-        &scratch.moe_expert_gate,
-        &scratch.moe_expert_counts,
-        &scratch.moe_packed_ids,
-        inter_dim,
-        hidden_dim,
-        gate_up_layout.gate_expert_stride,
-        gate_up_layout.gate_base_offset,
-        0,
-        0,
-        n_tokens,
-        cfg.n_experts_used,
-        cfg.n_experts,
-        n_tokens,
-    );
-    try dispatchDmmvMoeColsOnCmd(
-        engine,
-        cmd,
-        gate_up_layout.up_tensor,
-        &scratch.norm,
-        &scratch.moe_expert_up,
-        &scratch.moe_expert_counts,
-        &scratch.moe_packed_ids,
-        inter_dim,
-        hidden_dim,
-        gate_up_layout.up_expert_stride,
-        gate_up_layout.up_base_offset,
-        0,
-        0,
-        n_tokens,
-        cfg.n_experts_used,
-        cfg.n_experts,
-        n_tokens,
-    );
+    if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            route_slots,
+        );
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            route_slots,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            cfg.n_experts,
+            n_tokens,
+        );
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     {
@@ -7888,25 +8055,48 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
-    try dispatchDmmvMoeColsOnCmd(
-        engine,
-        cmd,
-        down_exps,
-        &scratch.moe_expert_swiglu,
-        &scratch.moe_expert_down,
-        &scratch.moe_expert_counts,
-        &scratch.moe_packed_ids,
-        hidden_dim,
-        inter_dim,
-        expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
-        0,
-        0,
-        0,
-        n_tokens,
-        1,
-        cfg.n_experts,
-        n_tokens,
-    );
+    if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            route_slots,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
@@ -15410,8 +15600,9 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
         .x_route_divisor = @intCast(k_used),
+        .use_active_blocks = 0,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
@@ -15726,8 +15917,9 @@ test "dmmv_q5_1_moe_cols shader matches per-route CPU reference" {
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
         .x_route_divisor = 1,
+        .use_active_blocks = 0,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
@@ -15841,8 +16033,9 @@ test "dmmv_q5k_moe_cols shader matches per-route CPU reference" {
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
         .x_route_divisor = 1,
+        .use_active_blocks = 0,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
@@ -15951,8 +16144,9 @@ test "dmmv_q6k_moe_cols shader matches per-route CPU reference" {
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
         .x_route_divisor = 1,
+        .use_active_blocks = 0,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
@@ -16748,6 +16942,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&topk_batched_pipe);
     var route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
     defer metal_pipeline.freePipeline(&route_pack_pipe);
+    var route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&route_pack_blocks_pipe);
     var route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
     defer metal_pipeline.freePipeline(&route_ids_pipe);
     var route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
@@ -16798,6 +16994,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(topk_scaled_pipe.handle != null);
     try std.testing.expect(topk_batched_pipe.handle != null);
     try std.testing.expect(route_pack_pipe.handle != null);
+    try std.testing.expect(route_pack_blocks_pipe.handle != null);
     try std.testing.expect(route_ids_pipe.handle != null);
     try std.testing.expect(route_gather_pipe.handle != null);
     try std.testing.expect(route_scatter_pipe.handle != null);
@@ -17545,6 +17742,8 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(@as(usize, n_tokens * engine.config.n_experts_used * 2 * @sizeOf(u32)), scratch.moe_routing.size);
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * @sizeOf(u32)), scratch.moe_expert_counts.size);
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * n_tokens * @sizeOf(u32)), scratch.moe_packed_ids.size);
+    try std.testing.expectEqual(@as(usize, route_slots * @sizeOf(u32)), scratch.moe_active_blocks.size);
+    try std.testing.expectEqual(@as(usize, @sizeOf(u32)), scratch.moe_active_block_count.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
     try std.testing.expectEqual(@as(usize, route_slots * inter_dim * @sizeOf(f32)), scratch.moe_expert_gate.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
