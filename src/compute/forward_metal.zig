@@ -28,6 +28,7 @@ const log = std.log.scoped(.forward);
 /// see this as a soft safety net rather than the primary limit.
 pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
+const qwen_ssm_projection_chunk_tokens: u32 = 4;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -1927,6 +1928,7 @@ pub const InferenceEngine = struct {
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
+    qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
@@ -1939,11 +1941,17 @@ pub const InferenceEngine = struct {
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
     qwen_ssm_proj_validate_layer: u32,
+    qwen_ssm_prefill_proj_active_tokens: u32,
     qwen_ssm_proj_validate_norm_buf: MetalBuffer,
     qwen_ssm_proj_validate_qkv_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_z_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_alpha_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_norm_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_qkv_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_z_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_alpha_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_beta_buf: MetalBuffer,
     /// Residency set covering all engine-owned scratch + KV-cache + per-layer
     /// norm buffers, mirroring the model loader's weight residency set.
     /// `commandBufferWithUnretainedReferences` skips Metal's auto-residency
@@ -2038,6 +2046,9 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.qwen_ssm_prefill_proj_enabled =
+            (readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse false) or
+            (readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse false);
         self.qwen_ssm_proj_validate_layer =
             readU32Env("ZINC_QWEN36_35B_SSM_PROJ_VALIDATE_LAYER") orelse
             readU32Env("ZINC_QWEN36_SSM_PROJ_VALIDATE_LAYER") orelse
@@ -2062,11 +2073,17 @@ pub const InferenceEngine = struct {
         self.request_profile = .{};
         self.prefill_profile = .{};
         self.qwen_ssm_proj_validate_captured_tokens = 0;
+        self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_ssm_proj_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_qkv_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_z_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_alpha_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_qkv_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_z_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_alpha_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_beta_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.scratch_rset = null;
         self.private_ssm_qkv_bufs = null;
         self.private_ssm_gate_bufs = null;
@@ -2094,6 +2111,11 @@ pub const InferenceEngine = struct {
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
         self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
+        self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * hidden_size, 4));
+        self.qwen_ssm_prefill_proj_qkv_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, conv_channels) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_z_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, d_inner) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_alpha_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_beta_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
         self.lm_head_private_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.expert_ids_buf = try metal_buffer.createBuffer(ctx, expert_ids_size);
         {
@@ -2799,6 +2821,11 @@ pub const InferenceEngine = struct {
         add(rs, &self.argmax_buf);
         add(rs, &self.embed_staging);
         add(rs, &self.prefill_embed_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_norm_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_qkv_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_z_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_alpha_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_beta_buf);
         add(rs, &self.lm_head_private_buf);
         add(rs, &self.expert_ids_buf);
         add(rs, &self.expert_gate_batch_buf);
@@ -2879,6 +2906,11 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_z_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_alpha_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_beta_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_norm_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_qkv_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_z_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_alpha_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_beta_buf);
 
         for (0..self.expert_gate_bufs.len) |i| {
             metal_buffer.freeBuffer(&self.expert_gate_bufs[i]);
@@ -3123,6 +3155,7 @@ pub const InferenceEngine = struct {
         self.request_profile.reset();
         self.prefill_profile.reset();
         self.qwen_ssm_proj_validate_captured_tokens = 0;
+        self.qwen_ssm_prefill_proj_active_tokens = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -3204,6 +3237,7 @@ pub const InferenceEngine = struct {
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
         }
+        try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len);
 
         const pending_count = prompt_tokens.len - 1;
         var pending = try self.allocator.alloc(MetalCommand, pending_count);
@@ -7913,6 +7947,81 @@ const QwenPrefillMoeValidationRef = struct {
     }
 };
 
+fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_len: usize) bool {
+    if (!engine.qwen_ssm_prefill_proj_enabled) return false;
+    if (prompt_len < qwen_ssm_projection_chunk_tokens) return false;
+    if (engine.position != 0) return false;
+    if (!engine.private_decode_buffers) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+
+    const cfg = engine.config;
+    if (cfg.architecture != .qwen2_moe or cfg.n_experts == 0 or cfg.ssm_d_inner == 0) return false;
+    if (isFullAttentionLayer(cfg, 0)) return false;
+    if (engine.gemm_q8_0_pipe.handle == null) return false;
+    if (engine.layer_tensors.len == 0) return false;
+
+    const lt = engine.layer_tensors[0];
+    const wqkv_t = lt.attn_qkv orelse return false;
+    const z_t = lt.attn_gate orelse return false;
+    const alpha_t = lt.ssm_alpha orelse return false;
+    const beta_t = lt.ssm_beta orelse return false;
+    return wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        alpha_t.info.type_ == .q8_0 and
+        beta_t.info.type_ == .q8_0;
+}
+
+fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize) !void {
+    engine.qwen_ssm_prefill_proj_active_tokens = 0;
+    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return;
+
+    const cfg = engine.config;
+    const hidden_dim = cfg.hidden_dim;
+    const d_inner = cfg.ssm_d_inner;
+    const dt_rank = cfg.ssm_dt_rank;
+    const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+    const n_tokens: u32 = @min(qwen_ssm_projection_chunk_tokens, @as(u32, @intCast(prompt_len)));
+    const lt = engine.layer_tensors[0];
+    const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
+    const z_t = lt.attn_gate orelse return error.MissingTensor;
+    const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
+    const beta_t = lt.ssm_beta orelse return error.MissingTensor;
+    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
+    profileBarrier(&cmd, profile, .ssm);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
+    profileBarrier(&cmd, profile, .ssm);
+    commitAndWaitProfiled(&cmd, profile);
+
+    engine.qwen_ssm_prefill_proj_active_tokens = n_tokens;
+    if (engine.profile_enabled) {
+        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d}", .{n_tokens});
+    }
+}
+
+fn shouldUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.qwen_ssm_prefill_proj_active_tokens > engine.position and layer_idx == 0;
+}
+
+fn dispatchQwenSsmPrefillProjectionChunkCopies(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+) void {
+    const token_idx = engine.position;
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.attn_out_buf, conv_channels, token_idx * conv_channels, 0);
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_z_buf, &engine.gate_buf, d_inner, token_idx * d_inner, 0);
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_alpha_buf, &engine.router_logits_buf, dt_rank, token_idx * dt_rank, 0);
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_beta_buf, &engine.down_buf, dt_rank, token_idx * dt_rank, 0);
+}
+
 fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize, use_standard_gpu_routed_moe: bool, using_local_cmd: bool) bool {
     const cfg = engine.config;
     return engine.qwen_prefill_validation_enabled and
@@ -7950,7 +8059,7 @@ fn shouldValidateQwenSsmProjection(
         engine.gemm_q8_0_pipe.handle != null;
 }
 
-const qwen_ssm_projection_validate_tokens: u32 = 4;
+const qwen_ssm_projection_validate_tokens: u32 = qwen_ssm_projection_chunk_tokens;
 
 fn ensureValidationBuffer(engine: *InferenceEngine, buf: *MetalBuffer, required_bytes: usize) !void {
     const size = @max(required_bytes, 4);
@@ -9741,11 +9850,10 @@ fn runDecodeStep(
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
 
-            // Fused RMSNorm + DMMV path: all SSM pre-projection consumers
-            // compute norm inline from L1-cached hidden state, eliminating the
-            // separate RMSNorm dispatch/barrier while preserving token-serial
-            // conv/delta recurrence.
-            const use_fused_norm = canUseQwenSsmFusedNormProjections(
+            const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
+            if (use_prefill_projection_chunk) {
+                dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank);
+            } else if (canUseQwenSsmFusedNormProjections(
                 engine,
                 wqkv_t,
                 z_t,
@@ -9755,9 +9863,11 @@ fn runDecodeStep(
                 d_inner,
                 dt_rank,
                 hidden_dim,
-            );
-
-            if (use_fused_norm) {
+            )) {
+                // Fused RMSNorm + DMMV path: all SSM pre-projection consumers
+                // compute norm inline from L1-cached hidden state, eliminating the
+                // separate RMSNorm dispatch/barrier while preserving token-serial
+                // conv/delta recurrence.
                 dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                 dispatchFusedNormDualQ8DmmvOnCmd(
                     engine,
