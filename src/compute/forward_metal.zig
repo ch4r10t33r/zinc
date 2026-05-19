@@ -719,6 +719,20 @@ const MoeGateUpDmmvPush = extern struct {
     up_y_offset: u32,
 };
 
+/// Push constants for fused Q4_K MoE gate/up DMMV when gate/up are separate tensors.
+const MoeGateUpDualDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    gate_a_offset: u32,
+    up_a_offset: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    gate_y_offset: u32,
+    up_y_offset: u32,
+};
+
 /// Push constants for grouped MoE DMMV columns. `ids_stride` is the number of
 /// packed route ids reserved per expert in `moe_route_pack`.
 const MoeColsDmmvPush = extern struct {
@@ -1825,6 +1839,7 @@ pub const InferenceEngine = struct {
     dmmv_q6k_moe_pipe: MetalPipeline,
     dmmv_q4k_moe_k2048_pipe: MetalPipeline,
     dmmv_q4k_moe_k2048_1024_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_dual_pipe: MetalPipeline,
 
     // Elementwise compute pipelines (for batched GPU dispatch)
     deinterleave_pipe: MetalPipeline,
@@ -2253,6 +2268,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q6k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe");
         self.dmmv_q4k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048");
         self.dmmv_q4k_moe_k2048_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048_1024");
+        self.dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
 
         // Elementwise pipelines for batched GPU dispatch
         self.deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
@@ -2989,6 +3005,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q6k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_1024_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_pipe);
         metal_pipeline.freePipeline(&self.deinterleave_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_q8_pipe);
@@ -5574,6 +5591,53 @@ fn dispatchDmmvMoeGateUpQ4kOnCmd(
         &bufs,
         &push,
         @sizeOf(MoeGateUpDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeGateUpDualQ4kOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    gate_output_buf: *const MetalBuffer,
+    up_output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+) !void {
+    if (gate_tensor.info.type_ != .q4_k or up_tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
+    if (engine.dmmv_q4k_moe_gate_up_dual_pipe.handle == null) return error.UnsupportedQuantType;
+
+    recordMoeDmmvProfile(engine, gate_tensor, M, K, engine.config.n_experts_used);
+    recordMoeDmmvProfile(engine, up_tensor, M, K, engine.config.n_experts_used);
+
+    const push = MoeGateUpDualDmmvPush{
+        .M = M,
+        .K = K,
+        .gate_a_offset = tensorPageOffset(engine.model, gate_tensor),
+        .up_a_offset = tensorPageOffset(engine.model, up_tensor),
+        .gate_expert_stride = gate_expert_stride,
+        .up_expert_stride = up_expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_offset,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, gate_output_buf, up_output_buf, routing_buf };
+    const rows_per_wg: u32 = 16;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_moe_gate_up_dual_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeGateUpDualDmmvPush),
         1,
     );
 }
@@ -9361,14 +9425,43 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     const gate_inp_shexp = lt.ffn_gate_inp_shexp;
     const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
     const expert_gate_bytes = expertSliceBytes(gate_exps.info.type_, inter_dim, hidden_dim);
+    const expert_up_bytes = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
     const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+    const use_dual_q4k_gate_up =
+        gate_exps.info.type_ == .q4_k and
+        up_exps.info.type_ == .q4_k and
+        engine.dmmv_q4k_moe_gate_up_dual_pipe.handle != null;
 
     dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
     profileBarrier(cmd, profile, .gpu_routed_moe); // router_output_buf visible before expert DMMVs
 
     // Phase B: gate+up expert DMMVs + shared expert DMMVs — all independent, overlap in concurrent mode.
-    try dispatchDmmvMoeOnCmd(engine, cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
-    try dispatchDmmvMoeOnCmd(engine, cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+    if (use_dual_q4k_gate_up) {
+        // Adapted from llama.cpp's small-token `kernel_mul_mv_id` shape:
+        // cache the selected route input once per expert slot, then compute
+        // separate gate/up Q4_K rows in one launch. vLLM-style route packing
+        // is deliberately avoided here because token-major prefill still has
+        // only one token per MoE record.
+        try dispatchDmmvMoeGateUpDualQ4kOnCmd(
+            engine,
+            cmd,
+            gate_exps,
+            up_exps,
+            &engine.norm_buf,
+            &engine.expert_gate_batch_buf,
+            &engine.expert_up_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            expert_gate_bytes,
+            expert_up_bytes,
+            0,
+            0,
+        );
+    } else {
+        try dispatchDmmvMoeOnCmd(engine, cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+        try dispatchDmmvMoeOnCmd(engine, cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_up_bytes, 0, 0);
+    }
     if (has_shexp) {
         dispatchDmmvOnCmd(engine, cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
@@ -14879,6 +14972,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_pipe);
     var dmmv_q4k_moe_gate_up_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_pipe);
+    var dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
     var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
@@ -14952,6 +15047,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(sigmoid_mul_pipe.handle != null);
     try std.testing.expect(dmmv_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
