@@ -212,9 +212,9 @@ pub fn detect(instance: *const Instance) GpuConfig {
 
 /// Classify AMD GPU architecture from device ID and name.
 fn classifyAmd(device_id: u32, name: []const u8) GpuVendor {
-    // gfx1200/gfx1201 = RDNA4 (Navi 48/44)
+    // gfx1201 = RDNA4 Navi 48 (RX 9070 / 9070 XT / 9070 GRE / Radeon AI PRO R9700)
+    // gfx1200 = RDNA4 Navi 44 (RX 9060 / 9060 XT)
     // gfx1100-gfx1103 = RDNA3
-    // Device IDs: RDNA4 starts at 0x15xx range
     _ = device_id;
 
     // RDNA4 iGPU: Strix Halo APU (gfx1151)
@@ -228,7 +228,7 @@ fn classifyAmd(device_id: u32, name: []const u8) GpuVendor {
         return .amd_rdna4_apu;
     }
 
-    // Discrete RDNA4: Navi 48 (gfx1200 / RX 9070) and Navi 44 (gfx1201 / RX 9060 / R9700)
+    // Discrete RDNA4: Navi 48 (gfx1201 / RX 9070 / R9700) and Navi 44 (gfx1200 / RX 9060)
     if (containsIgnoreCase(name, "gfx1200") or
         containsIgnoreCase(name, "gfx1201") or
         containsIgnoreCase(name, "9070") or
@@ -301,8 +301,8 @@ test "containsIgnoreCase" {
 }
 
 test "classifyAmd — discrete RDNA4" {
-    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7480, "AMD Radeon RX 9070 XT (RADV GFX1200)"));
-    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7481, "Radeon RX 9060 XT (RADV GFX1201)"));
+    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7480, "AMD Radeon RX 9070 XT (RADV GFX1201)"));
+    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7481, "Radeon RX 9060 XT (RADV GFX1200)"));
     try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7461, "Radeon AI PRO R9700 (RADV GFX1201)"));
 }
 
