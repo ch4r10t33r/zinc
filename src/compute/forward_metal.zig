@@ -17277,6 +17277,99 @@ test "moe_route_pack shader groups batched routing by expert" {
     try std.testing.expectEqual(@as(u32, 1), ids_ptr[5 * ids_stride + 0]);
 }
 
+test "moe_route_pack_blocks shader packs from flattened routes" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 5;
+    const n_experts: usize = 6;
+    const k: usize = 3;
+    const routing_stride: usize = k * 2;
+    const ids_stride: usize = n_tokens;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+    var active_count_buf = try metal_buffer.createBuffer(ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_count_buf);
+    var active_blocks_buf = try metal_buffer.createBuffer(ctx, route_slots * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_blocks_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        3, 2, 5, 0, 0, 0,
+        3, 1, 4, 0, 0, 0,
+        3, 0, 2, 0, 0, 0,
+        3, 4, 5, 0, 0, 0,
+        3, 1, 2, 0, 0, 0,
+    });
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0xff);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+    @memset(active_count_buf.cpu_ptr.?[0..active_count_buf.size], 0xff);
+    @memset(active_blocks_buf.cpu_ptr.?[0..active_blocks_buf.size], 0xff);
+
+    const push = MoeRoutePackPush{
+        .n_tokens = @intCast(n_tokens),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .ids_stride = @intCast(ids_stride),
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf, &active_count_buf, &active_blocks_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.commitAndWait();
+
+    const counts_ptr: [*]const u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]const u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    const active_count_ptr: [*]const u32 = @ptrCast(@alignCast(active_count_buf.cpu_ptr.?));
+    const active_blocks_ptr: [*]const u32 = @ptrCast(@alignCast(active_blocks_buf.cpu_ptr.?));
+
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
+    try std.testing.expectEqual(@as(u32, 7), active_count_ptr[0]);
+
+    var seen_routes = [_]bool{false} ** route_slots;
+    for (0..n_experts) |expert| {
+        for (0..@as(usize, @intCast(counts_ptr[expert]))) |i| {
+            const route = ids_ptr[expert * ids_stride + i];
+            try std.testing.expect(route < @as(u32, @intCast(route_slots)));
+            const route_index: usize = @intCast(route);
+            try std.testing.expect(!seen_routes[route_index]);
+            seen_routes[route_index] = true;
+
+            const token = route_index / k;
+            const slot = route_index - token * k;
+            try std.testing.expectEqual(@as(u32, @intCast(expert)), routing_ptr[token * routing_stride + slot]);
+        }
+    }
+    for (seen_routes) |seen| try std.testing.expect(seen);
+
+    var seen_blocks = [_][4]bool{[_]bool{false} ** 4} ** n_experts;
+    for (0..active_count_ptr[0]) |i| {
+        const entry = active_blocks_ptr[i];
+        const expert = entry & 0xFFFF;
+        const block_idx = entry >> 16;
+        try std.testing.expect(expert < @as(u32, @intCast(n_experts)));
+        try std.testing.expect(block_idx < 4);
+        seen_blocks[@intCast(expert)][@intCast(block_idx)] = true;
+    }
+    for (0..n_experts) |expert| {
+        const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
+        for (0..@as(usize, @intCast(expected_blocks))) |block_idx| {
+            try std.testing.expect(seen_blocks[expert][block_idx]);
+        }
+    }
+}
+
 test "moe_route_ids shader flattens batched routing in route order" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
