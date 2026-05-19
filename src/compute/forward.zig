@@ -11678,8 +11678,12 @@ pub const InferenceEngine = struct {
         if (n_tokens < 2) return false;
         if (self.validation_diagnostics_enabled or self.profile_enabled) return false;
         if (self.instance.push_descriptor_fn == null) return false;
-        const mode = std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE") orelse return false;
-        return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+        if (std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE")) |mode| {
+            return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+        }
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return n_tokens >= 16;
     }
 
     fn prefillQwen36DenseFfnPrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, prefix_layers: u32) !void {
