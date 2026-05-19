@@ -32,6 +32,7 @@ const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 const qwen_moe_route_pack_validate_tokens: u32 = 4;
 const qwen_route_packed_prefix_layer_limit: usize = 12;
+const moe_route_block_cols: u32 = 4;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -1361,6 +1362,20 @@ fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool
         .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
         else => false,
     };
+}
+
+fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
+    if (route_slots == 0 or n_experts == 0) return 0;
+
+    // vLLM's `moe_align_block_size` and llama.cpp's Metal `mul_mm_id` both
+    // operate on expert-contiguous route blocks. Once every expert has one
+    // partially-filled block, each additional block needs `moe_route_block_cols`
+    // more routes assigned to that expert. This is a correctness-safe upper
+    // bound for the active-block grid and avoids launching raw-route-count
+    // early-exit threadgroups.
+    const first_blocks = @min(route_slots, n_experts);
+    const remaining_routes = route_slots - first_blocks;
+    return first_blocks + remaining_routes / moe_route_block_cols;
 }
 
 fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -7943,6 +7958,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     const total_hidden = n_tokens * hidden_dim;
     const route_slots = n_tokens * cfg.n_experts_used;
     const use_active_blocks = engine.moe_route_pack_blocks_pipe.handle != null;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, cfg.n_experts);
 
     if (use_active_blocks) {
         dispatchMoeRoutePackBlocksOnCmd(
@@ -7984,7 +8000,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
             0,
             n_tokens,
             cfg.n_experts_used,
-            route_slots,
+            active_block_upper_bound,
         );
         try dispatchDmmvMoeColsActiveBlocksOnCmd(
             engine,
@@ -8004,7 +8020,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
             0,
             n_tokens,
             cfg.n_experts_used,
-            route_slots,
+            active_block_upper_bound,
         );
     } else {
         try dispatchDmmvMoeColsOnCmd(
@@ -8074,7 +8090,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
             0,
             n_tokens,
             1,
-            route_slots,
+            active_block_upper_bound,
         );
     } else {
         try dispatchDmmvMoeColsOnCmd(
@@ -17749,6 +17765,15 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_swiglu.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "maxPackedMoeRouteBlocks bounds active route block grid" {
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(0, 256));
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
+    try std.testing.expectEqual(@as(u32, 8), maxPackedMoeRouteBlocks(8, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
+    try std.testing.expectEqual(@as(u32, 257), maxPackedMoeRouteBlocks(260, 256));
+    try std.testing.expectEqual(@as(u32, 460), maxPackedMoeRouteBlocks(134 * 8, 256));
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {
