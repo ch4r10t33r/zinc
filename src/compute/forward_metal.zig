@@ -13222,11 +13222,13 @@ fn runDecodeStep(
             }
 
             const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
+            var use_direct_prefill_projection_chunk = false;
             if (use_prefill_projection_chunk) {
-                dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank, hidden_dim);
                 const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
                 const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
-                if (!alpha_batched or !beta_batched) {
+                use_direct_prefill_projection_chunk = alpha_batched and beta_batched;
+                if (!use_direct_prefill_projection_chunk) {
+                    dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank, hidden_dim);
                     profileBarrier(cmd, profile, .ssm);
                     if (!alpha_batched) {
                         dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
@@ -13281,7 +13283,9 @@ fn runDecodeStep(
                 dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
                 dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
             }
-            profileBarrier(cmd, profile, .ssm);
+            if (!use_direct_prefill_projection_chunk) {
+                profileBarrier(cmd, profile, .ssm);
+            }
             if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
                 commitAndWaitProfiled(cmd, profile);
                 const validation_start = profileStart(profile != null);
@@ -13293,16 +13297,25 @@ fn runDecodeStep(
 
             // Conv1d: attn_out_buf → swiglu_buf
             {
-                dispatchSsmConv1dWithPipe(
+                const conv_input_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_qkv_buf
+                else
+                    &engine.attn_out_buf;
+                const conv_input_offset = if (use_direct_prefill_projection_chunk)
+                    engine.position * conv_channels
+                else
+                    0;
+                dispatchSsmConv1dOffsetWithPipe(
                     cmd,
                     &engine.ssm_conv1d_pipe,
                     &engine.ssm_conv_kernel_bufs.?[layer_idx],
                     &engine.ssm_conv_state_bufs.?[layer_idx],
-                    &engine.attn_out_buf,
+                    conv_input_buf,
                     &engine.swiglu_buf,
                     conv_channels,
                     d_conv,
                     false,
+                    conv_input_offset,
                 );
                 if (profile) |p| p.ssm_conv_calls += 1;
             }
@@ -13320,14 +13333,22 @@ fn runDecodeStep(
                     .dt_bias_is_f16 = 0,
                     .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
                     .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
-                    .alpha_offset = 0,
-                    .beta_offset = 0,
+                    .alpha_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0,
+                    .beta_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0,
                     .output_offset = 0,
                 };
+                const alpha_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_alpha_buf
+                else
+                    &engine.router_logits_buf;
+                const beta_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_beta_buf
+                else
+                    &engine.down_buf;
                 const dn_bufs = [_]*const MetalBuffer{
-                    &engine.swiglu_buf,                    &engine.router_logits_buf,
+                    &engine.swiglu_buf,                    alpha_buf,
                     &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
-                    &engine.down_buf,                      &engine.ssm_state_bufs.?[layer_idx],
+                    beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
                     &engine.attn_out_buf,
                 };
                 // SPIRV-Cross Metal shader loops over all head_v_dim rows internally
@@ -13366,18 +13387,27 @@ fn runDecodeStep(
 
             // Gated norm: attn_out_buf → swiglu_buf
             {
-                dispatchSsmGatedNormWithPipe(
+                const z_gate_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_z_buf
+                else
+                    &engine.gate_buf;
+                const z_gate_offset = if (use_direct_prefill_projection_chunk)
+                    engine.position * d_inner
+                else
+                    0;
+                dispatchSsmGatedNormOffsetWithPipe(
                     cmd,
                     &engine.ssm_gated_norm_pipe,
                     &engine.attn_out_buf,
                     &engine.ssm_norm_weight_bufs.?[layer_idx],
-                    &engine.gate_buf,
+                    z_gate_buf,
                     &engine.swiglu_buf,
                     d_inner,
                     dt_rank,
                     head_v_dim,
                     d_state,
                     engine.ssm_norm_per_head.?[layer_idx],
+                    z_gate_offset,
                 );
                 if (profile) |p| p.ssm_gated_norm_calls += 1;
             }
