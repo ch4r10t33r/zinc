@@ -10360,9 +10360,12 @@ fn validateQwenMoeRoutePackChunk(
         canUseQwenSharedBatchedGemm(engine, gate_shexp.?.info.type_) and
         canUseQwenSharedBatchedGemm(engine, up_shexp.?.info.type_) and
         canUseQwenSharedBatchedGemm(engine, down_shexp.?.info.type_);
+    const f32_shared_gate =
+        gate_inp_shexp != null and
+        canUseQwenSharedGateInputF32(engine, gate_inp_shexp.?, hidden_dim);
     const can_validate_shared_acc =
         can_validate_shared and
-        (gate_inp_shexp == null or canUseQwenSharedBatchedGemm(engine, gate_inp_shexp.?.info.type_));
+        (gate_inp_shexp == null or canUseQwenSharedGateInputBatched(engine, gate_inp_shexp.?, hidden_dim));
     if (!supportsQwenMoeRoutePackCols(engine, gate_up_layout.gate_tensor.info.type_) or
         !supportsQwenMoeRoutePackCols(engine, gate_up_layout.up_tensor.info.type_) or
         !supportsQwenMoeRoutePackCols(engine, down_exps.info.type_) or
@@ -10481,7 +10484,7 @@ fn validateQwenMoeRoutePackChunk(
     }
     if (can_validate_shared_acc) {
         combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
-        if (gate_inp_shexp != null) {
+        if (gate_inp_shexp != null and !f32_shared_gate) {
             shared_acc_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * @sizeOf(f32), 4));
         }
     }
@@ -10584,7 +10587,9 @@ fn validateQwenMoeRoutePackChunk(
         try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, up_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_up_candidate_buf, shexp_inter_dim, hidden_dim, n);
         if (can_validate_shared_acc) {
             if (gate_inp_shexp) |gate_t| {
-                try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
+                if (!f32_shared_gate) {
+                    try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
+                }
             }
         }
         cmd.barrier();
@@ -10600,11 +10605,32 @@ fn validateQwenMoeRoutePackChunk(
             // Mirrors vLLM's topk_weight_and_reduce final unpermute/reduce:
             // start from routed expert delta, then fold in the batched shared
             // expert contribution with the optional Qwen shared gate.
-            dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
-            cmd.barrier();
             if (gate_inp_shexp != null) {
-                dispatchSigmoidScaleAccBatchedOnCmd(engine, &cmd, &combined_delta_candidate_buf, &shared_down_candidate_buf, &shared_acc_gate_candidate_buf, n, hidden_dim);
+                if (f32_shared_gate) {
+                    dispatchZeroF32OnCmd(engine, &cmd, &combined_delta_candidate_buf, n * hidden_dim);
+                    cmd.barrier();
+                    dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+                        engine,
+                        &cmd,
+                        &engine.qwen_moe_route_validate_routing_buf,
+                        &down_candidate_buf,
+                        &shared_down_candidate_buf,
+                        &engine.qwen_moe_route_validate_norm_buf,
+                        gate_inp_shexp.?,
+                        &combined_delta_candidate_buf,
+                        n,
+                        hidden_dim,
+                        cfg.n_experts,
+                        k,
+                    );
+                } else {
+                    dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
+                    cmd.barrier();
+                    dispatchSigmoidScaleAccBatchedOnCmd(engine, &cmd, &combined_delta_candidate_buf, &shared_down_candidate_buf, &shared_acc_gate_candidate_buf, n, hidden_dim);
+                }
             } else {
+                dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
+                cmd.barrier();
                 const acc_push = ScaleAccPush{ .n = n * hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                 const acc_bufs = [_]*const MetalBuffer{ &combined_delta_candidate_buf, &shared_down_candidate_buf };
                 cmd.dispatchV2(&engine.scale_acc_pipe, .{ (n * hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
@@ -10711,7 +10737,11 @@ fn validateQwenMoeRoutePackChunk(
             }
 
             const combined_candidate: [*]const f32 = @ptrCast(@alignCast(combined_delta_candidate_buf.cpu_ptr.?));
-            logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_grouped_shared", combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            const combined_tensor_name: []const u8 = if (f32_shared_gate)
+                "moe_delta_grouped_shared_gate_f32"
+            else
+                "moe_delta_grouped_shared";
+            logQwenMoeRoutePackValidationDiff(layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
         }
     }
 }
