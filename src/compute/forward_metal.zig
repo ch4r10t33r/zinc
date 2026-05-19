@@ -1135,6 +1135,7 @@ const SsmGatedNormPush = extern struct {
     d_state: u32,
     norm_per_head: u32,
     z_offset: u32,
+    output_offset: u32,
 };
 
 const GGMLType = gguf.GGMLType;
@@ -7142,7 +7143,7 @@ fn dispatchSsmGatedNormWithPipe(
     d_state: u32,
     norm_per_head: bool,
 ) void {
-    dispatchSsmGatedNormOffsetWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0);
+    dispatchSsmGatedNormOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0, 0);
 }
 
 fn dispatchSsmGatedNormOffsetWithPipe(
@@ -7159,6 +7160,24 @@ fn dispatchSsmGatedNormOffsetWithPipe(
     norm_per_head: bool,
     z_offset: u32,
 ) void {
+    dispatchSsmGatedNormOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, z_offset, 0);
+}
+
+fn dispatchSsmGatedNormOffsetsWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    z_offset: u32,
+    output_offset: u32,
+) void {
     const push = SsmGatedNormPush{
         .d_inner = d_inner,
         .dt_rank = dt_rank,
@@ -7166,6 +7185,7 @@ fn dispatchSsmGatedNormOffsetWithPipe(
         .d_state = d_state,
         .norm_per_head = if (norm_per_head) 1 else 0,
         .z_offset = z_offset,
+        .output_offset = output_offset,
     };
     const bufs = [_]*const MetalBuffer{ delta_net_output, norm_weight, z_gate, output };
     cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
@@ -8043,24 +8063,23 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         }
         profileBarrier(cmd, profile, .ssm);
 
-        dispatchSsmGatedNormOffsetWithPipe(
+        dispatchSsmGatedNormOffsetsWithPipe(
             cmd,
             &engine.ssm_gated_norm_pipe,
             &engine.attn_out_buf,
             &engine.ssm_norm_weight_bufs.?[layer_idx],
             &engine.qwen_ssm_prefill_proj_z_buf,
-            &engine.swiglu_buf,
+            &scratch.swiglu,
             d_inner,
             dt_rank,
             head_v_dim,
             d_state,
             engine.ssm_norm_per_head.?[layer_idx],
             token_ssm_offset,
+            token_ssm_offset,
         );
         if (profile) |p| p.ssm_gated_norm_calls += 1;
         profileBarrier(cmd, profile, .ssm);
-
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.swiglu_buf, &scratch.swiglu, d_inner, 0, token_ssm_offset);
     }
     profileBarrier(cmd, profile, .ssm);
 
