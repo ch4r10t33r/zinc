@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 660" font-family="-apple-system, system-ui, sans-serif" font-size="13">
+  <defs>
+    <linearGradient id="warpGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#fde68a" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0.55"/>
+    </linearGradient>
+    <pattern id="cachePattern" patternUnits="userSpaceOnUse" width="6" height="6">
+      <rect width="6" height="6" fill="#86efac"/>
+      <path d="M0 6 L6 0" stroke="#22c55e" stroke-width="0.8"/>
+    </pattern>
+  </defs>
+
+  <!-- Background: warm parchment / amber -->
+  <rect width="1120" height="660" fill="#fef3c7"/>
+
+  <!-- Title -->
+  <text x="40" y="36" font-size="17" font-weight="700" fill="#451a03">Three paths to a Qwen3 thinking budget</text>
+  <text x="40" y="56" font-size="12" fill="#78350f">Same prompt, same model, same budget of 256 thinking tokens. Only one path is shipping in production today.</text>
+
+  <!-- Legend -->
+  <g transform="translate(40, 78)">
+    <rect x="0" y="0" width="14" height="14" rx="2" fill="#c4b5fd"/>
+    <text x="20" y="11" fill="#1e1b4b">user prompt</text>
+    <rect x="108" y="0" width="14" height="14" rx="2" fill="#fef3c7" stroke="#a16207"/>
+    <text x="128" y="11" fill="#451a03">&lt;think&gt; / &lt;/think&gt;</text>
+    <rect x="244" y="0" width="14" height="14" rx="2" fill="#fde68a" stroke="#b45309" stroke-width="0.5"/>
+    <text x="264" y="11" fill="#451a03">thinking tokens</text>
+    <rect x="372" y="0" width="14" height="14" rx="2" fill="#fbbf24" stroke="#92400e"/>
+    <text x="392" y="11" fill="#451a03">early-stopping splice</text>
+    <rect x="514" y="0" width="14" height="14" rx="2" fill="#84cc16"/>
+    <text x="534" y="11" fill="#1a2e05">answer</text>
+    <rect x="588" y="0" width="14" height="14" rx="2" fill="url(#cachePattern)"/>
+    <text x="608" y="11" fill="#14532d">cache reused</text>
+    <rect x="704" y="0" width="14" height="14" rx="2" fill="#bae6fd" stroke="#0369a1"/>
+    <text x="724" y="11" fill="#0c4a6e">new prefill chunk</text>
+  </g>
+
+  <!-- Time axis -->
+  <line x1="100" y1="120" x2="1080" y2="120" stroke="#a16207" stroke-width="0.8"/>
+  <text x="100" y="112" font-size="11" fill="#78350f">t = 0</text>
+  <text x="1050" y="112" font-size="11" fill="#78350f">decoded</text>
+  <g font-size="10" fill="#a16207">
+    <line x1="180" y1="118" x2="180" y2="122" stroke="#a16207"/>
+    <text x="172" y="135">prompt</text>
+    <line x1="240" y1="118" x2="240" y2="122" stroke="#a16207"/>
+    <text x="222" y="135">&lt;think&gt;</text>
+    <line x1="820" y1="118" x2="820" y2="122" stroke="#a16207"/>
+    <text x="800" y="135">budget = 256</text>
+    <line x1="1000" y1="118" x2="1000" y2="122" stroke="#a16207"/>
+    <text x="982" y="135">answer end</text>
+  </g>
+
+  <!-- ROW 1: Cloud native -->
+  <g transform="translate(0, 160)">
+    <text x="40" y="0" font-size="14" font-weight="600" fill="#451a03">1. Alibaba Cloud Model Studio: native budget</text>
+    <text x="40" y="16" font-size="11" fill="#78350f">Single API call. Server splices the stop-thinking sentence inline. Total ≈ 280 decoded tokens, ≈ 2.4 s at 117 tok/s.</text>
+
+    <!-- track -->
+    <rect x="100" y="30" width="980" height="48" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="0.5"/>
+
+    <!-- user prompt tile -->
+    <rect x="105" y="34" width="70" height="40" rx="3" fill="#c4b5fd"/>
+    <text x="140" y="58" text-anchor="middle" font-size="11" fill="#1e1b4b">user</text>
+
+    <!-- <think> open -->
+    <rect x="178" y="34" width="60" height="40" rx="3" fill="#fef3c7" stroke="#a16207"/>
+    <text x="208" y="58" text-anchor="middle" font-size="10" fill="#451a03">&lt;think&gt;</text>
+
+    <!-- thinking band -->
+    <rect x="240" y="34" width="578" height="40" rx="3" fill="#fde68a"/>
+    <text x="529" y="50" text-anchor="middle" font-size="11" fill="#78350f">≤ 256 thinking tokens</text>
+    <text x="529" y="65" text-anchor="middle" font-size="10" fill="#a16207">"Let me check… 52² = 2,704. Verify: 50² + 2·50·2 + 2²…"</text>
+
+    <!-- budget line -->
+    <line x1="820" y1="28" x2="820" y2="80" stroke="#ea580c" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <!-- splice -->
+    <rect x="822" y="34" width="92" height="40" rx="3" fill="#fbbf24" stroke="#92400e"/>
+    <text x="868" y="50" text-anchor="middle" font-size="9" fill="#451a03">"Considering the</text>
+    <text x="868" y="62" text-anchor="middle" font-size="9" fill="#451a03">limited time…"</text>
+
+    <!-- </think> -->
+    <rect x="916" y="34" width="50" height="40" rx="3" fill="#fef3c7" stroke="#a16207"/>
+    <text x="941" y="58" text-anchor="middle" font-size="9" fill="#451a03">&lt;/think&gt;</text>
+
+    <!-- answer -->
+    <rect x="968" y="34" width="110" height="40" rx="3" fill="#84cc16"/>
+    <text x="1023" y="50" text-anchor="middle" font-size="11" fill="#1a2e05">"2704"</text>
+    <text x="1023" y="65" text-anchor="middle" font-size="10" fill="#365314">20 tokens</text>
+
+    <!-- check mark -->
+    <circle cx="1095" cy="54" r="11" fill="#16a34a"/>
+    <path d="M1090 54 L1094 58 L1101 50" stroke="white" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- ROW 2: Two-pass workaround -->
+  <g transform="translate(0, 280)">
+    <text x="40" y="0" font-size="14" font-weight="600" fill="#451a03">2. Local two-pass splice per the Qwen3 docs</text>
+    <text x="40" y="16" font-size="11" fill="#78350f">Two API calls. The client appends the stop-thinking sentence and replays. ≈ 2.7 s including a 32-token splice prefill at 88 tok/s.</text>
+
+    <!-- track -->
+    <rect x="100" y="30" width="980" height="78" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="0.5"/>
+
+    <!-- Call 1 label -->
+    <text x="105" y="26" font-size="10" font-weight="600" fill="#92400e">CALL 1</text>
+
+    <!-- user prompt tile -->
+    <rect x="105" y="34" width="70" height="40" rx="3" fill="#c4b5fd"/>
+    <text x="140" y="58" text-anchor="middle" font-size="11" fill="#1e1b4b">user</text>
+
+    <!-- <think> open -->
+    <rect x="178" y="34" width="60" height="40" rx="3" fill="#fef3c7" stroke="#a16207"/>
+    <text x="208" y="58" text-anchor="middle" font-size="10" fill="#451a03">&lt;think&gt;</text>
+
+    <!-- thinking band capped at budget -->
+    <rect x="240" y="34" width="578" height="40" rx="3" fill="#fde68a"/>
+    <text x="529" y="58" text-anchor="middle" font-size="11" fill="#78350f">256 thinking tokens, no &lt;/think&gt; emitted</text>
+
+    <!-- budget line -->
+    <line x1="820" y1="28" x2="820" y2="108" stroke="#ea580c" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <!-- red x at end of call 1 -->
+    <g transform="translate(830, 50)">
+      <circle r="11" fill="#dc2626"/>
+      <path d="M-5 -5 L5 5 M-5 5 L5 -5" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+    </g>
+    <text x="850" y="48" font-size="9" fill="#7f1d1d">trace did not close</text>
+    <text x="850" y="60" font-size="9" fill="#7f1d1d">on its own</text>
+
+    <!-- Vertical dashed divider -->
+    <line x1="820" y1="78" x2="820" y2="78" stroke="#92400e" stroke-width="1" stroke-dasharray="2,2"/>
+
+    <!-- Cache band (reused from call 1) -->
+    <rect x="105" y="82" width="713" height="10" fill="url(#cachePattern)" opacity="0.85"/>
+    <text x="461" y="90" text-anchor="middle" font-size="9" fill="#14532d">KV cache reused from call 1 — no recompute</text>
+
+    <!-- Call 2 label -->
+    <text x="822" y="26" font-size="10" font-weight="600" fill="#92400e">CALL 2</text>
+
+    <!-- splice as new prefill -->
+    <rect x="822" y="34" width="92" height="40" rx="3" fill="#bae6fd" stroke="#0369a1"/>
+    <text x="868" y="50" text-anchor="middle" font-size="9" fill="#0c4a6e">"Considering the</text>
+    <text x="868" y="62" text-anchor="middle" font-size="9" fill="#0c4a6e">limited time…"</text>
+    <text x="868" y="103" text-anchor="middle" font-size="9" fill="#0369a1">+32 tokens prefill</text>
+
+    <!-- </think> -->
+    <rect x="916" y="34" width="50" height="40" rx="3" fill="#fef3c7" stroke="#a16207"/>
+    <text x="941" y="58" text-anchor="middle" font-size="9" fill="#451a03">&lt;/think&gt;</text>
+
+    <!-- answer -->
+    <rect x="968" y="34" width="110" height="40" rx="3" fill="#84cc16"/>
+    <text x="1023" y="50" text-anchor="middle" font-size="11" fill="#1a2e05">"2704"</text>
+    <text x="1023" y="65" text-anchor="middle" font-size="10" fill="#365314">20 tokens</text>
+
+    <!-- check mark -->
+    <circle cx="1095" cy="54" r="11" fill="#16a34a"/>
+    <path d="M1090 54 L1094 58 L1101 50" stroke="white" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- ROW 3: Logit warp -->
+  <g transform="translate(0, 432)">
+    <text x="40" y="0" font-size="14" font-weight="600" fill="#451a03">3. Local logit-warp sampler per Mueller's TIL</text>
+    <text x="40" y="16" font-size="11" fill="#78350f">Single forward pass. The sampler clamps everything but \n and &lt;/think&gt; at the boundary. No extra prefill. Close differs from the trained route.</text>
+
+    <!-- track -->
+    <rect x="100" y="30" width="980" height="58" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="0.5"/>
+
+    <!-- user prompt tile -->
+    <rect x="105" y="34" width="70" height="40" rx="3" fill="#c4b5fd"/>
+    <text x="140" y="58" text-anchor="middle" font-size="11" fill="#1e1b4b">user</text>
+
+    <!-- <think> open -->
+    <rect x="178" y="34" width="60" height="40" rx="3" fill="#fef3c7" stroke="#a16207"/>
+    <text x="208" y="58" text-anchor="middle" font-size="10" fill="#451a03">&lt;think&gt;</text>
+
+    <!-- thinking band -->
+    <rect x="240" y="34" width="578" height="40" rx="3" fill="#fde68a"/>
+    <text x="450" y="58" text-anchor="middle" font-size="11" fill="#78350f">256 thinking tokens, natural decode</text>
+
+    <!-- warp gradient overlay last 5% of thinking band -->
+    <rect x="789" y="34" width="29" height="40" rx="0" fill="url(#warpGradient)"/>
+    <text x="803" y="103" text-anchor="middle" font-size="9" fill="#92400e">95% mark:</text>
+    <text x="803" y="114" text-anchor="middle" font-size="9" fill="#92400e">prior bump</text>
+
+    <!-- budget line -->
+    <line x1="820" y1="28" x2="820" y2="88" stroke="#ea580c" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <!-- sampler arrow toward </think> -->
+    <path d="M780 78 Q810 84 830 78" stroke="#92400e" stroke-width="1" fill="none" marker-end="url(#arrowHead)"/>
+
+    <!-- </think> close (no splice) -->
+    <rect x="822" y="34" width="50" height="40" rx="3" fill="#fef3c7" stroke="#a16207" stroke-width="1.5"/>
+    <text x="847" y="58" text-anchor="middle" font-size="9" fill="#451a03">&lt;/think&gt;</text>
+
+    <!-- answer (begins immediately) -->
+    <rect x="874" y="34" width="204" height="40" rx="3" fill="#84cc16"/>
+    <text x="976" y="50" text-anchor="middle" font-size="11" fill="#1a2e05">"2704"</text>
+    <text x="976" y="65" text-anchor="middle" font-size="10" fill="#365314">20 tokens — no splice, but answer is shaped by the trace alone</text>
+
+    <!-- check with caveat -->
+    <circle cx="1095" cy="54" r="11" fill="#ca8a04"/>
+    <text x="1095" y="58" text-anchor="middle" font-size="13" font-weight="700" fill="white">~</text>
+  </g>
+
+  <defs>
+    <marker id="arrowHead" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0 L6 3 L0 6 z" fill="#92400e"/>
+    </marker>
+  </defs>
+
+  <!-- Footer -->
+  <line x1="40" y1="615" x2="1080" y2="615" stroke="#a16207" stroke-width="0.4"/>
+  <text x="40" y="635" font-size="10" fill="#78350f">Budget = 256 thinking tokens. Splice prompt = 32 tokens per the Qwen3 technical report §4.3. Decode 117 tok/s, prefill 88 tok/s on the May 10 R9700 suite</text>
+  <text x="40" y="650" font-size="10" fill="#78350f">running Qwen3.6-35B-A3B UD Q4_K_XL. Native-budget row reflects the Alibaba Cloud Model Studio API; rows 2 and 3 are the open-source workarounds for engines that do not yet ship a budget.</text>
+</svg>
