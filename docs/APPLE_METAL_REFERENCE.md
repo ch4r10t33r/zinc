@@ -158,7 +158,7 @@ The public MSL features most worth using for inference are:
 - `[[thread_position_in_threadgroup]]`
 - `[[thread_index_in_simdgroup]]`
 - `[[simdgroup_index_in_threadgroup]]`
-- `half` and bf16-capable paths when precision and hardware support make them worthwhile
+- `half` is the active precision path; `bfloat` is supported by MSL on Apple-family GPUs but ZINC's Metal shaders do not currently emit bf16 kernels
 - `simdgroup_matrix` / TensorOps-style paths on the families where the public stack supports them
 
 Useful kernel heuristics:

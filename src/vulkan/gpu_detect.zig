@@ -185,15 +185,21 @@ pub fn detect(instance: *const Instance) GpuConfig {
     } else if (props.vendorID == 0x8086) {
         config.vendor = classifyIntel(props.deviceID, name_slice);
         if (config.vendor == .intel_arc_xe2) {
-            // Xe2 (Battlemage, Arc B-series).
-            // B770 Pro: 32 Xe2-HPG cores, 256-bit GDDR6 @ 20 Gbps ≈ 640 GB/s.
+            // Xe2 (Battlemage, Arc B-series). Per-SKU bandwidth ranges from
+            // 224 GB/s (B50) to 608 GB/s (B70 / B65 / B580) on the supported
+            // cards; 640 GB/s here is a high-water-mark headroom assumption,
+            // not a per-SKU lookup. See docs/INTEL_GPU_REFERENCE.md for the
+            // actual per-card table.
             config.bandwidth_gbps = 640;
             config.compute_units = 32;
-            config.l1_cache_kb = 64;
+            // Xe2 has 256 KB L1 per Xe-core; on B70's 32 Xe-cores that totals
+            // 8 MB across the GPU. The shared GPU-wide L2 size is driver-
+            // reported and varies by SKU; 8 MB is a planner placeholder.
+            config.l1_cache_kb = 256;
             config.l2_cache_mb = 8;
         } else {
-            // Xe-HPG (Alchemist, Arc A-series).
-            // A770: 512 GB/s, 32 Xe-cores.
+            // Xe-HPG (Alchemist, Arc A-series). A770: 512 GB/s, 32 Xe-cores.
+            // L1/SLM is configurable on Alchemist; keep a conservative L1 hint.
             config.bandwidth_gbps = 512;
             config.compute_units = 32;
             config.l1_cache_kb = 64;
@@ -259,7 +265,7 @@ fn classifyIntel(device_id: u32, name: []const u8) GpuVendor {
     _ = device_id;
     // Xe2 = Battlemage (Arc B-series): Mesa ANV reports these as
     // "Intel(R) Graphics (BMG Gxx)" where BMG is the Battlemage codename.
-    // Retail names like "Arc B580" / "Arc B770" may also appear.
+    // Retail names like "Arc B580", "Arc B570", "Arc Pro B70" may also appear.
     // Xe-HPG = Alchemist (Arc A-series): default for other Intel Arc GPUs.
     if (containsIgnoreCase(name, "bmg") or
         containsIgnoreCase(name, "xe2") or
@@ -320,7 +326,7 @@ test "classifyAmd — RDNA3" {
 }
 
 test "classifyIntel — Arc B-series (Xe2)" {
-    try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel Arc B770 Pro"));
+    try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel Arc Pro B70"));
     try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel Arc B580"));
     // Real Mesa ANV device name on Arc B70 (BMG G31)
     try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel(R) Graphics (BMG G31)"));
