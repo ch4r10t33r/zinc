@@ -766,6 +766,7 @@ const MoeColsDmmvPush = extern struct {
     x_offset: u32,
     y_offset: u32,
     ids_stride: u32,
+    x_route_divisor: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -6109,6 +6110,7 @@ fn dispatchDmmvMoeColsOnCmd(
     x_byte_offset: u32,
     y_byte_offset: u32,
     ids_stride: u32,
+    x_route_divisor: u32,
     n_experts: u32,
     max_count: u32,
 ) !void {
@@ -6132,6 +6134,7 @@ fn dispatchDmmvMoeColsOnCmd(
         .x_offset = x_byte_offset,
         .y_offset = y_byte_offset,
         .ids_stride = ids_stride,
+        .x_route_divisor = @max(x_route_divisor, 1),
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf };
     const rows_per_wg: u32 = 2;
@@ -7287,6 +7290,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
+            1,
             cfg.n_experts,
             n_tokens,
         );
@@ -7305,6 +7309,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
+            1,
             cfg.n_experts,
             n_tokens,
         );
@@ -7350,6 +7355,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
+            1,
             cfg.n_experts,
             n_tokens,
         );
@@ -7831,14 +7837,15 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
 
     dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
     profileBarrier(cmd, profile, .gpu_routed_moe);
-    dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.norm, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
-    profileBarrier(cmd, profile, .gpu_routed_moe);
 
+    // Adapt llama.cpp `ggml_metal_op_mul_mat_id` source indexing: packed IDs
+    // already encode token*k+slot, so gate/up can read token-ordered norms
+    // directly instead of materializing a duplicated route-slot input buffer.
     try dispatchDmmvMoeColsOnCmd(
         engine,
         cmd,
         gate_up_layout.gate_tensor,
-        &scratch.moe_route_input,
+        &scratch.norm,
         &scratch.moe_expert_gate,
         &scratch.moe_expert_counts,
         &scratch.moe_packed_ids,
@@ -7849,6 +7856,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
         0,
         0,
         n_tokens,
+        cfg.n_experts_used,
         cfg.n_experts,
         n_tokens,
     );
@@ -7856,7 +7864,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
         engine,
         cmd,
         gate_up_layout.up_tensor,
-        &scratch.moe_route_input,
+        &scratch.norm,
         &scratch.moe_expert_up,
         &scratch.moe_expert_counts,
         &scratch.moe_packed_ids,
@@ -7867,6 +7875,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
         0,
         0,
         n_tokens,
+        cfg.n_experts_used,
         cfg.n_experts,
         n_tokens,
     );
@@ -7894,6 +7903,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
         0,
         0,
         n_tokens,
+        1,
         cfg.n_experts,
         n_tokens,
     );
@@ -9543,8 +9553,6 @@ fn validateQwenMoeRoutePackChunk(
     defer metal_buffer.freeBuffer(&counts_buf);
     var packed_ids_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * n_usize * @sizeOf(u32), 4));
     defer metal_buffer.freeBuffer(&packed_ids_buf);
-    var route_input_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * hidden_n * @sizeOf(f32), 4));
-    defer metal_buffer.freeBuffer(&route_input_buf);
     var gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
     defer metal_buffer.freeBuffer(&gate_candidate_buf);
     var up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
@@ -9591,24 +9599,12 @@ fn validateQwenMoeRoutePackChunk(
         cfg.n_experts,
         k,
     );
-    dispatchMoeRouteGatherOnCmd(
-        engine,
-        &cmd,
-        &engine.qwen_moe_route_validate_routing_buf,
-        &engine.qwen_moe_route_validate_norm_buf,
-        &route_input_buf,
-        n,
-        hidden_dim,
-        cfg.n_experts,
-        k,
-        true,
-    );
     cmd.barrier();
     try dispatchDmmvMoeColsOnCmd(
         engine,
         &cmd,
         gate_up_layout.gate_tensor,
-        &route_input_buf,
+        &engine.qwen_moe_route_validate_norm_buf,
         &gate_candidate_buf,
         &counts_buf,
         &packed_ids_buf,
@@ -9619,6 +9615,7 @@ fn validateQwenMoeRoutePackChunk(
         0,
         0,
         n,
+        k,
         cfg.n_experts,
         n,
     );
@@ -9626,7 +9623,7 @@ fn validateQwenMoeRoutePackChunk(
         engine,
         &cmd,
         gate_up_layout.up_tensor,
-        &route_input_buf,
+        &engine.qwen_moe_route_validate_norm_buf,
         &up_candidate_buf,
         &counts_buf,
         &packed_ids_buf,
@@ -9637,6 +9634,7 @@ fn validateQwenMoeRoutePackChunk(
         0,
         0,
         n,
+        k,
         cfg.n_experts,
         n,
     );
@@ -9662,6 +9660,7 @@ fn validateQwenMoeRoutePackChunk(
         0,
         0,
         n,
+        1,
         cfg.n_experts,
         n,
     );
@@ -15347,7 +15346,7 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
 
     var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
     defer metal_buffer.freeBuffer(&weight_buf);
-    var input_buf = try metal_buffer.createBuffer(ctx, route_slots * K * @sizeOf(f32));
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&input_buf);
     var output_buf = try metal_buffer.createBuffer(ctx, route_slots * M * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&output_buf);
@@ -15386,10 +15385,10 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
     }
 
     const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
-    for (0..route_slots) |route| {
+    for (0..n_tokens) |token| {
         for (0..K) |i| {
-            const raw: i32 = @intCast((route * 17 + i * 11 + 5) % 23);
-            input_ptr[route * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 11));
+            const raw: i32 = @intCast((token * 17 + i * 11 + 5) % 23);
+            input_ptr[token * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 11));
         }
     }
 
@@ -15410,6 +15409,7 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
         .x_offset = 0,
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = @intCast(k_used),
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
@@ -15425,8 +15425,9 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
     var max_diff: f32 = 0.0;
     for (0..route_slots) |route| {
         const expert_id: usize = if (route % 2 == 0) 1 else 2;
+        const token = route / k_used;
         const matrix_raw = weight_buf.cpu_ptr.?[expert_id * expert_stride ..][0..expert_stride];
-        const input_slice = input_ptr[route * K .. (route + 1) * K];
+        const input_slice = input_ptr[token * K .. (token + 1) * K];
         for (0..M) |row| {
             dequantRow(matrix_raw, @intCast(row), @intCast(K), .q4_k, ref_row);
             var expected: f32 = 0.0;
@@ -15724,6 +15725,7 @@ test "dmmv_q5_1_moe_cols shader matches per-route CPU reference" {
         .x_offset = 0,
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
@@ -15838,6 +15840,7 @@ test "dmmv_q5k_moe_cols shader matches per-route CPU reference" {
         .x_offset = 0,
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
@@ -15947,6 +15950,7 @@ test "dmmv_q6k_moe_cols shader matches per-route CPU reference" {
         .x_offset = 0,
         .y_offset = 0,
         .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 

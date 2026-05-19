@@ -18,6 +18,7 @@ struct MoeColsDmmvPush {
     uint x_offset;
     uint y_offset;
     uint ids_stride;
+    uint x_route_divisor;
 };
 
 #define NUM_COLS 4u
@@ -56,11 +57,12 @@ kernel void main0(
     const uint route2 = active2 ? expert_ids[packed_base + 2u] : 0u;
     const uint route3 = active3 ? expert_ids[packed_base + 3u] : 0u;
 
+    const uint x_div = max(p.x_route_divisor, 1u);
     device const float* x_base = X + (p.x_offset / 4u);
-    device const float* x0 = x_base + route0 * p.K;
-    device const float* x1 = x_base + route1 * p.K;
-    device const float* x2 = x_base + route2 * p.K;
-    device const float* x3 = x_base + route3 * p.K;
+    device const float* x0 = x_base + (route0 / x_div) * p.K;
+    device const float* x1 = x_base + (route1 / x_div) * p.K;
+    device const float* x2 = x_base + (route2 / x_div) * p.K;
+    device const float* x3 = x_base + (route3 / x_div) * p.K;
 
     const uint nb = p.K / 32u;
     const uint bpb = 24u;
