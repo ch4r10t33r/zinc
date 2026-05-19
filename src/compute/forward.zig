@@ -11554,6 +11554,14 @@ pub const InferenceEngine = struct {
         return @min(layers, cfg.n_layers - 1);
     }
 
+    fn qwen36DensePrefillTailPipelineEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (n_tokens < 2) return false;
+        if (self.validation_diagnostics_enabled or self.profile_enabled) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        const mode = std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE") orelse return false;
+        return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+    }
+
     fn prefillQwen36DenseFfnPrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, prefix_layers: u32) !void {
         if (prompt_tokens.len == 0 or prefix_layers == 0) return;
 
@@ -11862,14 +11870,52 @@ pub const InferenceEngine = struct {
         self.partial_decode_hidden_out = null;
         self.partial_decode_advance_position = true;
 
+        // The prefix path runs the first layer(s) layer-major, then returns to
+        // token-major decode for the remainder. Reuse prefillBatch's two-slot
+        // command-buffer pipeline for that remainder when explicitly requested.
+        const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
         var tok_idx: u32 = 0;
         while (tok_idx < n_tokens) : (tok_idx += 1) {
             const collect_output = tok_idx + 1 == n_tokens;
+            const pipeline_this = pipeline_tail and !collect_output;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
             self.prefill_current_token_idx = tok_idx;
             state.position = base_token + tok_idx;
             self.partial_decode_hidden_in_offset = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
             self.partial_decode_allow_final_tail = collect_output;
             try self.decodeStep(state, prompt_tokens[tok_idx], collect_output);
+
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
         }
     }
 
