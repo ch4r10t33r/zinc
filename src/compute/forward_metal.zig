@@ -11391,7 +11391,7 @@ fn validateQwenMoeRoutePackChunk(
     }
     if (can_validate_shared_acc) {
         combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
-        if (gate_inp_shexp != null and !f32_shared_gate) {
+        if (gate_inp_shexp != null) {
             shared_acc_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * @sizeOf(f32), 4));
         }
         if (can_validate_active_blocks and f32_shared_gate) {
@@ -11603,7 +11603,9 @@ fn validateQwenMoeRoutePackChunk(
         try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, up_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_up_candidate_buf, shexp_inter_dim, hidden_dim, n);
         if (can_validate_shared_acc) {
             if (gate_inp_shexp) |gate_t| {
-                if (!f32_shared_gate) {
+                if (f32_shared_gate) {
+                    dispatchGemmF32SmallOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
+                } else {
                     try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
                 }
             }
@@ -11812,6 +11814,23 @@ fn validateQwenMoeRoutePackChunk(
         logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_down_batched", shared_down_ref[0..shared_down_total], shared_down_candidate[0..shared_down_total], hidden_dim, 1, n, 5e-2);
 
         if (can_validate_shared_acc) {
+            if (gate_inp_shexp) |gate_t| {
+                const shared_gate_scalar_ref = try allocator.alloc(f32, n_usize);
+                defer allocator.free(shared_gate_scalar_ref);
+                const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+                const tdo = engine.model.gguf_file.tensor_data_offset;
+                for (0..n_usize) |t| {
+                    const norm_token = norm_dst + t * hidden_n;
+                    try cpuDmmvFallback(mmap, gate_t, tdo, norm_token, shared_gate_scalar_ref.ptr + t, 1, hidden_dim, 0, allocator);
+                }
+                const shared_gate_scalar_candidate: [*]const f32 = @ptrCast(@alignCast(shared_acc_gate_candidate_buf.cpu_ptr.?));
+                const scalar_tensor_name: []const u8 = if (f32_shared_gate)
+                    "shared_gate_f32_batched"
+                else
+                    "shared_gate_batched_acc";
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, scalar_tensor_name, shared_gate_scalar_ref[0..n_usize], shared_gate_scalar_candidate[0..n_usize], 1, 1, n, 5e-2);
+            }
+
             const combined_ref = try allocator.alloc(f32, delta_total);
             defer allocator.free(combined_ref);
             @memcpy(combined_ref, delta_ref);
