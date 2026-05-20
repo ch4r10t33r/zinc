@@ -9683,7 +9683,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         0,
     );
     if (profile) |p| p.ssm_conv_calls += n_tokens;
-    profileBarrier(cmd, profile, .ssm);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
 
     const dt_rank_usize: usize = @intCast(dt_rank);
     const hidden_dim_usize: usize = @intCast(hidden_dim);
@@ -9721,7 +9721,17 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
                 );
             }
         }
-        profileBarrier(cmd, profile, .ssm);
+        var tail_barrier_bufs: [2]*const MetalBuffer = undefined;
+        var tail_barrier_count: usize = 0;
+        if (!alpha_batched) {
+            tail_barrier_bufs[tail_barrier_count] = &engine.qwen_ssm_prefill_proj_alpha_buf;
+            tail_barrier_count += 1;
+        }
+        if (!beta_batched) {
+            tail_barrier_bufs[tail_barrier_count] = &engine.qwen_ssm_prefill_proj_beta_buf;
+            tail_barrier_count += 1;
+        }
+        profileBarrierBuffers(cmd, profile, .ssm, tail_barrier_bufs[0..tail_barrier_count]);
     }
 
     {
@@ -9752,7 +9762,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
         if (profile) |p| p.ssm_delta_calls += n_tokens;
         engine.position = n_tokens - 1;
-        profileBarrier(cmd, profile, .ssm);
+        profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.attn_out});
     }
 
     // Adapt llama.cpp's Metal encoder barrier discipline
@@ -9778,10 +9788,10 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         n_tokens,
     );
     if (profile) |p| p.ssm_gated_norm_calls += 1;
-    profileBarrier(cmd, profile, .ssm);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.swiglu});
 
     dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
-    profileBarrier(cmd, profile, .ssm);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.down});
 
     // Adapt llama.cpp `ggml_metal_op_concurrency_reset` and vLLM
     // `grouped_topk`: after the token-ordered SSM recurrence and batched
@@ -9793,10 +9803,10 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
         cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
     }
-    profileBarrier(cmd, profile, .router);
+    profileBarrierBuffers(cmd, profile, .router, &.{&scratch.norm});
 
     try recordQwenRoutePackedRouterOnCmd(engine, cmd, profile, router_t, &scratch.norm, &scratch.gate, &scratch.moe_routing, n_tokens);
-    profileBarrier(cmd, profile, .gpu_routed_moe);
+    profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&scratch.moe_routing});
 
     const moe_record_start = profileStart(profile != null);
     try recordQwenRoutePackedLayerMoeOnCmd(engine, cmd, profile, lt, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
