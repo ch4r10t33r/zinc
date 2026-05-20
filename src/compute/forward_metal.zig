@@ -3819,11 +3819,11 @@ pub const InferenceEngine = struct {
         }
 
         // Adapt llama.cpp `ggml-metal-context.m::ggml_metal_graph_compute`:
-        // commit a small leading graph slice so the GPU starts while the CPU
-        // records the remaining command buffer. The Effort 16 prompt is only
-        // 134 tokens; a 10% token split under-feeds the first CB, while 16
-        // tokens gives enough queued work without becoming a third large wait.
-        const graph_fraction = @max(@as(usize, 16), prompt_len / 10);
+        // commit a leading graph slice so the GPU starts while the CPU records
+        // the remaining command buffer. Keep the same two-CB shape, but give
+        // M4 Qwen prompt prefill a slightly deeper front slice; 16 tokens is
+        // often too shallow once layer-0 work is precomputed asynchronously.
+        const graph_fraction = @max(@as(usize, 24), prompt_len / 8);
         return @min(prompt_len / 2, @min(graph_fraction, 32));
     }
 
