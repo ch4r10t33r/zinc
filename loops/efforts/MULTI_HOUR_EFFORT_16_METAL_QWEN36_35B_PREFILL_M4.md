@@ -70,6 +70,36 @@ bun loops/implement_metal.ts --effort 16 --dry-run
 
 ## Current standing
 
+Updated after the 100-cycle run ending at commit `8826583`:
+
+- Accepted best is `43.8 prefill tok/s` on the Effort 16 chat prompt.
+- The original measured baseline was about `34.1 prefill tok/s`, so the loop
+  banked roughly +28% accepted throughput.
+- The largest accepted jump was cycle 89: token-major Qwen F32 shared-gate MoE
+  combine, adapted from vLLM top-k weighted reduce and llama.cpp `mul_mat_id`
+  discipline. That moved the accepted best from about `36.4` to `43.4`.
+- Cycle 100 added the current best `43.8 prefill tok/s` via a 16-token early
+  prompt graph commit. Treat 50 tok/s as the next practical milestone before
+  chasing llama.cpp prompt parity.
+- Repeated fast-looking route-packed/F32 shared-gate promotions produced
+  bang-only output (`!!!!!!!!!!!!!!!!`) despite measuring around `36.8-44.5`.
+  Do not count these as progress and do not enable them by default without
+  full active-prompt validation and a `Paris` output.
+- Dual-Q8 SSM projection grouping also produced bang-only output around
+  `43.5`; keep that family behind validators until the tensor diff is known.
+
+Best next directions for 50+:
+
+1. Extend the accepted token-major F32 shared-gate combine rather than
+   re-enabling the route-packed layer-0 F32 path directly.
+2. Measure early prompt commit chunk sizes around the current 16-token chunk
+   before wider graph submission rewrites.
+3. Use the route-pack validators to find the exact tensor/layer where F32
+   shared-gate route packing diverges. A promotion needs layer, prompt-token
+   count, max abs diff, flag-on command, and a `Paris` run.
+4. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
+   validators or microbenchmarks before default-on changes.
+
 Known facts before the first Effort 16 baseline:
 
 - Effort 5 measured local Metal decode on this model at about `38.11 tok/s`.

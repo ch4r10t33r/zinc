@@ -55,6 +55,7 @@ const METRIC_LABEL = METRIC_MODE === "prefill" ? "prefill tok/s" : "decode tok/s
 const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable throughput measurement
 const REFERENCE_TEXT = "Paris"; // Expected in correct output
 const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
+const QWEN36_PREFILL_INTERMEDIATE_TARGET = 50;
 const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
 // Pre-rolls discarded before any timed sample. Each fresh ZINC invocation
 // resets Metal residency + GPU clocks, so the FIRST few samples in a series
@@ -145,6 +146,136 @@ function isGemmaRun(state?: Pick<RunState, "effortId" | "effortFile" | "effortPl
     state?.effortId === 11 ||
     (state?.effortFile?.toLowerCase().includes("gemma") ?? false) ||
     (state?.effortPlan?.toLowerCase().includes("gemma") ?? false);
+}
+
+function isQwen36PrefillRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">,
+): boolean {
+  const model = displayModelLabel().toLowerCase();
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  const qwen36 = model.includes("qwen36-35b") ||
+    model.includes("qwen3.6") ||
+    effortText.includes("qwen36") ||
+    effortText.includes("qwen 3.6") ||
+    effortText.includes("qwen3.6");
+  const largeMoe = model.includes("35b") ||
+    effortText.includes("35b") ||
+    effortText.includes("35b-a3b");
+  const prefill = METRIC_MODE === "prefill" ||
+    state?.effortId === 16 ||
+    effortText.includes("prefill");
+  return qwen36 && largeMoe && prefill && !isGemmaRun(state);
+}
+
+function promptTrunc(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): number | null {
+  const candidates: number[] = [];
+  if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
+    candidates.push(state.bestTokPerSec);
+  }
+  if (lastResult.strongAnswer && lastResult.tokPerSec != null && lastResult.tokPerSec > 0) {
+    candidates.push(lastResult.tokPerSec);
+  }
+  for (const c of state.cycles) {
+    if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
+      candidates.push(c.tokPerSec);
+    }
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
+function highestMatchingCycle(
+  cycles: CycleResult[],
+  predicate: (cycle: CycleResult) => boolean,
+): CycleResult | null {
+  let best: CycleResult | null = null;
+  for (const cycle of cycles) {
+    if (!predicate(cycle) || cycle.tokPerSec == null) continue;
+    if (best == null || (cycle.tokPerSec ?? 0) > (best.tokPerSec ?? 0)) {
+      best = cycle;
+    }
+  }
+  return best;
+}
+
+function cycleSummary(cycle: CycleResult): string {
+  const rate = cycle.tokPerSec == null ? "" : ` (${cycle.tokPerSec.toFixed(1)} tok/s)`;
+  return `cycle ${cycle.cycle}: ${promptTrunc(cycle.description, 118)}${rate}`;
+}
+
+function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+
+  const best = bestAcceptedTokPerSec(state, lastResult);
+  const tokenMajorWin = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && /token-major|shared-gate|topk_weight_and_reduce/i.test(c.description),
+  );
+  const earlyCommitWin = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && /early graph|leading prompt chunk|commit/i.test(c.description),
+  );
+  const routePackFailures = state.cycles.filter((c) => {
+    const text = `${c.description}\n${c.outputText}\n${c.selfAnalysis}`.toLowerCase();
+    return !c.kept && !c.containsReference && /route.?pack|f32 shared.?gate|shared-gate/.test(text);
+  });
+  const dualQ8Failures = state.cycles.filter((c) => {
+    const text = `${c.description}\n${c.outputText}\n${c.selfAnalysis}`.toLowerCase();
+    return !c.kept && !c.containsReference && /dual.?q8|two-row|qkv\+z|attn_qkv\+attn_gate/.test(text);
+  });
+  const bangOnlyFailures = state.cycles.filter((c) => !c.kept && /^!+$/.test(c.outputText.trim()));
+
+  const lines: string[] = [
+    "## Qwen3.6 35B Prefill 50 tok/s Focus",
+  ];
+
+  if (best != null) {
+    const gap = QWEN36_PREFILL_INTERMEDIATE_TARGET - best;
+    if (gap > 0) {
+      const pct = ((gap / best) * 100).toFixed(1);
+      lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; the next milestone is ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} prefill tok/s, a +${gap.toFixed(1)} tok/s (${pct}%) gap.`);
+    } else {
+      lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; keep pushing past the 50 tok/s milestone with correctness intact.`);
+    }
+  } else {
+    lines.push(`- No accepted prefill baseline is known yet; establish one before chasing the ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} tok/s milestone.`);
+  }
+
+  if (tokenMajorWin) {
+    lines.push(`- Banked win to build on: ${cycleSummary(tokenMajorWin)}. This is the current productive MoE direction.`);
+  }
+  if (earlyCommitWin) {
+    lines.push(`- Banked dispatch win to refine: ${cycleSummary(earlyCommitWin)}. Try measured chunk-size variants before wider graph rewrites.`);
+  }
+
+  const traps: string[] = [];
+  if (routePackFailures.length > 0) {
+    traps.push(`${routePackFailures.length} route-packed/F32 shared-gate correctness failures`);
+  }
+  if (dualQ8Failures.length > 0) {
+    traps.push(`${dualQ8Failures.length} dual-Q8 SSM correctness failures`);
+  }
+  if (bangOnlyFailures.length > 0) {
+    traps.push(`${bangOnlyFailures.length} bang-only outputs`);
+  }
+  if (traps.length > 0) {
+    lines.push(`- Measured-dead traps: ${traps.join(", ")}. Treat their tok/s as invalid until the output contains Paris.`);
+  }
+
+  lines.push(
+    "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
+    "- Next high-leverage moves for 50+: extend the accepted token-major F32 shared-gate combine safely, reduce remaining SSM projection/conv/delta launch overhead, and A/B early prompt commit chunk sizes with the same 5-sample prefill contract.",
+    "- If adding a validator or microbench, make it report the exact layer, prompt-token count, max abs diff, and flag-on command so the next cycle can decide whether to promote or abandon it.",
+    "",
+  );
+
+  return lines;
 }
 
 function zigBuildArgs(): string[] {
@@ -1366,6 +1497,11 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
   if (state.reviewSummaries && state.reviewSummaries.length > 0) {
     // Include the latest review
     sections.push(state.reviewSummaries[state.reviewSummaries.length - 1], "");
+  }
+
+  const qwen36PrefillFocus = buildQwen36PrefillFocus(state, lastResult);
+  if (qwen36PrefillFocus.length > 0) {
+    sections.push(...qwen36PrefillFocus);
   }
 
   sections.push(

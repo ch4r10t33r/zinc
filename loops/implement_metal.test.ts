@@ -611,6 +611,61 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("shader: 3/5 kept");
   });
 
+  test("Effort 16 prompt includes 50 tok/s Qwen prefill focus and fast-wrong traps", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 43.8,
+      stalledCycles: 11,
+      cycles: [
+        makeCycle({
+          cycle: 89,
+          kept: true,
+          tokPerSec: 43.4,
+          description: "Adapted vLLM topk_weight_and_reduce with a token-major Qwen F32 shared-gate MoE combine kernel.",
+        }),
+        makeCycle({
+          cycle: 95,
+          kept: false,
+          tokPerSec: 43.5,
+          containsReference: false,
+          description: "Adapted a dual Q8 SSM attn_qkv+attn_gate path.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 96,
+          kept: false,
+          tokPerSec: 44.5,
+          containsReference: false,
+          description: "Enabled Qwen layer-0 F32 shared-gate route-packed prefill.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 100,
+          kept: true,
+          tokPerSec: 43.8,
+          description: "Adapted early graph submission by committing a 16-token leading prompt chunk.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 43.8,
+      tokPerSecSamples: [43.7, 43.8, 43.9],
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Qwen3.6 35B Prefill 50 tok/s Focus");
+    expect(prompt).toContain("50.0 prefill tok/s");
+    expect(prompt).toContain("token-major Qwen F32 shared-gate");
+    expect(prompt).toContain("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1");
+    expect(prompt).toContain("full active-prompt validation");
+    expect(prompt).toContain("dual-Q8 SSM");
+  });
+
   test("correctness regression prompt tells agent to restore output", () => {
     const state = makeState({
       currentBest: { tokPerSec: 36, containsReference: true },
