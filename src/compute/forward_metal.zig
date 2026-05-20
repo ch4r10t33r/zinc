@@ -2304,6 +2304,7 @@ pub const InferenceEngine = struct {
     dmmv_mxfp4_moe_sg_pipe: MetalPipeline,
     dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
+    dmmv_q8_0_k512_quad_pipe: MetalPipeline,
     dmmv_q8_0_quad_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
     dmmv_q8_0_pair_pipe: MetalPipeline,
@@ -2793,6 +2794,7 @@ pub const InferenceEngine = struct {
         self.dmmv_mxfp4_moe_sg_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
         self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
+        self.dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
         self.dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
         self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
@@ -3568,6 +3570,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_sg_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k512_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
@@ -5031,6 +5034,14 @@ pub const InferenceEngine = struct {
                         self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
                     {
                         break :blk .{ .pipe = &self.dmmv_q8_0_lmhead_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k512_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k512_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 shared-down shape: split each K=512 Q8
+                        // block across two lanes so all lanes participate.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
                     }
                     if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
                         self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
@@ -20340,6 +20351,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
     var dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_quad_pipe);
+    var dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k512_quad_pipe);
     var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
@@ -20445,6 +20458,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k512_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
@@ -23215,6 +23229,79 @@ test "dmmv_q8_0_native scalar shader matches CPU reference" {
         var expected: f32 = 0;
         for (0..K) |i| expected += ref_row[i] * input_ptr[i];
         try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.01);
+    }
+}
+
+test "dmmv_q8_0_k512_quad shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 19;
+    const K: usize = 512;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+    const allocator = std.testing.allocator;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + (row % 7) + (blk % 5)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 13 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 7 + 3) % 19);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 9));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+    const block_size: u32 = 512;
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs: u32 = @intCast((M + rows_per_wg - 1) / rows_per_wg);
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
     }
 }
 
