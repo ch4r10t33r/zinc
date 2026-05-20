@@ -12007,30 +12007,56 @@ pub const InferenceEngine = struct {
         return n_tokens >= 16;
     }
 
-    fn qwen36DensePrefillSegmentLayer(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32) ?u32 {
-        if (prompt_len < 16 or self.validation_diagnostics_enabled) return null;
-        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return null;
-        if (!self.isQwen36DenseHybrid27B()) return null;
-        if (!self.isAmdRdna()) return null;
+    fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[16]u32, count: *usize, layer: u32, prefix_layers: u32) void {
+        const cfg = self.model.config;
+        if (count.* >= out.len) return;
+        if (layer <= prefix_layers) return;
+        if (layer + 1 >= cfg.n_layers) return;
+        for (out[0..count.*]) |existing| {
+            if (existing == layer) return;
+        }
+        out[count.*] = layer;
+        count.* += 1;
+    }
+
+    fn qwen36DensePrefillSegmentLayers(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32, out: *[16]u32) usize {
+        if (prompt_len < 16 or self.validation_diagnostics_enabled) return 0;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
+        if (!self.isQwen36DenseHybrid27B()) return 0;
+        if (!self.isAmdRdna()) return 0;
 
         const cfg = self.model.config;
-        if (prefix_layers + 1 >= cfg.n_layers) return null;
-        const parsed = if (std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT")) |raw| blk: {
-            if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return null;
+        if (prefix_layers + 1 >= cfg.n_layers) return 0;
+
+        var count: usize = 0;
+        if (std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT")) |raw| {
+            if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return 0;
             if (std.mem.eql(u8, raw, "1")) {
                 const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
                 var candidate = prefix_layers;
                 while (candidate + 1 < cfg.n_layers) : (candidate += 1) {
-                    if (((candidate + 1) % full_attn_interval) == 0) break :blk candidate;
+                    if (((candidate + 1) % full_attn_interval) == 0) break;
                 }
-                break :blk prefix_layers + 1;
+                self.appendQwen36DensePrefillSegment(out, &count, candidate, prefix_layers);
+                return count;
             }
-            break :blk std.fmt.parseInt(u32, raw, 10) catch return null;
-        } else @as(u32, 15);
 
-        if (parsed <= prefix_layers) return null;
-        if (parsed + 1 >= cfg.n_layers) return null;
-        return parsed;
+            var it = std.mem.splitScalar(u8, raw, ',');
+            while (it.next()) |part_raw| {
+                const part = std.mem.trim(u8, part_raw, " \t\r\n");
+                if (part.len == 0) continue;
+                const parsed = std.fmt.parseInt(u32, part, 10) catch continue;
+                self.appendQwen36DensePrefillSegment(out, &count, parsed, prefix_layers);
+            }
+            return count;
+        }
+
+        const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+        var segment_layer: u32 = full_attn_interval - 1;
+        while (segment_layer + 1 < cfg.n_layers and count < out.len) : (segment_layer += full_attn_interval) {
+            self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
+        }
+        return count;
     }
 
     fn prefillQwen36RunPartialTokenLoop(
@@ -12451,19 +12477,22 @@ pub const InferenceEngine = struct {
 
         const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);
         var tail_start_layer = prefix_layers;
-        if (self.qwen36DensePrefillSegmentLayer(prompt_tokens.len, prefix_layers)) |segment_layer| {
-            log.info("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after prefix_layers={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
+        var segment_layers: [16]u32 = undefined;
+        const n_segment_layers = self.qwen36DensePrefillSegmentLayers(prompt_tokens.len, prefix_layers, &segment_layers);
+        for (segment_layers[0..n_segment_layers]) |segment_layer| {
+            if (segment_layer < tail_start_layer) continue;
+            log.info("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
                 segment_layer,
-                prefix_layers,
+                tail_start_layer,
             });
-            if (segment_layer > prefix_layers) {
+            if (segment_layer > tail_start_layer) {
                 try self.prefillQwen36RunPartialTokenLoop(
                     state,
                     prompt_tokens,
                     base_token,
                     n_tokens,
                     hidden_size,
-                    prefix_layers,
+                    tail_start_layer,
                     segment_layer,
                     scratch_hidden,
                     null,

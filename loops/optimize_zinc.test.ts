@@ -246,9 +246,10 @@ describe("parsePrefillPhaseBudget", () => {
     "info(forward): Prefill GPU phases: per-tok attn=4.50 ms moe=10.40 ms shared=0.50 ms ssm=11.80 ms tail=0.90 ms embed=0.002 ms | totals attn=693.0 moe=1601.6 shared=77.0 ssm=1817.2 tail=138.6 embed=0.3",
     "info(forward): Prefill MoE subphases totals: router=301.0 topk=120.0 gate_up=480.0 swiglu=80.0 down=540.0 weighted_acc=80.6 ms",
     "info(forward): Prefill SSM subphases totals: proj=1300.0 conv=150.0 delta=210.0 gnorm=90.0 out=67.2 ms",
+    "info(forward): Prefill dense_ffn subphases totals: gateup=2100.0 gate=1000.0 up=900.0 down=900.0 ms",
   ].join("\n");
 
-  test("parses per-token averages, totals, MoE and SSM sub-buckets", () => {
+  test("parses per-token averages, totals, MoE, SSM, and dense FFN sub-buckets", () => {
     const budget = parsePrefillPhaseBudget(sample);
     expect(budget).not.toBeNull();
     expect(budget!.perTokenMs.attn).toBeCloseTo(4.5, 2);
@@ -257,6 +258,8 @@ describe("parsePrefillPhaseBudget", () => {
     expect(budget!.totalsMs.ssm).toBeCloseTo(1817.2, 1);
     expect(budget!.moeTotalsMs.gate_up).toBeCloseTo(480.0, 1);
     expect(budget!.ssmTotalsMs.proj).toBeCloseTo(1300.0, 1);
+    expect(budget!.denseTotalsMs?.gateup).toBeCloseTo(2100.0, 1);
+    expect(budget!.denseTotalsMs?.down).toBeCloseTo(900.0, 1);
   });
 
   test("biggestBucket picks the largest non-embed total", () => {

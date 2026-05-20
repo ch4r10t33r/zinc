@@ -580,13 +580,16 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Do not flip ZINC_SSM_DELTA_COLS8=0 or retry ZINC_SSM_DELTA_NORMED_QK=1 without new evidence. Both were mixed or negative on the full 27B matrix.",
       "Do not retry Q6_K K=17408 dense-down specialization or broad Q4/Q6 wide variants. They were flat or negative on the 27B matrix.",
       "Do not widen the fused attention o-proj merge to hidden_dim=5120. It caused a severe long-context regression.",
+      "Do not repeat direct descriptor-offset SSM prefill projection replay. Cycle 36 measured flag OFF 31.34 tok/s vs flag ON 31.22 tok/s and reverted it.",
+      "Do not repeat Q5_K row4 SSM-out, SSM delta tile8, or other SSM-side variants while dense_ffn remains the largest phase bucket. Recent SSM cycles produced zero perf keeps.",
+      "Do not repeat Q4_K scale-unpack cleanup, BN=64 mul_mm_q4k projection batches, Q6_K batched-kpar chunk tuning, prefix dense-down batched accumulate, or wave32 row1 selector without new dense subphase evidence. These measured flat or negative around the 31.29 tok/s checkpoint.",
     ],
     structuralSwingIdeas: [
-      "First build a default-off validation harness for Qwen3.6-27B layer-major prefill. Capture one layer/chunk from the current per-token path, then compare batched dense FFN intermediates: ffn_norm, gate, up, SwiGLU, down, post-FFN hidden.",
-      "Batch dense FFN prefill per layer after validation. The 27B dense FFN streams about 173 MB of weights per layer per token today; amortizing gate/up/down across a token chunk is the main prefill lever.",
-      "Only after dense FFN validation, batch SSM projections per layer and token chunk while keeping conv/delta recurrence exact. Compare wqkv, z, alpha, beta, delta_out, ssm_out, and post-SSM hidden against captures.",
-      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors.",
-      "If decode work is needed after prefill foundation, split dense gate/up/down and SSM projection profiling first. Try one flag-gated candidate at a time; prefer q5_k SSM out or a lower-register-pressure dense gate/up/SwiGLU shape, not the rejected wide fused variant.",
+      "Current corrected-harness profile has dense_ffn as the top bucket (~3.1 s vs SSM ~2.3 s). Next cycles should attack dense_ffn unless a fresh ZINC_PREFILL_PROFILE=1 run shows another bucket overtook it.",
+      "Extend the existing Qwen3.6-27B layer-major dense FFN prefix into a measured segment path for one additional layer after the prefix. Keep it flag-gated, sweep only a few layer indices, and keep only if flag ON beats the 31.29 tok/s checkpoint.",
+      "Fuse dense down projection with residual accumulation for the batched dense FFN path. The current path writes scratch_down, barriers, then scale-accumulates into scratch_hidden; a Q6_K batched down+acc kernel would attack dense_ffn_down without replaying SSM.",
+      "Use the parsed dense_ffn subphase profile before editing. If gateup dominates, improve the existing row1 fused Q4_K gate+up+SwiGLU path structurally; if down dominates, work on down+acc; if neither subphase is dominant, do not burn a cycle on micro-kernel tuning.",
+      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors. Flag-gated paths must be measured flag OFF and flag ON in the same cycle.",
     ],
     referenceImplementations: [
       {
@@ -1257,6 +1260,11 @@ export function formatPhaseBudget(
     const moe = Object.entries(budget.moeTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- MoE sub-buckets (ms): ${moe.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
   }
+  const denseTotals = budget.denseTotalsMs ?? {};
+  if (Object.keys(denseTotals).length > 0) {
+    const dense = Object.entries(denseTotals).sort((a, b) => b[1] - a[1]);
+    lines.push(`- Dense FFN sub-buckets (ms): ${dense.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
+  }
   if (Object.keys(budget.ssmTotalsMs).length > 0) {
     const ssm = Object.entries(budget.ssmTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- SSM sub-buckets (ms): ${ssm.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
@@ -1267,6 +1275,24 @@ export function formatPhaseBudget(
     );
   }
   return lines.join("\n");
+}
+
+function formatDominantBucketDirective(budget: PrefillPhaseBudget | null | undefined): string | null {
+  const biggest = budget?.biggestBucket;
+  if (!biggest) return null;
+  const sorted = Object.entries(budget.totalsMs)
+    .filter(([name]) => name !== "embed")
+    .sort((a, b) => b[1] - a[1]);
+  const runnerUp = sorted.find(([name]) => name !== biggest.name);
+  const runnerUpText = runnerUp ? `; runner-up is ${runnerUp[0]} at ${runnerUp[1].toFixed(1)} ms` : "";
+  const lines = [
+    `The current profile's largest top-level bucket is ${biggest.name} at ${biggest.totalMs.toFixed(1)} ms${runnerUpText}.`,
+    `A cycle that targets another bucket must cite a fresh profile or a concrete dependency that unlocks ${biggest.name}.`,
+  ];
+  if (biggest.name === "dense_ffn") {
+    lines.push("For effort 15, prefer dense layer-major segment work, dense gate/up/SwiGLU structural changes, or dense down+acc fusion. Avoid SSM-only work while dense_ffn remains largest.");
+  }
+  return lines.map((line) => `- ${line}`).join("\n");
 }
 
 function tailHistory(history: string, maxLines = HISTORY_LINES_IN_PROMPT): string {
@@ -1625,6 +1651,9 @@ export function buildAgentPrompt(
   const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
+    : null;
 
   const echoWarning = context
     ? detectEchoChamber(context.cycles, options.referenceImplementations?.map((r) => r.path) ?? [])
@@ -1689,7 +1718,7 @@ ${currentVsBestNote}
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}
@@ -1814,6 +1843,9 @@ export function buildPivotPrompt(
   const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
+    : null;
   const knownFlatBlock = options.knownFlatCategories?.length
     ? options.knownFlatCategories.map((entry, i) => `${i + 1}. ${entry}`).join("\n")
     : null;
@@ -1839,7 +1871,7 @@ ${plan}
 - ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
 ## Committed Foundations From Recent Cycles
 ${committedFoundations}
 

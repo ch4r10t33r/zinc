@@ -173,6 +173,7 @@ export function parseTokPerSec(output: string): number | null {
  *   Prefill GPU phases: per-tok attn=... ms moe=... ms shared=... ms ssm=... ms tail=... ms embed=... ms | totals attn=... moe=... shared=... ssm=... tail=... embed=...
  *   Prefill MoE subphases totals: router=... topk=... gate_up=... swiglu=... down=... weighted_acc=... ms
  *   Prefill SSM subphases totals: proj=... conv=... delta=... gnorm=... out=... ms
+ *   Prefill dense_ffn subphases totals: gateup=... gate=... up=... down=... ms
  */
 export type PrefillPhaseBudget = {
   // Per-token averages in milliseconds (one sample = one prompt token).
@@ -183,6 +184,8 @@ export type PrefillPhaseBudget = {
   moeTotalsMs: Record<string, number>;
   // SSM sub-bucket totals in milliseconds.
   ssmTotalsMs: Record<string, number>;
+  // Dense FFN sub-bucket totals in milliseconds.
+  denseTotalsMs?: Record<string, number>;
   // Cached "biggest top-level bucket" name for quick prompt inclusion.
   biggestBucket: { name: string; totalMs: number } | null;
 };
@@ -217,6 +220,14 @@ export function parsePrefillPhaseBudget(output: string): PrefillPhaseBudget | nu
     }
   }
 
+  const denseLine = cleaned.match(/Prefill dense_ffn subphases totals:\s*([^\n]+)/i);
+  const denseTotalsMs: Record<string, number> = {};
+  if (denseLine) {
+    for (const [, name, value] of denseLine[1].matchAll(/([a-z_]+)\s*=\s*(\d+\.?\d*)/gi)) {
+      denseTotalsMs[name.toLowerCase()] = parseFloat(value);
+    }
+  }
+
   let biggestBucket: { name: string; totalMs: number } | null = null;
   for (const [name, value] of Object.entries(totalsMs)) {
     // "embed" is tiny and not a real optimization target; skip.
@@ -226,7 +237,7 @@ export function parsePrefillPhaseBudget(output: string): PrefillPhaseBudget | nu
     }
   }
 
-  return { perTokenMs, totalsMs, moeTotalsMs, ssmTotalsMs, biggestBucket };
+  return { perTokenMs, totalsMs, moeTotalsMs, ssmTotalsMs, denseTotalsMs, biggestBucket };
 }
 
 /** Parse number of tokens generated from ZINC output. */

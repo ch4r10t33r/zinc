@@ -946,6 +946,7 @@ describe("formatPhaseBudget", () => {
       perTokenMs: { attn: 4.5, moe: 10.4, ssm: 11.8, tail: 0.9 },
       totalsMs: { attn: 693.0, moe: 1601.6, ssm: 1817.2, tail: 138.6, embed: 0.3 },
       moeTotalsMs: { router: 301, topk: 120, gate_up: 480, swiglu: 80, down: 540, weighted_acc: 80 },
+      denseTotalsMs: { gateup: 1200, gate: 550, up: 500, down: 617 },
       ssmTotalsMs: { proj: 1300, conv: 150, delta: 210, gnorm: 90, out: 67 },
       biggestBucket: { name: "ssm", totalMs: 1817.2 },
     }, 0);
@@ -960,6 +961,7 @@ describe("formatPhaseBudget", () => {
     expect(out).not.toContain("embed:");
     expect(out).toContain("Biggest top-level bucket: ssm");
     expect(out).toContain("MoE sub-buckets");
+    expect(out).toContain("Dense FFN sub-buckets");
     expect(out).toContain("SSM sub-buckets");
   });
 });
@@ -997,6 +999,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
           perTokenMs: { attn: 4.5, moe: 10.4, ssm: 11.8, tail: 0.9 },
           totalsMs: { attn: 693, moe: 1601.6, ssm: 1817.2, tail: 138.6 },
           moeTotalsMs: {},
+          denseTotalsMs: { gateup: 1200, down: 600 },
           ssmTotalsMs: { proj: 1300 },
           biggestBucket: { name: "ssm", totalMs: 1817.2 },
         },
@@ -1011,6 +1014,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     );
     expect(prompt).toContain("Current Prefill Phase Budget");
     expect(prompt).toContain("Biggest top-level bucket: ssm");
+    expect(prompt).toContain("Dominant Bucket Directive");
     expect(prompt).toContain("Known Flat Territory");
     expect(prompt).toContain("narrowing compute→compute barriers is flat on RDNA4");
     expect(prompt).toContain("Structural Swing Ideas");
@@ -1047,6 +1051,44 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     expect(prompt).toContain("STRUCTURAL SWING REQUIRED");
     expect(prompt).toContain("structural swing required this cycle: YES");
     expect(prompt).toContain("known-flat pattern");
+  });
+
+  test("dominant bucket directive steers custom 27B prefill labels toward dense FFN", () => {
+    const prompt = buildAgentPrompt(
+      "Step 1",
+      baseline,
+      baseline,
+      37,
+      "",
+      "qwen3627b",
+      {
+        cycles: [],
+        failedApproaches: [],
+        ideas: [],
+        stalledCycles: 4,
+        consecutiveFoundationKeeps: 0,
+        reviewSummary: null,
+        bestPerf: null,
+        phaseBudget: {
+          perTokenMs: { dense_ffn: 8.87, ssm: 6.54, attn: 1.11 },
+          totalsMs: { dense_ffn: 3087, ssm: 2274.5, attn: 387, tail: 1.9 },
+          moeTotalsMs: {},
+          denseTotalsMs: { gateup: 1900, down: 1187 },
+          ssmTotalsMs: { proj: 982.1, delta: 804.6 },
+          biggestBucket: { name: "dense_ffn", totalMs: 3087 },
+        },
+        phaseBudgetCycle: 34,
+      },
+      {
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
+        benchmarkMethod: "site-aligned context-medium Coding Review",
+        structuralSwingIdeas: ["dense down+acc fusion"],
+      },
+    );
+    expect(prompt).toContain("Dominant Bucket Directive");
+    expect(prompt).toContain("largest top-level bucket is dense_ffn");
+    expect(prompt).toContain("Avoid SSM-only work");
+    expect(prompt).toContain("Dense FFN sub-buckets");
   });
 
   test("a freshly-banked foundation keep still demands a swing next cycle", () => {
@@ -1728,6 +1770,7 @@ describe("buildAgentPrompt pivot mode", () => {
           perTokenMs: { attn: 4.5, ssm: 11.8 },
           totalsMs: { attn: 693, ssm: 1817.2 },
           moeTotalsMs: {},
+          denseTotalsMs: {},
           ssmTotalsMs: { proj: 1300 },
           biggestBucket: { name: "ssm", totalMs: 1817.2 },
         },
@@ -1749,6 +1792,7 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("Pivot proposal");
     expect(prompt).toContain("Committed Foundations");
     expect(prompt).toContain("Current Prefill Phase Budget");
+    expect(prompt).toContain("Dominant Bucket Directive");
     expect(prompt).toContain("Biggest top-level bucket: ssm");
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
