@@ -1399,6 +1399,7 @@ const MoeWeightedAccSharedGateF32NormPush = extern struct {
     gate_weight_offset: u32,
     norm_offset: u32,
     eps: f32,
+    hidden_scale: f32,
 };
 
 /// Push constants for sigmoid multiply dispatch (matches sigmoid_mul.metal: buffer(0)).
@@ -10231,11 +10232,9 @@ fn qwenMoeNextAttnNormTarget(
     engine: *InferenceEngine,
     layer_idx: usize,
     layer_count: usize,
-    layer_output_scale: f32,
 ) ?*const MetalBuffer {
     const next_layer_idx = layer_idx + 1;
     if (next_layer_idx >= layer_count or next_layer_idx >= engine.attn_norm_bufs.len) return null;
-    if (layer_output_scale != 1.0) return null;
     if (engine.config.architecture != .qwen2_moe or engine.config.ssm_d_inner == 0) return null;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return null;
     return &engine.attn_norm_bufs[next_layer_idx];
@@ -10256,6 +10255,7 @@ fn dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(
     n_used: u32,
     src_stride: u32,
     norm_byte_offset: u32,
+    hidden_scale: f32,
 ) void {
     const push = MoeWeightedAccSharedGateF32NormPush{
         .n = n,
@@ -10264,6 +10264,7 @@ fn dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(
         .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
         .norm_offset = norm_byte_offset,
         .eps = engine.config.rms_norm_eps,
+        .hidden_scale = hidden_scale,
     };
     const bufs = [_]*const MetalBuffer{
         accum,
@@ -14156,7 +14157,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             // fusion: the MoE finalizer already has the new hidden row in
             // registers, so also emit the next layer's attn/SSM norm row and
             // let the next layer skip its standalone RMSNorm dispatch.
-            dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, &engine.norm_buf, next_attn_norm.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset);
+            dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, &engine.norm_buf, next_attn_norm.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset, hidden_scale);
             wrote_next_attn_norm = true;
         } else if (use_f32_shared_gate_acc) {
             // Adapt vLLM's top-k weight+reduce finalization and llama.cpp's
@@ -14738,10 +14739,13 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        const next_attn_norm = qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count, layer_output_scale);
                         const fold_moe_layer_scale = layer_output_scale != 1.0 and
                             canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
                         const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const next_attn_norm = if (layer_output_scale == 1.0 or fold_moe_layer_scale)
+                            qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
+                        else
+                            null;
                         const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
@@ -15218,10 +15222,13 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        const next_attn_norm = qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count, layer_output_scale);
                         const fold_moe_layer_scale = layer_output_scale != 1.0 and
                             canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
                         const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const next_attn_norm = if (layer_output_scale == 1.0 or fold_moe_layer_scale)
+                            qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
+                        else
+                            null;
                         const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
@@ -23331,6 +23338,7 @@ test "moe_weighted_acc_shared_gate_f32_qwen2048_norm computes reduce and next no
         .gate_weight_offset = 0,
         .norm_offset = 0,
         .eps = eps,
+        .hidden_scale = 0.5,
     };
     const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf, &next_norm_buf, &next_weight_buf };
 
@@ -23352,7 +23360,7 @@ test "moe_weighted_acc_shared_gate_f32_qwen2048_norm computes reduce and next no
             expert_sum += weight * src_ptr[expert * n_usize + i];
         }
         const initial = 0.003 * @as(f32, @floatFromInt(i % 19));
-        const h = initial + expert_sum + gate * shared_ptr[i];
+        const h = (initial + expert_sum + gate * shared_ptr[i]) * 0.5;
         expected_hidden[i] = h;
         sum_sq += @as(f64, h) * @as(f64, h);
     }

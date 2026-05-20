@@ -8,6 +8,7 @@ struct Params {
     uint gate_weight_offset;
     uint norm_offset;
     float eps;
+    float hidden_scale;
 };
 
 // Exact Qwen3.6 token-major MoE finalize plus next-layer RMSNorm.
@@ -72,7 +73,7 @@ kernel void main0(
         sum = fma(route_weights[6], src[12288u + id], sum);
         sum = fma(route_weights[7], src[14336u + id], sum);
 
-        const float h = hidden[id] + sum + gate * shared_src[id];
+        const float h = (hidden[id] + sum + gate * shared_src[id]) * p.hidden_scale;
         hidden[id] = h;
         h_vals[h_count] = h;
         h_idxs[h_count] = id;
