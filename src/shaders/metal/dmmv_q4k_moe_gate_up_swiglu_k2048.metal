@@ -123,6 +123,7 @@ kernel void main0(
     const float gate_sum = simd_sum(gate_acc);
     const float up_sum = simd_sum(up_acc);
     if (lane == 0u) {
-        swigluY[p.gate_y_offset / 4u + expert_slot * p.M + row] = (gate_sum / (1.0f + exp(-gate_sum))) * up_sum;
+        swigluY[p.gate_y_offset / 4u + expert_slot * p.M + row] =
+            gate_sum * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum)) * up_sum;
     }
 }
