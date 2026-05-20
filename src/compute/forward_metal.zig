@@ -9394,7 +9394,7 @@ fn recordQwenSsmProjectionChunkOnCmd(
     const beta_t = lt.ssm_beta orelse return error.MissingTensor;
 
     dispatchRmsNormOnCmd(engine, cmd, input, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-    profileBarrier(cmd, profile, .ssm);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
     dispatchGemmQ8_0OnCmd(engine, cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
     dispatchGemmQ8_0OnCmd(engine, cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
     if (canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim)) {
@@ -9403,7 +9403,12 @@ fn recordQwenSsmProjectionChunkOnCmd(
     if (canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim)) {
         try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
     }
-    profileBarrier(cmd, profile, .ssm);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+    });
 }
 
 fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
@@ -11274,7 +11279,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
 
     var cmd = try beginProfiledCommand(engine, profile);
     dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
-    profileBarrier(&cmd, profile, .ssm);
+    profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
     dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
     dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
     const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
@@ -11285,7 +11290,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     if (beta_batched) {
         try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
     }
-    profileBarrier(&cmd, profile, .ssm);
+    profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
     const branch_batched =
         alpha_batched and
         beta_batched and
@@ -11327,7 +11332,11 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             0,
         );
         if (profile) |p| p.ssm_conv_calls += 1;
-        profileBarrier(&cmd, profile, .ssm);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+        });
 
         {
             const push = SsmDeltaNetPrefillPush{
@@ -11361,7 +11370,10 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
-        profileBarrier(&cmd, profile, .ssm);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_branch_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
+        });
 
         dispatchSsmGatedNormBatchedOffsetsWithPipe(
             &cmd,
@@ -11381,7 +11393,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             n_tokens,
         );
         if (profile) |p| p.ssm_gated_norm_calls += 1;
-        profileBarrier(&cmd, profile, .ssm);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_branch_buf});
 
         dispatchGemmQ8_0OnCmd(engine, &cmd, ssm_out_t, &engine.qwen_ssm_prefill_branch_buf, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_dim, d_inner, n_tokens);
 
@@ -11391,7 +11403,10 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         // This keeps MoE routing on the validated per-token path but removes
         // one residual+rms_norm dispatch from every prompt token.
         dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
-        profileBarrier(&cmd, profile, .ssm);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_branch_buf,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+        });
         {
             const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
             const bufs = [_]*const MetalBuffer{
