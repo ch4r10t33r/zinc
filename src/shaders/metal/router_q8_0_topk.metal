@@ -33,11 +33,6 @@ kernel void main0(
     threadgroup float values[MAX_EXPERTS];
     threadgroup float selected_val[MAX_K_USED];
 
-    if (local_id < MAX_EXPERTS) {
-        values[local_id] = -INFINITY;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     device const float* input = X + (p.x_offset >> 2);
     const uint blocks_per_row = p.K >> 5;
     const ulong row_bytes = ulong(blocks_per_row) * 34ull;

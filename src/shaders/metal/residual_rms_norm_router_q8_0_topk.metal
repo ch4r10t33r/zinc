@@ -78,9 +78,8 @@ kernel void main0(
         }
     }
 
-    if (local_id < MAX_EXPERTS) {
-        values[local_id] = -INFINITY;
-    }
+    // All valid expert rows are overwritten below. This barrier only makes the
+    // freshly materialized norm_cache visible to the router matvec.
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint blocks_per_row = p.K >> 5;
