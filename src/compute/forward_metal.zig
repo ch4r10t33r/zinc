@@ -2328,6 +2328,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_proj_validate_layer: u32,
     qwen_ssm_prefill_proj_active_tokens: u32,
     qwen_ssm_prefill_branch_active_tokens: u32,
+    qwen_ssm_prefill_branch_norm_active_tokens: u32,
     qwen_ssm_proj_validate_norm_buf: MetalBuffer,
     qwen_ssm_proj_validate_qkv_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_z_ref_buf: MetalBuffer,
@@ -2480,6 +2481,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_ssm_prefill_branch_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_norm_active_tokens = 0;
         self.qwen_ssm_proj_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_qkv_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_z_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3624,6 +3626,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_ssm_prefill_branch_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_norm_active_tokens = 0;
         self.qwen_moe_route_validate_target_tokens = 0;
         self.qwen_moe_route_validate_failure_hint_emitted = false;
 
@@ -3737,12 +3740,20 @@ pub const InferenceEngine = struct {
 
         for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
             const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[pending_count], null, 0);
+            const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                &self.qwen_ssm_prefill_branch_buf
+            else
+                &self.prefill_embed_buf;
+            try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, 0);
             pending_count += 1;
         }
 
         const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
-        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null, null, 0);
+        const final_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > pending_token_count)
+            &self.qwen_ssm_prefill_branch_buf
+        else
+            &self.prefill_embed_buf;
+        try runDecodeStep(self, true, final_src, final_offset, null, null, 0);
         state.position = self.position;
     }
 
@@ -3985,7 +3996,11 @@ pub const InferenceEngine = struct {
             errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
             for (prompt_tokens[0..split_token], 0..) |_, i| {
                 const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-                try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, null, &first_prompt_cmd, 0);
+                const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                    &self.qwen_ssm_prefill_branch_buf
+                else
+                    &self.prefill_embed_buf;
+                try runDecodeStep(self, false, embed_src, embed_offset, null, &first_prompt_cmd, 0);
             }
             commitAsyncProfiled(&first_prompt_cmd, profile);
         }
@@ -3995,10 +4010,18 @@ pub const InferenceEngine = struct {
 
         for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
             const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, null, &prompt_cmd, 0);
+            const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                &self.qwen_ssm_prefill_branch_buf
+            else
+                &self.prefill_embed_buf;
+            try runDecodeStep(self, false, embed_src, embed_offset, null, &prompt_cmd, 0);
         }
         const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
-        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null, &prompt_cmd, 0);
+        const final_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > pending_token_count)
+            &self.qwen_ssm_prefill_branch_buf
+        else
+            &self.prefill_embed_buf;
+        try runDecodeStep(self, true, final_src, final_offset, null, &prompt_cmd, 0);
         commitAndWaitProfiled(&prompt_cmd, profile);
         state.position = self.position;
     }
@@ -10498,6 +10521,7 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
 fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize, async_out: ?*MetalCommand) !bool {
     engine.qwen_ssm_prefill_proj_active_tokens = 0;
     engine.qwen_ssm_prefill_branch_active_tokens = 0;
+    engine.qwen_ssm_prefill_branch_norm_active_tokens = 0;
     if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return false;
 
     const cfg = engine.config;
@@ -10546,6 +10570,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         d_inner > 0 and
         cfg.ssm_d_state > 0 and
         d_inner % dt_rank == 0;
+    var branch_norm_batched = false;
     if (branch_batched) {
         const d_conv = cfg.ssm_d_conv;
         const d_state = cfg.ssm_d_state;
@@ -10623,10 +10648,25 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         profileBarrier(&cmd, profile, .ssm);
 
         dispatchGemmQ8_0OnCmd(engine, &cmd, ssm_out_t, &engine.qwen_ssm_prefill_branch_buf, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_dim, d_inner, n_tokens);
-        // No in-encoder consumer follows this SSM-out materialization. Match
-        // llama.cpp's Metal graph discipline: barrier only when the next
-        // encoded op reads the write; the command queue orders later prompt
-        // command buffers.
+
+        // Adapt llama.cpp `ggml_metal_graph_compute` output materialization:
+        // while layer-0 SSM is already layer-major, also materialize the
+        // post-SSM hidden row and FFN norm that token-major MoE consumes.
+        // This keeps MoE routing on the validated per-token path but removes
+        // one residual+rms_norm dispatch from every prompt token.
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
+        profileBarrier(&cmd, profile, .ssm);
+        {
+            const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
+            const bufs = [_]*const MetalBuffer{
+                &engine.qwen_ssm_prefill_branch_buf,
+                &engine.qwen_ssm_prefill_proj_norm_buf,
+                &engine.qwen_ssm_prefill_proj_norm_buf,
+                &engine.ffn_norm_bufs[0],
+            };
+            cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+        }
+        branch_norm_batched = true;
     }
     if (async_out) |out| {
         commitAsyncProfiled(&cmd, profile);
@@ -10643,14 +10683,21 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
 
     engine.qwen_ssm_prefill_proj_active_tokens = n_tokens;
     engine.qwen_ssm_prefill_branch_active_tokens = if (branch_batched) n_tokens else 0;
+    engine.qwen_ssm_prefill_branch_norm_active_tokens = if (branch_norm_batched) n_tokens else 0;
     if (engine.profile_enabled) {
-        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched });
+        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={} branch_norm_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched, branch_norm_batched });
     }
     return true;
 }
 
 fn shouldUseQwenSsmPrefillBranchChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
-    return engine.qwen_ssm_prefill_branch_active_tokens > engine.position and layer_idx == 0;
+    return engine.qwen_ssm_prefill_branch_active_tokens > engine.position and
+        engine.qwen_ssm_prefill_branch_norm_active_tokens <= engine.position and
+        layer_idx == 0;
+}
+
+fn shouldUseQwenSsmPrefillBranchNormChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.qwen_ssm_prefill_branch_norm_active_tokens > engine.position and layer_idx == 0;
 }
 
 fn shouldUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
@@ -13632,9 +13679,17 @@ fn runDecodeStep(
                 try captureQwenRoutePackedLayerInput(engine, hidden_dim);
             }
 
+            const use_prefill_branch_norm = shouldUseQwenSsmPrefillBranchNormChunk(engine, layer_idx);
             var ssm_residual_buf: *const MetalBuffer = &engine.down_buf;
             var ssm_residual_offset: u32 = 0;
-            if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
+            if (use_prefill_branch_norm) {
+                // `prepareQwenSsmPrefillProjectionChunk` already materialized
+                // hidden += layer0_ssm_out and the FFN norm for this token.
+                // The step-level hidden copy reads the precomputed hidden row;
+                // copy only the matching norm row into the single-token buffer
+                // before the validated token-major router/MoE path.
+                dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, engine.position * hidden_dim, 0);
+            } else if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
                 // Adapt llama.cpp's `ggml_metal_op_concurrency_check` discipline:
                 // the layer-0 precompute command buffer already materialized this
                 // branch output, so read the token slice directly instead of
@@ -13904,7 +13959,9 @@ fn runDecodeStep(
 
             // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
             // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
-            dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+            if (!use_prefill_branch_norm) {
+                dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+            }
             if (!is_moe and layer_shared_cmd != null) {
                 profileBarrier(cmd, profile, .dense_ffn);
             }
