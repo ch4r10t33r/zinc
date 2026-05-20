@@ -33,6 +33,7 @@ struct MetalCmd {
     id<MTLCommandBuffer> cmd_buf;
     id<MTLComputeCommandEncoder> encoder;
     id<MTLComputePipelineState> current_pipeline;
+    void* current_buffers[64];
     uint8_t is_concurrent;
 };
 
@@ -372,6 +373,26 @@ static inline void mtl_set_pipeline_if_needed(MetalCmd* cmd, MetalPipe* pipe) {
     }
 }
 
+static inline void mtl_set_buffer_if_needed(MetalCmd* cmd, MetalBuf* buf, uint32_t idx) {
+    if (!buf || !buf->buffer) return;
+
+    void* current = (__bridge void*)buf->buffer;
+    if (idx < 64 && cmd->current_buffers[idx] == current) {
+        return;
+    }
+
+    [cmd->encoder setBuffer:buf->buffer offset:0 atIndex:idx];
+    if (idx < 64) {
+        cmd->current_buffers[idx] = current;
+    }
+}
+
+static inline void mtl_mark_bytes_binding(MetalCmd* cmd, uint32_t idx) {
+    if (idx < 64) {
+        cmd->current_buffers[idx] = NULL;
+    }
+}
+
 void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
                   const uint32_t grid[3], const uint32_t block[3],
                   MetalBuf** bufs, uint32_t n_bufs,
@@ -383,13 +404,14 @@ void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
     // Bind data buffers at indices 0..n_bufs-1
     for (uint32_t i = 0; i < n_bufs; i++) {
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:i];
+            mtl_set_buffer_if_needed(cmd, bufs[i], i);
         }
     }
 
     // Bind push constants as a buffer at index n_bufs (equivalent to Vulkan push constants)
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:n_bufs];
+        mtl_mark_bytes_binding(cmd, n_bufs);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -410,13 +432,14 @@ void mtl_dispatch_v2(MetalCmd* cmd, MetalPipe* pipe,
     for (uint32_t i = 0; i < n_bufs; i++) {
         uint32_t slot = (i < push_idx) ? i : (i + 1);
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:slot];
+            mtl_set_buffer_if_needed(cmd, bufs[i], slot);
         }
     }
 
     // Bind push constants at push_idx via setBytes (inlined into command buffer)
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
+        mtl_mark_bytes_binding(cmd, push_idx);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -436,12 +459,13 @@ void mtl_dispatch_v2_tgmem(MetalCmd* cmd, MetalPipe* pipe,
     for (uint32_t i = 0; i < n_bufs; i++) {
         uint32_t slot = (i < push_idx) ? i : (i + 1);
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:slot];
+            mtl_set_buffer_if_needed(cmd, bufs[i], slot);
         }
     }
 
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
+        mtl_mark_bytes_binding(cmd, push_idx);
     }
 
     if (tg_mem_size > 0) {
