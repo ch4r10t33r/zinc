@@ -2313,6 +2313,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_moe_k2048_pipe: MetalPipeline,
     dmmv_q4k_moe_k2048_1024_pipe: MetalPipeline,
     dmmv_q4k_moe_gate_up_dual_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_dual_k2048_pipe: MetalPipeline,
 
     // Elementwise compute pipelines (for batched GPU dispatch)
     deinterleave_pipe: MetalPipeline,
@@ -2797,6 +2798,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048");
         self.dmmv_q4k_moe_k2048_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048_1024");
         self.dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+        self.dmmv_q4k_moe_gate_up_dual_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
 
         // Elementwise pipelines for batched GPU dispatch
         self.deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
@@ -3564,6 +3566,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_1024_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_k2048_pipe);
         metal_pipeline.freePipeline(&self.deinterleave_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_q8_pipe);
@@ -6798,11 +6801,22 @@ fn dispatchDmmvMoeGateUpDualQ4kOnCmd(
         .up_y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, gate_output_buf, up_output_buf, routing_buf };
+    const use_qwen_k2048 =
+        engine.config.architecture == .qwen2_moe and
+        M == 512 and
+        K == 2048 and
+        engine.config.n_experts_used == 8 and
+        engine.dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null;
+    const pipe = if (use_qwen_k2048)
+        &engine.dmmv_q4k_moe_gate_up_dual_k2048_pipe
+    else
+        &engine.dmmv_q4k_moe_gate_up_dual_pipe;
+    const block_size: u32 = if (use_qwen_k2048) 512 else 256;
     const rows_per_wg: u32 = 16;
     cmd.dispatchV2(
-        &engine.dmmv_q4k_moe_gate_up_dual_pipe,
+        pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
-        .{ 256, 1, 1 },
+        .{ block_size, 1, 1 },
         &bufs,
         &push,
         @sizeOf(MoeGateUpDualDmmvPush),
@@ -18291,6 +18305,125 @@ test "dmmv_q4k_moe_gate_up shader matches CPU reference across selected experts"
     }
 }
 
+test "dmmv_q4k_moe_gate_up_dual_k2048 matches cached dual path" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var ref_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+    defer metal_pipeline.freePipeline(&ref_pipe);
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 17;
+    const K: usize = 2048;
+    const n_used: usize = 2;
+    const n_experts: usize = 3;
+    const x_pad: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 144;
+    const expert_stride: usize = M * row_bytes;
+
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+    var up_weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&up_weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + n_used * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var gate_ref_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_ref_buf);
+    var up_ref_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&up_ref_buf);
+    var gate_out_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_out_buf);
+    var up_out_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&up_out_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(gate_weight_buf.cpu_ptr.?[0..gate_weight_buf.size], 0);
+    @memset(up_weight_buf.cpu_ptr.?[0..up_weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(gate_ref_buf.cpu_ptr.?[0..gate_ref_buf.size], 0);
+    @memset(up_ref_buf.cpu_ptr.?[0..up_ref_buf.size], 0);
+    @memset(gate_out_buf.cpu_ptr.?[0..gate_out_buf.size], 0);
+    @memset(up_out_buf.cpu_ptr.?[0..up_out_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for ([_]*MetalBuffer{ &gate_weight_buf, &up_weight_buf }, 0..) |buf, tensor_idx| {
+        for (0..n_experts) |expert| {
+            for (0..M) |row| {
+                for (0..blocks_per_row) |blk| {
+                    const base = expert * expert_stride + row * row_bytes + blk * 144;
+                    const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + tensor_idx * 5 + expert + (row % 7) + blk))));
+                    const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((tensor_idx * 13 + expert + row + blk) % 9)))));
+                    const d_bits = @as(u16, @bitCast(d));
+                    const dmin_bits = @as(u16, @bitCast(dmin));
+                    buf.cpu_ptr.?[base] = @truncate(d_bits);
+                    buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                    buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                    buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                    for (0..12) |i| {
+                        buf.cpu_ptr.?[base + 4 + i] = @intCast((tensor_idx * 41 + expert * 31 + row * 9 + blk * 5 + i * 3) & 0xFF);
+                    }
+                    for (0..128) |i| {
+                        const lo: u8 = @intCast((tensor_idx * 23 + expert * 19 + row * 13 + blk * 17 + i * 7) & 0x0F);
+                        const hi: u8 = @intCast((tensor_idx * 29 + expert * 11 + row * 5 + blk * 3 + i * 9) & 0x0F);
+                        buf.cpu_ptr.?[base + 16 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 23 + i * 19 + 5) % 21);
+            input_ptr[x_pad + slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 10));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 2;
+    routing_ptr[1] = 0;
+
+    const push = MoeGateUpDualDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .gate_a_offset = 0,
+        .up_a_offset = 0,
+        .gate_expert_stride = @intCast(expert_stride),
+        .up_expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+
+    {
+        const bufs = [_]*const MetalBuffer{ &gate_weight_buf, &up_weight_buf, &input_buf, &gate_ref_buf, &up_ref_buf, &routing_buf };
+        var cmd = try metal_command.beginCommand(ctx);
+        cmd.dispatchV2(&ref_pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpDualDmmvPush), 1);
+        cmd.commitAndWait();
+    }
+    {
+        const bufs = [_]*const MetalBuffer{ &gate_weight_buf, &up_weight_buf, &input_buf, &gate_out_buf, &up_out_buf, &routing_buf };
+        var cmd = try metal_command.beginCommand(ctx);
+        cmd.dispatchV2(&pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpDualDmmvPush), 1);
+        cmd.commitAndWait();
+    }
+
+    const gate_ref: [*]const f32 = @ptrCast(@alignCast(gate_ref_buf.cpu_ptr.?));
+    const up_ref: [*]const f32 = @ptrCast(@alignCast(up_ref_buf.cpu_ptr.?));
+    const gate_out: [*]const f32 = @ptrCast(@alignCast(gate_out_buf.cpu_ptr.?));
+    const up_out: [*]const f32 = @ptrCast(@alignCast(up_out_buf.cpu_ptr.?));
+    for (0..n_used * M) |i| {
+        try std.testing.expectApproxEqAbs(gate_ref[i], gate_out[i], 0.01);
+        try std.testing.expectApproxEqAbs(up_ref[i], up_out[i], 0.01);
+    }
+}
+
 test "dmmv_q5_1_moe shader matches CPU reference across selected experts" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -19921,6 +20054,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_pipe);
     var dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_pipe);
+    var dmmv_q4k_moe_gate_up_dual_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_k2048_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
     var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
@@ -20019,6 +20154,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
