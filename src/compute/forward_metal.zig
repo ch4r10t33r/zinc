@@ -1234,6 +1234,18 @@ const ResidualRmsNormPush = extern struct {
     residual_offset: u32,
 };
 
+/// Push constants for residual_rms_norm + Q8 router top-k fusion.
+const ResidualRmsNormRouterQ8TopkPush = extern struct {
+    n: u32,
+    eps: f32,
+    scale: f32,
+    residual_offset: u32,
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+};
+
 /// Push constants for triple-fused residual_norm + residual_add + output_norm
 /// (matches post_norm_residual_rms_norm.metal: buffer(0)). Replaces the
 /// separate post_*_norm + barrier + residual_rms_norm pair. `hidden_scale`
@@ -2412,6 +2424,7 @@ pub const InferenceEngine = struct {
     moe_weighted_acc_pipe: MetalPipeline,
     moe_weighted_acc_scaled_pipe: MetalPipeline,
     residual_rms_norm_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
@@ -2908,6 +2921,7 @@ pub const InferenceEngine = struct {
         self.moe_weighted_acc_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc");
         self.moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
         self.residual_rms_norm_pipe = try loadShaderPipeline(ctx, "residual_rms_norm");
+        self.residual_rms_norm_router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
@@ -3688,6 +3702,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.moe_weighted_acc_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_scaled_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
@@ -7409,6 +7424,61 @@ fn dispatchResidualRmsNormOffsetOnCmd(
     const push = ResidualRmsNormPush{ .n = n, .eps = engine.config.rms_norm_eps, .scale = scale, .residual_offset = residual_offset };
     const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, weights };
     cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+}
+
+fn canUseQwenResidualRmsNormRouterQ8Topk(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    residual_offset: u32,
+) bool {
+    return (readBoolEnv("ZINC_METAL_QWEN_RESIDUAL_ROUTER_Q8_FUSED") orelse true) and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k <= 16 and
+        residual_offset == 0 and
+        router.info.type_ == .q8_0 and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.max_threads_per_threadgroup >= 1024;
+}
+
+fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    router: *const metal_loader.LoadedTensor,
+    output: *const MetalBuffer,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    const push = ResidualRmsNormRouterQ8TopkPush{
+        .n = hidden_dim,
+        .eps = engine.config.rms_norm_eps,
+        .scale = scale,
+        .residual_offset = residual_offset,
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, router),
+    };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output };
+    cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
 }
 
 /// Triple-fused: residual_norm + residual_add + output_norm.
@@ -14630,8 +14700,42 @@ fn runDecodeStep(
 
             // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
             // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
+            var residual_router_output_ready = false;
             if (!use_prefill_branch_norm) {
-                dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+                if (is_moe and
+                    !skip_pre_ffn_router and
+                    use_standard_gpu_routed_moe and
+                    ffn_norm_input_buf == &engine.norm_buf and
+                    ffn_norm_input_byte_offset == 0)
+                {
+                    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+                    if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, ssm_residual_offset)) {
+                        // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                        // router discipline and vLLM's compact top-k finalize:
+                        // materialize the exact token-major norm row and route
+                        // ids in one dispatch, then feed the unchanged MoE path.
+                        dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+                            engine,
+                            cmd,
+                            &engine.hidden_buf,
+                            ssm_residual_buf,
+                            &engine.norm_buf,
+                            &engine.ffn_norm_bufs[layer_idx],
+                            router_t,
+                            &engine.router_output_buf,
+                            hidden_dim,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            1.0,
+                            ssm_residual_offset,
+                        );
+                        residual_router_output_ready = true;
+                    } else {
+                        dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+                    }
+                } else {
+                    dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+                }
             }
             if (!is_moe and layer_shared_cmd != null) {
                 profileBarrier(cmd, profile, .dense_ffn);
@@ -14640,7 +14744,7 @@ fn runDecodeStep(
                 // The direct branch-norm row was produced by the earlier
                 // precompute command buffer, so queue ordering is the
                 // dependency; there is no current-encoder write to flush.
-                if (!use_direct_prefill_branch_norm) {
+                if (!use_direct_prefill_branch_norm and !residual_router_output_ready) {
                     profileBarrier(cmd, profile, .router);
                 }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
@@ -14660,11 +14764,14 @@ fn runDecodeStep(
                     break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 };
                 const use_fused_q8_router =
+                    !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else if (residual_router_output_ready) {
+                    // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
                 } else {
@@ -14682,7 +14789,7 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset);
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset);
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
