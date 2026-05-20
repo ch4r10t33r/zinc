@@ -30,15 +30,19 @@ kernel void main0(
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
 ) {
-    if (p.n != 2048u) {
+    if (p.n != 2048u || p.n_used != 8u || p.src_stride != 2048u) {
         return;
     }
 
     threadgroup float gate_partials[32];
     threadgroup float norm_partials[32];
+    threadgroup float route_weights[8];
     device const float* gate_weight = (device const float*)(gate_weight_bytes + p.gate_weight_offset);
     device const float* norm = norm_src + (p.norm_offset >> 2);
     const uint threads_per_tg = simdgroups_per_tg * 32u;
+    if (tid < 8u) {
+        route_weights[tid] = as_type<float>(routing[8u + tid]);
+    }
 
     float gate_dot = 0.0f;
     for (uint dim = tid; dim < p.n; dim += threads_per_tg) {
@@ -59,11 +63,14 @@ kernel void main0(
     uint h_count = 0u;
     float hidden_sq = 0.0f;
     for (uint id = tid; id < p.n; id += threads_per_tg) {
-        float sum = 0.0f;
-        for (uint expert = 0u; expert < p.n_used; expert++) {
-            const float weight = as_type<float>(routing[p.n_used + expert]);
-            sum += weight * src[expert * p.src_stride + id];
-        }
+        float sum = route_weights[0] * src[id];
+        sum = fma(route_weights[1], src[2048u + id], sum);
+        sum = fma(route_weights[2], src[4096u + id], sum);
+        sum = fma(route_weights[3], src[6144u + id], sum);
+        sum = fma(route_weights[4], src[8192u + id], sum);
+        sum = fma(route_weights[5], src[10240u + id], sum);
+        sum = fma(route_weights[6], src[12288u + id], sum);
+        sum = fma(route_weights[7], src[14336u + id], sum);
 
         const float h = hidden[id] + sum + gate * shared_src[id];
         hidden[id] = h;
