@@ -13748,7 +13748,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
 
     if (!router_output_ready) {
         dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
-        profileBarrier(cmd, profile, .gpu_routed_moe); // router_output_buf visible before expert DMMVs
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.router_output_buf}); // router_output_buf visible before expert DMMVs
     }
 
     // Phase B: gate+up expert DMMVs + shared expert DMMVs — all independent, overlap in concurrent mode.
@@ -13816,7 +13816,39 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             }
         }
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up outputs visible before SwiGLU
+    {
+        // llama.cpp's `ggml_metal_op_concurrency_check/reset` places barriers at
+        // dependency edges. In Qwen's token-major routed MoE, Phase B only hands
+        // activation buffers to Phase C/D, so scope the barrier to those resources
+        // instead of flushing every buffer touched by independent DMMVs.
+        var barrier_bufs: [6]*const MetalBuffer = undefined;
+        var barrier_count: usize = 0;
+        if (use_fused_q4k_gate_up_swiglu) {
+            barrier_bufs[barrier_count] = &engine.expert_swiglu_batch_buf;
+            barrier_count += 1;
+        } else {
+            barrier_bufs[barrier_count] = &engine.expert_gate_batch_buf;
+            barrier_count += 1;
+            barrier_bufs[barrier_count] = &engine.expert_up_batch_buf;
+            barrier_count += 1;
+        }
+        if (has_shexp) {
+            if (use_fused_shared_q8_swiglu) {
+                barrier_bufs[barrier_count] = &engine.swiglu_buf;
+                barrier_count += 1;
+            } else {
+                barrier_bufs[barrier_count] = &engine.gate_buf;
+                barrier_count += 1;
+                barrier_bufs[barrier_count] = &engine.up_buf;
+                barrier_count += 1;
+            }
+            if (gate_inp_shexp != null and !use_f32_shared_gate_acc) {
+                barrier_bufs[barrier_count] = &engine.router_logits_buf;
+                barrier_count += 1;
+            }
+        }
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, barrier_bufs[0..barrier_count]); // gate/up outputs visible before SwiGLU/down
+    }
 
     // Phase C: SwiGLU — batched experts + shared expert overlap.
     var phase_c_dispatched = false;
@@ -13835,7 +13867,17 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         }
     }
     if (phase_c_dispatched) {
-        profileBarrier(cmd, profile, .gpu_routed_moe); // SwiGLU outputs visible before down DMMVs
+        var barrier_bufs: [2]*const MetalBuffer = undefined;
+        var barrier_count: usize = 0;
+        if (!use_fused_q4k_gate_up_swiglu) {
+            barrier_bufs[barrier_count] = &engine.expert_swiglu_batch_buf;
+            barrier_count += 1;
+        }
+        if (has_shexp and !use_fused_shared_q8_swiglu) {
+            barrier_bufs[barrier_count] = &engine.swiglu_buf;
+            barrier_count += 1;
+        }
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, barrier_bufs[0..barrier_count]); // SwiGLU outputs visible before down DMMVs
     }
 
     // Phase D: down expert DMMVs + shared down — overlap.
@@ -13843,7 +13885,11 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     if (has_shexp) {
         dispatchDmmvOnCmd(engine, cmd, down_shexp.?, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // down outputs visible before accumulate
+    if (has_shexp) {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{ &engine.expert_down_batch_buf, &engine.down_buf }); // down outputs visible before accumulate
+    } else {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.expert_down_batch_buf}); // down outputs visible before accumulate
+    }
 
     // Phase E: weighted accumulate + shared expert into hidden_buf (fused — saves one barrier per layer).
     if (has_shexp) {
@@ -13860,7 +13906,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     } else {
         dispatchMoeWeightedAccOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, cfg.n_experts_used, hidden_dim);
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer's RMS norm
+    profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.hidden_buf}); // hidden_buf visible to next layer's RMS norm
 }
 
 fn recordGpuRoutedGptOssMoeOnCmd(
