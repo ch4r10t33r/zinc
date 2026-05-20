@@ -419,6 +419,36 @@ fn ssmDeltaGatedNormThreadgroupSize(
     return 64;
 }
 
+fn canUseQwenSsmConvD4FastPath(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) bool {
+    return defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+        conv_channels == 8192 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        engine.ssm_conv1d_qwen_d4_pipe.handle != null;
+}
+
+fn ssmConv1dThreadgroupSize(
+    pipe: *const MetalPipeline,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) u32 {
+    if (conv_channels == 8192 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
+}
+
 const DmmvPathClass = enum(u8) {
     other,
     ssm,
@@ -2341,6 +2371,7 @@ pub const InferenceEngine = struct {
 
     // SSM GPU pipelines (cross-compiled from GLSL via SPIRV-Cross)
     ssm_conv1d_pipe: MetalPipeline,
+    ssm_conv1d_qwen_d4_pipe: MetalPipeline,
     ssm_conv1d_prefill_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
     ssm_delta_net_offset_pipe: MetalPipeline,
@@ -2927,6 +2958,7 @@ pub const InferenceEngine = struct {
 
         // SSM GPU pipelines
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
+        self.ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
         self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
         self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
@@ -3585,6 +3617,7 @@ pub const InferenceEngine = struct {
         self.allocator.free(self.layer_tensors);
 
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
@@ -7854,7 +7887,8 @@ fn dispatchSsmConv1dOffsetWithPipe(
         .input_offset = input_offset,
     };
     const bufs = [_]*const MetalBuffer{ kernel, state, current_input, output };
-    cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
+    const block_size = ssmConv1dThreadgroupSize(pipe, conv_channels, d_conv, kernel_is_f16);
+    cmd.dispatchV2(pipe, .{ (conv_channels + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
 }
 
 fn dispatchSsmConv1dPrefillOnCmd(
@@ -14037,9 +14071,13 @@ fn runDecodeStep(
                         engine.position * conv_channels
                     else
                         0;
+                    const conv_pipe = if (canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, false))
+                        &engine.ssm_conv1d_qwen_d4_pipe
+                    else
+                        &engine.ssm_conv1d_pipe;
                     dispatchSsmConv1dOffsetWithPipe(
                         cmd,
-                        &engine.ssm_conv1d_pipe,
+                        conv_pipe,
                         &engine.ssm_conv_kernel_bufs.?[layer_idx],
                         &engine.ssm_conv_state_bufs.?[layer_idx],
                         conv_input_buf,
@@ -16958,6 +16996,20 @@ test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
     }
 }
 
+test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 128), ssmConv1dThreadgroupSize(&pipe, 8192, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 3, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 4096, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 4, true));
+}
+
 test "ssm_conv1d shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -19798,6 +19850,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
     var ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
     defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_pipe);
+    var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
@@ -19847,6 +19901,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(moe_weighted_acc_shared_gate_f32_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
 }
 
 test "deinterleave shader splits block-interleaved Q and gate" {
