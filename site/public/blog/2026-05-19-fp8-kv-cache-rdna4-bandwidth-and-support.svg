@@ -1,0 +1,225 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" role="img" aria-labelledby="title desc">
+  <title id="title">FP8 KV cache decode bandwidth gain on Qwen3 and where the kernel runs in production today</title>
+  <desc id="desc">A two-panel data visualization on a soft slate-blue background. The left panel is a grouped vertical bar chart comparing per-token KV cache bytes against measured decode ITL slope as a percentage of BF16 for four KV formats: FP16, Q8_0, FP8 E4M3FN, and Q4_0. FP8 E4M3FN is highlighted with a bold outline showing the validated 54 percent decode slope from the vLLM April 22 2026 blog. The right panel is a five-by-four support matrix grid showing where FP8 KV cache plus FP8 attention runs in production across vLLM Flash Attention 3, vLLM FlashInfer, SGLang, llama.cpp HIP, and llama.cpp Vulkan on H100 Hopper, B200 Blackwell, MI350X CDNA, and R9700 RDNA4 gfx1201.</desc>
+
+  <style>
+    .bg { fill: #e8edf4; }
+    .panel { fill: #ffffff; stroke: #c4cbd8; stroke-width: 1; }
+    .ink { fill: #1b2333; }
+    .ink-soft { fill: #4a5468; }
+    .ink-faint { fill: #7b8499; }
+    .axis { stroke: #b8c0cf; stroke-width: 1; }
+    .grid { stroke: #d4dae5; stroke-width: 0.75; stroke-dasharray: 2 3; }
+    .label { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11.5px; fill: #1b2333; }
+    .label-soft { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #4a5468; }
+    .label-faint { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10px; fill: #7b8499; }
+    .label-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #1b2333; }
+    .label-bold { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11.5px; fill: #1b2333; font-weight: 600; }
+    .title-text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: #1b2333; font-weight: 600; }
+    .panel-title { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #1b2333; font-weight: 600; }
+    .subtitle { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11px; fill: #4a5468; }
+    .bar-bytes { fill: #3d5a85; }
+    .bar-slope { fill: #d97548; }
+    .bar-est { fill: #e3a781; stroke: #d97548; stroke-width: 0.75; stroke-dasharray: 3 2; }
+    .accent-outline { stroke: #1b2333; stroke-width: 2; }
+    .cell-green { fill: #4a8f5e; }
+    .cell-yellow { fill: #d9b04a; }
+    .cell-gray { fill: #b8c0cf; }
+    .cell-red { fill: #c0533a; }
+    .cell-outline { stroke: #1b2333; stroke-width: 2.2; fill: none; }
+  </style>
+
+  <rect class="bg" width="960" height="600"/>
+
+  <!-- Header -->
+  <text class="title-text" x="32" y="34">The FP8 KV cache cut on RDNA4: what it buys and where it actually runs</text>
+  <text class="subtitle" x="32" y="52">Decode ITL slopes from the vLLM April 22 2026 Hopper benchmark on Qwen3 and Llama 3.1; support cells from public engine source as of May 2026</text>
+
+  <!-- ============ LEFT PANEL: grouped bar chart ============ -->
+  <rect class="panel" x="32" y="72" width="468" height="476" rx="6"/>
+  <text class="panel-title" x="48" y="96">Per-token KV bytes vs decode ITL slope</text>
+  <text class="label-soft" x="48" y="112">Lower bar is bytes per element; right bar is ITL slope as % of BF16</text>
+
+  <!-- Axes -->
+  <!-- Plot area: x from 80 to 470, y from 150 to 460. -->
+  <!-- Left y-axis: 0 to 2.5 bytes per element. -->
+  <!-- Right y-axis: 0 to 100% slope. -->
+
+  <!-- Left y-axis ticks (bytes) -->
+  <line class="axis" x1="80" y1="150" x2="80" y2="460"/>
+  <line class="axis" x1="80" y1="460" x2="470" y2="460"/>
+
+  <line class="grid" x1="80" y1="150" x2="470" y2="150"/>
+  <line class="grid" x1="80" y1="212" x2="470" y2="212"/>
+  <line class="grid" x1="80" y1="274" x2="470" y2="274"/>
+  <line class="grid" x1="80" y1="336" x2="470" y2="336"/>
+  <line class="grid" x1="80" y1="398" x2="470" y2="398"/>
+
+  <text class="label-faint" x="74" y="153" text-anchor="end">2.5</text>
+  <text class="label-faint" x="74" y="215" text-anchor="end">2.0</text>
+  <text class="label-faint" x="74" y="277" text-anchor="end">1.5</text>
+  <text class="label-faint" x="74" y="339" text-anchor="end">1.0</text>
+  <text class="label-faint" x="74" y="401" text-anchor="end">0.5</text>
+  <text class="label-faint" x="74" y="463" text-anchor="end">0</text>
+  <text class="label-soft" x="42" y="305" transform="rotate(-90 42 305)" text-anchor="middle">bytes per K or V element</text>
+
+  <!-- Right y-axis ticks (slope %) -->
+  <line class="axis" x1="470" y1="150" x2="470" y2="460"/>
+  <text class="label-faint" x="476" y="153">100%</text>
+  <text class="label-faint" x="476" y="215">80%</text>
+  <text class="label-faint" x="476" y="277">60%</text>
+  <text class="label-faint" x="476" y="339">40%</text>
+  <text class="label-faint" x="476" y="401">20%</text>
+  <text class="label-faint" x="476" y="463">0%</text>
+
+  <!-- Bars. Group centers at x=140, 220, 300, 380. Bar width 24.  -->
+  <!-- Bytes scale: 2.5 -> 0 maps 150 -> 460. So bar_top = 460 - (bytes/2.5)*310.  -->
+  <!-- Slope scale: 100% -> 0 maps 150 -> 460. So bar_top = 460 - (slope/100)*310. -->
+
+  <!-- FP16: bytes=2.000 -> top=460 - 248 = 212. slope=100 -> top=150 -->
+  <rect class="bar-bytes" x="120" y="212" width="22" height="248"/>
+  <rect class="bar-slope" x="146" y="150" width="22" height="310"/>
+  <text class="label-bold" x="144" y="478" text-anchor="middle">FP16</text>
+  <text class="label-mono" x="131" y="206" text-anchor="middle" fill="#1b2333">2.000</text>
+  <text class="label-mono" x="157" y="144" text-anchor="middle" fill="#1b2333">100%</text>
+
+  <!-- Q8_0: bytes=1.0625 -> top=460 - 131.75 = 328.25. slope=70 -> top=460 - 217 = 243 -->
+  <rect class="bar-bytes" x="200" y="328" width="22" height="132"/>
+  <rect class="bar-slope" x="226" y="243" width="22" height="217"/>
+  <text class="label-bold" x="224" y="478" text-anchor="middle">Q8_0</text>
+  <text class="label-mono" x="211" y="322" text-anchor="middle" fill="#1b2333">1.0625</text>
+  <text class="label-mono" x="237" y="237" text-anchor="middle" fill="#1b2333">~70%</text>
+
+  <!-- FP8 E4M3FN: bytes=1.000 -> top=460 - 124 = 336. slope=54 -> top=460 - 167.4 = 292.6 -->
+  <rect class="bar-bytes accent-outline" x="280" y="336" width="22" height="124"/>
+  <rect class="bar-slope accent-outline" x="306" y="293" width="22" height="167"/>
+  <text class="label-bold" x="304" y="478" text-anchor="middle" fill="#1b2333">FP8</text>
+  <text class="label-soft" x="304" y="492" text-anchor="middle">E4M3FN</text>
+  <text class="label-mono" x="291" y="330" text-anchor="middle" fill="#1b2333" font-weight="600">1.000</text>
+  <text class="label-mono" x="317" y="287" text-anchor="middle" fill="#1b2333" font-weight="600">54%</text>
+
+  <!-- Q4_0: bytes=0.5625 -> top=460 - 69.75 = 390.25. slope ~55 (estimated dashed) -> top=460 - 170.5 = 289.5 -->
+  <rect class="bar-bytes" x="360" y="390" width="22" height="70"/>
+  <rect class="bar-est" x="386" y="290" width="22" height="170"/>
+  <text class="label-bold" x="384" y="478" text-anchor="middle">Q4_0</text>
+  <text class="label-mono" x="371" y="384" text-anchor="middle" fill="#1b2333">0.5625</text>
+  <text class="label-mono" x="397" y="284" text-anchor="middle" fill="#4a5468">~55% est.</text>
+
+  <!-- Annotation callout for FP8 -->
+  <line stroke="#1b2333" stroke-width="1" x1="328" y1="293" x2="395" y2="170"/>
+  <rect fill="#fffbed" stroke="#1b2333" stroke-width="1" x="270" y="100" width="190" height="58" rx="4"/>
+  <text class="label-bold" x="280" y="118">vLLM April 22 2026</text>
+  <text class="label-soft" x="280" y="132">Llama 3.1 8B on H100 FA3:</text>
+  <text class="label-soft" x="280" y="146">ITL slope 4.37e-5 → 2.37e-5</text>
+
+  <!-- Legend -->
+  <rect class="bar-bytes" x="80" y="510" width="14" height="14"/>
+  <text class="label-soft" x="100" y="521">bytes per element</text>
+  <rect class="bar-slope" x="215" y="510" width="14" height="14"/>
+  <text class="label-soft" x="235" y="521">ITL slope vs BF16</text>
+  <rect class="bar-est" x="340" y="510" width="14" height="14"/>
+  <text class="label-soft" x="360" y="521">estimate</text>
+
+  <text class="label-faint" x="80" y="540">Q8_0 slope reflects symmetric -ctk q8_0 -ctv q8_0 with fused FA;</text>
+  <text class="label-faint" x="80" y="554">Q4_0 dequantizes inside the kernel and the slope is a rough estimate.</text>
+
+  <!-- ============ RIGHT PANEL: support matrix ============ -->
+  <rect class="panel" x="516" y="72" width="412" height="476" rx="6"/>
+  <text class="panel-title" x="532" y="96">Where FP8 KV cache + FP8 attention runs in production</text>
+  <text class="label-soft" x="532" y="112">Cells in the R9700 column are the gap zinc has to take</text>
+
+  <!-- Matrix grid. 5 rows (engines), 4 columns (hardware). -->
+  <!-- Column headers at y=148. Cells from y=160 to y=440 in 5 rows of 56px each. -->
+  <!-- Row labels x=534 to 706; cells start at x=716 to x=908, 4 cells of 48px each -->
+
+  <!-- Column headers -->
+  <text class="label-bold" x="740" y="142" text-anchor="middle">H100</text>
+  <text class="label-faint" x="740" y="154" text-anchor="middle">Hopper</text>
+  <text class="label-bold" x="788" y="142" text-anchor="middle">B200</text>
+  <text class="label-faint" x="788" y="154" text-anchor="middle">Blackwell</text>
+  <text class="label-bold" x="836" y="142" text-anchor="middle">MI350X</text>
+  <text class="label-faint" x="836" y="154" text-anchor="middle">CDNA</text>
+  <text class="label-bold" x="884" y="142" text-anchor="middle">R9700</text>
+  <text class="label-faint" x="884" y="154" text-anchor="middle">RDNA4 gfx1201</text>
+
+  <!-- Vertical divider for R9700 column -->
+  <rect fill="#f3f5fa" x="860" y="160" width="48" height="280"/>
+
+  <!-- Row 1: vLLM FA3 -->
+  <text class="label" x="700" y="190" text-anchor="end">vLLM FA3</text>
+  <rect class="cell-green" x="716" y="170" width="48" height="40"/>
+  <text class="label-mono" x="740" y="195" text-anchor="middle" fill="#ffffff">native</text>
+  <rect class="cell-gray" x="764" y="170" width="48" height="40"/>
+  <text class="label-mono" x="788" y="195" text-anchor="middle" fill="#ffffff">—</text>
+  <rect class="cell-gray" x="812" y="170" width="48" height="40"/>
+  <text class="label-mono" x="836" y="195" text-anchor="middle" fill="#ffffff">—</text>
+  <rect class="cell-gray" x="860" y="170" width="48" height="40"/>
+  <text class="label-mono" x="884" y="195" text-anchor="middle" fill="#ffffff">—</text>
+
+  <!-- Row 2: vLLM FlashInfer -->
+  <text class="label" x="700" y="246" text-anchor="end">vLLM FlashInfer</text>
+  <rect class="cell-gray" x="716" y="226" width="48" height="40"/>
+  <text class="label-mono" x="740" y="251" text-anchor="middle" fill="#ffffff">—</text>
+  <rect class="cell-green" x="764" y="226" width="48" height="40"/>
+  <text class="label-mono" x="788" y="251" text-anchor="middle" fill="#ffffff">native</text>
+  <rect class="cell-yellow" x="812" y="226" width="48" height="40"/>
+  <text class="label-mono" x="836" y="251" text-anchor="middle" fill="#1b2333">wt FP8</text>
+  <rect class="cell-gray" x="860" y="226" width="48" height="40"/>
+  <text class="label-mono" x="884" y="251" text-anchor="middle" fill="#ffffff">—</text>
+
+  <!-- Row 3: SGLang -->
+  <text class="label" x="700" y="302" text-anchor="end">SGLang</text>
+  <rect class="cell-green" x="716" y="282" width="48" height="40"/>
+  <text class="label-mono" x="740" y="307" text-anchor="middle" fill="#ffffff">native</text>
+  <rect class="cell-yellow" x="764" y="282" width="48" height="40"/>
+  <text class="label-mono" x="788" y="307" text-anchor="middle" fill="#1b2333">FP8 KV</text>
+  <rect class="cell-yellow" x="812" y="282" width="48" height="40"/>
+  <text class="label-mono" x="836" y="307" text-anchor="middle" fill="#1b2333">wt FP8</text>
+  <rect class="cell-gray" x="860" y="282" width="48" height="40"/>
+  <text class="label-mono" x="884" y="307" text-anchor="middle" fill="#ffffff">—</text>
+
+  <!-- Row 4: llama.cpp HIP -->
+  <text class="label" x="700" y="358" text-anchor="end">llama.cpp HIP</text>
+  <rect class="cell-yellow" x="716" y="338" width="48" height="40"/>
+  <text class="label-mono" x="740" y="358" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="740" y="372" text-anchor="middle">sym</text>
+  <rect class="cell-gray" x="764" y="338" width="48" height="40"/>
+  <text class="label-mono" x="788" y="363" text-anchor="middle" fill="#ffffff">—</text>
+  <rect class="cell-yellow" x="812" y="338" width="48" height="40"/>
+  <text class="label-mono" x="836" y="358" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="836" y="372" text-anchor="middle">sym</text>
+  <rect class="cell-yellow" x="860" y="338" width="48" height="40"/>
+  <text class="label-mono" x="884" y="358" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="884" y="372" text-anchor="middle">sym</text>
+
+  <!-- Row 5: llama.cpp Vulkan -->
+  <text class="label" x="700" y="414" text-anchor="end">llama.cpp Vulkan</text>
+  <rect class="cell-yellow" x="716" y="394" width="48" height="40"/>
+  <text class="label-mono" x="740" y="414" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="740" y="428" text-anchor="middle">sym</text>
+  <rect class="cell-yellow" x="764" y="394" width="48" height="40"/>
+  <text class="label-mono" x="788" y="414" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="788" y="428" text-anchor="middle">sym</text>
+  <rect class="cell-yellow" x="812" y="394" width="48" height="40"/>
+  <text class="label-mono" x="836" y="414" text-anchor="middle" fill="#1b2333">Q8_0</text>
+  <text class="label-faint" x="836" y="428" text-anchor="middle">sym</text>
+  <rect class="cell-yellow" x="860" y="394" width="48" height="40"/>
+  <rect class="cell-outline" x="860" y="394" width="48" height="40"/>
+  <text class="label-mono" x="884" y="414" text-anchor="middle" fill="#1b2333" font-weight="600">Q8_0</text>
+  <text class="label-faint" x="884" y="428" text-anchor="middle">sym</text>
+
+  <!-- Legend for matrix -->
+  <rect class="cell-green" x="532" y="460" width="14" height="14"/>
+  <text class="label-soft" x="552" y="471">native FP8 KV + FP8 attn</text>
+  <rect class="cell-yellow" x="700" y="460" width="14" height="14"/>
+  <text class="label-soft" x="720" y="471">partial / weight FP8 only</text>
+  <rect class="cell-gray" x="532" y="482" width="14" height="14"/>
+  <text class="label-soft" x="552" y="493">not built</text>
+  <rect class="cell-outline" x="700" y="482" width="14" height="14"/>
+  <text class="label-soft" x="720" y="493">zinc's slot to take</text>
+
+  <text class="label-faint" x="532" y="514">RDNA4 has v_wmma_f32_16x16x16_fp8_fp8 documented in the</text>
+  <text class="label-faint" x="532" y="528">RDNA4 ISA but no Vulkan attention shader currently reads</text>
+  <text class="label-faint" x="532" y="542">an FP8 KV tile through it.</text>
+
+</svg>

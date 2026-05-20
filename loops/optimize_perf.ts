@@ -612,7 +612,19 @@ export function getEffortSpec(effort: number): EffortSpec | null {
   return EFFORT_SPECS[effort] ?? null;
 }
 
-const BENCHMARK_SAMPLES = 3;
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+const BENCHMARK_MIN_SAMPLES = 3;
+const BENCHMARK_MAX_SAMPLES = Math.max(
+  BENCHMARK_MIN_SAMPLES,
+  positiveIntEnv("ZINC_BENCH_MAX_SAMPLES", 5),
+);
+// If the primary metric is noisy, collect a couple of extra samples instead
+// of making a keep/revert decision from a lucky or unlucky 3-run median.
+const BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT = 0.015;
 // Absolute floor on a "material improvement" in tok/s. Previously 0.5,
 // which rejected three effort-6 cycles (13/16/21) that produced gains of
 // 0.29-0.45 tok/s with sample noise well below the gap. Lowered to 0.2 so
@@ -660,6 +672,10 @@ const PIVOT_STALL_THRESHOLD = 3;
 // implementations on disk (llama.cpp, vllm) so the agent can steal
 // known-good patterns instead of guessing.
 const REFERENCE_IMPLS_STALL_THRESHOLD = 4;
+
+function shouldCleanRemoteBenchmarkNode(): boolean {
+  return process.env.ZINC_SKIP_REMOTE_CLEAN !== "1";
+}
 
 // Multiple prompts to catch different failure modes:
 // - Short factual: catches total corruption
@@ -879,6 +895,24 @@ async function rsyncToRemote(): Promise<void> {
     `${REPO_ROOT}/`, `${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/`,
   ], { timeout: 120_000 });
   if (exitCode !== 0) throw new Error(`rsync failed: ${stderr.slice(0, 300)}`);
+}
+
+async function cleanRemoteBenchmarkNode(): Promise<void> {
+  if (!shouldCleanRemoteBenchmarkNode()) return;
+  console.log(c("2", "  Cleaning stale RDNA benchmark processes..."));
+  try {
+    await ssh(
+      [
+        "pkill -f '[z]ig-out/bin/zinc' || true",
+        "pkill -f '[l]lama-server' || true",
+        "pkill -f '[l]lama-cli' || true",
+        "sleep 1",
+      ].join("; "),
+      30_000,
+    );
+  } catch (e) {
+    console.log(c("1;33", `  Warning: remote cleanup failed; benchmark may be contaminated (${String(e).slice(0, 120)})`));
+  }
 }
 
 // -- Build & benchmark -------------------------------------------------------
@@ -1496,6 +1530,24 @@ export function sampleStdev(samples: number[]): number {
   return Math.sqrt(variance);
 }
 
+export function relativeSampleSpread(samples: number[]): number {
+  const med = median(samples);
+  if (med == null || med <= 0 || samples.length < 2) return 0;
+  const min = Math.min(...samples);
+  const max = Math.max(...samples);
+  return (max - min) / med;
+}
+
+export function shouldCollectExtraBenchSample(
+  samples: number[],
+  minSamples = BENCHMARK_MIN_SAMPLES,
+  maxSamples = BENCHMARK_MAX_SAMPLES,
+): boolean {
+  if (samples.length < minSamples) return true;
+  if (samples.length >= maxSamples) return false;
+  return relativeSampleSpread(samples) >= BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT;
+}
+
 /**
  * Noise-aware override: when a candidate's sample dispersion is tight and
  * the gain vs best is a multiple of that noise, the measurement is
@@ -2052,13 +2104,19 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
   }
 
   const parseMetric = metricParserForSpec(effortSpec);
+  const samplePlan = BENCHMARK_MAX_SAMPLES > BENCHMARK_MIN_SAMPLES
+    ? `${BENCHMARK_MIN_SAMPLES}-${BENCHMARK_MAX_SAMPLES}`
+    : `${BENCHMARK_MIN_SAMPLES}`;
   console.log(c(
     "2",
-    `  Benchmarking (${BENCHMARK_SAMPLES} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
+    `  Benchmarking (${samplePlan} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
   ));
   const tokPerSecSamples: number[] = [];
   const bandwidthSamples: number[] = [];
-  for (let sample = 0; sample < BENCHMARK_SAMPLES; sample++) {
+  for (let sample = 0; sample < BENCHMARK_MAX_SAMPLES; sample++) {
+    if (sample >= BENCHMARK_MIN_SAMPLES && !shouldCollectExtraBenchSample(tokPerSecSamples)) {
+      break;
+    }
     let benchOutput: string;
     try {
       benchOutput = await ssh(
@@ -2083,9 +2141,12 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     const bw = effortSpec.metricMode === "decode" ? parseBandwidthUtil(benchOutput) : null;
     if (tps != null) tokPerSecSamples.push(tps);
     if (bw != null) bandwidthSamples.push(bw);
+    const sampleLabel = sample < BENCHMARK_MIN_SAMPLES
+      ? `${sample + 1}/${BENCHMARK_MIN_SAMPLES}`
+      : `extra ${sample + 1}/${BENCHMARK_MAX_SAMPLES}`;
     console.log(c(
       "2",
-      `    sample ${sample + 1}/${BENCHMARK_SAMPLES}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
+      `    sample ${sampleLabel}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
     ));
   }
 
@@ -2612,19 +2673,22 @@ async function saveLoopState(state: LoopState): Promise<void> {
   await writeFile(statePathForEffort(state.effort), JSON.stringify(state, null, 2));
 }
 
-export function benchmarkSignatureForSpec(spec: EffortSpec): string {
+export function benchmarkSignatureForSpec(spec: EffortSpec, modelKey?: string, modelPath?: string): string {
+  const selectedModelKey = modelKey ?? spec.defaultModel ?? null;
   return JSON.stringify({
     doc: spec.doc,
     metricMode: spec.metricMode,
     primaryMetricLabel: spec.primaryMetricLabel,
+    modelKey: selectedModelKey,
+    modelPath: modelPath ?? (selectedModelKey ? MODELS[selectedModelKey]?.path ?? null : null),
     benchmarkPrompt: spec.benchmarkPrompt,
     benchmarkMaxTokens: spec.benchmarkMaxTokens,
     benchmarkMethod: spec.benchmarkMethod,
   });
 }
 
-export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec): boolean {
-  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec);
+export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec, modelKey?: string, modelPath?: string): boolean {
+  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec, modelKey, modelPath);
 }
 
 function createInitialState(
@@ -2853,6 +2917,7 @@ async function main() {
 
   // Step 1: Sync and get baseline
   console.log(c("1;33", "\u2500\u2500 Baseline " + "\u2500".repeat(54)));
+  await cleanRemoteBenchmarkNode();
   await rsyncToRemote();
   const originalBaseline = await buildAndBench(modelTarget, effortSpec);
 
@@ -2879,7 +2944,7 @@ async function main() {
     }
   }
 
-  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec);
+  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec, model, modelTarget.path);
   let currentCode = originalBaseline;
   let bestPerf = originalBaseline;
   let bestTokPerSec = bestPerf.tokPerSec ?? 0;
@@ -2892,7 +2957,7 @@ async function main() {
   if (resume) {
     const saved = await loadLoopState(effort);
     if (saved) {
-      if (!isResumeStateCompatible(saved, effortSpec)) {
+      if (!isResumeStateCompatible(saved, effortSpec, model, modelTarget.path)) {
         console.log(c(
           "1;33",
           "  Resume note: saved state uses an older or different benchmark signature. Ignoring it and starting fresh for this effort.",
@@ -3044,6 +3109,7 @@ async function main() {
 
     // Sync and benchmark — with up to 2 fix-up retries if build fails
     console.log(c("2", "  Syncing changes..."));
+    await cleanRemoteBenchmarkNode();
     await rsyncToRemote();
     let result = await buildAndBench(modelTarget, effortSpec);
 

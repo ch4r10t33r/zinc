@@ -24,7 +24,9 @@ import {
   introducesRuntimeFlag,
   isMeasuredDeadRevert,
   passesNoiseAwareOverride,
+  relativeSampleSpread,
   sampleStdev,
+  shouldCollectExtraBenchSample,
   isResumeStateCompatible,
   isMaterialImprovement,
   loadPreviousRun,
@@ -529,6 +531,33 @@ describe("controller helpers", () => {
     }, spec!);
     expect(legacyStateCompatible).toBe(false);
   });
+
+  test("resume compatibility includes the selected model key and path", () => {
+    const spec = getEffortSpec(15);
+    expect(spec).not.toBeNull();
+    const saved = {
+      effort: 15,
+      planDoc: "MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+      benchmarkSignature: benchmarkSignatureForSpec(spec!, "qwen3627b", "/root/models/Qwen3.6-27B-Q4_K_M.gguf"),
+      runStartedAt: "2026-05-20T00:00:00.000Z",
+      lastUpdatedAt: "2026-05-20T00:00:00.000Z",
+      lastCycle: 16,
+      bestTokPerSec: 38.55,
+      bestCycle: 16,
+      bestCommitHash: "d1b4033",
+      bestResult: null,
+      stalledCycles: 0,
+      consecutiveFoundationKeeps: 0,
+      cycles: [],
+      failedApproaches: [],
+      ideas: [],
+      reviewSummaries: [],
+    };
+
+    expect(isResumeStateCompatible(saved, spec!, "qwen3627b", "/root/models/Qwen3.6-27B-Q4_K_M.gguf")).toBe(true);
+    expect(isResumeStateCompatible(saved, spec!, "qwen36b", "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe(false);
+    expect(isResumeStateCompatible(saved, spec!, "qwen3627b", "/root/models/other.gguf")).toBe(false);
+  });
 });
 
 describe("controller memory helpers", () => {
@@ -920,6 +949,14 @@ describe("config", () => {
   test("startup banner shows cycles for the current run", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
     expect(src).toContain("Cycles this run:");
+  });
+
+  test("remote benchmark cleanup is enabled with an escape hatch", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain("cleanRemoteBenchmarkNode");
+    expect(src).toContain("ZINC_SKIP_REMOTE_CLEAN");
+    expect(src).toContain("pkill -f '[z]ig-out/bin/zinc'");
+    expect(src).toContain("pkill -f '[l]lama-server'");
   });
 
   test("claude invocations pin the 1M-context Opus model and max effort", async () => {
@@ -1315,6 +1352,18 @@ describe("introducesRuntimeFlag / hasFlagOnMeasurementEvidence", () => {
 describe("sampleStdev + passesNoiseAwareOverride", () => {
   test("sampleStdev returns 0 for a single sample", () => {
     expect(sampleStdev([42])).toBe(0);
+  });
+
+  test("relativeSampleSpread reports spread around the median", () => {
+    expect(relativeSampleSpread([100, 101, 99])).toBeCloseTo(0.02, 4);
+    expect(relativeSampleSpread([100])).toBe(0);
+  });
+
+  test("shouldCollectExtraBenchSample requests extra samples only for noisy runs", () => {
+    expect(shouldCollectExtraBenchSample([38.55, 38.56], 3, 5)).toBe(true);
+    expect(shouldCollectExtraBenchSample([38.55, 38.56, 38.54], 3, 5)).toBe(false);
+    expect(shouldCollectExtraBenchSample([38.00, 38.80, 38.40], 3, 5)).toBe(true);
+    expect(shouldCollectExtraBenchSample([38.00, 38.80, 38.40, 38.35, 38.50], 3, 5)).toBe(false);
   });
 
   test("sampleStdev on cycle-16-like samples is near zero", () => {
