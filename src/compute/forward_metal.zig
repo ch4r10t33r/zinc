@@ -272,11 +272,12 @@ fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u
 fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const name = tensor.info.name;
 
-    // Keep the llama.cpp-style Q8_0 128-thread shape available for A/B, but do
-    // not force it by default. llama.cpp's ggml-metal Q8 path is selected with
-    // shape-specific function constants, and the Effort 16 profile shows the
-    // current default is GPU-work bound rather than command-submit bound.
-    if (!(readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_TG128") orelse false)) return false;
+    // Adapt llama.cpp `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` and
+    // `ggml-metal-impl.h`'s Q8_0 geometry (N_R0=2, N_SG=4): Qwen3.6 SSM
+    // prompt prefill is dominated by these Q8 projections, and the 128-thread
+    // shape keeps the per-row reduction close to the production Metal backend
+    // instead of the wider Apple9 override.
+    if ((readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_TG128") orelse true) == false) return false;
 
     if (K == 2048 and M >= 4096 and
         (std.mem.endsWith(u8, name, "attn_qkv.weight") or
