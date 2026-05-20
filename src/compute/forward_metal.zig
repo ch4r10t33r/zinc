@@ -2385,6 +2385,7 @@ pub const InferenceEngine = struct {
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
+    moe_weighted_acc_shared_gate_f32_qwen2048_pipe: MetalPipeline,
     copy_u32_pipe: MetalPipeline,
     copy_f32_pipe: MetalPipeline,
     zero_f32_pipe: MetalPipeline,
@@ -2877,6 +2878,7 @@ pub const InferenceEngine = struct {
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+        self.moe_weighted_acc_shared_gate_f32_qwen2048_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
         self.copy_u32_pipe = try loadShaderPipeline(ctx, "copy_u32");
         self.copy_f32_pipe = try loadShaderPipeline(ctx, "copy_f32");
         self.zero_f32_pipe = try loadShaderPipeline(ctx, "zero_f32");
@@ -3653,6 +3655,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_qwen2048_pipe);
         metal_pipeline.freePipeline(&self.copy_u32_pipe);
         metal_pipeline.freePipeline(&self.copy_f32_pipe);
         metal_pipeline.freePipeline(&self.zero_f32_pipe);
@@ -9866,6 +9869,19 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
         .norm_offset = norm_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
+    const use_qwen2048 =
+        n == 2048 and
+        n_used == 8 and
+        src_stride == 2048 and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        (readBoolEnv("ZINC_METAL_QWEN_F32_GATE_ACC_QWEN2048") orelse true) and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe.thread_execution_width == 32 and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe.max_threads_per_threadgroup >= 1024;
+    if (use_qwen2048) {
+        cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+        return;
+    }
     const block_size: u32 = if (n >= 512 and engine.moe_weighted_acc_shared_gate_f32_pipe.max_threads_per_threadgroup >= 512) 512 else 256;
     cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
 }
@@ -20779,6 +20795,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&moe_weighted_acc_scaled_pipe);
     var moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
     defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_pipe);
+    var moe_weighted_acc_shared_gate_f32_qwen2048_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_qwen2048_pipe);
     var ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
     defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
     var ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
@@ -20842,6 +20860,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(moe_weighted_acc_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_scaled_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_shared_gate_f32_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_shared_gate_f32_qwen2048_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
@@ -22246,6 +22265,86 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
             0.3 * src_ptr[n_usize + i] +
             0.5 * src_ptr[2 * n_usize + i] +
             gate * shared_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
+    }
+}
+
+test "moe_weighted_acc_shared_gate_f32_qwen2048 computes one-tile gate dot and reduce" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 1024) return error.SkipZigTest;
+
+    const n: u32 = 2048;
+    const n_used: u32 = 8;
+    const n_usize: usize = @intCast(n);
+    const n_used_usize: usize = @intCast(n_used);
+
+    var accum_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&accum_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_used_usize * n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used_usize * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+
+    const accum_ptr: [*]f32 = @ptrCast(@alignCast(accum_buf.cpu_ptr.?));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+
+    for (0..n_usize) |i| {
+        accum_ptr[i] = 0.01 * @as(f32, @floatFromInt(i % 17));
+        shared_ptr[i] = 0.02 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6));
+        norm_ptr[i] = 0.001 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5));
+        gate_weight_ptr[i] = 0.002 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3));
+    }
+    for (0..n_used_usize) |expert| {
+        for (0..n_usize) |i| {
+            src_ptr[expert * n_usize + i] = 0.01 * @as(f32, @floatFromInt(expert + 1)) +
+                0.001 * @as(f32, @floatFromInt(i % 5));
+        }
+    }
+    for (0..n_used_usize) |expert| {
+        routing_ptr[expert] = @intCast(expert * 3);
+        routing_ptr[n_used_usize + expert] = @bitCast(0.0275 * @as(f32, @floatFromInt(expert + 1)));
+    }
+
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = n,
+        .gate_weight_offset = 0,
+        .norm_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.commitAndWait();
+
+    var dot: f32 = 0.0;
+    for (0..n_usize) |i| dot += norm_ptr[i] * gate_weight_ptr[i];
+    const gate = 1.0 / (1.0 + @exp(-dot));
+
+    for (0..n_usize) |i| {
+        var expert_sum: f32 = 0.0;
+        for (0..n_used_usize) |expert| {
+            const weight: f32 = @bitCast(routing_ptr[n_used_usize + expert]);
+            expert_sum += weight * src_ptr[expert * n_usize + i];
+        }
+        const initial = 0.01 * @as(f32, @floatFromInt(i % 17));
+        const expected = initial + expert_sum + gate * shared_ptr[i];
         try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
     }
 }
