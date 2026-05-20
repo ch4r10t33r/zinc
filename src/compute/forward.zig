@@ -12007,7 +12007,9 @@ pub const InferenceEngine = struct {
         return n_tokens >= 16;
     }
 
-    fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[16]u32, count: *usize, layer: u32, prefix_layers: u32) void {
+    const qwen36_dense_prefill_max_segments = 24;
+
+    fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[qwen36_dense_prefill_max_segments]u32, count: *usize, layer: u32, prefix_layers: u32) void {
         const cfg = self.model.config;
         if (count.* >= out.len) return;
         if (layer <= prefix_layers) return;
@@ -12019,7 +12021,7 @@ pub const InferenceEngine = struct {
         count.* += 1;
     }
 
-    fn qwen36DensePrefillSegmentLayers(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32, out: *[16]u32) usize {
+    fn qwen36DensePrefillSegmentLayers(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32, out: *[qwen36_dense_prefill_max_segments]u32) usize {
         if (prompt_len < 16 or self.validation_diagnostics_enabled) return 0;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
         if (!self.isQwen36DenseHybrid27B()) return 0;
@@ -12053,9 +12055,10 @@ pub const InferenceEngine = struct {
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
         if (full_attn_interval == 4 and cfg.n_layers > 52) {
-            // Measured on the 27B Coding Review prefill: mid-model SSM FFN
-            // segments beat spending the final slots on late attention layers.
-            const tuned_layers = [_]u32{ 3, 7, 11, 14, 15, 18, 19, 20, 23, 27, 31, 35, 39, 43, 47, 51 };
+            // Measured on the 27B Coding Review prefill: the extra mid/late SSM
+            // segments keep more dense FFN work layer-major without repeating
+            // the rejected SSM projection replay path.
+            const tuned_layers = [_]u32{ 3, 7, 11, 12, 14, 15, 16, 18, 19, 20, 22, 23, 24, 27, 28, 31, 35, 39, 43, 47, 51, 55, 56, 59 };
             for (tuned_layers) |segment_layer| {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
@@ -12486,7 +12489,7 @@ pub const InferenceEngine = struct {
 
         const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);
         var tail_start_layer = prefix_layers;
-        var segment_layers: [16]u32 = undefined;
+        var segment_layers: [qwen36_dense_prefill_max_segments]u32 = undefined;
         const n_segment_layers = self.qwen36DensePrefillSegmentLayers(prompt_tokens.len, prefix_layers, &segment_layers);
         for (segment_layers[0..n_segment_layers]) |segment_layer| {
             if (segment_layer < tail_start_layer) continue;
