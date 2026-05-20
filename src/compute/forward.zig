@@ -12023,7 +12023,7 @@ pub const InferenceEngine = struct {
         return n_tokens >= 16;
     }
 
-    const qwen36_dense_prefill_max_segments = 37;
+    const qwen36_dense_prefill_max_segments = 45;
 
     fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[qwen36_dense_prefill_max_segments]u32, count: *usize, layer: u32, prefix_layers: u32) void {
         const cfg = self.model.config;
@@ -12075,7 +12075,7 @@ pub const InferenceEngine = struct {
             // segments keep more dense FFN work layer-major without repeating
             // the rejected SSM projection replay path. The earliest segments
             // cost more orchestration than they save on this prompt shape.
-            const tuned_layers = [_]u32{ 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44, 47, 51, 52, 53, 55 };
+            const tuned_layers = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55 };
             for (tuned_layers) |segment_layer| {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
