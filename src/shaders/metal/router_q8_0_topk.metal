@@ -102,26 +102,14 @@ kernel void main0(
                 simdgroup_barrier(mem_flags::mem_threadgroup);
             }
 
-            if (lane == 0u) {
-                float max_sel = -INFINITY;
-                #pragma unroll
-                for (uint slot = 0u; slot < 8u; ++slot) {
-                    max_sel = max(max_sel, selected_val[slot]);
-                }
-
-                float sum = 0.0f;
-                #pragma unroll
-                for (uint slot = 0u; slot < 8u; ++slot) {
-                    const float e = fast::exp(selected_val[slot] - max_sel);
-                    selected_val[slot] = e;
-                    sum += e;
-                }
-
-                const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-                #pragma unroll
-                for (uint slot = 0u; slot < 8u; ++slot) {
-                    output_data[8u + slot] = as_type<uint>(selected_val[slot] * inv_sum);
-                }
+            const bool weight_lane = lane < 8u;
+            const float selected_score = weight_lane ? selected_val[lane] : -INFINITY;
+            const float max_sel = simd_max(selected_score);
+            const float exp_score = weight_lane ? fast::exp(selected_score - max_sel) : 0.0f;
+            const float sum = simd_sum(exp_score);
+            const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+            if (weight_lane) {
+                output_data[8u + lane] = as_type<uint>(exp_score * inv_sum);
             }
         }
         return;
