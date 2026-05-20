@@ -123,13 +123,13 @@ kernel void main0(
                 #pragma unroll
                 for (uint col4 = 0u; col4 < 32u; ++col4) {
                     const float4 old_state = state_vec[col4];
-                    const float4 decayed = old_state * decay;
                     const float4 kv = k_vec[col4];
-                    sk_raw = fma(decayed.x, kv.x, sk_raw);
-                    sk_raw = fma(decayed.y, kv.y, sk_raw);
-                    sk_raw = fma(decayed.z, kv.z, sk_raw);
-                    sk_raw = fma(decayed.w, kv.w, sk_raw);
+                    sk_raw = fma(old_state.x, kv.x, sk_raw);
+                    sk_raw = fma(old_state.y, kv.y, sk_raw);
+                    sk_raw = fma(old_state.z, kv.z, sk_raw);
+                    sk_raw = fma(old_state.w, kv.w, sk_raw);
                 }
+                sk_raw *= decay;
 
                 const float v = conv_out[v_base + row];
                 const float delta = beta_val * (v - sk_raw * k_scale);
