@@ -8,6 +8,9 @@ using namespace metal;
 // routed expert activation buffer. The token-major Qwen path only consumes the
 // gate/up projections through the following SwiGLU, so this removes one small
 // dispatch from every routed MoE layer without changing routing semantics.
+//
+// Like llama.cpp's fixed-shape Metal mul_mv specializations, this bakes the
+// Qwen3.6 K=2048 block count and row stride into the hot loop.
 
 struct MoeGateUpDualDmmvPush {
     uint M;
@@ -104,8 +107,8 @@ kernel void main0(
     }
 
     device const float* input = X + (p.x_offset / 4u) + expert_slot * p.x_expert_stride;
-    const uint blocks_per_row = p.K / 256u;
-    const ulong row_bytes = ulong(blocks_per_row) * 144ul;
+    constexpr uint blocks_per_row = 8u;
+    constexpr ulong row_bytes = 1152ul;
     const ulong gate_expert_base = ulong(p.gate_a_offset) + ulong(expert_id) * ulong(p.gate_expert_stride);
     const ulong up_expert_base = ulong(p.up_a_offset) + ulong(expert_id) * ulong(p.up_expert_stride);
 
@@ -115,6 +118,7 @@ kernel void main0(
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
 
+    #pragma unroll
     for (uint bi = 0u; bi < blocks_per_row; bi++) {
         accumulate_q4k_direct(gate_row + ulong(bi) * 144ul, input, bi, uint(lane), gate_acc);
         accumulate_q4k_direct(up_row + ulong(bi) * 144ul, input, bi, uint(lane), up_acc);
