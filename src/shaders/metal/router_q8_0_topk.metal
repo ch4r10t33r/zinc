@@ -103,7 +103,7 @@ kernel void main0(
             float sum = 0.0f;
             #pragma unroll
             for (uint slot = 0u; slot < 8u; slot++) {
-                const float e = exp(selected_val[slot] - max_sel);
+                const float e = fast::exp(selected_val[slot] - max_sel);
                 selected_val[slot] = e;
                 sum += e;
             }
@@ -139,7 +139,7 @@ kernel void main0(
 
         float sum = 0.0f;
         for (uint slot = 0u; slot < k; slot++) {
-            const float e = exp(selected_val[slot] - max_sel);
+            const float e = fast::exp(selected_val[slot] - max_sel);
             selected_val[slot] = e;
             sum += e;
         }
