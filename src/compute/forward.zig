@@ -9497,8 +9497,14 @@ pub const InferenceEngine = struct {
         const KPAR_MAX_COLS: u32 = 40;
         const f32_bytes: u32 = @sizeOf(f32);
         var chunk_start: u32 = 0;
+        const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
+            tensor.info.type_ == .q6_k and
+            M == self.model.config.hidden_dim and
+            K == self.model.config.intermediate_dim and
+            n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
+            if (prefer_serial_qwen36_dense_down) break :blk null;
             switch (tensor.info.type_) {
                 .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
                 .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
