@@ -32,6 +32,7 @@ struct MetalPipe {
 struct MetalCmd {
     id<MTLCommandBuffer> cmd_buf;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> current_pipeline;
     uint8_t is_concurrent;
 };
 
@@ -358,8 +359,17 @@ MetalCmd* mtl_begin_command_mode(MetalCtx* ctx, uint8_t serial) {
     if (!cmd) return NULL;
     cmd->cmd_buf = cmd_buf;
     cmd->encoder = encoder;
+    cmd->current_pipeline = nil;
     cmd->is_concurrent = serial ? 0 : 1;
     return cmd;
+}
+
+static inline void mtl_set_pipeline_if_needed(MetalCmd* cmd, MetalPipe* pipe) {
+    id<MTLComputePipelineState> state = pipe->state;
+    if (cmd->current_pipeline != state) {
+        [cmd->encoder setComputePipelineState:state];
+        cmd->current_pipeline = state;
+    }
 }
 
 void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
@@ -368,7 +378,7 @@ void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
                   const void* push_data, size_t push_size) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     // Bind data buffers at indices 0..n_bufs-1
     for (uint32_t i = 0; i < n_bufs; i++) {
@@ -394,7 +404,7 @@ void mtl_dispatch_v2(MetalCmd* cmd, MetalPipe* pipe,
                      uint32_t push_idx) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     // Bind data buffers, shifting indices to skip push_idx
     for (uint32_t i = 0; i < n_bufs; i++) {
@@ -421,7 +431,7 @@ void mtl_dispatch_v2_tgmem(MetalCmd* cmd, MetalPipe* pipe,
                      uint32_t push_idx, uint32_t tg_mem_size) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     for (uint32_t i = 0; i < n_bufs; i++) {
         uint32_t slot = (i < push_idx) ? i : (i + 1);
@@ -485,6 +495,7 @@ void mtl_commit_and_wait(MetalCmd* cmd) {
     }
 
     cmd->encoder = nil;
+    cmd->current_pipeline = nil;
     cmd->cmd_buf = nil;
     free(cmd);
 }
@@ -493,6 +504,7 @@ void mtl_commit_async(MetalCmd* cmd) {
     if (!cmd) return;
     [cmd->encoder endEncoding];
     cmd->encoder = nil;
+    cmd->current_pipeline = nil;
     [cmd->cmd_buf commit];
 }
 
