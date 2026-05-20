@@ -14636,7 +14636,7 @@ fn runDecodeStep(
                         p.ssm_delta_calls += 1;
                         p.ssm_gated_norm_calls += 1;
                     }
-                    profileBarrier(cmd, profile, .ssm);
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf});
                 } else {
                     // Delta-net: swiglu_buf → attn_out_buf
                     {
@@ -14667,7 +14667,7 @@ fn runDecodeStep(
                         cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
                         if (profile) |p| p.ssm_delta_calls += 1;
                     }
-                    profileBarrier(cmd, profile, .ssm);
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf});
                     if (should_debug_ssm_compare) {
                         commitAndWaitProfiled(cmd, profile);
                         const debug_start = profileStart(profile != null);
@@ -14709,7 +14709,7 @@ fn runDecodeStep(
                         z_gate_offset,
                     );
                     if (profile) |p| p.ssm_gated_norm_calls += 1;
-                    profileBarrier(cmd, profile, .ssm);
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf});
                 }
 
                 // SSM out DMMV: gated SSM activation → down_buf
@@ -14721,7 +14721,7 @@ fn runDecodeStep(
                 const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
                 const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
-                profileBarrier(cmd, profile, .ssm);
+                profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.down_buf});
                 if (should_debug_ssm_compare) {
                     commitAndWaitProfiled(cmd, profile);
                     const debug_start = profileStart(profile != null);
