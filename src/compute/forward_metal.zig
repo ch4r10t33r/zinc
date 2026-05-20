@@ -269,6 +269,20 @@ fn preferApple9QwenSharedDownQ8QuadPath(cfg: ModelConfig, tensor: *const metal_l
     return readBoolEnv("ZINC_METAL_QWEN_SHARED_DOWN_Q8_QUAD") orelse true;
 }
 
+fn preferApple9QwenSsmQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        K == 2048 and
+        M >= 4096 and
+        (std.mem.endsWith(u8, tensor.info.name, "attn_qkv.weight") or
+            std.mem.endsWith(u8, tensor.info.name, "attn_gate.weight"));
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_QUAD") orelse true;
+}
+
 fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const name = tensor.info.name;
     if (K <= 2048 and M >= 4096 and
@@ -5059,6 +5073,15 @@ pub const InferenceEngine = struct {
                         // Qwen3.6 shared down is a narrow K=512 projection.
                         // Four rows per simdgroup halves workgroups versus
                         // the K<=2048 nr=2 path while preserving per-row math.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSsmQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 SSM qkv/gate shape: four adjacent rows
+                        // per simdgroup reuse the 2048-wide activation vector
+                        // across the hottest prompt-side Q8 projections.
                         break :blk .{ .pipe = &self.dmmv_q8_0_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
                     }
                     if (preferApple9Q8K2048Path(tensor, M, K) and
