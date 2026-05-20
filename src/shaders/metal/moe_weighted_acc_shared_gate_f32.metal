@@ -10,9 +10,9 @@ struct Params {
 
 // Token-major Qwen MoE finalize with one-row F32 shared gate.
 //
-// This is the single-token analogue of the route-packed F32 shared-gate
-// combine kernel: compute sigmoid(dot(norm, gate_weight)) once per tile, then
-// fold the weighted top-k expert sum and gated shared expert into hidden.
+// This mirrors vLLM's final top-k weight+reduce discipline for one token: first
+// compute the shared-gate scalar once, then sweep the hidden vector and fold the
+// routed expert sum plus gated shared expert into hidden.
 kernel void main0(
     device float* accum [[buffer(0)]],
     device const float* src [[buffer(1)]],
@@ -21,7 +21,6 @@ kernel void main0(
     device const float* shared_src [[buffer(4)]],
     device const float* norm_src [[buffer(5)]],
     device const char* gate_weight_bytes [[buffer(6)]],
-    uint tile [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     ushort simdgroup [[simdgroup_index_in_threadgroup]]
@@ -55,16 +54,13 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint id = tile * 256u + tid;
-    if (id >= p.n) {
-        return;
-    }
+    for (uint id = tid; id < p.n; id += 256u) {
+        float sum = 0.0f;
+        for (uint expert = 0u; expert < p.n_used; expert++) {
+            const float weight = as_type<float>(routing[p.n_used + expert]);
+            sum += weight * src[expert * p.src_stride + id];
+        }
 
-    float sum = 0.0f;
-    for (uint expert = 0u; expert < p.n_used; expert++) {
-        const float weight = as_type<float>(routing[p.n_used + expert]);
-        sum += weight * src[expert * p.src_stride + id];
+        accum[id] += sum + gate_value * shared_src[id];
     }
-
-    accum[id] += sum + gate_value * shared_src[id];
 }

@@ -9333,7 +9333,7 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
         .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
-    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
 }
 
 /// Returns true if the attention gate (sigmoid gating) should be applied after flash attn.
