@@ -20,10 +20,10 @@ struct Params {
     uint a_offset;
 };
 
-#define NORM_SIMDGROUPS 8
 #define SIMD_WIDTH 32
-#define NORM_TG_SIZE (NORM_SIMDGROUPS * SIMD_WIDTH)
 #define ROUTER_TG_SIZE 1024
+#define NORM_SIMDGROUPS (ROUTER_TG_SIZE / SIMD_WIDTH)
+#define NORM_TG_SIZE ROUTER_TG_SIZE
 #define MAX_HIDDEN 2048
 #define MAX_EXPERTS 256
 #define MAX_K_USED 16
@@ -51,17 +51,15 @@ kernel void main0(
     threadgroup float selected_val[MAX_K_USED];
 
     float sum_sq = 0.0f;
-    if (local_id < NORM_TG_SIZE) {
-        for (uint i = local_id; i < p.n; i += NORM_TG_SIZE) {
-            const float h = fma(p.scale, residual[p.residual_offset + i], hidden[i]);
-            hidden[i] = h;
-            norm_cache[i] = h;
-            sum_sq = fma(h, h, sum_sq);
-        }
+    for (uint i = local_id; i < MAX_HIDDEN; i += NORM_TG_SIZE) {
+        const float h = fma(p.scale, residual[p.residual_offset + i], hidden[i]);
+        hidden[i] = h;
+        norm_cache[i] = h;
+        sum_sq = fma(h, h, sum_sq);
     }
 
     const float sg_sum = simd_sum(sum_sq);
-    if (sg_idx < NORM_SIMDGROUPS && lane == 0u) {
+    if (lane == 0u) {
         partial_sums[sg_idx] = sg_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -70,12 +68,10 @@ kernel void main0(
     const float total_sq = simd_sum(v);
     const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
 
-    if (local_id < NORM_TG_SIZE) {
-        for (uint i = local_id; i < p.n; i += NORM_TG_SIZE) {
-            const float nval = norm_weight[i] * (norm_cache[i] * rms_inv);
-            norm_cache[i] = nval;
-            norm_out[i] = nval;
-        }
+    for (uint i = local_id; i < MAX_HIDDEN; i += NORM_TG_SIZE) {
+        const float nval = norm_weight[i] * (norm_cache[i] * rms_inv);
+        norm_cache[i] = nval;
+        norm_out[i] = nval;
     }
 
     // All valid expert rows are overwritten below. This barrier only makes the
