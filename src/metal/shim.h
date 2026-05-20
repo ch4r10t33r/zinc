@@ -65,6 +65,7 @@ void mtl_dispatch_v2_tgmem(MetalCmd* cmd, MetalPipe* pipe,
                      const void* push_data, size_t push_size,
                      uint32_t push_idx, uint32_t tg_mem_size);
 void mtl_barrier(MetalCmd* cmd);
+void mtl_barrier_buffers(MetalCmd* cmd, MetalBuf** bufs, uint32_t n_bufs);
 void mtl_commit_and_wait(MetalCmd* cmd);
 void mtl_commit_async(MetalCmd* cmd);
 void mtl_wait(MetalCmd* cmd);

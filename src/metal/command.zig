@@ -139,6 +139,28 @@ pub const MetalCommand = struct {
         }
     }
 
+    /// Insert a resource-scoped memory barrier for the listed buffers.
+    pub fn barrierBuffers(self: *MetalCommand, bufs: []const *const MetalBuffer) void {
+        if (!self.barrier_enabled) return;
+        if (self.dispatch_count == 0) return;
+        if (self.last_barrier_dispatch_count == self.dispatch_count) return;
+        if (self.handle) |h| {
+            var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
+            var n_bufs: u32 = 0;
+            for (bufs) |b| {
+                if (@as(usize, n_bufs) == c_bufs.len) break;
+                if (b.handle) |handle| {
+                    c_bufs[@intCast(n_bufs)] = handle;
+                    n_bufs += 1;
+                }
+            }
+            if (n_bufs == 0) return;
+            self.barrier_count += 1;
+            self.last_barrier_dispatch_count = self.dispatch_count;
+            shim.mtl_barrier_buffers(h, @ptrCast(&c_bufs), n_bufs);
+        }
+    }
+
     /// Commit the command buffer to the GPU and block until execution completes.
     pub fn commitAndWait(self: *MetalCommand) void {
         if (self.handle) |h| {

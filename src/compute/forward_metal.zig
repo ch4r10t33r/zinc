@@ -653,6 +653,22 @@ fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierC
     };
 }
 
+fn profileBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierClass, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrierBuffers(bufs);
+    if (cmd.barrier_count == before_count) return;
+    if (profile) |p| switch (class) {
+        .embed => p.embed_barrier_calls += 1,
+        .full_attn => p.full_attn_barrier_calls += 1,
+        .ssm => p.ssm_barrier_calls += 1,
+        .router => p.router_barrier_calls += 1,
+        .gpu_routed_moe => p.gpu_routed_moe_barrier_calls += 1,
+        .fallback_moe => p.fallback_moe_barrier_calls += 1,
+        .dense_ffn => p.dense_ffn_barrier_calls += 1,
+        .final => p.final_barrier_calls += 1,
+    };
+}
+
 fn fullAttentionInterval(cfg: ModelConfig) u32 {
     return if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
 }
@@ -14568,7 +14584,10 @@ fn runDecodeStep(
                     );
                     if (profile) |p| p.ssm_conv_calls += 1;
                 }
-                profileBarrier(cmd, profile, .ssm);
+                // Adapt llama.cpp's `ggml_metal_op_concurrency_reset` idea at
+                // the true dependency edge only: delta-net consumes the conv
+                // output buffer, so avoid a command-wide buffer barrier here.
+                profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf});
 
                 const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
                 const alpha_buf = if (use_direct_prefill_projection_chunk)
