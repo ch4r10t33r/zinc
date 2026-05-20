@@ -9532,6 +9532,66 @@ fn dispatchFullAttnPrepOnCmd(
     return gate_mode.apply_attn_gate;
 }
 
+fn dispatchFullAttnKvCacheOnlyOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    attn: LayerAttentionParams,
+    hidden_dim: u32,
+) !void {
+    const cfg = engine.config;
+    const k_tensor = lt.attn_k orelse return error.MissingTensor;
+    const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
+
+    const can_pair_attn_kv = !attn.use_k_as_v and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
+    if (can_pair_attn_kv) {
+        dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
+    } else {
+        dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
+        dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+    }
+    profileBarrier(cmd, profile, .full_attn);
+
+    if (lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
+        if (!attn.use_k_as_v) {
+            if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
+        }
+        profileBarrier(cmd, profile, .full_attn);
+    }
+
+    const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
+    var did_norm_dispatch = false;
+    if (engine.attn_k_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads);
+        did_norm_dispatch = true;
+    }
+    if (need_v_unit_norm) {
+        dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
+        did_norm_dispatch = true;
+    }
+    if (did_norm_dispatch) {
+        profileBarrier(cmd, profile, .full_attn);
+    }
+
+    dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
+    profileBarrier(cmd, profile, .full_attn);
+
+    dispatchKvCacheWriteOnCmd(
+        engine,
+        cmd,
+        layer_idx,
+        attn.kv_dim,
+        engine.position * attn.kv_dim,
+        @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
+    );
+    if (profile) |p| p.full_attn_kv_write_calls += 1;
+}
+
 /// Adapted from llama.cpp `ggml_metal_op_rope_set_rows`: rotates the K vector
 /// for the current token and writes the result (plus an unrotated V copy)
 /// directly into the layer's KV cache slot. Extended to also rotate the Q
@@ -13238,24 +13298,26 @@ fn runDecodeStep(
                 dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
                 profileBarrier(cmd, profile, .full_attn); // norm_buf visible before attn prep reads it
             }
-            const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
-            profileBarrier(cmd, profile, .full_attn); // KV cache + q_buf visible before flash attn
-            if (using_external_shared_cmd and
+            const skip_final_prompt_tail = using_external_shared_cmd and
                 !emit_logits and
                 layer_idx + 1 == layer_count and
                 cfg.architecture == .qwen2_moe and
-                cfg.ssm_d_inner != 0)
-            {
+                cfg.ssm_d_inner != 0;
+            if (skip_final_prompt_tail) {
                 // Non-terminal prompt tokens only need the final layer's K/V
                 // state for future tokens. Adapt llama.cpp's Metal graph
-                // materialization discipline: after the dependency barrier
-                // publishes the K/V write, skip the logits-only final
-                // flash/out/MoE tail for this prompt token.
+                // materialization discipline (`ggml_metal_graph_compute`
+                // encodes only requested graph outputs): skip Q/gate and
+                // flash/output/MoE materialization for this prompt token.
+                try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
+                profileBarrier(cmd, profile, .full_attn); // KV cache visible before a later token reads it
                 if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                 releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
                 engine.position += 1;
                 return;
             }
+            const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
+            profileBarrier(cmd, profile, .full_attn); // KV cache + q_buf visible before flash attn
             dispatchFlashAttnOnCmd(
                 engine,
                 cmd,
