@@ -296,6 +296,32 @@ fn preferApple9QwenSsmOutQ8K4096Path(cfg: ModelConfig, tensor: *const metal_load
     return readBoolEnv("ZINC_METAL_QWEN_SSM_OUT_Q8_K4096") orelse true;
 }
 
+fn preferApple9QwenFullAttnQ8K2048QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        K == 2048 and
+        M >= 4096 and
+        std.mem.endsWith(u8, tensor.info.name, "attn_q.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ATTN_Q8_K2048_QUAD") orelse true;
+}
+
+fn preferApple9QwenFullAttnOutQ8K4096Path(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 2048 and
+        K == 4096 and
+        std.mem.endsWith(u8, tensor.info.name, "attn_output.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ATTN_OUT_Q8_K4096") orelse true;
+}
+
 fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const name = tensor.info.name;
     if (K <= 2048 and M >= 4096 and
@@ -5145,6 +5171,25 @@ pub const InferenceEngine = struct {
                         // Exact Qwen3.6 SSM out shape: four adjacent rows per
                         // simdgroup share the K=4096 activation vector, reducing
                         // simdgroup count versus the conservative nr=2 fallback.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k4096_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenFullAttnQ8K2048QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k2048_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 full-attention packed Q(+gate)
+                        // shape. This applies the same llama.cpp-style
+                        // adjacent-row Q8 matvec grouping used for SSM qkv to
+                        // the remaining hot attn M=8192,K=2048 prompt bucket.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k2048_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenFullAttnOutQ8K4096Path(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k4096_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k4096_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 attention-output projection. Reuse the
+                        // accepted K=4096 quad-row Q8 kernel from SSM out for
+                        // the full-attention out M=2048,K=4096 prompt bucket.
                         break :blk .{ .pipe = &self.dmmv_q8_0_k4096_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
                     }
                     if (preferApple9QwenSsmOutQ8K4096Path(self.config, tensor, M, K) and
