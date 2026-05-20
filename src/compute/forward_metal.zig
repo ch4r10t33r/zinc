@@ -2307,6 +2307,7 @@ pub const InferenceEngine = struct {
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_pipe: MetalPipeline,
     dmmv_q5k_moe_cols_pipe: MetalPipeline,
+    dmmv_q5k_moe_k512_pipe: MetalPipeline,
     dmmv_q5k_moe_k2048_pipe: MetalPipeline,
     dmmv_q6k_moe_pipe: MetalPipeline,
     dmmv_q6k_moe_cols_pipe: MetalPipeline,
@@ -2793,6 +2794,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
         self.dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
+        self.dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
         self.dmmv_q5k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048");
         self.dmmv_q6k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe");
         self.dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
@@ -3304,7 +3306,7 @@ pub const InferenceEngine = struct {
             },
         );
         log.debug(
-            "Metal pipeline caps: dmmv_q4k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q6k_moe tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048_1024 tw={d} max={d} stgmem={d}",
+            "Metal pipeline caps: dmmv_q4k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k512 tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q6k_moe tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048_1024 tw={d} max={d} stgmem={d}",
             .{
                 self.dmmv_q4k_moe_pipe.thread_execution_width,
                 self.dmmv_q4k_moe_pipe.max_threads_per_threadgroup,
@@ -3312,6 +3314,9 @@ pub const InferenceEngine = struct {
                 self.dmmv_q5k_moe_pipe.thread_execution_width,
                 self.dmmv_q5k_moe_pipe.max_threads_per_threadgroup,
                 self.dmmv_q5k_moe_pipe.static_threadgroup_memory_length,
+                self.dmmv_q5k_moe_k512_pipe.thread_execution_width,
+                self.dmmv_q5k_moe_k512_pipe.max_threads_per_threadgroup,
+                self.dmmv_q5k_moe_k512_pipe.static_threadgroup_memory_length,
                 self.dmmv_q5k_moe_k2048_pipe.thread_execution_width,
                 self.dmmv_q5k_moe_k2048_pipe.max_threads_per_threadgroup,
                 self.dmmv_q5k_moe_k2048_pipe.static_threadgroup_memory_length,
@@ -3562,6 +3567,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_cols_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_moe_cols_pipe);
@@ -6485,14 +6491,20 @@ fn dispatchDmmvMoeQ5kOnCmd(
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const use_k512 =
+        K == 512 and
+        M >= 1024 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight") and
+        engine.dmmv_q5k_moe_k512_pipe.max_threads_per_threadgroup >= 512;
     const k2048_or_less = K <= 2048;
     const use_k2048 =
+        !use_k512 and
         k2048_or_less and
         engine.dmmv_q5k_moe_k2048_pipe.max_threads_per_threadgroup >= 512;
-    const rows_per_wg: u32 = if (use_k2048) 16 else 8;
-    const block_size: u32 = if (use_k2048) 512 else 256;
+    const rows_per_wg: u32 = if (use_k512 or use_k2048) 16 else 8;
+    const block_size: u32 = if (use_k512 or use_k2048) 512 else 256;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
-    const pipe = if (use_k2048) &engine.dmmv_q5k_moe_k2048_pipe else &engine.dmmv_q5k_moe_pipe;
+    const pipe = if (use_k512) &engine.dmmv_q5k_moe_k512_pipe else if (use_k2048) &engine.dmmv_q5k_moe_k2048_pipe else &engine.dmmv_q5k_moe_pipe;
     cmd.dispatchV2(pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
 }
 
@@ -20149,6 +20161,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_pipe);
     var dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_cols_pipe);
+    var dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
+    defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k512_pipe);
     var dmmv_q5k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k2048_pipe);
     var dmmv_q6k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe");
@@ -20243,6 +20257,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q5k_moe_k512_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);

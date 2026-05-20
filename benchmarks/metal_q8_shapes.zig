@@ -857,7 +857,14 @@ fn selectMoePipeline(
             },
         },
         .q5_k => switch (variant) {
-            .runtime => if (cols <= 2048) .{
+            .runtime => if (cols == 512 and rows >= 1024) .{
+                .shader_name = "dmmv_q5k_moe_k512",
+                .variant_label = "runtime",
+                .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512"),
+                .push_idx = 1,
+                .rows_per_wg = 16,
+                .block_size = 512,
+            } else if (cols <= 2048) .{
                 .shader_name = "dmmv_q5k_moe_k2048",
                 .variant_label = "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048"),
