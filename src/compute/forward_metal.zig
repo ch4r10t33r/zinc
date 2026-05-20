@@ -9853,7 +9853,8 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
         .norm_offset = norm_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
-    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    const block_size: u32 = if (n >= 512 and engine.moe_weighted_acc_shared_gate_f32_pipe.max_threads_per_threadgroup >= 512) 512 else 256;
+    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
 }
 
 /// Returns true if the attention gate (sigmoid gating) should be applied after flash attn.
@@ -22058,7 +22059,7 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
     var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
     defer metal_pipeline.freePipeline(&pipe);
 
-    const n: u32 = 8;
+    const n: u32 = 768;
     const n_used: u32 = 3;
     const n_usize: usize = @intCast(n);
     const n_used_usize: usize = @intCast(n_used);
@@ -22110,8 +22111,9 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
     };
     const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
 
+    const block_size: u32 = if (pipe.max_threads_per_threadgroup >= 512) 512 else 256;
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.dispatchV2(&pipe, .{ (n + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
     cmd.commitAndWait();
 
     var dot: f32 = 0.0;
