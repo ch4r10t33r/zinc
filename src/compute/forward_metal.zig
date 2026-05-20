@@ -3795,7 +3795,11 @@ pub const InferenceEngine = struct {
 
     fn queuedTokenMajorEarlyCommitTokens(prompt_len: usize) usize {
         if (prompt_len < 64) return 0;
-        return @min(prompt_len / 2, 16);
+        // Match llama.cpp's ggml-metal-context.m graph submission heuristic:
+        // commit a small leading slice, roughly 10% of the graph, so the GPU
+        // starts while the CPU records the remaining command buffer.
+        const graph_fraction = @max(@as(usize, 8), prompt_len / 10);
+        return @min(prompt_len / 2, @min(graph_fraction, 32));
     }
 
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
