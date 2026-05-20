@@ -97,8 +97,8 @@ kernel void main0(
     if (simd_lane == 0u) {
         const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
         const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
-        q_scale_lane = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
-        k_scale_lane = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
+        q_scale_lane = fast::rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
+        k_scale_lane = fast::rsqrt(fast::max(k_norm_sq, 1.0e-13f));
         decay_lane = fast::exp(softplus_alpha * ssm_a[head]);
         beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + head]));
     }
@@ -157,7 +157,7 @@ kernel void main0(
     // the final RMS scalar.
     const float partial = (simd_lane < simdgroups_per_tg) ? partial_sq[simd_lane] : 0.0f;
     const float total_sq = simd_sum(partial);
-    const float rms = rsqrt((total_sq / float(head_v_dim)) + 1.0e-6f);
+    const float rms = fast::rsqrt(fast::divide(total_sq, float(head_v_dim)) + 1.0e-6f);
     for (uint row = tid; row < head_v_dim; row += tg_threads) {
         const uint idx = head * head_v_dim + row;
         const uint weight_idx = (p.norm_per_head != 0u) ? idx : row;

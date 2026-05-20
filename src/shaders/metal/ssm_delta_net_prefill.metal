@@ -103,8 +103,8 @@ kernel void main0(
                     ((p.has_dt_bias != 0u) ? dt_bias[head] : 0.0f);
                 const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
                 const float decay_arg = (p.has_ssm_a != 0u) ? (softplus_alpha * ssm_a[head]) : (-softplus_alpha);
-                q_scale_lane = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
-                k_scale_lane = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
+                q_scale_lane = fast::rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
+                k_scale_lane = fast::rsqrt(fast::max(k_norm_sq, 1.0e-13f));
                 decay_lane = fast::exp(decay_arg);
                 beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + token * p.beta_stride + head]));
             }
@@ -199,8 +199,8 @@ kernel void main0(
                 ((p.has_dt_bias != 0u) ? dt_bias[head] : 0.0f);
             const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
             const float decay_arg = (p.has_ssm_a != 0u) ? (softplus_alpha * ssm_a[head]) : (-softplus_alpha);
-            q_scale_lane = rsqrt(fast::max(q_total, 1.0e-13f)) / sqrt(float(p.d_state));
-            k_scale_lane = rsqrt(fast::max(k_total, 1.0e-13f));
+            q_scale_lane = fast::rsqrt(fast::max(q_total, 1.0e-13f)) / sqrt(float(p.d_state));
+            k_scale_lane = fast::rsqrt(fast::max(k_total, 1.0e-13f));
             decay_lane = fast::exp(decay_arg);
             beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + token * p.beta_stride + dt_index]));
         }
