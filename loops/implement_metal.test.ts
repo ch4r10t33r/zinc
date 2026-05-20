@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bestKeptCorrectTokPerSec,
   buildPrompt,
   buildReflectionSummary,
   buildSelfReview,
   decideKeep,
   detectPhase,
   evaluateOutputText,
+  keepBaselinesForCycle,
   mergeUniqueEntries,
   parseTokPerSec,
   snapshotFromResult,
@@ -315,6 +317,40 @@ describe("mergeUniqueEntries", () => {
     const merged = mergeUniqueEntries(["", "  ", "real idea"], [], 10);
     expect(merged.length).toBe(1);
     expect(merged[0]).toBe("real idea");
+  });
+});
+
+// ── keep baselines ──────────────────────────────────────────────────
+
+describe("keep baseline helpers", () => {
+  test("recovers stale bestTokPerSec from kept correct cycle history", () => {
+    const state = makeState({
+      bestTokPerSec: 43.4,
+      currentBest: { tokPerSec: 43.2, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 100, kept: true, containsReference: true, tokPerSec: 43.8 }),
+        makeCycle({ cycle: 104, kept: true, containsReference: true, tokPerSec: 44.0 }),
+        makeCycle({ cycle: 106, kept: true, containsReference: true, tokPerSec: 43.2 }),
+      ],
+    });
+    expect(bestKeptCorrectTokPerSec(state)).toBe(44.0);
+  });
+
+  test("anchors neutral keeps to this cycle's measured accepted baseline", () => {
+    const state = makeState({
+      bestTokPerSec: 43.4,
+      currentBest: { tokPerSec: 43.2, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 104, kept: true, containsReference: true, tokPerSec: 44.0 }),
+        makeCycle({ cycle: 107, kept: true, containsReference: true, tokPerSec: 43.2 }),
+      ],
+    });
+    const baselines = keepBaselinesForCycle(
+      state,
+      makeResult({ containsReference: true, strongAnswer: true, tokPerSec: 44.0 }),
+    );
+    expect(baselines.bestTokPerSec).toBe(44.0);
+    expect(baselines.acceptedTokPerSec).toBe(44.0);
   });
 });
 

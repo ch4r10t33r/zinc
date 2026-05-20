@@ -190,6 +190,57 @@ function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): num
   return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
+export function bestKeptCorrectTokPerSec(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+): number {
+  const candidates: number[] = [];
+  if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
+    candidates.push(state.bestTokPerSec);
+  }
+  if (
+    state.currentBest?.containsReference &&
+    state.currentBest.tokPerSec != null &&
+    state.currentBest.tokPerSec > 0
+  ) {
+    candidates.push(state.currentBest.tokPerSec);
+  }
+  for (const c of state.cycles) {
+    if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
+      candidates.push(c.tokPerSec);
+    }
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : 0;
+}
+
+function currentAcceptedTokPerSec(state: Pick<RunState, "currentBest" | "bestTokPerSec">): number {
+  if (
+    state.currentBest?.containsReference &&
+    state.currentBest.tokPerSec != null &&
+    state.currentBest.tokPerSec > 0
+  ) {
+    return state.currentBest.tokPerSec;
+  }
+  return Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0 ? state.bestTokPerSec : 0;
+}
+
+function correctResultTokPerSec(result: Pick<BuildRunResult, "containsReference" | "tokPerSec">): number {
+  return result.containsReference && result.tokPerSec != null && result.tokPerSec > 0 ? result.tokPerSec : 0;
+}
+
+export function keepBaselinesForCycle(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  cycleBaseline: Pick<BuildRunResult, "containsReference" | "tokPerSec">,
+): { bestTokPerSec: number; acceptedTokPerSec: number } {
+  const measuredBaseline = correctResultTokPerSec(cycleBaseline);
+  const bestTokPerSec = Math.max(bestKeptCorrectTokPerSec(state), measuredBaseline);
+  const acceptedTokPerSec = Math.max(currentAcceptedTokPerSec(state), measuredBaseline);
+  return { bestTokPerSec, acceptedTokPerSec };
+}
+
+function normalizeStateBestTokPerSec(state: RunState): void {
+  state.bestTokPerSec = Math.max(state.bestTokPerSec, bestKeptCorrectTokPerSec(state));
+}
+
 function highestMatchingCycle(
   cycles: CycleResult[],
   predicate: (cycle: CycleResult) => boolean,
@@ -1871,6 +1922,7 @@ async function main() {
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
+    normalizeStateBestTokPerSec(state);
     // Re-read the effort doc from disk every resume so an edited plan
     // reaches the next agent invocation without losing saved history.
     if (effortBundle) {
@@ -2014,26 +2066,22 @@ async function main() {
 
     // Keep/revert decision — tight for optimization
     let kept = false;
-    const prevTps = state.bestTokPerSec;
+    const baselines = keepBaselinesForCycle(state, result);
+    const bestTps = baselines.bestTokPerSec;
+    const acceptedTps = baselines.acceptedTokPerSec;
     const verifyTps = verify.tokPerSec ?? 0;
-    // Proportional bands so the keep/reject thresholds scale with the
-    // current best. At a 0.21 tok/s baseline a hardcoded 0.5/0.3 band
-    // accepts every diff under +0.6 as "kept-within-noise" and ratchets
-    // best upward by accumulated noise (Effort 12 cycles 1-24). Below the
-    // floor the hardcoded values still apply, so the behavior is
-    // unchanged on the 12B effort where prevTps was 30+ tok/s.
+    // Proportional bands scale with real accepted performance, but use
+    // two different anchors: promotion compares with the best kept
+    // correct result, while neutral keeps compare with the current
+    // accepted baseline measured at the start of this cycle. This avoids
+    // the Effort 16 cycle-106/107 drift where a stale best=43.4 allowed
+    // a 44.0 tree to keep 43.2 tok/s regressions as "within noise".
     //
-    // Effort 14 2026-05-14: dropped improveBand from 5% to 2% because
-    // the new 7-sample 2-trim harness regularly produces sample ranges
-    // of 0.3-1.0 tok/s — tighter than the old 1-3 tok/s spreads. At a
-    // best of 44.25 the 5% threshold was 2.21 tok/s, which never fired
-    // even when cycles repeatedly measured 46.0+. Best stayed stuck at
-    // the Cycle 2 number across 30+ cycles while the actual tree state
-    // was clearly faster. The 2% threshold (0.89 tok/s at 44.25) is
-    // still well above the typical trimmed range so it can't ratchet
-    // on noise, but real wins of 1-2% can promote.
-    const improveBand = Math.max(0.3, prevTps * 0.02);
-    const noiseBand = Math.max(0.3, prevTps * 0.03);
+    // The neutral band is intentionally tighter than the promotion band:
+    // a correct foundation step can be kept when it is flat, but not when
+    // it materially slows the current tree.
+    const improveBand = Math.max(0.3, bestTps * 0.02);
+    const noiseBand = Math.max(0.25, acceptedTps * 0.01);
 
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
@@ -2053,20 +2101,20 @@ async function main() {
       await runCommand("git", ["reset", "--hard", preHash]);
       state.failedApproaches.push(`${description} — broke correctness`);
       state.stalledCycles++;
-    } else if (verify.containsReference && verifyTps > prevTps + improveBand) {
+    } else if (verify.containsReference && verifyTps > bestTps + improveBand) {
       // Meaningful speed improvement with correct output
       kept = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
-      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (was ${prevTps.toFixed(2)}, +${(verifyTps - prevTps).toFixed(2)}; band ±${improveBand.toFixed(2)})`));
-    } else if (verify.containsReference && verifyTps >= prevTps - noiseBand) {
+      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (best was ${bestTps.toFixed(2)}, +${(verifyTps - bestTps).toFixed(2)}; band +${improveBand.toFixed(2)})`));
+    } else if (verify.containsReference && verifyTps >= acceptedTps - noiseBand) {
       // Within noise band, correct output — keep the change but DO NOT
       // advance bestTokPerSec. Advancing on noise creates a one-way
       // ratchet that pretends throughput improved when it did not
       // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
       kept = true;
       state.stalledCycles++;
-      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of ${prevTps.toFixed(2)}; best unchanged)`));
+      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
       kept = true;
@@ -2075,9 +2123,9 @@ async function main() {
       console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} ${METRIC_LABEL}`));
     } else {
       // Regressed speed or no correctness
-      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < ${prevTps.toFixed(2)} (regressed ${(prevTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));
+      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < current ${acceptedTps.toFixed(2)} (regressed ${(acceptedTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));
       await runCommand("git", ["reset", "--hard", preHash]);
-      state.failedApproaches.push(`${description} — regressed from ${prevTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
+      state.failedApproaches.push(`${description} — regressed from current ${acceptedTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
       state.stalledCycles++;
     }
 
