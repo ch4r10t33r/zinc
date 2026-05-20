@@ -119,13 +119,15 @@ kernel void main0(
     float local_sq = 0.0f;
     for (uint row = tid; row < p.head_v_dim; row += tg_threads) {
         const uint row_base = head_state_base + row * p.head_v_dim;
-        for (uint col = 0u; col < p.head_v_dim; ++col) {
-            state[row_base + col] *= decay;
-        }
-
         float sk = 0.0f;
         for (uint col = 0u; col < k_len; ++col) {
-            sk = fma(state[row_base + col], k[col], sk);
+            const uint state_idx = row_base + col;
+            const float decayed = state[state_idx] * decay;
+            state[state_idx] = decayed;
+            sk = fma(decayed, k[col], sk);
+        }
+        for (uint col = k_len; col < p.head_v_dim; ++col) {
+            state[row_base + col] *= decay;
         }
 
         const float v = conv_out[v_base + row];
