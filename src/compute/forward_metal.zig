@@ -14007,7 +14007,12 @@ fn runDecodeStep(
                 profileBarrier(cmd, profile, .dense_ffn);
             }
             if (is_moe and !skip_pre_ffn_router) {
-                profileBarrier(cmd, profile, .router);
+                // The direct branch-norm row was produced by the earlier
+                // precompute command buffer, so queue ordering is the
+                // dependency; there is no current-encoder write to flush.
+                if (!use_direct_prefill_branch_norm) {
+                    profileBarrier(cmd, profile, .router);
+                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
