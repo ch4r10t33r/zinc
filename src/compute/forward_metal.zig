@@ -14409,14 +14409,18 @@ fn runDecodeStep(
             }
             if (is_moe and !skip_pre_ffn_router) {
                 if (!residual_router_output_ready) {
-                    profileBarrier(cmd, profile, .router); // norm_buf visible before router DMMV
+                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        &engine.norm_buf;
+                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
                 }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
                         const gate_scale = lt.ffn_gate_inp_scale orelse return error.MissingTensor;
                         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, gate_scale, hidden_dim, 1);
-                        profileBarrier(cmd, profile, .router);
+                        profileBarrierBuffers(cmd, profile, .router, &.{&engine.residual_buf});
                         break :blk &engine.residual_buf;
                     }
                     break :blk &engine.norm_buf;
@@ -14440,7 +14444,19 @@ fn runDecodeStep(
                 } else {
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
                 }
-                profileBarrier(cmd, profile, .router); // router output/logits visible before MoE
+                {
+                    var router_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_barrier_count: usize = 1;
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router)
+                        &engine.router_output_buf
+                    else
+                        &engine.router_logits_buf;
+                    if (residual_router_output_ready) {
+                        router_barrier_bufs[router_barrier_count] = &engine.norm_buf;
+                        router_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
+                }
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
@@ -14842,14 +14858,18 @@ fn runDecodeStep(
                 // precompute command buffer, so queue ordering is the
                 // dependency; there is no current-encoder write to flush.
                 if (!use_direct_prefill_branch_norm and !residual_router_output_ready) {
-                    profileBarrier(cmd, profile, .router);
+                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        ffn_norm_input_buf;
+                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
                 }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
                         const gate_scale = lt.ffn_gate_inp_scale orelse return error.MissingTensor;
                         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, gate_scale, hidden_dim, 1);
-                        profileBarrier(cmd, profile, .router);
+                        profileBarrierBuffers(cmd, profile, .router, &.{&engine.residual_buf});
                         break :blk &engine.residual_buf;
                     }
                     break :blk ffn_norm_input_buf;
@@ -14874,7 +14894,19 @@ fn runDecodeStep(
                 } else {
                     dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
                 }
-                profileBarrier(cmd, profile, .router); // router output/logits visible before MoE
+                {
+                    var router_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_barrier_count: usize = 1;
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router)
+                        &engine.router_output_buf
+                    else
+                        &engine.router_logits_buf;
+                    if (residual_router_output_ready) {
+                        router_barrier_bufs[router_barrier_count] = ffn_norm_input_buf;
+                        router_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
+                }
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
