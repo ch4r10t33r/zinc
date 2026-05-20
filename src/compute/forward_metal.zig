@@ -13469,7 +13469,11 @@ fn runDecodeStep(
                 // encodes only requested graph outputs): skip Q/gate and
                 // flash/output/MoE materialization for this prompt token.
                 try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
-                profileBarrier(cmd, profile, .full_attn); // KV cache visible before a later token reads it
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                // this tail write has no immediate in-encoder consumer. The
+                // later layer-local flash-attention read is ordered by the next
+                // real barrier on that path, or by command-buffer ordering
+                // across the early/tail prompt split.
                 if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                 releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
                 engine.position += 1;
