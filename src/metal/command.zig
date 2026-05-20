@@ -165,9 +165,9 @@ pub const MetalCommand = struct {
             if (n_bufs == 0) return;
             self.barrier_count += 1;
             self.last_barrier_dispatch_count = self.dispatch_count;
-            if (n_bufs >= 4) {
-                // Match llama.cpp's dependency-reset discipline for wider
-                // phase boundaries: a scoped in-encoder barrier avoids a hot
+            if (n_bufs >= 2) {
+                // Match llama.cpp's dependency-reset discipline at phase
+                // boundaries: a scoped in-encoder barrier avoids the hot
                 // Objective-C resource-list call while preserving ordering.
                 shim.mtl_barrier(h);
             } else {
