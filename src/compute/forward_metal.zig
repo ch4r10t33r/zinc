@@ -5244,8 +5244,9 @@ pub const InferenceEngine = struct {
                         self.dmmv_q8_0_k512_quad_pipe.max_threads_per_threadgroup >= 512)
                     {
                         // Exact Qwen3.6 shared-down shape: split each K=512 Q8
-                        // block across two lanes so all lanes participate.
-                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                        // block across two lanes and process eight adjacent
+                        // rows per simdgroup, reusing each X half-block load.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 128, .block_size = 512 };
                     }
                     if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
                         self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
@@ -24914,7 +24915,7 @@ test "dmmv_q8_0_k512_quad shader matches CPU reference" {
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
     const block_size: u32 = 512;
-    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const rows_per_wg: u32 = (block_size / 32) * 8;
     const wgs: u32 = @intCast((M + rows_per_wg - 1) / rows_per_wg);
 
     var cmd = try metal_command.beginCommand(ctx);

@@ -13,8 +13,9 @@ struct DmmvPush {
 //
 // The generic quad-row Q8 path assigns one Q8 block to one lane. At K=512 that
 // leaves lanes 16..31 idle because there are only 16 blocks per row. Split each
-// block across two lanes instead, keeping four output rows per simdgroup while
-// making every lane contribute to the dot product.
+// block across two lanes instead. This variant extends llama.cpp's adjacent-row
+// reuse discipline to eight output rows per simdgroup; each lane loads the X
+// half-block once and applies it to eight Q8 rows.
 kernel void main0(
     constant DmmvPush& p [[buffer(0)]],
     device const uchar* W [[buffer(1)]],
@@ -25,7 +26,7 @@ kernel void main0(
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
 ) {
-    const uint base_row = (tg_id * simdgroups_per_tg + sg_idx) * 4u;
+    const uint base_row = (tg_id * simdgroups_per_tg + sg_idx) * 8u;
     if (base_row >= p.M) return;
 
     device const float* input = X + (p.x_offset >> 2);
@@ -36,11 +37,19 @@ kernel void main0(
     const bool has1 = base_row + 1u < p.M;
     const bool has2 = base_row + 2u < p.M;
     const bool has3 = base_row + 3u < p.M;
+    const bool has4 = base_row + 4u < p.M;
+    const bool has5 = base_row + 5u < p.M;
+    const bool has6 = base_row + 6u < p.M;
+    const bool has7 = base_row + 7u < p.M;
 
     device const uchar* row0 = W + p.a_offset + ulong(base_row) * row_bytes;
     device const uchar* row1 = has1 ? (row0 + row_bytes) : row0;
     device const uchar* row2 = has2 ? (row0 + 2ull * row_bytes) : row0;
     device const uchar* row3 = has3 ? (row0 + 3ull * row_bytes) : row0;
+    device const uchar* row4 = has4 ? (row0 + 4ull * row_bytes) : row0;
+    device const uchar* row5 = has5 ? (row0 + 5ull * row_bytes) : row0;
+    device const uchar* row6 = has6 ? (row0 + 6ull * row_bytes) : row0;
+    device const uchar* row7 = has7 ? (row0 + 7ull * row_bytes) : row0;
 
     const uint block_idx = lane >> 1;
     const uint half_sel = lane & 1u;
@@ -51,21 +60,37 @@ kernel void main0(
     device const uchar* blk1 = row1 + block_idx * 34u;
     device const uchar* blk2 = row2 + block_idx * 34u;
     device const uchar* blk3 = row3 + block_idx * 34u;
+    device const uchar* blk4 = row4 + block_idx * 34u;
+    device const uchar* blk5 = row5 + block_idx * 34u;
+    device const uchar* blk6 = row6 + block_idx * 34u;
+    device const uchar* blk7 = row7 + block_idx * 34u;
 
     const float s0 = float(as_type<half>(*(device const ushort*)(blk0)));
     const float s1 = float(as_type<half>(*(device const ushort*)(blk1)));
     const float s2 = float(as_type<half>(*(device const ushort*)(blk2)));
     const float s3 = float(as_type<half>(*(device const ushort*)(blk3)));
+    const float s4 = float(as_type<half>(*(device const ushort*)(blk4)));
+    const float s5 = float(as_type<half>(*(device const ushort*)(blk5)));
+    const float s6 = float(as_type<half>(*(device const ushort*)(blk6)));
+    const float s7 = float(as_type<half>(*(device const ushort*)(blk7)));
 
     device const packed_char4* q0 = (device const packed_char4*)(blk0 + 2u + half_base);
     device const packed_char4* q1 = (device const packed_char4*)(blk1 + 2u + half_base);
     device const packed_char4* q2 = (device const packed_char4*)(blk2 + 2u + half_base);
     device const packed_char4* q3 = (device const packed_char4*)(blk3 + 2u + half_base);
+    device const packed_char4* q4 = (device const packed_char4*)(blk4 + 2u + half_base);
+    device const packed_char4* q5 = (device const packed_char4*)(blk5 + 2u + half_base);
+    device const packed_char4* q6 = (device const packed_char4*)(blk6 + 2u + half_base);
+    device const packed_char4* q7 = (device const packed_char4*)(blk7 + 2u + half_base);
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     float acc2 = 0.0f;
     float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
 
     #pragma unroll
     for (uint vi = 0u; vi < 4u; ++vi) {
@@ -74,16 +99,28 @@ kernel void main0(
         acc1 = fma(s1, dot(float4(char4(q1[vi])), x), acc1);
         acc2 = fma(s2, dot(float4(char4(q2[vi])), x), acc2);
         acc3 = fma(s3, dot(float4(char4(q3[vi])), x), acc3);
+        acc4 = fma(s4, dot(float4(char4(q4[vi])), x), acc4);
+        acc5 = fma(s5, dot(float4(char4(q5[vi])), x), acc5);
+        acc6 = fma(s6, dot(float4(char4(q6[vi])), x), acc6);
+        acc7 = fma(s7, dot(float4(char4(q7[vi])), x), acc7);
     }
 
     const float sum0 = simd_sum(acc0);
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
+    const float sum4 = simd_sum(acc4);
+    const float sum5 = simd_sum(acc5);
+    const float sum6 = simd_sum(acc6);
+    const float sum7 = simd_sum(acc7);
     if (lane == 0u) {
         output[base_row] = sum0;
         if (has1) output[base_row + 1u] = sum1;
         if (has2) output[base_row + 2u] = sum2;
         if (has3) output[base_row + 3u] = sum3;
+        if (has4) output[base_row + 4u] = sum4;
+        if (has5) output[base_row + 5u] = sum5;
+        if (has6) output[base_row + 6u] = sum6;
+        if (has7) output[base_row + 7u] = sum7;
     }
 }
