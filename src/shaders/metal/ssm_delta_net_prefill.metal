@@ -48,6 +48,112 @@ kernel void main0(
     threadgroup float partial_q[4];
     threadgroup float partial_k[4];
 
+    if (p.dt_rank == 32u &&
+        p.head_v_dim == 128u &&
+        p.d_state == 128u &&
+        p.n_group == 16u &&
+        p.d_inner == 4096u)
+    {
+        constexpr uint head_v_dim = 128u;
+        constexpr uint qk_dim = 2048u;
+        constexpr uint v_base0 = 4096u;
+        constexpr float inv_sqrt_d_state = 0.08838834764831845f;
+
+        const uint group_exact = head & 15u;
+        const uint q_base0 = group_exact * head_v_dim;
+        const uint k_base0 = qk_dim + group_exact * head_v_dim;
+        const uint v_base_head = v_base0 + head * head_v_dim;
+        const uint head_state_base_exact = head * head_v_dim * head_v_dim;
+        threadgroup const float4* k_vec = (threadgroup const float4*)k;
+        threadgroup const float4* q_vec = (threadgroup const float4*)q;
+
+        for (uint token = 0u; token < p.n_tokens; ++token) {
+            const uint conv_token_base = p.conv_offset + token * p.conv_stride;
+
+            float q_ss = 0.0f;
+            float k_ss = 0.0f;
+            for (uint i = tid; i < head_v_dim; i += tg_threads) {
+                const float qv = conv_out[conv_token_base + q_base0 + i];
+                const float kv = conv_out[conv_token_base + k_base0 + i];
+                q[i] = qv;
+                k[i] = kv;
+                q_ss = fma(qv, qv, q_ss);
+                k_ss = fma(kv, kv, k_ss);
+            }
+
+            const float q_sum = simd_sum(q_ss);
+            const float k_sum = simd_sum(k_ss);
+            if (simd_lane == 0u) {
+                partial_q[simd_idx] = q_sum;
+                partial_k[simd_idx] = k_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float q_partial = (simd_lane < simdgroups_per_tg) ? partial_q[simd_lane] : 0.0f;
+            const float k_partial = (simd_lane < simdgroups_per_tg) ? partial_k[simd_lane] : 0.0f;
+            const float q_norm_sq = simd_sum(q_partial);
+            const float k_norm_sq = simd_sum(k_partial);
+
+            float q_scale_lane = 0.0f;
+            float k_scale_lane = 0.0f;
+            float decay_lane = 0.0f;
+            float beta_lane = 0.0f;
+            if (simd_lane == 0u) {
+                const float alpha_raw = alpha[p.alpha_offset + token * p.alpha_stride + head] +
+                    ((p.has_dt_bias != 0u) ? dt_bias[head] : 0.0f);
+                const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
+                const float decay_arg = (p.has_ssm_a != 0u) ? (softplus_alpha * ssm_a[head]) : (-softplus_alpha);
+                q_scale_lane = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
+                k_scale_lane = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
+                decay_lane = fast::exp(decay_arg);
+                beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + token * p.beta_stride + head]));
+            }
+
+            const float q_scale = simd_broadcast(q_scale_lane, 0u);
+            const float k_scale = simd_broadcast(k_scale_lane, 0u);
+            const float decay = simd_broadcast(decay_lane, 0u);
+            const float beta_val = simd_broadcast(beta_lane, 0u);
+            const uint head_out_base = p.output_offset + token * p.output_stride + head * head_v_dim;
+            const uint v_base = conv_token_base + v_base_head;
+
+            for (uint row = tid; row < head_v_dim; row += tg_threads) {
+                const uint row_base = head_state_base_exact + row * head_v_dim;
+                device float4* state_vec = (device float4*)(state + row_base);
+                float sk_raw = 0.0f;
+                #pragma unroll
+                for (uint col4 = 0u; col4 < 32u; ++col4) {
+                    const float4 decayed = state_vec[col4] * decay;
+                    state_vec[col4] = decayed;
+                    const float4 kv = k_vec[col4];
+                    sk_raw = fma(decayed.x, kv.x, sk_raw);
+                    sk_raw = fma(decayed.y, kv.y, sk_raw);
+                    sk_raw = fma(decayed.z, kv.z, sk_raw);
+                    sk_raw = fma(decayed.w, kv.w, sk_raw);
+                }
+
+                const float v = conv_out[v_base + row];
+                const float delta = beta_val * (v - sk_raw * k_scale);
+                const float scaled_delta = delta * k_scale;
+                float out_v = 0.0f;
+                #pragma unroll
+                for (uint col4 = 0u; col4 < 32u; ++col4) {
+                    const float4 kv = k_vec[col4];
+                    const float4 qv = q_vec[col4];
+                    const float4 updated = fma(kv, scaled_delta, state_vec[col4]);
+                    state_vec[col4] = updated;
+                    out_v = fma(updated.x, qv.x, out_v);
+                    out_v = fma(updated.y, qv.y, out_v);
+                    out_v = fma(updated.z, qv.z, out_v);
+                    out_v = fma(updated.w, qv.w, out_v);
+                }
+                output[head_out_base + row] = out_v * q_scale;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return;
+    }
+
     const uint qk_dim = p.d_state * p.n_group;
     const uint group = (p.n_group == p.dt_rank) ? head : (head % p.n_group);
     const uint k_len = min(p.d_state, p.head_v_dim);
