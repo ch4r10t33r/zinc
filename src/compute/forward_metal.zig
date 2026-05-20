@@ -3833,13 +3833,11 @@ pub const InferenceEngine = struct {
 
         // Adapt llama.cpp `ggml-metal-context.m::ggml_metal_graph_compute`:
         // commit a small leading graph slice so the GPU starts while the CPU
-        // records the remaining command buffer. Its `n_main` policy is about
-        // 10% of graph nodes after a small floor; token-major Qwen prefill has
-        // much more GPU work than CPU record work per token, so keeping the
-        // front slice shallow should start the queued Metal work earlier while
-        // still leaving enough work to cover tail recording.
-        const graph_fraction = @max(@as(usize, 8), prompt_len / 10);
-        return @min(prompt_len / 2, @min(graph_fraction, 16));
+        // records the remaining command buffer. Qwen token-major prefill has
+        // enough GPU work per token that the prior 10% node-style heuristic is
+        // too shallow on the Effort 16 verifier, so keep the useful 16-token
+        // front slice directly.
+        return @min(prompt_len / 2, @as(usize, 16));
     }
 
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
