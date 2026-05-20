@@ -432,6 +432,21 @@ fn canUseQwenSsmConvD4FastPath(
         engine.ssm_conv1d_qwen_d4_pipe.handle != null;
 }
 
+fn qwenSsmConvD4PrefillPipe(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+) *const MetalPipeline {
+    if (defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+        conv_channels == 8192 and
+        d_conv == 4 and
+        engine.ssm_conv1d_prefill_qwen_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_prefill_qwen_d4_pipe;
+    }
+    return &engine.ssm_conv1d_prefill_pipe;
+}
+
 fn ssmConv1dThreadgroupSize(
     pipe: *const MetalPipeline,
     conv_channels: u32,
@@ -2373,6 +2388,7 @@ pub const InferenceEngine = struct {
     ssm_conv1d_pipe: MetalPipeline,
     ssm_conv1d_qwen_d4_pipe: MetalPipeline,
     ssm_conv1d_prefill_pipe: MetalPipeline,
+    ssm_conv1d_prefill_qwen_d4_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
     ssm_delta_net_offset_pipe: MetalPipeline,
     ssm_delta_net_prefill_pipe: MetalPipeline,
@@ -2960,6 +2976,7 @@ pub const InferenceEngine = struct {
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
         self.ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
         self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
+        self.ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
         self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
         self.ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
@@ -3619,6 +3636,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_prefill_pipe);
@@ -7914,7 +7932,8 @@ fn dispatchSsmConv1dPrefillOnCmd(
         .output_offset = output_offset,
     };
     const bufs = [_]*const MetalBuffer{ kernel, state, input, output };
-    cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPrefillPush), 0);
+    const block_size = ssmConv1dThreadgroupSize(pipe, conv_channels, d_conv, false);
+    cmd.dispatchV2(pipe, .{ (conv_channels + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPrefillPush), 0);
 }
 
 fn dispatchSsmGatedNormWithPipe(
@@ -9100,9 +9119,10 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     // recurrence token-ordered, but batch this layer's Q8 input projections,
     // SSM-out projection, and route-packed MoE over the full prompt slice.
     try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
+    const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
     dispatchSsmConv1dPrefillOnCmd(
         cmd,
-        &engine.ssm_conv1d_prefill_pipe,
+        conv_prefill_pipe,
         &engine.ssm_conv_kernel_bufs.?[layer_idx],
         &engine.ssm_conv_state_bufs.?[layer_idx],
         &engine.qwen_ssm_prefill_proj_qkv_buf,
@@ -10808,10 +10828,11 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         const d_state = cfg.ssm_d_state;
         const n_group = cfg.ssm_n_group;
         const head_v_dim = d_inner / dt_rank;
+        const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
 
         dispatchSsmConv1dPrefillOnCmd(
             &cmd,
-            &engine.ssm_conv1d_prefill_pipe,
+            conv_prefill_pipe,
             &engine.ssm_conv_kernel_bufs.?[0],
             &engine.ssm_conv_state_bufs.?[0],
             &engine.qwen_ssm_prefill_proj_qkv_buf,
@@ -17180,6 +17201,89 @@ test "ssm_conv1d_prefill shader matches repeated CPU reference" {
     }
 }
 
+test "qwen ssm_conv1d_prefill d4 shader matches repeated CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 8192;
+    const d_conv: usize = 4;
+    const n_tokens: usize = 3;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+    const total_values: usize = n_tokens * conv_channels;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, total_values * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, total_values * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..kernel_len) |i| {
+        kernel_ptr[i] = (@as(f32, @floatFromInt(i % 17)) - 8.0) * 0.03125;
+    }
+    for (0..state_len) |i| {
+        state_ptr[i] = (@as(f32, @floatFromInt(i % 23)) - 11.0) * 0.015625;
+    }
+    for (0..total_values) |i| {
+        input_ptr[i] = (@as(f32, @floatFromInt(i % 29)) - 14.0) * 0.020833334;
+    }
+    @memset(output_ptr[0..total_values], 0);
+
+    const allocator = std.testing.allocator;
+    const ref_state = try allocator.alloc(f32, state_len);
+    defer allocator.free(ref_state);
+    const ref_output = try allocator.alloc(f32, total_values);
+    defer allocator.free(ref_output);
+    @memcpy(ref_state, state_ptr[0..state_len]);
+    @memset(ref_output, 0);
+    for (0..n_tokens) |t| {
+        refRunSsmConv1d(
+            input_ptr[t * conv_channels .. (t + 1) * conv_channels],
+            kernel_ptr[0..kernel_len],
+            ref_state,
+            ref_output[t * conv_channels .. (t + 1) * conv_channels],
+            conv_channels,
+            d_conv,
+        );
+    }
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        @intCast(n_tokens),
+        @intCast(conv_channels),
+        0,
+        0,
+    );
+    cmd.commitAndWait();
+
+    for (0..total_values) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
 test "ssm_gated_norm shader matches CPU reference with shared norm weights" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -19852,6 +19956,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_pipe);
     var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
+    var ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_prefill_qwen_d4_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
@@ -19902,6 +20008,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_prefill_qwen_d4_pipe.handle != null);
 }
 
 test "deinterleave shader splits block-interleaved Q and gate" {
