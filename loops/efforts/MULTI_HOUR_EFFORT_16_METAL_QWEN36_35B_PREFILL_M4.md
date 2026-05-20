@@ -70,35 +70,52 @@ bun loops/implement_metal.ts --effort 16 --dry-run
 
 ## Current standing
 
-Updated after the 100-cycle run ending at commit `8826583`:
+Updated after cycle 120 of the follow-up run:
 
-- Accepted best is `43.8 prefill tok/s` on the Effort 16 chat prompt.
+- Accepted best is `44.8 prefill tok/s` on the Effort 16 chat prompt.
 - The original measured baseline was about `34.1 prefill tok/s`, so the loop
-  banked roughly +28% accepted throughput.
+  banked roughly +31% accepted throughput.
 - The largest accepted jump was cycle 89: token-major Qwen F32 shared-gate MoE
   combine, adapted from vLLM top-k weighted reduce and llama.cpp `mul_mat_id`
   discipline. That moved the accepted best from about `36.4` to `43.4`.
 - Cycle 100 added the current best `43.8 prefill tok/s` via a 16-token early
-  prompt graph commit. Treat 50 tok/s as the next practical milestone before
-  chasing llama.cpp prompt parity.
+  prompt graph commit. Cycles 108-120 moved the accepted tree to `44.8`
+  with final-layer prompt tail skipping, layer-0 SSM branch precompute, and
+  smaller barrier/materialization cleanups.
+- The last 10-cycle self-review at cycle 120 showed no accepted movement above
+  `44.8`. Treat this as a stall. Do not spend more cycles on small variants of
+  early prompt split, terminal-only barriers, or layer-0 materialization unless
+  a fresh profile proves the named bucket moved.
 - Repeated fast-looking route-packed/F32 shared-gate promotions produced
   bang-only output (`!!!!!!!!!!!!!!!!`) despite measuring around `36.8-44.5`.
   Do not count these as progress and do not enable them by default without
   full active-prompt validation and a `Paris` output.
 - Dual-Q8 SSM projection grouping also produced bang-only output around
   `43.5`; keep that family behind validators until the tensor diff is known.
+- The token-major F32 shared-gate reducer rewrite was tried twice and measured
+  slower (`44.1` in cycle 117 after the repaired neutral-keep guard). Do not
+  retry one-threadgroup-per-token shared-gate reduction without new evidence.
+- Codex subprocesses in this harness may fail direct Metal runs with
+  `Metal device not available`; the outer loop's benchmark gate still has the
+  real Metal measurement. Do not burn cycles retrying in-agent Metal smokes.
+- The local llama.cpp checkout no longer has `ggml-metal.m`. Use
+  `ggml-metal-context.m`, `ggml-metal-ops.cpp`, and `ggml-metal.metal` directly
+  when the stalled prompt requests reference study.
 
 Best next directions for 50+:
 
-1. Extend the accepted token-major F32 shared-gate combine rather than
-   re-enabling the route-packed layer-0 F32 path directly.
-2. Measure early prompt commit chunk sizes around the current 16-token chunk
-   before wider graph submission rewrites.
-3. Use the route-pack validators to find the exact tensor/layer where F32
+1. Use the route-pack validators to find the exact tensor/layer where F32
    shared-gate route packing diverges. A promotion needs layer, prompt-token
    count, max abs diff, flag-on command, and a `Paris` run.
-4. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
+2. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
    validators or microbenchmarks before default-on changes.
+3. Explore layer-major work beyond layer 0 only when the dependency is explicit:
+   hidden for layer N depends on all prior layer MoE outputs. A safe candidate
+   must prove the candidate input equals the token-major input before replacing
+   production work.
+4. Add profiling or validation that explains the remaining `ssm 132.98 GiB`,
+   `moe-expert 75.84 GiB`, and `barriers/step 504.4` buckets. A neutral keep is
+   only useful if it directly unlocks a default-on structural change.
 
 Known facts before the first Effort 16 baseline:
 

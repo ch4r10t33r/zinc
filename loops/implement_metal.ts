@@ -1341,9 +1341,12 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       diagnosis.push("git clone --depth 1 https://github.com/ggerganov/llama.cpp /tmp/llama.cpp");
       diagnosis.push("```");
     }
-    diagnosis.push("Read these files:");
-    diagnosis.push(`- \`${llamaMetal}/ggml-metal.m\` — the core Metal dispatch loop`);
-    diagnosis.push(`- \`${llamaMetal}/ggml-metal.metal\` — Q8/Q4 matvec kernels`);
+    diagnosis.push("Read these files if they exist in the local checkout:");
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal-context.m\` — graph command-buffer scheduling and commit/wait policy`);
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal-ops.cpp\` — op-level encoder barriers, fusion, and mul_mat_id dispatch`);
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal.metal\` — Q8/Q4 matvec and routed matmul kernels`);
+    diagnosis.push("Some llama.cpp checkouts no longer have `ggml-metal.m`; do not waste a cycle rediscovering that rename.");
+    diagnosis.push("After reading the current files once, cite the specific function you are adapting and move to a measured code change.");
     diagnosis.push("- Look at how they batch command buffers, manage encoders, and choose per-shape Q8 paths");
     diagnosis.push("- Note how many commitAndWait calls happen per token (likely 1)");
     diagnosis.push("");
@@ -1361,6 +1364,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push("Identify the SPECIFIC technique from llama.cpp or vLLM that addresses our bottleneck,");
     diagnosis.push("then implement it. Cite which file/function you're adapting from in @@@DESCRIPTION.");
     diagnosis.push("Do NOT repeat variations of previously failed approaches.");
+    diagnosis.push("If the local Codex subprocess cannot initialize Metal, do not spend the cycle retrying direct `./zig-out/bin/zinc` or Metal microbenchmarks; the outer harness owns the Metal measurement gate.");
   } else if (state.stalledCycles >= 3) {
     diagnosis.push("");
     diagnosis.push(`## Note: ${state.stalledCycles}/${STALL_THRESHOLD} cycles without improvement — will switch to reference study soon`);
