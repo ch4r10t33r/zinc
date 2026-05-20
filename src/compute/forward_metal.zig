@@ -10623,7 +10623,10 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         profileBarrier(&cmd, profile, .ssm);
 
         dispatchGemmQ8_0OnCmd(engine, &cmd, ssm_out_t, &engine.qwen_ssm_prefill_branch_buf, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_dim, d_inner, n_tokens);
-        profileBarrier(&cmd, profile, .ssm);
+        // No in-encoder consumer follows this SSM-out materialization. Match
+        // llama.cpp's Metal graph discipline: barrier only when the next
+        // encoded op reads the write; the command queue orders later prompt
+        // command buffers.
     }
     if (async_out) |out| {
         commitAsyncProfiled(&cmd, profile);
