@@ -34,6 +34,7 @@ layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 
 const uint NUM_ROWS = 2u;
 const uint Q5K_BLOCK_U32 = 44u;  // 176 bytes / 4
+const uint MAX_BATCH_COLS = 40u;
 
 // Shared memory for cross-subgroup reduction when gl_NumSubgroups > 1
 // (e.g. Intel Xe2 SIMD16: 4 subgroups per 64-thread workgroup).
@@ -87,6 +88,99 @@ void main() {
     // subblocks 0/1/4/5 or 2/3/6/7, so shifting by 0 or 16 bits picks the
     // relevant packed bytes without the dynamic bytes[12] array.
     uint shift = v_im * 16u;
+
+    // Batched prefill mode. Reuses the existing Q5_K pipeline and push layout:
+    // acc_mode > 1 means "num_cols" instead of scalar accumulate. One workgroup
+    // owns one output row and carries up to 40 token-column sums in registers.
+    // Normal decode keeps acc_mode 0/1 and falls through to the original
+    // two-rows-per-workgroup path below.
+    if (acc_mode > 1u) {
+        uint num_cols = min(acc_mode, MAX_BATCH_COLS);
+        uint row = wg_id;
+        if (row >= M) return;
+
+        uint row_u32 = a_base + row * blocks_per_row * Q5K_BLOCK_U32;
+        float sums[MAX_BATCH_COLS];
+        for (uint c = 0u; c < num_cols; c++) sums[c] = 0.0;
+
+        for (uint i = ix; i < blocks_per_row; i += it_size) {
+            uint b_idx = (i * 256u + y_offset_local) / 4u;
+            uint b_idx2 = (i * 256u + y_offset_local + 128u) / 4u;
+            uint blk_u32 = row_u32 + i * Q5K_BLOCK_U32;
+
+            uint d_dmin = a_u32[blk_u32];
+            float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+            float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+
+            uint sc0 = a_u32[blk_u32 + 1u];
+            uint sc1 = a_u32[blk_u32 + 2u];
+            uint sc2 = a_u32[blk_u32 + 3u];
+
+            uint qh_u32 = a_u32[blk_u32 + 4u + l0 / 4u];
+            uint qs_u32_0 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u];
+            uint qs_u32_1 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u + 16u];
+
+            vec4 q0_lo = unpack_nibbles_lo(qs_u32_0);
+            vec4 q0_hi = unpack_nibbles_hi(qs_u32_0);
+            vec4 q1_lo = unpack_nibbles_lo(qs_u32_1);
+            vec4 q1_hi = unpack_nibbles_hi(qs_u32_1);
+
+            uint sb_a = 2u * v_im;
+            uint sb_b = 2u * v_im + 1u;
+            uint sb_c = 2u * v_im + 4u;
+            uint sb_d = 2u * v_im + 5u;
+            q0_lo += unpack_qh_bits(qh_u32, sb_a);
+            q0_hi += unpack_qh_bits(qh_u32, sb_b);
+            q1_lo += unpack_qh_bits(qh_u32, sb_c);
+            q1_hi += unpack_qh_bits(qh_u32, sb_d);
+
+            uint sc0_v = sc0 >> shift;
+            uint sc1_v = sc1 >> shift;
+            uint sc2_v = sc2 >> shift;
+            float sc_a = float(sc0_v & 0x3Fu);
+            float mn_a = float(sc1_v & 0x3Fu);
+            float sc_b = float((sc0_v >> 8u) & 0x3Fu);
+            float mn_b = float((sc1_v >> 8u) & 0x3Fu);
+            float sc_c = float((sc2_v & 0xFu) | ((sc0_v & 0xC0u) >> 2u));
+            float mn_c = float(((sc2_v & 0xF0u) >> 4u) | ((sc1_v & 0xC0u) >> 2u));
+            float sc_d = float(((sc2_v >> 8u) & 0xFu) | (((sc0_v >> 8u) & 0xC0u) >> 2u));
+            float mn_d = float((((sc2_v >> 8u) & 0xF0u) >> 4u) | (((sc1_v >> 8u) & 0xC0u) >> 2u));
+
+            float factor0 = d_val * sc_a; float bias0 = dmin_val * mn_a;
+            float factor1 = d_val * sc_b; float bias1 = dmin_val * mn_b;
+            float factor2 = d_val * sc_c; float bias2 = dmin_val * mn_c;
+            float factor3 = d_val * sc_d; float bias3 = dmin_val * mn_d;
+
+            for (uint c = 0u; c < num_cols; c++) {
+                uint col_base = x_base + (c * K) / 4u;
+                vec4 by0 = x_v4[col_base + b_idx];
+                vec4 by1 = x_v4[col_base + b_idx + 8u];
+                vec4 by2 = x_v4[col_base + b_idx2];
+                vec4 by3 = x_v4[col_base + b_idx2 + 8u];
+
+                sums[c] += dot(vec4(factor0) * q0_lo - vec4(bias0), by0);
+                sums[c] += dot(vec4(factor1) * q0_hi - vec4(bias1), by1);
+                sums[c] += dot(vec4(factor2) * q1_lo - vec4(bias2), by2);
+                sums[c] += dot(vec4(factor3) * q1_hi - vec4(bias3), by3);
+            }
+        }
+
+        for (uint c = 0u; c < num_cols; c++) {
+            float reduced = subgroupAdd(sums[c]);
+            if (gl_NumSubgroups > 1u) {
+                if (subgroupElect()) s_sg_sums[gl_SubgroupID] = reduced;
+                barrier();
+                if (tid == 0u) {
+                    for (uint sg = 1u; sg < gl_NumSubgroups; sg++) reduced += s_sg_sums[sg];
+                }
+                barrier();
+            }
+            if (tid == 0u) {
+                y_data[y_base + c * M + row] = reduced;
+            }
+        }
+        return;
+    }
 
     uint row0 = wg_id * NUM_ROWS;
     if (row0 >= M) return;

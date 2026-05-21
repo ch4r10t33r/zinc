@@ -9495,6 +9495,7 @@ pub const InferenceEngine = struct {
         // Keep these in sync with the GLSL arrays:
         // - dmmv_q{4,6}k_batch.comp:       MAX_COLS = 32
         // - dmmv_q{4,6}k_batch_kpar.comp:  MAX_COLS = 40
+        // - dmmv_q5k.comp batched mode:    MAX_COLS = 40
         //
         // Intel currently uses the serial batch shaders, not the wave64 kpar
         // variants. Sending 40 columns to the serial shader overruns its
@@ -9513,6 +9514,7 @@ pub const InferenceEngine = struct {
             if (prefer_serial_qwen36_dense_down) break :blk null;
             switch (tensor.info.type_) {
                 .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
+                .q5_k => break :blk if (self.dmmv.pipeline_q5k) |*p| p else null,
                 .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
                 else => break :blk null,
             }
@@ -9532,19 +9534,43 @@ pub const InferenceEngine = struct {
                     .y_offset = y_offset,
                     .num_cols = chunk,
                 };
-                self.pushDispatch3(
-                    pip,
-                    std.mem.asBytes(&push),
-                    tensor.gpu_buffer.handle,
-                    tensor.gpu_buffer.size,
-                    x_buf.handle,
-                    x_buf.size,
-                    y_buf.handle,
-                    y_buf.size,
-                    M,
-                    1,
-                    1,
-                );
+                if (tensor.info.type_ == .q5_k) {
+                    const q5_push = DmmvPushConstants{
+                        .M = M,
+                        .K = K,
+                        .a_offset = 0,
+                        .x_offset = x_offset,
+                        .y_offset = y_offset,
+                        .acc_mode = chunk,
+                    };
+                    self.pushDispatch3(
+                        pip,
+                        std.mem.asBytes(&q5_push),
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        x_buf.handle,
+                        x_buf.size,
+                        y_buf.handle,
+                        y_buf.size,
+                        M,
+                        1,
+                        1,
+                    );
+                } else {
+                    self.pushDispatch3(
+                        pip,
+                        std.mem.asBytes(&push),
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        x_buf.handle,
+                        x_buf.size,
+                        y_buf.handle,
+                        y_buf.size,
+                        M,
+                        1,
+                        1,
+                    );
+                }
             } else {
                 try self.dmmv.recordBatchDispatchPush(
                     &self.decode_cmd,
@@ -12237,6 +12263,7 @@ pub const InferenceEngine = struct {
         scratch_hidden: Buffer,
         scratch_swiglu: Buffer,
         scratch_norm: Buffer,
+        scratch_down: Buffer,
         pipeline_enabled: bool,
     ) !void {
         if (n_tokens == 0) return;
@@ -12332,22 +12359,39 @@ pub const InferenceEngine = struct {
 
         const ssm_phase = self.beginProfilePhase();
         const ssm_out_phase = self.beginProfilePhase();
-        var out_tok: u32 = 0;
-        while (out_tok < n_tokens) : (out_tok += 1) {
-            const x_offset = out_tok * d_inner * @sizeOf(f32);
-            const y_offset = out_tok * hidden_dim * @sizeOf(f32);
-            try self.dispatchDmmvInner(
-                ssm_out_t,
-                scratch_swiglu,
-                scratch_swiglu.size,
-                scratch_hidden,
-                hidden_dim,
-                d_inner,
-                0,
-                x_offset,
-                y_offset,
-                1,
+        const use_batched_q5k_ssm_out = ssm_out_t.info.type_ == .q5_k and
+            self.use_q4k_batch_kpar and
+            self.dmmv.pipeline_q5k != null and
+            n_tokens >= 2;
+        if (use_batched_q5k_ssm_out) {
+            try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+            self.decode_cmd.computeBarrier();
+            try self.dispatchScaleAcc(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                n_tokens * hidden_dim,
+                1.0,
             );
+        } else {
+            var out_tok: u32 = 0;
+            while (out_tok < n_tokens) : (out_tok += 1) {
+                const x_offset = out_tok * d_inner * @sizeOf(f32);
+                const y_offset = out_tok * hidden_dim * @sizeOf(f32);
+                try self.dispatchDmmvInner(
+                    ssm_out_t,
+                    scratch_swiglu,
+                    scratch_swiglu.size,
+                    scratch_hidden,
+                    hidden_dim,
+                    d_inner,
+                    0,
+                    x_offset,
+                    y_offset,
+                    1,
+                );
+            }
         }
         self.endProfilePhase(.ssm_out, ssm_out_phase);
         self.endProfilePhase(.ssm, ssm_phase);
@@ -12719,6 +12763,7 @@ pub const InferenceEngine = struct {
                     scratch_hidden,
                     scratch_swiglu,
                     scratch_norm,
+                    scratch_down,
                     false,
                 );
             } else {
@@ -12799,6 +12844,7 @@ pub const InferenceEngine = struct {
                     scratch_hidden,
                     scratch_swiglu,
                     scratch_norm,
+                    scratch_down,
                     pipeline_tail,
                 );
             } else {
