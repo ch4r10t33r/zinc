@@ -2554,6 +2554,7 @@ pub const InferenceEngine = struct {
     router_f32_topk_bias_pipe: MetalPipeline,
     router_f32_topk_batched_pipe: MetalPipeline,
     router_q8_0_topk_pipe: MetalPipeline,
+    router_q8_0_topk_k2048_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
     moe_route_pack_blocks_pipe: MetalPipeline,
@@ -2571,6 +2572,7 @@ pub const InferenceEngine = struct {
     moe_weighted_acc_scaled_pipe: MetalPipeline,
     residual_rms_norm_pipe: MetalPipeline,
     residual_rms_norm_router_q8_0_topk_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_k2048_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
@@ -3089,6 +3091,7 @@ pub const InferenceEngine = struct {
         self.router_f32_topk_bias_pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
         self.router_f32_topk_batched_pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
         self.router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
+        self.router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_k2048");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
         self.moe_route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
@@ -3106,6 +3109,7 @@ pub const InferenceEngine = struct {
         self.moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
         self.residual_rms_norm_pipe = try loadShaderPipeline(ctx, "residual_rms_norm");
         self.residual_rms_norm_router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk");
+        self.residual_rms_norm_router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_k2048");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
@@ -3925,6 +3929,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.router_f32_topk_bias_pipe);
         metal_pipeline.freePipeline(&self.router_f32_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.router_q8_0_topk_pipe);
+        metal_pipeline.freePipeline(&self.router_q8_0_topk_k2048_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_blocks_pipe);
@@ -3942,6 +3947,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.moe_weighted_acc_scaled_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_k2048_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
@@ -7793,6 +7799,21 @@ fn canUseQwenResidualRmsNormRouterQ8Topk(
         engine.residual_rms_norm_router_q8_0_topk_pipe.max_threads_per_threadgroup >= 1024;
 }
 
+fn canUseQwenRouterQ8K2048Exact(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+) bool {
+    return engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k == 8 and
+        router.info.type_ == .q8_0;
+}
+
 fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -7821,6 +7842,14 @@ fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
         .a_offset = tensorPageOffset(engine.model, router),
     };
     const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output };
+    if (canUseQwenRouterQ8K2048Exact(engine, router, hidden_dim, n_experts, k) and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+        return;
+    }
     cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
 }
 
@@ -8571,6 +8600,14 @@ fn dispatchRouterQ8TopkOnCmd(
         .x_offset = x_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
+    if (canUseQwenRouterQ8K2048Exact(engine, tensor, hidden_dim, n_experts, k) and
+        engine.router_q8_0_topk_k2048_pipe.handle != null and
+        engine.router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
+        engine.router_q8_0_topk_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.router_q8_0_topk_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+        return;
+    }
     cmd.dispatchV2(&engine.router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
 }
 
