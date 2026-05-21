@@ -505,6 +505,9 @@ describe("controller helpers", () => {
     expect(spec?.benchmarkPrompt).toContain("Code review request");
     expect(spec?.benchmarkPrompt).toContain("src/cache.ts");
     expect(spec?.benchmarkPrompt).not.toContain("capital of France");
+    expect(spec?.minHealthyTokPerSec).toBe(10);
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("PARTIAL_ATTN_NORM_STORE");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("shaderstats");
   });
 
   test("resume compatibility rejects state from older benchmark regimes", () => {

@@ -234,6 +234,11 @@ type EffortSpec = {
   benchmarkMaxTokens: number;
   benchmarkMethod: string;
   defaultModel?: string;
+  // Optional sanity floor for the baseline benchmark. This catches cases
+  // where the RDNA node is effectively not using the GPU path, is badly
+  // contaminated by stale processes, or has fallen into a driver/runtime
+  // state that makes optimization results meaningless.
+  minHealthyTokPerSec?: number;
   // Optional per-effort controller hints. These are rendered into the agent
   // prompt so the loop can encode knowledge the base plan document doesn't
   // (or shouldn't) encode itself.
@@ -581,6 +586,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     benchmarkPrompt: QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT,
     benchmarkMaxTokens: 8,
     benchmarkMethod: "site-aligned context-medium Coding Review prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    minHealthyTokPerSec: 10,
     knownFlatCategories: [
       "Do not optimize against the old synthetic Paris prefill prompt for effort 15. It reported ~148 tok/s but does not match the site context-medium workload that exposes the real ~29 tok/s 27B prefill gap.",
       "Do not relax canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0 as a first step. A prior SSM batched prefill attempt caused QueueSubmitFailed / GPU resets and had a real hidden-state dependency bug.",
@@ -592,12 +598,15 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Do not repeat direct descriptor-offset SSM prefill projection replay. Cycle 36 measured flag OFF 31.34 tok/s vs flag ON 31.22 tok/s and reverted it.",
       "Do not repeat Q5_K row4 SSM-out, SSM delta tile8, or other SSM-side variants while dense_ffn remains the largest phase bucket. Recent SSM cycles produced zero perf keeps.",
       "Do not repeat Q4_K scale-unpack cleanup, BN=64 mul_mm_q4k projection batches, Q6_K batched-kpar chunk tuning, prefix dense-down batched accumulate, or wave32 row1 selector without new dense subphase evidence. These measured flat or negative around the 31.29 tok/s checkpoint.",
+      "Do not repeat lower-bound dense segment additions unless a fresh profile proves the first layers are now hot. Layer-1 extension measured old 4-62 override at 50.16 tok/s vs new layer-1 schedule at 50.07 tok/s and reverted; earlier prefix-depth/layer 2/3/4/8 sweeps were also flat or negative.",
+      "Do not repeat fusing the partial hidden scratch copy with the first attention-layer RMS norm at full-attention segment handoff. Measured with ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE: OFF median 49.96 tok/s [51.32, 49.82, 49.96] vs ON median 49.53 tok/s [49.53, 49.42, 49.62]; reverted. It also moved attention RMS work outside the normal phase timer, making profiles less trustworthy.",
     ],
     structuralSwingIdeas: [
-      "Current corrected-harness profile has dense_ffn as the top bucket (~3.1 s vs SSM ~2.3 s). Next cycles should attack dense_ffn unless a fresh ZINC_PREFILL_PROFILE=1 run shows another bucket overtook it.",
-      "Extend the existing Qwen3.6-27B layer-major dense FFN prefix into a measured segment path for one additional layer after the prefix. Keep it flag-gated, sweep only a few layer indices, and keep only if flag ON beats the 31.29 tok/s checkpoint.",
+      "Current corrected-harness profile still has dense_ffn as the top bucket, but the recent best checkpoint is ~49.91 tok/s rather than the older 31.29 tok/s plan text. Next cycles should attack dense_ffn only from a fresh ZINC_PREFILL_PROFILE=1 subphase, not from stale prompt-era assumptions.",
+      "Treat the current Qwen3.6-27B layer-major dense segment range as provisionally settled. Do not add earlier layers again; segment work should be a paired subset/removal or boundary-stability sweep only if it includes an old-vs-new control in the same cycle and a profile-backed reason.",
+      "Before more dense kernel rewrites, collect RADV_DEBUG=shaderstats for the current fused Q4_K gate/up/SwiGLU path and Q6_K batched down/kpar path. Only edit the shader if shaderstats shows a concrete occupancy, register, spill, or instruction issue that maps to the dense_ffn subphase currently on top.",
       "Fuse dense down projection with residual accumulation for the batched dense FFN path. The current path writes scratch_down, barriers, then scale-accumulates into scratch_hidden; a Q6_K batched down+acc kernel would attack dense_ffn_down without replaying SSM.",
-      "Use the parsed dense_ffn subphase profile before editing. If gateup dominates, improve the existing row1 fused Q4_K gate+up+SwiGLU path structurally; if down dominates, work on down+acc; if neither subphase is dominant, do not burn a cycle on micro-kernel tuning.",
+      "Use the parsed dense_ffn subphase profile before editing. If gateup dominates, improve the existing fused Q4_K gate/up/SwiGLU path structurally; if down dominates, work on down+acc; if sample spread is bimodal or above the noise gate, run a paired control before attributing a small movement to code.",
       "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors. Flag-gated paths must be measured flag OFF and flag ON in the same cycle.",
     ],
     referenceImplementations: [
@@ -624,6 +633,16 @@ export function getEffortSpec(effort: number): EffortSpec | null {
 function positiveIntEnv(name: string, fallback: number): number {
   const parsed = Number(process.env[name] ?? fallback);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function minHealthyTokPerSecForSpec(effortSpec: EffortSpec): number | null {
+  const override = process.env.ZINC_MIN_HEALTHY_TPS;
+  if (override != null && override.trim() !== "") {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (parsed === 0) return null;
+  }
+  return effortSpec.minHealthyTokPerSec ?? null;
 }
 
 const BENCHMARK_MIN_SAMPLES = 3;
@@ -2989,6 +3008,20 @@ async function main() {
   }
   if (!originalBaseline.correct) {
     console.error(c("1;31", `Baseline output incorrect: "${originalBaseline.outputText}". Fix correctness first.`));
+    process.exit(1);
+  }
+  if (originalBaseline.tokPerSec == null) {
+    console.error(c("1;31", `Baseline ${effortSpec.primaryMetricLabel} was not parseable. Fix the benchmark command or parser before starting optimization cycles.`));
+    process.exit(1);
+  }
+  const minHealthyTokPerSec = minHealthyTokPerSecForSpec(effortSpec);
+  if (minHealthyTokPerSec != null && originalBaseline.tokPerSec < minHealthyTokPerSec) {
+    console.error(c(
+      "1;31",
+      `Baseline ${effortSpec.primaryMetricLabel} ${originalBaseline.tokPerSec.toFixed(2)} tok/s is below the ${minHealthyTokPerSec.toFixed(2)} tok/s health floor.`,
+    ));
+    console.error(c("1;31", "This usually means the RDNA node is contaminated, the GPU path is not active, or the driver/runtime state is unhealthy. Clean/reboot/fix the node before burning agent cycles."));
+    console.error(c("2", "Set ZINC_MIN_HEALTHY_TPS=0 only if you intentionally want to optimize from this degraded baseline."));
     process.exit(1);
   }
 
