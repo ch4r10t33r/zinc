@@ -2449,6 +2449,67 @@ fn dispatchQwenSsmProjectionTailBatchedOnCmd(
     try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, weight, input, output, M, K, N);
 }
 
+fn canUseQwenSsmF32AlphaBetaDual(
+    engine: *const InferenceEngine,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+) bool {
+    const cfg = engine.config;
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        rows == cfg.ssm_dt_rank and
+        rows == 32 and
+        cols == 2048 and
+        alpha_t.info.type_ == .f32 and
+        beta_t.info.type_ == .f32 and
+        alpha_t.info.numElements() == @as(u64, rows) * @as(u64, cols) and
+        beta_t.info.numElements() == @as(u64, rows) * @as(u64, cols) and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.dmmv_f32_dual_small_pipe.handle != null and
+        engine.dmmv_f32_dual_small_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    alpha_output_buf: *const MetalBuffer,
+    beta_output_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, alpha_t, rows, cols);
+    recordDmmvProfile(engine, beta_t, rows, cols);
+
+    const push = DualQ8DmmvPush{
+        .M0 = rows,
+        .M1 = rows,
+        .K = cols,
+        .a0_offset = tensorPageOffset(engine.model, alpha_t),
+        .a1_offset = tensorPageOffset(engine.model, beta_t),
+        .x_offset = x_byte_offset,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &alpha_t.gpu_buffer, &beta_t.gpu_buffer, input_buf, alpha_output_buf, beta_output_buf };
+    cmd.dispatchV2(
+        &engine.dmmv_f32_dual_small_pipe,
+        .{ (rows + 63) / 64, 2, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        0,
+    );
+}
+
 /// Metal inference engine — owns GPU buffers, pipelines, and KV cache.
 pub const InferenceEngine = struct {
     model: *const metal_loader.Model,
@@ -2539,6 +2600,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_repacked_k4096_qwen_pipe: MetalPipeline,
     dmmv_f16_pipe: MetalPipeline,
     dmmv_f32_pipe: MetalPipeline,
+    dmmv_f32_dual_small_pipe: MetalPipeline,
     dmmv_q4k_moe_pipe: MetalPipeline,
     dmmv_q4k_moe_gate_up_pipe: MetalPipeline,
     dmmv_q4k_dense_gate_up_geglu_pipe: MetalPipeline,
@@ -3082,6 +3144,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
         self.dmmv_f16_pipe = try loadShaderPipeline(ctx, "dmmv_f16");
         self.dmmv_f32_pipe = try loadShaderPipeline(ctx, "dmmv_f32");
+        self.dmmv_f32_dual_small_pipe = try loadShaderPipeline(ctx, "dmmv_f32_dual_small");
         self.dmmv_q4k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe");
         self.dmmv_q4k_moe_gate_up_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
         self.dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
@@ -3956,6 +4019,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f16_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_f32_dual_small_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_geglu_pipe);
@@ -15431,8 +15495,12 @@ fn runDecodeStep(
                         // tail after conv and let the concurrent encoder overlap
                         // it with the recurrent conv dispatch.
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
-                        dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
-                        dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        if (canUseQwenSsmF32AlphaBetaDual(engine, alpha_t, beta_t, dt_rank, hidden_dim)) {
+                            dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, &engine.norm_buf, &engine.router_logits_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        } else {
+                            dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
+                            dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        }
                         profileBarrierBuffers(cmd, profile, .ssm, &.{
                             &engine.swiglu_buf,
                             &engine.gate_buf,
@@ -21622,6 +21690,80 @@ test "gemm_f32_small shader matches CPU reference for batched tokens" {
             }
             try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.001);
         }
+    }
+}
+
+test "dmmv_f32_dual_small shader matches two CPU references" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_f32_dual_small");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 7;
+    const K: usize = 64;
+    const weight_offset: usize = 16;
+
+    var weight0_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight0_buf);
+    var weight1_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight1_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output0_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output0_buf);
+    var output1_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output1_buf);
+
+    @memset(weight0_buf.cpu_ptr.?[0..weight0_buf.size], 0);
+    @memset(weight1_buf.cpu_ptr.?[0..weight1_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
+    @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
+
+    const w0: [*]f32 = @ptrCast(@alignCast(weight0_buf.cpu_ptr.? + weight_offset));
+    const w1: [*]f32 = @ptrCast(@alignCast(weight1_buf.cpu_ptr.? + weight_offset));
+    for (0..M * K) |i| {
+        const raw0: i32 = @intCast((i * 11 + 5) % 31);
+        const raw1: i32 = @intCast((i * 13 + 7) % 29);
+        w0[i] = 0.03125 * @as(f32, @floatFromInt(raw0 - 15));
+        w1[i] = 0.025 * @as(f32, @floatFromInt(raw1 - 14));
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 37);
+        input_ptr[i] = 0.05 * @as(f32, @floatFromInt(raw - 18));
+    }
+
+    const push = DualQ8DmmvPush{
+        .M0 = @intCast(M),
+        .M1 = @intCast(M),
+        .K = @intCast(K),
+        .a0_offset = @intCast(weight_offset),
+        .a1_offset = @intCast(weight_offset),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &input_buf, &output0_buf, &output1_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 63) / 64), 2, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const out0: [*]const f32 = @ptrCast(@alignCast(output0_buf.cpu_ptr.?));
+    const out1: [*]const f32 = @ptrCast(@alignCast(output1_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        var expected0: f32 = 0;
+        var expected1: f32 = 0;
+        for (0..K) |col| {
+            expected0 += w0[row * K + col] * input_ptr[col];
+            expected1 += w1[row * K + col] * input_ptr[col];
+        }
+        try std.testing.expectApproxEqAbs(expected0, out0[row], 0.0001);
+        try std.testing.expectApproxEqAbs(expected1, out1[row], 0.0001);
     }
 }
 
