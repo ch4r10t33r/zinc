@@ -1396,6 +1396,18 @@ const ResidualRmsNormRouterQ8TopkPush = extern struct {
     a_offset: u32,
 };
 
+/// Push constants for residual_rms_norm + F32 router top-k fusion.
+const ResidualRmsNormRouterF32TopkPush = extern struct {
+    n: u32,
+    eps: f32,
+    scale: f32,
+    residual_offset: u32,
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+};
+
 /// Push constants for triple-fused residual_norm + residual_add + output_norm
 /// (matches post_norm_residual_rms_norm.metal: buffer(0)). Replaces the
 /// separate post_*_norm + barrier + residual_rms_norm pair. `hidden_scale`
@@ -2701,6 +2713,7 @@ pub const InferenceEngine = struct {
     residual_rms_norm_router_q8_0_topk_pipe: MetalPipeline,
     residual_rms_norm_router_q8_0_topk_k2048_pipe: MetalPipeline,
     residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
+    residual_rms_norm_router_f32_topk_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
@@ -3247,6 +3260,7 @@ pub const InferenceEngine = struct {
         self.residual_rms_norm_router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk");
         self.residual_rms_norm_router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_k2048");
         self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
+        self.residual_rms_norm_router_f32_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
@@ -4122,6 +4136,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_k2048_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_f32_topk_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
@@ -8168,6 +8183,59 @@ fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
         return;
     }
     cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+}
+
+fn canUseQwenResidualRmsNormRouterF32Topk(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+) bool {
+    return (readBoolEnv("ZINC_METAL_QWEN_RESIDUAL_ROUTER_F32_FUSED") orelse true) and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k == 8 and
+        router.info.type_ == .f32 and
+        engine.residual_rms_norm_router_f32_topk_pipe.handle != null and
+        engine.residual_rms_norm_router_f32_topk_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_f32_topk_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    router: *const metal_loader.LoadedTensor,
+    output: *const MetalBuffer,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    const push = ResidualRmsNormRouterF32TopkPush{
+        .n = hidden_dim,
+        .eps = engine.config.rms_norm_eps,
+        .scale = scale,
+        .residual_offset = residual_offset,
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, router),
+    };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output };
+    cmd.dispatchV2(&engine.residual_rms_norm_router_f32_topk_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
 }
 
 /// Triple-fused: residual_norm + residual_add + output_norm.
@@ -15291,6 +15359,26 @@ fn runDecodeStep(
                         0,
                     );
                     residual_router_output_ready = true;
+                } else if (allow_prefill_f32_router_fusion and canUseQwenResidualRmsNormRouterF32Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used)) {
+                    // Same boundary fusion for Qwen3.6's F32 routers: keep the
+                    // normalized row for MoE inputs and produce compact top-k
+                    // routing without a separate router dispatch.
+                    dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+                        engine,
+                        cmd,
+                        &engine.hidden_buf,
+                        &engine.down_buf,
+                        &engine.norm_buf,
+                        &engine.ffn_norm_bufs[layer_idx],
+                        router_t,
+                        &engine.router_output_buf,
+                        hidden_dim,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        1.0,
+                        0,
+                    );
+                    residual_router_output_ready = true;
                 } else {
                     dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
                 }
@@ -15802,6 +15890,29 @@ fn runDecodeStep(
                             router_t,
                             router_ref.buffer,
                             router_ref.offset,
+                            &engine.router_output_buf,
+                            hidden_dim,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            1.0,
+                            ssm_residual_offset,
+                        );
+                        residual_router_output_ready = true;
+                    } else if (allow_prefill_f32_router_fusion and
+                        canUseQwenResidualRmsNormRouterF32Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used))
+                    {
+                        // Qwen3.6's production router is F32. Fuse the SSM
+                        // residual+FFN norm and F32 top-k routing so the MoE
+                        // path still receives the materialized norm row while
+                        // dropping one dispatch and one router-input barrier.
+                        dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+                            engine,
+                            cmd,
+                            &engine.hidden_buf,
+                            ssm_residual_buf,
+                            &engine.norm_buf,
+                            &engine.ffn_norm_bufs[layer_idx],
+                            router_t,
                             &engine.router_output_buf,
                             hidden_dim,
                             cfg.n_experts,
@@ -22448,6 +22559,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&router_q8_repacked_pipe);
     var residual_router_q8_repacked_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
     defer metal_pipeline.freePipeline(&residual_router_q8_repacked_pipe);
+    var residual_router_f32_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
+    defer metal_pipeline.freePipeline(&residual_router_f32_pipe);
     var route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
     defer metal_pipeline.freePipeline(&route_pack_pipe);
     var route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
@@ -24347,6 +24460,127 @@ test "router_f32_topk_batched shader routes each prompt token" {
             const actual_weight: f32 = @bitCast(out[k + slot]);
             try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
         }
+    }
+}
+
+test "residual_rms_norm_router_f32_topk shader matches residual norm and CPU top-k" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 512) return error.SkipZigTest;
+
+    const K: usize = 64;
+    const n_experts: usize = 96;
+    const k: usize = 4;
+    const residual_pad: usize = 8;
+    const scale: f32 = 0.75;
+    const eps: f32 = 1.0e-6;
+
+    var hidden_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var residual_buf = try metal_buffer.createBuffer(ctx, (residual_pad + K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&residual_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var norm_weight_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_weight_buf);
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    const residual_ptr: [*]f32 = @ptrCast(@alignCast(residual_buf.cpu_ptr.?));
+    const norm_weight_ptr: [*]f32 = @ptrCast(@alignCast(norm_weight_buf.cpu_ptr.?));
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..K) |i| {
+        hidden_ptr[i] = 0.10 + 0.001 * @as(f32, @floatFromInt(i));
+        residual_ptr[residual_pad + i] = 0.02 + 0.0003 * @as(f32, @floatFromInt(i % 17));
+        norm_weight_ptr[i] = 1.0 + 0.0001 * @as(f32, @floatFromInt(i));
+    }
+    for (0..residual_pad) |i| residual_ptr[i] = -99.0;
+    for (0..n_experts) |expert| {
+        for (0..K) |i| {
+            const shape = 1.0 + @as(f32, @floatFromInt(i % 7));
+            weight_ptr[expert * K + i] = 0.00001 * @as(f32, @floatFromInt(expert + 1)) * shape;
+        }
+    }
+
+    var expected_hidden: [K]f32 = undefined;
+    var expected_norm: [K]f32 = undefined;
+    var sq: f32 = 0.0;
+    for (0..K) |i| {
+        const h = hidden_ptr[i] + scale * residual_ptr[residual_pad + i];
+        expected_hidden[i] = h;
+        sq += h * h;
+    }
+    const rms_inv = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(K)) + eps);
+    for (0..K) |i| expected_norm[i] = norm_weight_ptr[i] * expected_hidden[i] * rms_inv;
+
+    var logits: [n_experts]f32 = undefined;
+    for (0..n_experts) |expert| {
+        var dot: f32 = 0.0;
+        for (0..K) |i| dot += weight_ptr[expert * K + i] * expected_norm[i];
+        logits[expert] = dot;
+    }
+
+    var expected_ids: [k]u32 = undefined;
+    var selected_vals: [k]f32 = undefined;
+    for (0..k) |slot| {
+        var best_val = -std.math.inf(f32);
+        var best_idx: usize = 0;
+        for (0..n_experts) |expert| {
+            if (logits[expert] > best_val) {
+                best_val = logits[expert];
+                best_idx = expert;
+            }
+        }
+        expected_ids[slot] = @intCast(best_idx);
+        selected_vals[slot] = best_val;
+        logits[best_idx] = -std.math.inf(f32);
+    }
+    var max_sel = -std.math.inf(f32);
+    for (selected_vals) |v| max_sel = @max(max_sel, v);
+    var sum: f32 = 0.0;
+    var expected_weights: [k]f32 = undefined;
+    for (0..k) |slot| {
+        expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+        sum += expected_weights[slot];
+    }
+    for (&expected_weights) |*w| w.* /= sum;
+
+    const push = ResidualRmsNormRouterF32TopkPush{
+        .n = @intCast(K),
+        .eps = eps,
+        .scale = scale,
+        .residual_offset = @intCast(residual_pad),
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &hidden_buf, &residual_buf, &norm_buf, &norm_weight_buf, &weight_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
+    cmd.commitAndWait();
+
+    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        try std.testing.expectApproxEqAbs(expected_hidden[i], hidden_ptr[i], 0.00001);
+        try std.testing.expectApproxEqAbs(expected_norm[i], norm_ptr[i], 0.00005);
+    }
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..k) |slot| {
+        try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
+        const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
+        try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
     }
 }
 
