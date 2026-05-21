@@ -9501,7 +9501,7 @@ pub const InferenceEngine = struct {
         // Intel currently uses the serial batch shaders, not the wave64 kpar
         // variants. Sending 40 columns to the serial shader overruns its
         // 32-element register array and can end in FenceWaitFailed.
-        const SERIAL_Q4_MAX_COLS: u32 = 32;
+        const SERIAL_MAX_COLS: u32 = 32;
         const SERIAL_Q6_MAX_COLS: u32 = 24;
         const KPAR_MAX_COLS: u32 = 40;
         const f32_bytes: u32 = @sizeOf(f32);
@@ -9521,10 +9521,12 @@ pub const InferenceEngine = struct {
                 else => break :blk null,
             }
         };
-        const max_cols: u32 = if (kpar_pipeline != null) KPAR_MAX_COLS else switch (tensor.info.type_) {
+        const serial_max_cols: u32 = switch (tensor.info.type_) {
             .q6_k => SERIAL_Q6_MAX_COLS,
-            else => SERIAL_Q4_MAX_COLS,
+            else => SERIAL_MAX_COLS,
         };
+        // Pre-Q6 split, this was: if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS.
+        const max_cols: u32 = if (kpar_pipeline != null) KPAR_MAX_COLS else serial_max_cols;
         while (chunk_start < n_tokens) {
             const chunk: u32 = @min(max_cols, n_tokens - chunk_start);
             const x_offset: u32 = chunk_start * K * f32_bytes;
