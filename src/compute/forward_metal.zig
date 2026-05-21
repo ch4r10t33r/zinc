@@ -2618,6 +2618,8 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_repacked_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_nr2_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_nr2_qwen_pipe: MetalPipeline,
     dmmv_q8_0_repacked_quad_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_quad_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_quad_pipe: MetalPipeline,
@@ -3162,6 +3164,8 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_repacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked");
         self.dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
         self.dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
+        self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
+        self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
         self.dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
         self.dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
         self.dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
@@ -4037,6 +4041,8 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_quad_pipe);
@@ -6858,6 +6864,24 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 128;
             const rows_per_wg: u32 = (block_size / 32) * 2;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            if (K == 2048 and
+                M % 2 == 0 and
+                engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+            if (K == 4096 and
+                M % 2 == 0 and
+                engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
             if (K == 2048 and
                 engine.dmmv_q8_0_repacked_k2048_pipe.thread_execution_width == 32 and
                 engine.dmmv_q8_0_repacked_k2048_pipe.max_threads_per_threadgroup >= block_size)
@@ -22349,6 +22373,10 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_pipe);
     var dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_pipe);
+    var dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+    var dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_nr2_qwen_pipe);
     var dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_quad_pipe);
     var dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
@@ -22483,6 +22511,8 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_repacked_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_qwen_pipe.handle != null);
