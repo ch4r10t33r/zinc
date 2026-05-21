@@ -6587,6 +6587,23 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             .y_offset = 0,
         };
         const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
+        if (std.posix.getenv("ZINC_METAL_Q8_TG_SIZE") == null and
+            preferLlamaQ8SmallThreadgroupForQwenSsm(tensor, M, K) and
+            engine.dmmv_q8_0_repacked_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_pipe.max_threads_per_threadgroup >= 128)
+        {
+            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl` (N_R0_Q8_0=2,
+            // N_SG_Q8_0=4) to the private-repacked SSM Q8 path. The four-row
+            // repacked kernels reduce x-vector traffic, but the 512-thread
+            // shape can lose Apple9 occupancy on the 134-token prompt's
+            // repeated M=8192/4096/2048 SSM projections; keep a single exact
+            // dispatch-policy lever and let the harness measure it.
+            const block_size: u32 = 128;
+            const rows_per_wg: u32 = (block_size / 32) * 2;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
         if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
             K == 2048 and
             engine.dmmv_q8_0_repacked_k2048_quad_pipe.thread_execution_width == 32 and
