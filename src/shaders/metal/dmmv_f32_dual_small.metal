@@ -16,7 +16,9 @@ struct DualF32DmmvPush {
 //
 // Qwen3.6 SSM alpha/beta tails are both 32x2048 F32 projections. The previous
 // path launched dmmv_f32 twice; this keeps the same one-thread-per-row,
-// sequential K reduction, but uses grid.y to select alpha vs beta.
+// sequential K reduction, but uses grid.y to select alpha vs beta. grid.z is
+// the prompt-token row for layer-major prefill; single-token decode dispatches
+// z=1 and keeps the original layout.
 kernel void main0(
     constant DualF32DmmvPush& p [[buffer(0)]],
     device const char* W0 [[buffer(1)]],
@@ -40,7 +42,8 @@ kernel void main0(
     device float* Y = second ? Y1 : Y0;
 
     device const float* W = (device const float*)(Wc + a_offset);
-    device const float* x = X + (p.x_offset >> 2);
+    const uint token = tg_pos.z;
+    device const float* x = X + (p.x_offset >> 2) + token * p.K;
     device const float* w = W + row * p.K;
 
     float acc = 0.0f;
@@ -48,5 +51,5 @@ kernel void main0(
         acc = fma(w[k], x[k], acc);
     }
 
-    Y[(y_offset >> 2) + row] = acc;
+    Y[(y_offset >> 2) + token * M + row] = acc;
 }

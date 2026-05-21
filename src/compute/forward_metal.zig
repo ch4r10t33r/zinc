@@ -2483,6 +2483,7 @@ fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
     beta_output_buf: *const MetalBuffer,
     rows: u32,
     cols: u32,
+    n_tokens: u32,
     x_byte_offset: u32,
 ) void {
     recordDmmvProfile(engine, alpha_t, rows, cols);
@@ -2501,13 +2502,37 @@ fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
     const bufs = [_]*const MetalBuffer{ &alpha_t.gpu_buffer, &beta_t.gpu_buffer, input_buf, alpha_output_buf, beta_output_buf };
     cmd.dispatchV2(
         &engine.dmmv_f32_dual_small_pipe,
-        .{ (rows + 63) / 64, 2, 1 },
+        .{ (rows + 63) / 64, 2, n_tokens },
         .{ 64, 1, 1 },
         &bufs,
         &push,
         @sizeOf(DualQ8DmmvPush),
         0,
     );
+}
+
+fn dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    alpha_output: *const MetalBuffer,
+    beta_output: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+) !void {
+    if (canUseQwenSsmF32AlphaBetaDual(engine, alpha_t, beta_t, rows, cols)) {
+        dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, input, alpha_output, beta_output, rows, cols, n_tokens, 0);
+        return;
+    }
+    if (canBatchQwenSsmProjectionTail(engine, alpha_t, rows, cols)) {
+        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, alpha_t, input, alpha_output, rows, cols, n_tokens);
+    }
+    if (canBatchQwenSsmProjectionTail(engine, beta_t, rows, cols)) {
+        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, beta_t, input, beta_output, rows, cols, n_tokens);
+    }
 }
 
 /// Metal inference engine — owns GPU buffers, pipelines, and KV cache.
@@ -9967,12 +9992,18 @@ fn recordQwenSsmProjectionChunkOnCmd(
     profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
     dispatchGemmQ8_0OnCmd(engine, cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
     dispatchGemmQ8_0OnCmd(engine, cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
-    if (canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim)) {
-        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
-    }
-    if (canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim)) {
-        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
-    }
+    try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+        engine,
+        cmd,
+        alpha_t,
+        beta_t,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+        dt_rank,
+        hidden_dim,
+        n_tokens,
+    );
     profileBarrierBuffers(cmd, profile, .ssm, &.{
         &engine.qwen_ssm_prefill_proj_qkv_buf,
         &engine.qwen_ssm_prefill_proj_z_buf,
@@ -12016,12 +12047,18 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         // consumes QKV, so record the independent Z/alpha/beta tail after the
         // conv dispatch and join them at the delta-net dependency edge.
         dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
-        if (alpha_batched) {
-            try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
-        }
-        if (beta_batched) {
-            try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
-        }
+        try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+            engine,
+            &cmd,
+            alpha_t,
+            beta_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+            dt_rank,
+            hidden_dim,
+            n_tokens,
+        );
         profileBarrierBuffers(&cmd, profile, .ssm, &.{
             &engine.qwen_ssm_prefill_proj_qkv_buf,
             &engine.qwen_ssm_prefill_proj_alpha_buf,
@@ -12110,12 +12147,18 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         branch_norm_batched = true;
     } else {
         dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
-        if (alpha_batched) {
-            try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
-        }
-        if (beta_batched) {
-            try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
-        }
+        try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+            engine,
+            &cmd,
+            alpha_t,
+            beta_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+            dt_rank,
+            hidden_dim,
+            n_tokens,
+        );
     }
     if (async_out) |out| {
         commitAsyncProfiled(&cmd, profile);
@@ -15496,7 +15539,7 @@ fn runDecodeStep(
                         // it with the recurrent conv dispatch.
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
                         if (canUseQwenSsmF32AlphaBetaDual(engine, alpha_t, beta_t, dt_rank, hidden_dim)) {
-                            dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, &engine.norm_buf, &engine.router_logits_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                            dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, &engine.norm_buf, &engine.router_logits_buf, &engine.down_buf, dt_rank, hidden_dim, 1, 0);
                         } else {
                             dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
                             dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
@@ -21693,7 +21736,7 @@ test "gemm_f32_small shader matches CPU reference for batched tokens" {
     }
 }
 
-test "dmmv_f32_dual_small shader matches two CPU references" {
+test "dmmv_f32_dual_small shader matches batched alpha beta CPU references" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
     defer shim.mtl_destroy(ctx);
@@ -21703,17 +21746,18 @@ test "dmmv_f32_dual_small shader matches two CPU references" {
 
     const M: usize = 7;
     const K: usize = 64;
+    const N: usize = 3;
     const weight_offset: usize = 16;
 
     var weight0_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&weight0_buf);
     var weight1_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&weight1_buf);
-    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&input_buf);
-    var output0_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    var output0_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&output0_buf);
-    var output1_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    var output1_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&output1_buf);
 
     @memset(weight0_buf.cpu_ptr.?[0..weight0_buf.size], 0);
@@ -21732,7 +21776,7 @@ test "dmmv_f32_dual_small shader matches two CPU references" {
     }
 
     const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
-    for (0..K) |i| {
+    for (0..N * K) |i| {
         const raw: i32 = @intCast((i * 17 + 9) % 37);
         input_ptr[i] = 0.05 * @as(f32, @floatFromInt(raw - 18));
     }
@@ -21750,20 +21794,23 @@ test "dmmv_f32_dual_small shader matches two CPU references" {
     const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &input_buf, &output0_buf, &output1_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 63) / 64), 2, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 63) / 64), 2, @intCast(N) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
     cmd.commitAndWait();
 
     const out0: [*]const f32 = @ptrCast(@alignCast(output0_buf.cpu_ptr.?));
     const out1: [*]const f32 = @ptrCast(@alignCast(output1_buf.cpu_ptr.?));
-    for (0..M) |row| {
-        var expected0: f32 = 0;
-        var expected1: f32 = 0;
-        for (0..K) |col| {
-            expected0 += w0[row * K + col] * input_ptr[col];
-            expected1 += w1[row * K + col] * input_ptr[col];
+    for (0..N) |token| {
+        for (0..M) |row| {
+            var expected0: f32 = 0;
+            var expected1: f32 = 0;
+            for (0..K) |col| {
+                const x = input_ptr[token * K + col];
+                expected0 += w0[row * K + col] * x;
+                expected1 += w1[row * K + col] * x;
+            }
+            try std.testing.expectApproxEqAbs(expected0, out0[token * M + row], 0.0001);
+            try std.testing.expectApproxEqAbs(expected1, out1[token * M + row], 0.0001);
         }
-        try std.testing.expectApproxEqAbs(expected0, out0[row], 0.0001);
-        try std.testing.expectApproxEqAbs(expected1, out1[row], 0.0001);
     }
 }
 
