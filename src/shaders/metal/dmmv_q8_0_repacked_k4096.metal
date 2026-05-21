@@ -12,7 +12,8 @@ struct DmmvPush {
 // Repacked Q8_0 DMMV specialization for Qwen3.6 SSM out projections.
 //
 // Adapts llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s two-row simdgroup geometry
-// to ZINC's repacked layout while baking K=4096 for the TG128 SSM path.
+// to ZINC's repacked layout while baking K=4096 and the TG128/4-simdgroup
+// launch shape for the hot SSM path.
 kernel void main0(
     constant DmmvPush& p [[buffer(0)]],
     device const uchar* W [[buffer(1)]],
@@ -20,12 +21,9 @@ kernel void main0(
     device float* Y [[buffer(3)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    if (p.K != 4096u) return;
-
-    const uint base_row = (tg_id * simdgroups_per_tg + sg_idx) * 2u;
+    const uint base_row = (tg_id * 4u + sg_idx) * 2u;
     if (base_row >= p.M) return;
 
     device const float* input = X + (p.x_offset >> 2);
