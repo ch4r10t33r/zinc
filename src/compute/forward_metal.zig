@@ -297,17 +297,21 @@ fn preferApple9QwenSsmOutQ8K4096Path(cfg: ModelConfig, tensor: *const metal_load
 }
 
 fn preferApple9QwenSsmRepackedQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
-    const is_shape = cfg.architecture == .qwen2_moe and
+    const is_qwen36 = cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
         cfg.ssm_d_inner == 4096 and
         cfg.n_experts == 256 and
-        cfg.n_experts_used == 8 and
+        cfg.n_experts_used == 8;
+    const is_ssm_shape = is_qwen36 and
         (K == 2048 or K == 4096) and
         M >= 2048 and
         (std.mem.endsWith(u8, tensor.info.name, "attn_qkv.weight") or
             std.mem.endsWith(u8, tensor.info.name, "attn_gate.weight") or
             std.mem.endsWith(u8, tensor.info.name, "ssm_out.weight"));
-    if (!is_shape) return false;
+    const is_full_attn_shape = is_qwen36 and
+        ((K == 2048 and M >= 4096 and std.mem.endsWith(u8, tensor.info.name, "attn_q.weight")) or
+            (K == 4096 and M == 2048 and std.mem.endsWith(u8, tensor.info.name, "attn_output.weight")));
+    if (!is_ssm_shape and !is_full_attn_shape) return false;
     return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_QUAD") orelse true;
 }
 
@@ -3485,6 +3489,17 @@ pub const InferenceEngine = struct {
                         self.private_ssm_qkv_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
                         dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_ssm_qkv_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
                     }
+                } else if (self.layer_tensors[i].attn_q) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_qkv_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        }
+                    }
                 }
                 if (self.layer_tensors[i].attn_gate) |tensor| {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
@@ -3533,11 +3548,22 @@ pub const InferenceEngine = struct {
                         self.private_ssm_out_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
                         dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_ssm_out_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
                     }
+                } else if (self.layer_tensors[i].attn_output) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_out_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        }
+                    }
                 }
             }
             if (need_gpu_copy) cmd.commitAndWait();
             if (private_repacked_count > 0) {
-                log.info("Metal: private-repacked {d} Qwen SSM Q8_0 tensors ({d:.2} GiB) for coalesced access", .{
+                log.info("Metal: private-repacked {d} Qwen SSM/full-attn Q8_0 tensors ({d:.2} GiB) for coalesced access", .{
                     private_repacked_count,
                     @as(f64, @floatFromInt(private_repacked_bytes)) / (1024.0 * 1024.0 * 1024.0),
                 });
@@ -10395,6 +10421,12 @@ fn dispatchFullAttnPrepOnCmd(
     const q_tensor = lt.attn_q orelse return error.MissingTensor;
     const k_tensor = lt.attn_k orelse return error.MissingTensor;
     const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
+    const q_weight_buf: *const MetalBuffer = if (engine.private_ssm_qkv_bufs) |bufs|
+        (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &q_tensor.gpu_buffer)
+    else
+        &q_tensor.gpu_buffer;
+    const q_weight_offset: u32 = if (q_weight_buf == &q_tensor.gpu_buffer) tensorPageOffset(engine.model, q_tensor) else 0;
+    const q_uses_private_repacked = q_weight_buf != &q_tensor.gpu_buffer and q_weight_buf.is_repacked_q8;
 
     // Detect packed Q+gate vs separate format (matches Vulkan reference forward.zig:1499-1505).
     // Packed: attn_q has q_dim*2 rows (interleaved [Q,gate] per head) — Qwen3Next style.
@@ -10405,13 +10437,14 @@ fn dispatchFullAttnPrepOnCmd(
         ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
             canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
     const can_pair_attn_q_gate = gate_mode.separate_attn_gate and
+        !q_uses_private_repacked and
         ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim)) or
             canUseQwen36FullAttnQ8Pair(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim));
 
     if (gate_mode.packed_q_gate) {
         // Packed: project full Q+gate into attn_out_buf, then deinterleave.
         const q_full_dim = attn.q_dim * 2;
-        dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
+        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
         if (can_pair_attn_kv) {
             dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else {
@@ -10443,7 +10476,7 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             }
         } else {
-            dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
+            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
             if (gate_mode.separate_attn_gate) {
                 dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             }
@@ -14706,7 +14739,12 @@ fn runDecodeStep(
             }
             profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
             const o_tensor = lt.attn_output orelse return error.MissingTensor;
-            dispatchDmmvOnCmd(engine, cmd, o_tensor, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
+            const o_weight_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+                (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &o_tensor.gpu_buffer)
+            else
+                &o_tensor.gpu_buffer;
+            const o_weight_offset: u32 = if (o_weight_buf == &o_tensor.gpu_buffer) tensorPageOffset(engine.model, o_tensor) else 0;
+            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
             profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
