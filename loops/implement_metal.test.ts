@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   bestKeptCorrectTokPerSec,
   buildPrompt,
+  buildQwen36PrefillPlateauAnalysis,
   buildReflectionSummary,
   buildSelfReview,
   currentAcceptedTokPerSec,
@@ -12,6 +13,7 @@ import {
   mergeUniqueEntries,
   parseTokPerSec,
   recentAcceptedProgress,
+  shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
 } from "./implement_metal";
 import type { BuildRunResult, ControllerState, CycleResult, RunState } from "./implement_metal";
@@ -53,6 +55,7 @@ function makeCycle(overrides: Partial<CycleResult> = {}): CycleResult {
     testExitCode: 0,
     runExitCode: 0,
     outputText: "ĠParis.ĠTheĠcapitalĠof",
+    stepKind: "optimization",
     selfAnalysis: "",
     nextIdeas: [],
     ...overrides,
@@ -710,6 +713,92 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("ROUTE-PACK COOLDOWN");
     expect(prompt).toContain("do not edit route-pack/shared-gate validators");
     expect(prompt).toContain("must not run local Metal model commands");
+  });
+
+  test("Qwen effort prompt adds plateau analysis after many neutral keeps", () => {
+    const cycles = Array.from({ length: 32 }, (_, idx) => makeCycle({
+      cycle: 194 + idx,
+      kept: true,
+      containsReference: true,
+      tokPerSec: idx === 5 ? 51.6 : 51.1,
+      description: idx % 2 === 0
+        ? "Retuned fixed-K TG128 repacked Q8 SSM projection kernel"
+        : "Adjusted Qwen SSM delta threadgroup arithmetic",
+    }));
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 51.6,
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+      cycles,
+    });
+    const result = makeResult({
+      tokPerSec: 51.1,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Qwen3.6 35B Prefill Plateau Analysis");
+    expect(prompt).toContain("PLATEAU MODE");
+    expect(prompt).toContain("Neutral keeps are dominating");
+    expect(prompt).toContain("@@@STEP_KIND:");
+  });
+
+  test("plateau analysis can be generated directly from cycle history", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 51.6,
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+      cycles: Array.from({ length: 32 }, (_, idx) => makeCycle({
+        cycle: idx + 1,
+        kept: true,
+        containsReference: true,
+        tokPerSec: 51.1,
+        description: "Fixed-K TG128 repacked Q8 SSM cleanup",
+      })),
+    });
+    const analysis = buildQwen36PrefillPlateauAnalysis(state).join("\n");
+    expect(analysis).toContain("PLATEAU MODE");
+    expect(analysis).toContain("Cooldown");
+    expect(analysis).toContain("Required pivot");
+  });
+
+  test("Qwen plateau mode rejects neutral optimization churn but allows analysis", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+    });
+
+    expect(shouldRejectQwen36PlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Retune fixed-K Q8 math",
+      selfAnalysis: "Expected tiny speedup.",
+      verifyTokPerSec: 51.1,
+      acceptedTokPerSec: 51.1,
+      currentProgressBand: 0.15,
+    })).toBe(true);
+
+    expect(shouldRejectQwen36PlateauNeutralKeep({
+      state,
+      stepKind: "analysis",
+      description: "Add profile counter for route-pack validator",
+      selfAnalysis: "Unlocks layer-specific correctness diff.",
+      verifyTokPerSec: 51.1,
+      acceptedTokPerSec: 51.1,
+      currentProgressBand: 0.15,
+    })).toBe(false);
   });
 
   test("Gemma effort prompt uses Gemma model facts instead of Qwen facts", () => {

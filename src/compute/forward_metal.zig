@@ -29,6 +29,7 @@ const log = std.log.scoped(.forward);
 pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
+const qwen_ssm_projection_prefill_min_tokens: usize = 32;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 // llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
 // matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
@@ -11598,7 +11599,10 @@ const QwenPrefillMoeValidationRef = struct {
 
 fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_len: usize) bool {
     if (!engine.qwen_ssm_prefill_proj_enabled) return false;
-    if (prompt_len < qwen_ssm_projection_validate_tokens) return false;
+    // The layer-0 SSM precompute is a prompt-prefill optimization. Very short
+    // raw prompts are coherence-sensitive and do not amortize the extra graph
+    // anyway; keep them on the validated per-token path.
+    if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
     if (prompt_len > queued_prefill_embed_tokens) return false;
     if (engine.position != 0) return false;
     if (!engine.private_decode_buffers) return false;

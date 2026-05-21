@@ -74,6 +74,8 @@ const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
 const RECENT_PROGRESS_WINDOW = 10;
+const QWEN36_PLATEAU_STALL_CYCLES = 20;
+const QWEN36_PLATEAU_WINDOW = 32;
 const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
 const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
 const STOP_ON_TARGET = parseBoolEnv("ZINC_STOP_ON_TARGET", true);
@@ -302,6 +304,41 @@ function cycleSummary(cycle: CycleResult): string {
   return `cycle ${cycle.cycle}: ${promptTrunc(cycle.description, 118)}${rate}`;
 }
 
+function cycleTags(cycle: Pick<CycleResult, "description" | "selfAnalysis" | "nextIdeas">): string[] {
+  const text = [
+    cycle.description,
+    cycle.selfAnalysis,
+    ...cycle.nextIdeas,
+  ].join("\n").toLowerCase();
+  const tags: string[] = [];
+  if (/shader|kernel|threadgroup|simd|tg128|metal/.test(text)) tags.push("shader");
+  if (/dispatch|command|encoder|barrier|commit|batch|launch/.test(text)) tags.push("dispatch");
+  if (/buffer|alloc|pool|reuse|memory|private|repack/.test(text)) tags.push("memory");
+  if (/fuse|fusion|merged|combined/.test(text)) tags.push("fusion");
+  if (/moe|expert|router|topk|route.?pack|shared.?gate/.test(text)) tags.push("moe");
+  if (/attention|flash|kv.?cache|rope/.test(text)) tags.push("attention");
+  if (/ssm|delta|conv|gated.?norm|q8/.test(text)) tags.push("ssm");
+  if (/half|float16|bfloat|bf16|f16/.test(text)) tags.push("precision");
+  if (tags.length === 0) tags.push("other");
+  return tags;
+}
+
+function categoryCounts(cycles: CycleResult[]): Array<[string, { kept: number; reverted: number }]> {
+  const categories: Record<string, { kept: number; reverted: number }> = {};
+  for (const c of cycles) {
+    for (const tag of cycleTags(c)) {
+      if (!categories[tag]) categories[tag] = { kept: 0, reverted: 0 };
+      if (c.kept) categories[tag].kept++;
+      else categories[tag].reverted++;
+    }
+  }
+  return Object.entries(categories).sort((a, b) => {
+    const aTotal = a[1].kept + a[1].reverted;
+    const bTotal = b[1].kept + b[1].reverted;
+    return bTotal - aTotal || b[1].kept - a[1].kept;
+  });
+}
+
 function isRoutePackOrSharedGateWork(cycle: CycleResult): boolean {
   const text = [
     cycle.description,
@@ -317,6 +354,69 @@ function recentRoutePackCooldown(state: RunState): { active: boolean; count: num
   const recent = state.cycles.slice(-window);
   const count = recent.filter(c => !c.kept && isRoutePackOrSharedGateWork(c)).length;
   return { active: count >= 2, count, window };
+}
+
+export function buildQwen36PrefillPlateauAnalysis(state: RunState): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+  if (state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return [];
+
+  const recent = state.cycles.slice(-QWEN36_PLATEAU_WINDOW);
+  if (recent.length === 0) return [];
+
+  const keptCorrect = state.cycles.filter(c => c.kept && c.containsReference && c.tokPerSec != null);
+  const recentKeptCorrect = recent.filter(c => c.kept && c.containsReference && c.tokPerSec != null);
+  const overallBest = keptCorrect.length > 0
+    ? Math.max(...keptCorrect.map(c => c.tokPerSec!))
+    : bestKeptCorrectTokPerSec(state);
+  const recentBest = recentKeptCorrect.length > 0
+    ? Math.max(...recentKeptCorrect.map(c => c.tokPerSec!))
+    : 0;
+  const current = currentAcceptedTokPerSec(state);
+  const topRecent = [...recentKeptCorrect]
+    .sort((a, b) => (b.tokPerSec ?? 0) - (a.tokPerSec ?? 0))
+    .slice(0, 3);
+  const q8Retunes = recent.filter(c =>
+    /q8|repack|fixed.?k|k=2048|k=4096|tg128|threadgroup/i.test(`${c.description}\n${c.selfAnalysis}`)
+  );
+  const neutralKept = recent.filter(c =>
+    c.kept &&
+    c.containsReference &&
+    c.tokPerSec != null &&
+    overallBest > 0 &&
+    c.tokPerSec <= overallBest + 0.05
+  );
+  const categoryLine = categoryCounts(recent)
+    .slice(0, 5)
+    .map(([tag, stats]) => `${tag}=${stats.kept} kept/${stats.reverted} reverted`)
+    .join(", ");
+
+  const lines = [
+    "## Qwen3.6 35B Prefill Plateau Analysis",
+    `- PLATEAU MODE: ${state.stalledCycles} cycles without promoted-best improvement. Last ${recent.length} cycles: ${recent.filter(c => c.kept).length} kept, ${recent.filter(c => !c.kept).length} reverted; recent best ${recentBest.toFixed(1)} ${METRIC_LABEL}, overall best ${overallBest.toFixed(1)}, current tree ${current.toFixed(1)}.`,
+  ];
+
+  if (categoryLine) {
+    lines.push(`- Recent work mix: ${categoryLine}.`);
+  }
+  if (q8Retunes.length >= 4) {
+    lines.push(`- Cooldown: ${q8Retunes.length}/${recent.length} recent cycles touched Q8/repacked/fixed-K/TG128-style retunes. Do not spend the next cycle on another narrow shape retune unless the latest profile names that exact kernel as the top remaining cost and the change is expected to move at least 0.5 tok/s.`);
+  }
+  if (neutralKept.length >= Math.max(8, Math.floor(recent.length * 0.5))) {
+    lines.push(`- Neutral keeps are dominating (${neutralKept.length}/${recent.length} recent cycles). In plateau mode, a correct optimization that is merely within noise is churn; prefer a structural scheduler/validator change, or make the change beat current accepted throughput by the small-progress band.`);
+  }
+  if (topRecent.length > 0) {
+    lines.push("- Best recent evidence:");
+    for (const c of topRecent) {
+      lines.push(`  - ${cycleSummary(c)}`);
+    }
+  }
+  lines.push(
+    "- Required pivot: attack a larger remaining boundary (command scheduling, SSM/MoE phase fusion, route-pack correctness diff with layer/tensor max error, or an all-model coherence guard) instead of another local arithmetic cleanup.",
+    "- If the next step is neutral on speed, mark it `@@@STEP_KIND: enablement` or `@@@STEP_KIND: analysis` and name the exact follow-up speed path it unlocks; unlabeled neutral optimization steps are eligible for automatic revert in plateau mode.",
+    "",
+  );
+
+  return lines;
 }
 
 function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): string[] {
@@ -406,6 +506,8 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
     lines.push(`- The last kept cycle added measurement or validation visibility (${cycleSummary(lastKept)}). The next cycle should consume that evidence to promote, fix, or abandon a default-off path.`);
   }
 
+  lines.push(...buildQwen36PrefillPlateauAnalysis(state));
+
   lines.push(
     "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
     "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `zig build`/`zig build test`; the outer harness owns all Metal measurement and validation runs.",
@@ -424,6 +526,7 @@ function zigBuildArgs(): string[] {
 // ── Phase detection ──────────────────────────────────────────────────
 
 export type Phase = "fix" | "implement" | "optimize";
+export type StepKind = "optimization" | "enablement" | "analysis" | "fix" | "rollback";
 
 export type OutputEvaluation = {
   normalizedText: string;
@@ -1696,8 +1799,9 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "12. Prefer changes to forward_metal.zig and shaders. Avoid refactoring infrastructure.",
     "",
     "## Output Format",
-    "After making your change, print these 3 lines:",
+    "After making your change, print these 4 lines:",
     "@@@DESCRIPTION: <one-line summary>",
+    "@@@STEP_KIND: <optimization|enablement|analysis|fix|rollback>",
     "@@@SELF_ANALYSIS: <why this approach and what you expect, with estimated tok/s impact>",
     "@@@NEXT_IDEAS: <comma-separated ideas for future cycles>",
   );
@@ -1721,6 +1825,7 @@ export type CycleResult = {
   runExitCode: number | null;
   outputText: string;
   error?: string;
+  stepKind?: StepKind;
   selfAnalysis: string;
   nextIdeas: string[];
 };
@@ -1813,26 +1918,6 @@ export function buildSelfReview(state: RunState): string {
   const acceptedDelta = acceptedEnd - acceptedStart;
   const smallProgressThreshold = smallAcceptedProgressBand(acceptedStart);
 
-  // Categorize approaches by keywords
-  const categories: Record<string, { kept: number; reverted: number }> = {};
-  for (const c of recent) {
-    const desc = c.description.toLowerCase();
-    const tags: string[] = [];
-    if (desc.match(/shader|kernel|threadgroup|simd|metal/)) tags.push("shader");
-    if (desc.match(/dispatch|command|encoder|barrier|commit|batch/)) tags.push("dispatch");
-    if (desc.match(/buffer|alloc|pool|reuse|memory/)) tags.push("memory");
-    if (desc.match(/fuse|fusion|merged|combined/)) tags.push("fusion");
-    if (desc.match(/moe|expert|router|topk/)) tags.push("moe");
-    if (desc.match(/attention|flash|kv.?cache|rope/)) tags.push("attention");
-    if (desc.match(/half|float16|bfloat|bf16|f16/)) tags.push("precision");
-    if (tags.length === 0) tags.push("other");
-    for (const tag of tags) {
-      if (!categories[tag]) categories[tag] = { kept: 0, reverted: 0 };
-      if (c.kept) categories[tag].kept++;
-      else categories[tag].reverted++;
-    }
-  }
-
   const lines: string[] = [
     `## Self-Review (last ${recent.length} cycles)`,
     "",
@@ -1844,7 +1929,7 @@ export function buildSelfReview(state: RunState): string {
     "### What's working vs not:",
   ];
 
-  for (const [cat, stats] of Object.entries(categories).sort((a, b) => b[1].kept - a[1].kept)) {
+  for (const [cat, stats] of categoryCounts(recent).sort((a, b) => b[1].kept - a[1].kept)) {
     const total = stats.kept + stats.reverted;
     const rate = ((stats.kept / total) * 100).toFixed(0);
     const indicator = stats.kept > stats.reverted ? "✅" : stats.kept === 0 ? "❌" : "⚠";
@@ -1909,6 +1994,50 @@ function extractAgentText(stdout: string): string {
     } catch { /* not JSON */ }
   }
   return texts.join("\n");
+}
+
+function inferStepKind(description: string, selfAnalysis: string): StepKind {
+  const text = `${description}\n${selfAnalysis}`.toLowerCase();
+  if (/\b(rollback|revert|measured[- ]dead)\b/.test(text)) return "rollback";
+  if (/\b(fix|build failure|test failure|correctness regression|crash)\b/.test(text)) return "fix";
+  if (/\b(analysis|profile|measure|microbench|counter|diagnos|validator|diff|instrument)\b/.test(text)) return "analysis";
+  if (/\b(enablement|plumbing|infrastructure|harness|scaffold|guard|sweep|coherence)\b/.test(text)) return "enablement";
+  return "optimization";
+}
+
+function parseStepKind(raw: string | undefined, description: string, selfAnalysis: string): StepKind {
+  const normalized = raw?.trim().toLowerCase();
+  if (
+    normalized === "optimization" ||
+    normalized === "enablement" ||
+    normalized === "analysis" ||
+    normalized === "fix" ||
+    normalized === "rollback"
+  ) {
+    return normalized;
+  }
+  return inferStepKind(description, selfAnalysis);
+}
+
+export function shouldRejectQwen36PlateauNeutralKeep(args: {
+  state: RunState;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  verifyTokPerSec: number;
+  acceptedTokPerSec: number;
+  currentProgressBand: number;
+}): boolean {
+  if (!isQwen36PrefillRun(args.state)) return false;
+  if (args.state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return false;
+  if (args.verifyTokPerSec >= args.acceptedTokPerSec + args.currentProgressBand) return false;
+  if (args.stepKind !== "optimization") return false;
+
+  const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();
+  if (/\b(profile|measure|microbench|counter|diagnos|validator|validate|diff|instrument|coherence|harness)\b/.test(text)) {
+    return false;
+  }
+  return true;
 }
 
 // ── Main loop ────────────────────────────────────────────────────────
@@ -2172,10 +2301,12 @@ async function main() {
     const agentText = extractAgentText(agentResult.stdout);
     const lastChars = agentText.slice(-3000);
     const descMatch = lastChars.match(/@@@DESCRIPTION:\s*(.+)/im);
+    const stepKindMatch = lastChars.match(/@@@STEP_KIND:\s*(.+)/im);
     const analysisMatch = lastChars.match(/@@@SELF_ANALYSIS:\s*(.+)/im);
     const ideasMatch = lastChars.match(/@@@NEXT_IDEAS:\s*(.+)/im);
     const description = descMatch?.[1]?.trim() ?? "Agent made changes";
     const selfAnalysis = analysisMatch?.[1]?.trim() ?? "";
+    const stepKind = parseStepKind(stepKindMatch?.[1], description, selfAnalysis);
     const newIdeas = ideasMatch?.[1]?.split(",").map(s => s.trim()).filter(s => s.length > 3) ?? [];
 
     // Step 4: Verify
@@ -2232,13 +2363,28 @@ async function main() {
       // advance bestTokPerSec. Advancing on noise creates a one-way
       // ratchet that pretends throughput improved when it did not
       // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
-      kept = true;
-      if (verifyTps >= acceptedTps + currentProgressBand) {
-        state.stalledCycles = 0;
-        console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
-      } else {
+      if (shouldRejectQwen36PlateauNeutralKeep({
+        state,
+        stepKind,
+        description,
+        selfAnalysis,
+        verifyTokPerSec: verifyTps,
+        acceptedTokPerSec: acceptedTps,
+        currentProgressBand,
+      })) {
+        console.log(clr("1;31", `  ↩ REVERTING — Qwen36 plateau mode rejects neutral ${stepKind} keep at ${verifyTps.toFixed(2)} ${METRIC_LABEL}; current ${acceptedTps.toFixed(2)}`));
+        await resetCycleToPreHash(preHash);
+        state.failedApproaches.push(`${description} — plateau-neutral ${stepKind} did not beat current ${acceptedTps.toFixed(1)} ${METRIC_LABEL}`);
         state.stalledCycles++;
-        console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
+      } else {
+        kept = true;
+        if (verifyTps >= acceptedTps + currentProgressBand) {
+          state.stalledCycles = 0;
+          console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
+        } else {
+          state.stalledCycles++;
+          console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
+        }
       }
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
@@ -2290,6 +2436,7 @@ async function main() {
       runExitCode: verify.runExitCode,
       outputText: verify.outputText,
       selfAnalysis,
+      stepKind,
       nextIdeas: newIdeas,
     };
 
@@ -2306,6 +2453,7 @@ async function main() {
       console.log(clr("2", review));
     }
 
+    normalizeStateBestTokPerSec(state);
     await saveState(runDir, state);
 
     // Status summary

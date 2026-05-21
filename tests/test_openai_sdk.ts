@@ -66,7 +66,7 @@ async function parseJson(response: Response): Promise<any> {
   }
 }
 
-function spawnStreamingCurl(base: string, modelId: string, message: string): Bun.Subprocess {
+function spawnStreamingCurl(base: string, modelId: string, message: string, maxTokens = 256): Bun.Subprocess {
   return Bun.spawn({
     cmd: [
       "curl",
@@ -80,7 +80,7 @@ function spawnStreamingCurl(base: string, modelId: string, message: string): Bun
         model: modelId,
         messages: [{ role: "user", content: message }],
         stream: true,
-        max_tokens: 256,
+        max_tokens: maxTokens,
         temperature: 0,
       }),
     ],
@@ -274,7 +274,8 @@ async function testChatCompletionStreamingOverlapped(base: string, modelId: stri
 }
 
 async function testHealthReflectsQueuedLoad(base: string, modelId: string): Promise<void> {
-  const firstProc = spawnStreamingCurl(base, modelId, "The capital of France is");
+  const loadPrompt = "Write a numbered list of 120 unique short benchmark labels. Keep going until item 120.";
+  const firstProc = spawnStreamingCurl(base, modelId, loadPrompt, 512);
 
   const activeHealth = await waitForHealth(
     base,
@@ -283,7 +284,7 @@ async function testHealthReflectsQueuedLoad(base: string, modelId: string): Prom
     15_000,
   );
 
-  const secondProc = spawnStreamingCurl(base, modelId, "The capital of France is");
+  const secondProc = spawnStreamingCurl(base, modelId, loadPrompt, 512);
 
   const queuedHealth = await waitForHealth(
     base,
