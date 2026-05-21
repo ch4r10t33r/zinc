@@ -1,0 +1,222 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 600" role="img" aria-labelledby="title desc">
+<title id="title">Flash-Decoding fills the idle compute units of a batch=1 long-context decode on the Radeon AI PRO R9700</title>
+<desc id="desc">A two-panel data visualization on a dark slate background. The left panel shows two eight by eight grids of the R9700 64 compute units at batch one. The upper grid, FlashAttention, has 32 cells lit in cyan and 32 dark and idle. The lower grid, Flash-Decoding, has all 64 cells lit in a cyan to violet gradient. The right panel is a log-scale line chart of A100 attention runtime in the batch one regime: an orange FlashAttention v2 line climbing to 4592 microseconds at 128k context, and a flat cyan Flash-Decoding line between 56 and 107 microseconds.</desc>
+<style>
+ .ink{fill:#e8eef7} .soft{fill:#9fb0c7} .fnt{fill:#6b7d97}
+ .t{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+ .m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .title{font-size:18px;font-weight:600}
+ .sub{font-size:12.5px}
+ .ptitle{font-size:14px;font-weight:600}
+ .lab{font-size:12px} .labs{font-size:11px} .labf{font-size:10px}
+ .bold{font-weight:600}
+</style>
+<rect width="980" height="600" fill="#0e1726"/>
+<defs>
+ <linearGradient id="fill64" x1="0" y1="0" x2="1" y2="1">
+   <stop offset="0" stop-color="#38bdf8"/>
+   <stop offset="1" stop-color="#a78bfa"/>
+ </linearGradient>
+</defs>
+<text class="t title ink" x="40" y="44">Flash-Decoding fills the compute units batch=1 decode leaves idle</text>
+<text class="t sub soft" x="40" y="66">Radeon AI PRO R9700, 64 compute units, single-user batch=1 attention. A100 runtime from the PyTorch Flash-Decoding micro-benchmark.</text>
+<line x1="468" y1="86" x2="468" y2="556" stroke="#26344a" stroke-width="1"/>
+<text class="t ptitle ink" x="40" y="108">Attention workgroups on the 64 compute units</text>
+<text class="t lab ink bold" x="56" y="132">FlashAttention v2</text>
+<rect x="56" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="76" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="96" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="116" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="136" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="156" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="176" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="196" y="142" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="56" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="76" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="96" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="116" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="136" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="156" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="176" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="196" y="162" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="56" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="76" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="96" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="116" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="136" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="156" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="176" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="196" y="182" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="56" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="76" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="96" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="116" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="136" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="156" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="176" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="196" y="202" width="16" height="16" rx="2.5" fill="#38bdf8"/>
+<rect x="56" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="76" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="96" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="116" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="136" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="156" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="176" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="196" y="222" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="56" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="76" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="96" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="116" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="136" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="156" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="176" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="196" y="242" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="56" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="76" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="96" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="116" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="136" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="156" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="176" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="196" y="262" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="56" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="76" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="96" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="116" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="136" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="156" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="176" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<rect x="196" y="282" width="16" height="16" rx="2.5" fill="#1b2738" stroke="#2b3b54" stroke-width="1"/>
+<text class="t labs soft" x="252" y="150">32 workgroups,</text>
+<text class="t labs soft" x="252" y="166">one per query head</text>
+<text class="t labs ink bold" x="252" y="194">32 of 64 CUs busy</text>
+<text class="t labf fnt" x="252" y="214">no second workgroup</text>
+<text class="t labf fnt" x="252" y="228">to hide memory latency</text>
+<text class="t lab ink bold" x="56" y="332">Flash-Decoding</text>
+<rect x="56" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="342" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="362" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="382" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="402" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="422" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="442" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="462" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="56" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="76" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="96" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="116" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="136" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="156" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="176" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<rect x="196" y="482" width="16" height="16" rx="2.5" fill="url(#fill64)"/>
+<text class="t labs soft" x="252" y="350">32 heads x 8 KV splits</text>
+<text class="t labs soft" x="252" y="366">= 256 workgroups</text>
+<text class="t labs ink bold" x="252" y="394">every CU busy</text>
+<text class="t labf fnt" x="252" y="414">~4 workgroups resident,</text>
+<text class="t labf fnt" x="252" y="428">latency hidden across CUs</text>
+<text class="t ptitle ink" x="500" y="108">A100 attention runtime, batch=1 regime</text>
+<text class="t labs soft" x="500" y="126">microseconds, log scale (float16, 16 query / 2 KV heads)</text>
+<line x1="540" y1="411.5" x2="930" y2="411.5" stroke="#26344a" stroke-width="0.8" stroke-dasharray="2 3"/>
+<text class="m labf fnt" x="534" y="414.5" text-anchor="end">100us</text>
+<line x1="540" y1="264.4" x2="930" y2="264.4" stroke="#26344a" stroke-width="0.8" stroke-dasharray="2 3"/>
+<text class="m labf fnt" x="534" y="267.4" text-anchor="end">1,000us</text>
+<line x1="540" y1="470" x2="930" y2="470" stroke="#26344a" stroke-width="1"/>
+<rect x="855.0" y="150" width="75.0" height="320" fill="#fb7d3a" opacity="0.06"/>
+<text class="t labf fnt" x="892.5" y="462.0" text-anchor="middle">batch=1 region</text>
+<polyline points="555.0,324.5 595.0,328.6 635.0,328.8 675.0,331.1 715.0,322.7 755.0,305.1 795.0,298.9 835.0,255.2 875.0,211.2 915.0,167.1" fill="none" stroke="#fb7d3a" stroke-width="2.4"/>
+<polyline points="555.0,440.6 595.0,436.4 635.0,427.6 675.0,445.7 715.0,447.4 755.0,448.1 795.0,446.1 835.0,443.8 875.0,439.6 915.0,407.4" fill="none" stroke="#38bdf8" stroke-width="2.4"/>
+<circle cx="555.0" cy="324.5" r="3.1" fill="#fb7d3a"/>
+<circle cx="555.0" cy="440.6" r="3.1" fill="#38bdf8"/>
+<circle cx="595.0" cy="328.6" r="3.1" fill="#fb7d3a"/>
+<circle cx="595.0" cy="436.4" r="3.1" fill="#38bdf8"/>
+<circle cx="635.0" cy="328.8" r="3.1" fill="#fb7d3a"/>
+<circle cx="635.0" cy="427.6" r="3.1" fill="#38bdf8"/>
+<circle cx="675.0" cy="331.1" r="3.1" fill="#fb7d3a"/>
+<circle cx="675.0" cy="445.7" r="3.1" fill="#38bdf8"/>
+<circle cx="715.0" cy="322.7" r="3.1" fill="#fb7d3a"/>
+<circle cx="715.0" cy="447.4" r="3.1" fill="#38bdf8"/>
+<circle cx="755.0" cy="305.1" r="3.1" fill="#fb7d3a"/>
+<circle cx="755.0" cy="448.1" r="3.1" fill="#38bdf8"/>
+<circle cx="795.0" cy="298.9" r="3.1" fill="#fb7d3a"/>
+<circle cx="795.0" cy="446.1" r="3.1" fill="#38bdf8"/>
+<circle cx="835.0" cy="255.2" r="3.1" fill="#fb7d3a"/>
+<circle cx="835.0" cy="443.8" r="3.1" fill="#38bdf8"/>
+<circle cx="875.0" cy="211.2" r="3.1" fill="#fb7d3a"/>
+<circle cx="875.0" cy="439.6" r="3.1" fill="#38bdf8"/>
+<circle cx="915.0" cy="167.1" r="3.1" fill="#fb7d3a"/>
+<circle cx="915.0" cy="407.4" r="3.1" fill="#38bdf8"/>
+<text class="m labf fnt" x="555.0" y="486.0" text-anchor="middle">256</text>
+<text class="m labf fnt" x="555.0" y="499.0" text-anchor="middle">B256</text>
+<text class="m labf fnt" x="595.0" y="486.0" text-anchor="middle">512</text>
+<text class="m labf fnt" x="595.0" y="499.0" text-anchor="middle">B128</text>
+<text class="m labf fnt" x="635.0" y="486.0" text-anchor="middle">1k</text>
+<text class="m labf fnt" x="635.0" y="499.0" text-anchor="middle">B64</text>
+<text class="m labf fnt" x="675.0" y="486.0" text-anchor="middle">2k</text>
+<text class="m labf fnt" x="675.0" y="499.0" text-anchor="middle">B32</text>
+<text class="m labf fnt" x="715.0" y="486.0" text-anchor="middle">4k</text>
+<text class="m labf fnt" x="715.0" y="499.0" text-anchor="middle">B16</text>
+<text class="m labf fnt" x="755.0" y="486.0" text-anchor="middle">8k</text>
+<text class="m labf fnt" x="755.0" y="499.0" text-anchor="middle">B8</text>
+<text class="m labf fnt" x="795.0" y="486.0" text-anchor="middle">16k</text>
+<text class="m labf fnt" x="795.0" y="499.0" text-anchor="middle">B4</text>
+<text class="m labf fnt" x="835.0" y="486.0" text-anchor="middle">32k</text>
+<text class="m labf fnt" x="835.0" y="499.0" text-anchor="middle">B2</text>
+<text class="m labf fnt" x="875.0" y="486.0" text-anchor="middle">64k</text>
+<text class="m labf fnt" x="875.0" y="499.0" text-anchor="middle">B1</text>
+<text class="m labf fnt" x="915.0" y="486.0" text-anchor="middle">128k</text>
+<text class="m labf fnt" x="915.0" y="499.0" text-anchor="middle">B1</text>
+<text class="t labf fnt" x="735.0" y="516.0" text-anchor="middle">sequence length (top), batch size (bottom)</text>
+<text class="t labs bold" fill="#fb7d3a" x="835.0" y="241.2" text-anchor="middle">FlashAttention v2</text>
+<text class="t labs bold" fill="#38bdf8" x="755.0" y="436.1" text-anchor="middle">Flash-Decoding</text>
+<text class="t labs ink bold" x="863.0" y="185.2" text-anchor="end">43x at 128k</text>
+<text class="t labf fnt" x="863.0" y="198.2" text-anchor="end">4592us vs 107us</text>
+<text class="t labf fnt" x="40" y="582">Occupancy grids are schematic (one cell per CU). Runtime is the published A100 micro-benchmark from the PyTorch Flash-Decoding blog.</text>
+</svg>

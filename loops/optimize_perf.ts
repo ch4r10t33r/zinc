@@ -594,6 +594,9 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Do not repeat Q6_K+Q4_K fused SSM qkv+z pair dispatch. It engaged but regressed the SSM projection bucket.",
       "Do not flip ZINC_SSM_DELTA_COLS8=0 or retry ZINC_SSM_DELTA_NORMED_QK=1 without new evidence. Both were mixed or negative on the full 27B matrix.",
       "Do not retry Q6_K K=17408 dense-down specialization or broad Q4/Q6 wide variants. They were flat or negative on the 27B matrix.",
+      "Do not keep sweeping Q6_K dense-down tiled-kernel variants after the 64.87 tok/s checkpoint without fresh shaderstats. Cycle 27 kept the default-on tiled Q6_K path, but later Q6_K force-wave64, BN64, dequant-hoist, and tail-column FMA-skip variants all measured flat or dead.",
+      "Do not keep sweeping Q4_K gate/up/SwiGLU tile shapes without fresh shaderstats. BM16, K=5120 specialization, default-shape tweaks, and post-64 tok/s BN retile variants have all been flat/dead or too small to clear the keep threshold.",
+      "Do not spend another cycle on submit/barrier cosmetics around the layer-major prefill path unless the edit removes a named measured barrier cost. The cycle-32 scoped barrier keep was real; subsequent scoped-barrier, compute-to-transfer-barrier, and SSM+dense command-buffer fusion attempts were measured dead.",
       "Do not widen the fused attention o-proj merge to hidden_dim=5120. It caused a severe long-context regression.",
       "Do not repeat direct descriptor-offset SSM prefill projection replay. Cycle 36 measured flag OFF 31.34 tok/s vs flag ON 31.22 tok/s and reverted it.",
       "Do not repeat Q5_K row4 SSM-out, SSM delta tile8, or other SSM-side variants while dense_ffn remains the largest phase bucket. Recent SSM cycles produced zero perf keeps.",
@@ -602,11 +605,12 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Do not repeat fusing the partial hidden scratch copy with the first attention-layer RMS norm at full-attention segment handoff. Measured with ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE: OFF median 49.96 tok/s [51.32, 49.82, 49.96] vs ON median 49.53 tok/s [49.53, 49.42, 49.62]; reverted. It also moved attention RMS work outside the normal phase timer, making profiles less trustworthy.",
     ],
     structuralSwingIdeas: [
-      "Current corrected-harness profile still has dense_ffn as the top bucket, but the recent best checkpoint is ~49.91 tok/s rather than the older 31.29 tok/s plan text. Next cycles should attack dense_ffn only from a fresh ZINC_PREFILL_PROFILE=1 subphase, not from stale prompt-era assumptions.",
-      "Treat the current Qwen3.6-27B layer-major dense segment range as provisionally settled. Do not add earlier layers again; segment work should be a paired subset/removal or boundary-stability sweep only if it includes an old-vs-new control in the same cycle and a profile-backed reason.",
-      "Before more dense kernel rewrites, collect RADV_DEBUG=shaderstats for the current fused Q4_K gate/up/SwiGLU path and Q6_K batched down/kpar path. Only edit the shader if shaderstats shows a concrete occupancy, register, spill, or instruction issue that maps to the dense_ffn subphase currently on top.",
-      "Fuse dense down projection with residual accumulation for the batched dense FFN path. The current path writes scratch_down, barriers, then scale-accumulates into scratch_hidden; a Q6_K batched down+acc kernel would attack dense_ffn_down without replaying SSM.",
-      "Use the parsed dense_ffn subphase profile before editing. If gateup dominates, improve the existing fused Q4_K gate/up/SwiGLU path structurally; if down dominates, work on down+acc; if sample spread is bimodal or above the noise gate, run a paired control before attributing a small movement to code.",
+      "At the current 64.87 tok/s checkpoint, the profile is balanced rather than single-hot: dense_ffn ~=1848 ms, ssm ~=1498 ms, dense gateup ~=934 ms, dense down ~=916 ms, and SSM proj ~=1095 ms. A next jump probably needs a structural change that moves a whole bucket by multiple percent, not another sub-1% tile/barrier variant.",
+      "Before more dense kernel rewrites, collect paired RADV_DEBUG=shaderstats for the accepted fused Q4_K gate/up/SwiGLU path and Q6_K tiled dense-down path. Only edit the shader if shaderstats shows a concrete VGPR/SGPR, occupancy, LDS, spill, or memory-instruction problem that maps to the currently largest dense subphase.",
+      "Treat the current Qwen3.6-27B layer-major segment and barrier schedule as provisionally settled. Segment or barrier work now requires a paired old-vs-new control in the same cycle and a profile-backed reason; otherwise switch buckets.",
+      "If dense gateup and down remain tied, pivot to SSM projection as the largest single subphase. Revisit batched SSM qkv/z/alpha/beta only as a validated layer-major dataflow step, not the old descriptor-offset replay path, and measure flag OFF/ON in the same cycle.",
+      "If pursuing dense down, do not retune the existing Q6_K tile shape again. Either remove the separate residual accumulation with a correctly validated down+acc design, or collect shaderstats proving why the accepted tiled path is leaving occupancy/bandwidth on the table.",
+      "After any new keep above 65 tok/s, run the full four-scenario matrix before treating the win as broadly useful. The site-aligned Coding Review prefill benchmark is the controller metric, but the 27B work has already produced changes that helped one scenario while hurting context-long/decode.",
       "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors. Flag-gated paths must be measured flag OFF and flag ON in the same cycle.",
     ],
     referenceImplementations: [
@@ -1839,6 +1843,8 @@ If you intentionally do a plumbing/enabling step that may be performance-neutral
 
 **Flag-gated changes must be measured in the same cycle.** If your change introduces a new runtime env flag (ZINC_*), you MUST run the benchmark both with the flag OFF and with it ON, cite both tok/s numbers in your SELF_ANALYSIS, and make an explicit keep/revert decision. Dormant flag-gated infrastructure that is only validated in a later cycle has cost us ~5 committed foundation cycles; the loop now rejects flag-gated foundation keeps that lack a flag-on measurement.
 
+**Agent-side measurement budget.** The controller will sync, build, run the 3-sample primary benchmark, and run coherence after you return. Do not start tools/performance_suite.mjs from inside the agent, and do not run remote ./zig-out/bin/zinc with -n > 32 unless this exact cycle is an analysis/shaderstats cycle and you cite the bounded reason. Manual checks should be limited to shader compile/build plus one short smoke or one paired flag-off/flag-on target sample; long suites and repeated -n 96 / -n 160 diagnostics waste RDNA time and make controller decisions stale.
+
 Do not use sub-agents, delegation, spawn_agent, or wait_agent. Work directly in this repo.
 Before editing any file, re-read the exact current contents from disk. Do not rely on stale context, guessed line numbers, or cached snippets.
 
@@ -1981,6 +1987,8 @@ This cycle is different from a normal optimization cycle. Do exactly the followi
    - Have a concrete measurement strategy that fits in ONE cycle.
 
 3. **Pick one and execute.** Choose the most promising of your three proposals. Implement it. Measure. If it regresses, revert in this same cycle and record the finding. If it is flag-gated, measure both flag-off and flag-on in this cycle (dormant wiring is not acceptable). Produce a concrete tok/s number, not a hand-wave.
+
+Agent-side measurement budget: the controller will run the official sync/build/benchmark/coherence gate after you return. Do not launch tools/performance_suite.mjs from inside the agent. Do not run remote ./zig-out/bin/zinc with -n > 32 unless the pivot you picked is explicitly a bounded analysis/shaderstats cycle; if you do, stop after the one planned diagnostic and cite the evidence. Long -n 96 / -n 160 suites belong outside the cycle agent.
 
 Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS / @@@NEXT_IDEAS. Valid STEP_KIND values for a pivot cycle include:
 - rollback (if you reverted dead-end foundations)
@@ -3137,10 +3145,12 @@ async function main() {
       );
       state.ideas = mergeUniqueEntries(state.ideas, agentReport.nextIdeas, IDEA_LIMIT);
       // Revert-after-measurement cycles produce information (they disprove
-      // a hypothesis). They should not count as a stall because that was
-      // the exact behavior the pivot prompt asked for. Only bump stall
-      // for genuine no-ops where the agent produced no measurement.
-      if (!measuredDead) state.stalledCycles++;
+      // a hypothesis), but they still did not create a new best checkpoint.
+      // Count them as stall pressure so long runs of well-measured dead ends
+      // still trigger pivot prompts and phase-budget refreshes instead of
+      // printing stall=0 forever while the search keeps circling the same
+      // local neighborhood.
+      state.stalledCycles++;
       state.consecutiveFoundationKeeps = 0;
       state.lastCycle = cycle;
 

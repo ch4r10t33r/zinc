@@ -101,6 +101,30 @@ Interpretation:
   prompt). Segment boundary additions near the lower layers are now
   repeatedly measured dead; use fresh subphase data before editing.
 
+2026-05-21 loop checkpoint:
+
+- Best accepted effort-15 checkpoint on the same site-aligned Coding
+  Review prefill benchmark is now `64.87 tok/s` (`5610c871`), after:
+  - default-on tiled Q6_K dense-down prefill (`7a423f3`, cycle 27)
+  - default-on layer-major SSM batched-delta prefill (`4b9ff03`,
+    cycle 29)
+  - scoped layer-major dense-FFN barriers (`5610c871`, cycle 32)
+- The current prefill profile is no longer a single obvious hotspot:
+  `dense_ffn ~= 1848 ms`, `ssm ~= 1498 ms`, `attn ~= 433 ms`.
+  Dense subphases are roughly tied (`gateup ~= 934 ms`,
+  `down ~= 916 ms`), while the largest single SSM subphase is still
+  projection (`ssm_proj ~= 1095 ms`). `ssm_delta` is no longer the main
+  SSM cost after the batched-delta keep.
+- Post-64.87 dead ends are informative: Q4/Q6 tile retunes, scoped
+  barrier variants, dense-FFN submit fusion, Q6 dequant hoists, and
+  tail-column FMA skipping did not produce the next jump. Treat
+  sub-1% samples as noise unless a paired old-vs-new control and a
+  phase/profile counter both point the same way.
+- The next credible jump probably needs either a shaderstats-backed
+  dense kernel change that explains VGPR/occupancy/memory behavior, or
+  a validated SSM projection dataflow change. Another blind tile-shape
+  sweep is unlikely to clear the new `+~0.65 tok/s` keep threshold.
+
 ## Decode phase budget
 
 A clean single-stream profile on a 48-token decode prompt produced:
@@ -695,20 +719,32 @@ Open candidates:
 Do not port a broad new attention architecture before proving attention
 is a top bucket on the 27B long-context prompt.
 
-## Immediate next-cycle guidance after the 49.91 checkpoint
+## Immediate next-cycle guidance after the 64.87 checkpoint
 
-1. Refresh `ZINC_PREFILL_PROFILE=1` on the exact site-aligned Coding
-   Review prompt and record `dense_ffn` subphases.
-2. If `gateup` is still dominant, collect `RADV_DEBUG=shaderstats` for
-   the current fused Q4_K gate/up/SwiGLU kernel before editing it.
-3. If `down` is dominant, collect shaderstats for the current Q6_K
-   batched down/kpar path and target down+acc fusion or register pressure.
-4. If benchmark samples are bimodal around `50` and `53 tok/s`, run an
-   interleaved old-vs-new control. Do not accept a sub-1% change from an
-   unpaired run.
-5. Treat the layer-major segment boundary as provisionally settled.
-   Do not add layers 1, 2, or 3 again without a fresh profile showing
-   those layers are now the reason `dense_ffn` is hot.
+1. Do not run another blind Q4/Q6 tile-size, barrier, or command-buffer
+   fusion attempt. The post-64.87 loop has already measured those as
+   flat/dead unless backed by new shaderstats.
+2. Collect paired `RADV_DEBUG=shaderstats` for the accepted fused
+   Q4_K gate/up/SwiGLU path and accepted tiled Q6_K dense-down path
+   before editing either shader again. Record VGPR/SGPR, occupancy,
+   spills, LDS, and obvious memory-instruction differences in the
+   cycle self-analysis.
+3. If dense `gateup` and `down` remain tied, consider SSM projection as
+   the next structural bucket. The right version is a validated
+   layer-major qkv/z/alpha/beta dataflow, not the old descriptor-offset
+   replay path. It must measure flag OFF and flag ON in the same cycle.
+4. If benchmark samples are within ~1% of best, require an interleaved
+   old-vs-new control or treat the movement as noise. The current keep
+   threshold is about `+0.65 tok/s`, so one lucky `65.x` sample is not a
+   real win.
+5. After any new keep above `65 tok/s`, run the full four-scenario
+   matrix before using the result in public benchmarks. The controller
+   metric is the Coding Review prefill prompt, but earlier 27B changes
+   have helped that prompt while hurting context-long or decode.
+6. The controller should count measured-dead rollback cycles as
+   no-new-best pressure. They remain valuable information, but a long
+   run of measured-dead cycles should trigger pivot prompts and refreshed
+   phase budgets instead of printing `stall=0`.
 
 ## Suggested cycle schedule
 
