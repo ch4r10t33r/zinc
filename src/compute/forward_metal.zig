@@ -679,6 +679,9 @@ pub const RuntimeProfile = struct {
     lm_head_bytes: u64 = 0,
     ssm_bytes: u64 = 0,
     ssm_projection_bytes: u64 = 0,
+    ssm_qkv_projection_bytes: u64 = 0,
+    ssm_gate_projection_bytes: u64 = 0,
+    ssm_tail_projection_bytes: u64 = 0,
     ssm_out_bytes: u64 = 0,
     full_attn_bytes: u64 = 0,
     full_attn_projection_bytes: u64 = 0,
@@ -855,9 +858,12 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         nsToMs(profile.final_record_ns),
         bytesToGiB(profile.lm_head_bytes),
     });
-    log.info("  {s} buckets: ssm proj {d:.2} GiB recurrent conv/delta/gated {d}/{d}/{d} out {d:.2} GiB | router {d:.2} GiB topk {d} cpu {d:.2} ms", .{
+    log.info("  {s} buckets: ssm proj {d:.2} GiB (qkv {d:.2} gate {d:.2} tail {d:.2}) recurrent conv/delta/gated {d}/{d}/{d} out {d:.2} GiB | router {d:.2} GiB topk {d} cpu {d:.2} ms", .{
         label,
         bytesToGiB(profile.ssm_projection_bytes),
+        bytesToGiB(profile.ssm_qkv_projection_bytes),
+        bytesToGiB(profile.ssm_gate_projection_bytes),
+        bytesToGiB(profile.ssm_tail_projection_bytes),
         profile.ssm_conv_calls,
         profile.ssm_delta_calls,
         profile.ssm_gated_norm_calls,
@@ -5690,6 +5696,15 @@ fn recordDetailedDmmvBytes(profile: *RuntimeProfile, path: DmmvPathClass, name: 
                 profile.ssm_out_bytes += bytes;
             } else {
                 profile.ssm_projection_bytes += bytes;
+                if (std.mem.endsWith(u8, name, "attn_qkv.weight")) {
+                    profile.ssm_qkv_projection_bytes += bytes;
+                } else if (std.mem.endsWith(u8, name, "attn_gate.weight")) {
+                    profile.ssm_gate_projection_bytes += bytes;
+                } else if (std.mem.endsWith(u8, name, "ssm_alpha.weight") or
+                    std.mem.endsWith(u8, name, "ssm_beta.weight"))
+                {
+                    profile.ssm_tail_projection_bytes += bytes;
+                }
             }
         },
         .shared_expert => {
