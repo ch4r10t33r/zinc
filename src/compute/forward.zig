@@ -12824,12 +12824,18 @@ pub const InferenceEngine = struct {
         self.resetTimestamps();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         if (self.qwen36DensePrefillPartialStoreEnabled()) {
-            self.decode_cmd.computeBarrier();
+            const dense_input_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_hidden.handle, .size = scratch_hidden.size },
+                .{ .buffer = scratch_norm.handle, .size = scratch_norm.size },
+            };
+            self.decode_cmd.computeBuffersBarrier(&dense_input_ranges);
         } else {
             self.decode_cmd.transferToComputeBarrier();
         }
         const dense_ffn_phase = self.beginProfilePhase();
         const dense_ffn_gateup_phase = self.beginProfilePhase();
+        const swiglu_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
+        const hidden_batch_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
         const use_fused_gateup = self.use_qwen36_batched_fused_gateup and
             self.isQwen36DenseHybrid27B() and
             gate_t.info.type_ == .q4_k and
@@ -12865,7 +12871,11 @@ pub const InferenceEngine = struct {
             const dense_ffn_up_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
             self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
-            self.decode_cmd.computeBarrier();
+            const gateup_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_gate.handle, .size = swiglu_bytes },
+                .{ .buffer = scratch_up.handle, .size = swiglu_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&gateup_ranges);
             try self.dispatchFfnActivation(
                 scratch_gate.handle,
                 scratch_gate.size,
@@ -12876,11 +12886,11 @@ pub const InferenceEngine = struct {
                 n_tokens * inter_dim,
             );
         }
-        self.decode_cmd.computeBarrier();
+        self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_bytes);
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
-        self.decode_cmd.computeBarrier();
+        self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
         try self.dispatchScaleAcc(
             scratch_hidden.handle,
             scratch_hidden.size,
@@ -12893,7 +12903,7 @@ pub const InferenceEngine = struct {
         self.endProfilePhase(.dense_ffn, dense_ffn_phase);
         const layer_output_scale = self.layer_output_scales[layer];
         if (layer_output_scale != 1.0) {
-            self.decode_cmd.computeBarrier();
+            self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, hidden_batch_bytes);
             try self.dispatchScaleInPlace(
                 scratch_hidden.handle,
                 scratch_hidden.size,
