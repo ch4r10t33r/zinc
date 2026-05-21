@@ -405,6 +405,8 @@ pub const DmmvDispatch = struct {
     /// Batched dense FFN front-end for Qwen3.6-27B: gate/up Q4_K GEMMs plus
     /// SwiGLU in one tiled dispatch.
     pipeline_mul_mm_q4k_gate_up_swiglu: ?Pipeline,
+    /// Tiled Q6_K dense GEMM for Qwen3.6-27B batched dense-down prefill.
+    pipeline_mul_mm_q6k: ?Pipeline,
     /// Descriptor pool for this dispatch.
     descriptor_pool: vk.c.VkDescriptorPool,
     /// Logical device.
@@ -851,6 +853,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_gate_up_swiglu != null) {
             log.info("mul_mm_q4k_gate_up_swiglu pipeline loaded (Qwen3.6-27B batched dense FFN)", .{});
         }
+        const mul_mm_q6k_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k != null) {
+            log.info("mul_mm_q6k pipeline loaded (Qwen3.6-27B batched dense down)", .{});
+        }
 
         return DmmvDispatch{
             .pipeline_q4k = pipeline_q4k,
@@ -904,6 +914,7 @@ pub const DmmvDispatch = struct {
             .pipeline_count_experts = pipeline_count_experts,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
             .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
+            .pipeline_mul_mm_q6k = pipeline_mul_mm_q6k,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -1387,6 +1398,57 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Tiled Q6_K dense GEMM. Same push/layout as recordMulMmQ4K.
+    pub fn recordMulMmQ6K(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
     /// Destroy the loaded pipelines and descriptor pool.
     /// @param self Dispatch wrapper to tear down in place.
     pub fn deinit(self: *DmmvDispatch) void {
@@ -1437,6 +1499,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_count_experts) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }

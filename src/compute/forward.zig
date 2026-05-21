@@ -1175,6 +1175,10 @@ pub const InferenceEngine = struct {
     // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Uses a
     // tiled Q4_K gate+up+SwiGLU GEMM to avoid gate/up scratch writes.
     use_qwen36_batched_fused_gateup: bool = false,
+    // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Routes
+    // the Q6_K dense-down projection through a tiled GEMM instead of the
+    // serial batched DMMV chunks. Disable with ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0.
+    use_qwen36_q6_down_mul_mm: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -2484,6 +2488,18 @@ pub const InferenceEngine = struct {
             log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path DISABLED via ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0", .{});
         }
 
+        const qwen36_q6_down_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q6_DOWN_MUL_MM");
+        const qwen36_q6_down_mul_mm_explicitly_off = qwen36_q6_down_mul_mm_env != null and
+            std.mem.eql(u8, qwen36_q6_down_mul_mm_env.?, "0");
+        const qwen36_q6_down_mul_mm_enabled = !qwen36_q6_down_mul_mm_explicitly_off and
+            dmmv.pipeline_mul_mm_q6k != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_q6_down_mul_mm_enabled) {
+            log.info("Qwen3.6-27B Q6_K dense-down mul_mm path ENABLED (default, set ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0 to disable)", .{});
+        } else if (qwen36_q6_down_mul_mm_explicitly_off) {
+            log.info("Qwen3.6-27B Q6_K dense-down mul_mm path DISABLED via ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0", .{});
+        }
+
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
         const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
         const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
@@ -2948,6 +2964,7 @@ pub const InferenceEngine = struct {
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
             .use_mul_mm_proj = mul_mm_proj_enabled,
             .use_qwen36_batched_fused_gateup = qwen36_batched_gateup_enabled,
+            .use_qwen36_q6_down_mul_mm = qwen36_q6_down_mul_mm_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -9456,6 +9473,42 @@ pub const InferenceEngine = struct {
         K: u32,
         n_tokens: u32,
     ) !void {
+        // Keep these in sync with the GLSL arrays:
+        // - dmmv_q4k_batch.comp:           MAX_COLS = 32
+        // - dmmv_q6k_batch.comp:           MAX_COLS = 24
+        // - dmmv_q{4,6}k_batch_kpar.comp:  MAX_COLS = 40
+        // - dmmv_q5k.comp batched mode:    MAX_COLS = 40
+        //
+        // Intel currently uses the serial batch shaders, not the wave64 kpar
+        // variants. Sending 40 columns to the serial shader overruns its
+        // 32-element register array and can end in FenceWaitFailed.
+        const SERIAL_MAX_COLS: u32 = 32;
+        const SERIAL_Q6_MAX_COLS: u32 = 24;
+        const KPAR_MAX_COLS: u32 = 40;
+        const f32_bytes: u32 = @sizeOf(f32);
+        var chunk_start: u32 = 0;
+        const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
+            tensor.info.type_ == .q6_k and
+            M == self.model.config.hidden_dim and
+            K == self.model.config.intermediate_dim and
+            n_tokens >= 16;
+        const kpar_pipeline: ?*const Pipeline = blk: {
+            if (!self.use_q4k_batch_kpar) break :blk null;
+            if (prefer_serial_qwen36_dense_down) break :blk null;
+            switch (tensor.info.type_) {
+                .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
+                .q5_k => break :blk if (self.dmmv.pipeline_q5k) |*p| p else null,
+                .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
+                else => break :blk null,
+            }
+        };
+        const serial_max_cols: u32 = switch (tensor.info.type_) {
+            .q6_k => SERIAL_Q6_MAX_COLS,
+            else => SERIAL_MAX_COLS,
+        };
+        // Pre-Q6 split, this was: if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS.
+        const max_cols: u32 = if (kpar_pipeline != null) KPAR_MAX_COLS else serial_max_cols;
+
         // Fast path (effort-6 Step 5): route Q4_K projections with N >= 16 through
         // the tiled mul_mm_q4k pipeline. The kpar shader reads the M × K weight
         // tensor once per MAX_COLS=40 chunk (3× for an N=105 prefill), whereas
@@ -9492,41 +9545,35 @@ pub const InferenceEngine = struct {
             );
             return;
         }
-        // Keep these in sync with the GLSL arrays:
-        // - dmmv_q4k_batch.comp:           MAX_COLS = 32
-        // - dmmv_q6k_batch.comp:           MAX_COLS = 24
-        // - dmmv_q{4,6}k_batch_kpar.comp:  MAX_COLS = 40
-        // - dmmv_q5k.comp batched mode:    MAX_COLS = 40
-        //
-        // Intel currently uses the serial batch shaders, not the wave64 kpar
-        // variants. Sending 40 columns to the serial shader overruns its
-        // 32-element register array and can end in FenceWaitFailed.
-        const SERIAL_MAX_COLS: u32 = 32;
-        const SERIAL_Q6_MAX_COLS: u32 = 24;
-        const KPAR_MAX_COLS: u32 = 40;
-        const f32_bytes: u32 = @sizeOf(f32);
-        var chunk_start: u32 = 0;
-        const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
+        if (self.use_qwen36_q6_down_mul_mm and
             tensor.info.type_ == .q6_k and
+            self.isQwen36DenseHybrid27B() and
             M == self.model.config.hidden_dim and
             K == self.model.config.intermediate_dim and
-            n_tokens >= 16;
-        const kpar_pipeline: ?*const Pipeline = blk: {
-            if (!self.use_q4k_batch_kpar) break :blk null;
-            if (prefer_serial_qwen36_dense_down) break :blk null;
-            switch (tensor.info.type_) {
-                .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
-                .q5_k => break :blk if (self.dmmv.pipeline_q5k) |*p| p else null,
-                .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
-                else => break :blk null,
-            }
-        };
-        const serial_max_cols: u32 = switch (tensor.info.type_) {
-            .q6_k => SERIAL_Q6_MAX_COLS,
-            else => SERIAL_MAX_COLS,
-        };
-        // Pre-Q6 split, this was: if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS.
-        const max_cols: u32 = if (kpar_pipeline != null) KPAR_MAX_COLS else serial_max_cols;
+            n_tokens >= 16 and
+            (K & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q6k != null)
+        {
+            try self.dmmv.recordMulMmQ6K(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                x_buf.handle,
+                x_buf.size,
+                y_buf.handle,
+                y_buf.size,
+                M,
+                n_tokens,
+                K,
+                K,
+                M,
+                0,
+                0,
+                0,
+            );
+            return;
+        }
         while (chunk_start < n_tokens) {
             const chunk: u32 = @min(max_cols, n_tokens - chunk_start);
             const x_offset: u32 = chunk_start * K * f32_bytes;
