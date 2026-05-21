@@ -88,6 +88,19 @@ Interpretation:
   17% to 40% depending on scenario, with long-context decode the most
   painful.
 
+2026-05-20 loop checkpoint:
+
+- Best accepted effort-15 checkpoint on the current site-aligned Coding
+  Review prefill benchmark is `49.91 tok/s` (`7cec485`), after moving the
+  Qwen3.6-27B dense prefill segment range into the late layer-major path.
+- The old synthetic Paris prompt can still report about `148 tok/s`, but
+  it is not the controlling workload and should not drive keep/revert
+  decisions.
+- The current biggest profile bucket after the recent keeps remains
+  `dense_ffn` (recent refreshes around `2.4 s` on the site-aligned
+  prompt). Segment boundary additions near the lower layers are now
+  repeatedly measured dead; use fresh subphase data before editing.
+
 ## Decode phase budget
 
 A clean single-stream profile on a 48-token decode prompt produced:
@@ -231,6 +244,8 @@ reason the prior failure mode no longer applies.
 | Full SSM batched prefill gate flip | GPU hard resets / `QueueSubmitFailed`; dependency bug in hidden evolution | hard ban |
 | Prefix SSM projection replay (`ZINC_QWEN36_27B_SSM_PREFILL_PROJ=z/qkv/both`) | coherent after keeping fused RMS+alpha+beta, but context-medium regressed from ~29.24 tok/s to 29.09-29.17 tok/s at L1 and 27.91-28.97 tok/s at L2/L4/L8 | default-off diagnostic only |
 | Forcing separate SSM alpha/beta path (`ZINC_FUSED_SSM_AB=0`) | immediate `QueueSubmitFailed` on Qwen 3.6 27B | do not use as a prerequisite for 27B prefill work |
+| Layer-major dense segment lower-bound additions | layer-1 extension measured old 4-62 override at `50.16 tok/s` vs new layer-1 schedule at `50.07 tok/s`; earlier prefix/layer-depth sweeps were flat or worse | rejected unless a new profile proves lower layers are hot |
+| Partial hidden scratch copy fused with first attention RMS norm at segment handoff (`ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE`) | OFF median `49.96 tok/s` `[51.32, 49.82, 49.96]`; ON median `49.53 tok/s` `[49.53, 49.42, 49.62]`; also moved attention RMS outside the normal phase timer | rejected |
 
 Rejected matrix details:
 
@@ -258,6 +273,23 @@ Each cell is `prefill tok/s / decode tok/s`.
   `ZINC_QWEN36_27B_SSM_PREFILL_PROJ={qkv,z,both}` for diagnostics. It is
   not a fix for the context prefill gap because the replay setup/copy
   overhead cancels the saved projection work.
+
+2026-05-20 interrupted-cycle analysis:
+
+- I stopped the loop after it had produced a candidate source edit, then
+  measured the candidate directly against its own control instead of
+  allowing more cycles to build on it.
+- Candidate: fuse partial hidden scratch copy and first attention-layer
+  RMS norm at a full-attention segment handoff.
+- Result: control/OFF median `49.96 tok/s`; candidate/ON median
+  `49.53 tok/s`. The candidate was reverted.
+- Lesson: do not keep moving work out of the normal `attention`/`dense_ffn`
+  profile sections for cosmetic copy removal. It can make phase budgets
+  less trustworthy while not moving the real prefill wall time.
+- Next loops should pivot from boundary-extension variants to
+  measurement-backed dense subphase work: shaderstats for the current
+  fused Q4_K gate/up/SwiGLU path and Q6_K batched down/kpar path, then
+  one code change tied to the top subphase.
 
 ## Measurement contract
 
@@ -662,6 +694,21 @@ Open candidates:
 
 Do not port a broad new attention architecture before proving attention
 is a top bucket on the 27B long-context prompt.
+
+## Immediate next-cycle guidance after the 49.91 checkpoint
+
+1. Refresh `ZINC_PREFILL_PROFILE=1` on the exact site-aligned Coding
+   Review prompt and record `dense_ffn` subphases.
+2. If `gateup` is still dominant, collect `RADV_DEBUG=shaderstats` for
+   the current fused Q4_K gate/up/SwiGLU kernel before editing it.
+3. If `down` is dominant, collect shaderstats for the current Q6_K
+   batched down/kpar path and target down+acc fusion or register pressure.
+4. If benchmark samples are bimodal around `50` and `53 tok/s`, run an
+   interleaved old-vs-new control. Do not accept a sub-1% change from an
+   unpaired run.
+5. Treat the layer-major segment boundary as provisionally settled.
+   Do not add layers 1, 2, or 3 again without a fresh profile showing
+   those layers are now the reason `dense_ffn` is hot.
 
 ## Suggested cycle schedule
 

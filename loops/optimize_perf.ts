@@ -139,6 +139,15 @@ const MODELS: Record<string, ModelTarget> = {
 const MODEL_KEYS = Object.keys(MODELS).join(", ");
 
 const REMOTE_ZINC_ENV = "RADV_PERFTEST=coop_matrix";
+const REMOTE_VULKAN_DEVICE_INDEX = (() => {
+  const raw = process.env.ZINC_RDNA_DEVICE_INDEX
+    ?? ENV.ZINC_RDNA_DEVICE_INDEX
+    ?? process.env.ZINC_VULKAN_DEVICE_INDEX
+    ?? ENV.ZINC_VULKAN_DEVICE_INDEX
+    ?? "1";
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 1;
+})();
 const LONG_CONTEXT_BENCH_SENTENCE =
   "Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu.";
 
@@ -160,6 +169,35 @@ const PREFILL_BENCHMARK_PROMPT = [
   "Ignore unrelated filler and answer from the reference packet.",
   "",
   "Based on the reference above, the capital of France is",
+].join("\n");
+
+const CODING_REVIEW_SNIPPET = [
+  "File: src/cache.ts",
+  "```ts",
+  "const cache = new Map<string, string>();",
+  "const pending = new Map<string, Promise<string>>();",
+  "",
+  "export async function getValue(key: string, load: () => Promise<string>) {",
+  "  if (cache.has(key)) return cache.get(key)!;",
+  "  if (pending.has(key)) return cache.get(key)!;",
+  "",
+  "  const task = load().then((value) => {",
+  "    cache.set(key, value);",
+  "    pending.delete(key);",
+  "    return value;",
+  "  });",
+  "  pending.set(key, task);",
+  "  return task;",
+  "}",
+  "```",
+].join("\n");
+
+const QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT = [
+  "Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
+  "",
+  CODING_REVIEW_SNIPPET,
+  "",
+  "Review:",
 ].join("\n");
 
 // Long-context decode benchmark for Effort 11. The prompt is a single
@@ -195,6 +233,12 @@ type EffortSpec = {
   benchmarkPrompt: string;
   benchmarkMaxTokens: number;
   benchmarkMethod: string;
+  defaultModel?: string;
+  // Optional sanity floor for the baseline benchmark. This catches cases
+  // where the RDNA node is effectively not using the GPU path, is badly
+  // contaminated by stale processes, or has fallen into a driver/runtime
+  // state that makes optimization results meaningless.
+  minHealthyTokPerSec?: number;
   // Optional per-effort controller hints. These are rendered into the agent
   // prompt so the loop can encode knowledge the base plan document doesn't
   // (or shouldn't) encode itself.
@@ -538,23 +582,32 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     summary: "RDNA4 Qwen 3.6 27B dense-hybrid prefill/decode recovery",
     metricMode: "prefill",
     primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
-    benchmarkPrompt: PREFILL_BENCHMARK_PROMPT,
+    defaultModel: "qwen3627b",
+    benchmarkPrompt: QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT,
     benchmarkMaxTokens: 8,
-    benchmarkMethod: "long-context prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    benchmarkMethod: "site-aligned context-medium Coding Review prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    minHealthyTokPerSec: 10,
     knownFlatCategories: [
+      "Do not optimize against the old synthetic Paris prefill prompt for effort 15. It reported ~148 tok/s but does not match the site context-medium workload that exposes the real ~29 tok/s 27B prefill gap.",
       "Do not relax canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0 as a first step. A prior SSM batched prefill attempt caused QueueSubmitFailed / GPU resets and had a real hidden-state dependency bug.",
       "Do not repeat the widened dense fused gate+up+SwiGLU path for inter_dim=17408. On Qwen3.6-27B it was mixed or negative across the four-scenario matrix.",
       "Do not repeat Q6_K+Q4_K fused SSM qkv+z pair dispatch. It engaged but regressed the SSM projection bucket.",
       "Do not flip ZINC_SSM_DELTA_COLS8=0 or retry ZINC_SSM_DELTA_NORMED_QK=1 without new evidence. Both were mixed or negative on the full 27B matrix.",
       "Do not retry Q6_K K=17408 dense-down specialization or broad Q4/Q6 wide variants. They were flat or negative on the 27B matrix.",
       "Do not widen the fused attention o-proj merge to hidden_dim=5120. It caused a severe long-context regression.",
+      "Do not repeat direct descriptor-offset SSM prefill projection replay. Cycle 36 measured flag OFF 31.34 tok/s vs flag ON 31.22 tok/s and reverted it.",
+      "Do not repeat Q5_K row4 SSM-out, SSM delta tile8, or other SSM-side variants while dense_ffn remains the largest phase bucket. Recent SSM cycles produced zero perf keeps.",
+      "Do not repeat Q4_K scale-unpack cleanup, BN=64 mul_mm_q4k projection batches, Q6_K batched-kpar chunk tuning, prefix dense-down batched accumulate, or wave32 row1 selector without new dense subphase evidence. These measured flat or negative around the 31.29 tok/s checkpoint.",
+      "Do not repeat lower-bound dense segment additions unless a fresh profile proves the first layers are now hot. Layer-1 extension measured old 4-62 override at 50.16 tok/s vs new layer-1 schedule at 50.07 tok/s and reverted; earlier prefix-depth/layer 2/3/4/8 sweeps were also flat or negative.",
+      "Do not repeat fusing the partial hidden scratch copy with the first attention-layer RMS norm at full-attention segment handoff. Measured with ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE: OFF median 49.96 tok/s [51.32, 49.82, 49.96] vs ON median 49.53 tok/s [49.53, 49.42, 49.62]; reverted. It also moved attention RMS work outside the normal phase timer, making profiles less trustworthy.",
     ],
     structuralSwingIdeas: [
-      "First build a default-off validation harness for Qwen3.6-27B layer-major prefill. Capture one layer/chunk from the current per-token path, then compare batched dense FFN intermediates: ffn_norm, gate, up, SwiGLU, down, post-FFN hidden.",
-      "Batch dense FFN prefill per layer after validation. The 27B dense FFN streams about 173 MB of weights per layer per token today; amortizing gate/up/down across a token chunk is the main prefill lever.",
-      "Only after dense FFN validation, batch SSM projections per layer and token chunk while keeping conv/delta recurrence exact. Compare wqkv, z, alpha, beta, delta_out, ssm_out, and post-SSM hidden against captures.",
-      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors.",
-      "If decode work is needed after prefill foundation, split dense gate/up/down and SSM projection profiling first. Try one flag-gated candidate at a time; prefer q5_k SSM out or a lower-register-pressure dense gate/up/SwiGLU shape, not the rejected wide fused variant.",
+      "Current corrected-harness profile still has dense_ffn as the top bucket, but the recent best checkpoint is ~49.91 tok/s rather than the older 31.29 tok/s plan text. Next cycles should attack dense_ffn only from a fresh ZINC_PREFILL_PROFILE=1 subphase, not from stale prompt-era assumptions.",
+      "Treat the current Qwen3.6-27B layer-major dense segment range as provisionally settled. Do not add earlier layers again; segment work should be a paired subset/removal or boundary-stability sweep only if it includes an old-vs-new control in the same cycle and a profile-backed reason.",
+      "Before more dense kernel rewrites, collect RADV_DEBUG=shaderstats for the current fused Q4_K gate/up/SwiGLU path and Q6_K batched down/kpar path. Only edit the shader if shaderstats shows a concrete occupancy, register, spill, or instruction issue that maps to the dense_ffn subphase currently on top.",
+      "Fuse dense down projection with residual accumulation for the batched dense FFN path. The current path writes scratch_down, barriers, then scale-accumulates into scratch_hidden; a Q6_K batched down+acc kernel would attack dense_ffn_down without replaying SSM.",
+      "Use the parsed dense_ffn subphase profile before editing. If gateup dominates, improve the existing fused Q4_K gate/up/SwiGLU path structurally; if down dominates, work on down+acc; if sample spread is bimodal or above the noise gate, run a paired control before attributing a small movement to code.",
+      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors. Flag-gated paths must be measured flag OFF and flag ON in the same cycle.",
     ],
     referenceImplementations: [
       {
@@ -577,7 +630,29 @@ export function getEffortSpec(effort: number): EffortSpec | null {
   return EFFORT_SPECS[effort] ?? null;
 }
 
-const BENCHMARK_SAMPLES = 3;
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function minHealthyTokPerSecForSpec(effortSpec: EffortSpec): number | null {
+  const override = process.env.ZINC_MIN_HEALTHY_TPS;
+  if (override != null && override.trim() !== "") {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (parsed === 0) return null;
+  }
+  return effortSpec.minHealthyTokPerSec ?? null;
+}
+
+const BENCHMARK_MIN_SAMPLES = 3;
+const BENCHMARK_MAX_SAMPLES = Math.max(
+  BENCHMARK_MIN_SAMPLES,
+  positiveIntEnv("ZINC_BENCH_MAX_SAMPLES", 5),
+);
+// If the primary metric is noisy, collect a couple of extra samples instead
+// of making a keep/revert decision from a lucky or unlucky 3-run median.
+const BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT = 0.015;
 // Absolute floor on a "material improvement" in tok/s. Previously 0.5,
 // which rejected three effort-6 cycles (13/16/21) that produced gains of
 // 0.29-0.45 tok/s with sample noise well below the gap. Lowered to 0.2 so
@@ -626,6 +701,10 @@ const PIVOT_STALL_THRESHOLD = 3;
 // known-good patterns instead of guessing.
 const REFERENCE_IMPLS_STALL_THRESHOLD = 4;
 
+function shouldCleanRemoteBenchmarkNode(): boolean {
+  return process.env.ZINC_SKIP_REMOTE_CLEAN !== "1";
+}
+
 // Multiple prompts to catch different failure modes:
 // - Short factual: catches total corruption
 // - Arithmetic: catches subtle numeric drift (wrong MoE routing, bad dequant)
@@ -658,6 +737,7 @@ const COHERENCE_CHECKS: CoherenceCheck[] = [
 // The primary model (--model flag) is benchmarked; these are correctness-only.
 const COHERENCE_MODELS: ModelTarget[] = [
   MODELS.qwen36b,
+  MODELS.qwen3627b,
   MODELS.qwen8b,
   MODELS.gemma431b,
   MODELS.gemma412b,
@@ -678,6 +758,16 @@ type CoherenceSweep = {
   failureIds: string[];
 };
 
+type CoherenceCase = {
+  modelTarget: ModelTarget;
+  check: CoherenceCheck;
+  promptMode: PromptMode;
+  maxTokens: number;
+  prompt: string;
+  label: string;
+  id: string;
+};
+
 const BLOCKED_FILE_OPS = [
   "Edit(loops/*)", "Write(loops/*)", "Edit(site/*)", "Write(site/*)",
   "Edit(docs/*)", "Write(docs/*)", "Edit(.env)", "Write(.env)",
@@ -694,6 +784,10 @@ const BLOCKED_GIT_OPS = [
 // Directories the agent may change (used for selective revert)
 const REVERTABLE_PATHS = ["src/"];
 
+function isPrefillMetricLabel(label: string | undefined): boolean {
+  return /\bprefill\b/i.test(label ?? "");
+}
+
 // -- CLI parsing -------------------------------------------------------------
 
 type AgentType = "claude" | "codex";
@@ -704,6 +798,7 @@ function parseArgs() {
   let cycles = 20;
   let dryRun = false;
   let model = "qwen36b";
+  let modelExplicit = false;
   let resume = false;
   let agent: AgentType = "codex";
   let analyze = false;
@@ -714,7 +809,10 @@ function parseArgs() {
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--resume") resume = true;
     else if (args[i] === "--analyze") analyze = true;
-    else if (args[i] === "--model" && args[i + 1]) model = args[++i];
+    else if (args[i] === "--model" && args[i + 1]) {
+      model = args[++i];
+      modelExplicit = true;
+    }
     else if (args[i] === "--agent" && args[i + 1]) agent = args[++i] as AgentType;
   }
   if (!effort || !getEffortSpec(effort)) {
@@ -724,7 +822,7 @@ function parseArgs() {
     console.error("Options:");
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
-    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen36b)`);
+    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: effort-specific, else qwen36b)`);
     console.error("  --agent claude|codex     AI agent to use (default: codex)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
@@ -744,7 +842,7 @@ function parseArgs() {
     console.error(`Unknown model: ${model}. Use one of: ${MODEL_KEYS}.`);
     process.exit(1);
   }
-  return { effort, cycles, dryRun, model, resume, agent, analyze };
+  return { effort, cycles, dryRun, model, modelExplicit, resume, agent, analyze };
 }
 
 // -- Display helpers ---------------------------------------------------------
@@ -831,10 +929,29 @@ async function rsyncToRemote(): Promise<void> {
     "-e", `ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no`,
     "--exclude", ".zig-cache", "--exclude", "zig-out", "--exclude", "node_modules",
     "--exclude", ".git", "--exclude", ".perf_optimize", "--exclude", ".zinc_optimize",
-    "--exclude", "site", "--exclude", ".DS_Store",
+    "--exclude", "site", "--exclude", ".DS_Store", "--exclude", ".env", "--exclude", ".env.*",
+    "--exclude", "*.swp", "--exclude", "*.swo",
     `${REPO_ROOT}/`, `${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/`,
   ], { timeout: 120_000 });
   if (exitCode !== 0) throw new Error(`rsync failed: ${stderr.slice(0, 300)}`);
+}
+
+async function cleanRemoteBenchmarkNode(): Promise<void> {
+  if (!shouldCleanRemoteBenchmarkNode()) return;
+  console.log(c("2", "  Cleaning stale RDNA benchmark processes..."));
+  try {
+    await ssh(
+      [
+        "pkill -f '[z]ig-out/bin/zinc' || true",
+        "pkill -f '[l]lama-server' || true",
+        "pkill -f '[l]lama-cli' || true",
+        "sleep 1",
+      ].join("; "),
+      30_000,
+    );
+  } catch (e) {
+    console.log(c("1;33", `  Warning: remote cleanup failed; benchmark may be contaminated (${String(e).slice(0, 120)})`));
+  }
 }
 
 // -- Build & benchmark -------------------------------------------------------
@@ -1216,6 +1333,11 @@ export function formatPhaseBudget(
     const moe = Object.entries(budget.moeTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- MoE sub-buckets (ms): ${moe.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
   }
+  const denseTotals = budget.denseTotalsMs ?? {};
+  if (Object.keys(denseTotals).length > 0) {
+    const dense = Object.entries(denseTotals).sort((a, b) => b[1] - a[1]);
+    lines.push(`- Dense FFN sub-buckets (ms): ${dense.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
+  }
   if (Object.keys(budget.ssmTotalsMs).length > 0) {
     const ssm = Object.entries(budget.ssmTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- SSM sub-buckets (ms): ${ssm.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
@@ -1226,6 +1348,24 @@ export function formatPhaseBudget(
     );
   }
   return lines.join("\n");
+}
+
+function formatDominantBucketDirective(budget: PrefillPhaseBudget | null | undefined): string | null {
+  const biggest = budget?.biggestBucket;
+  if (!biggest) return null;
+  const sorted = Object.entries(budget.totalsMs)
+    .filter(([name]) => name !== "embed")
+    .sort((a, b) => b[1] - a[1]);
+  const runnerUp = sorted.find(([name]) => name !== biggest.name);
+  const runnerUpText = runnerUp ? `; runner-up is ${runnerUp[0]} at ${runnerUp[1].toFixed(1)} ms` : "";
+  const lines = [
+    `The current profile's largest top-level bucket is ${biggest.name} at ${biggest.totalMs.toFixed(1)} ms${runnerUpText}.`,
+    `A cycle that targets another bucket must cite a fresh profile or a concrete dependency that unlocks ${biggest.name}.`,
+  ];
+  if (biggest.name === "dense_ffn") {
+    lines.push("For effort 15, prefer dense layer-major segment work, dense gate/up/SwiGLU structural changes, or dense down+acc fusion. Avoid SSM-only work while dense_ffn remains largest.");
+  }
+  return lines.map((line) => `- ${line}`).join("\n");
 }
 
 function tailHistory(history: string, maxLines = HISTORY_LINES_IN_PROMPT): string {
@@ -1429,6 +1569,24 @@ export function sampleStdev(samples: number[]): number {
   return Math.sqrt(variance);
 }
 
+export function relativeSampleSpread(samples: number[]): number {
+  const med = median(samples);
+  if (med == null || med <= 0 || samples.length < 2) return 0;
+  const min = Math.min(...samples);
+  const max = Math.max(...samples);
+  return (max - min) / med;
+}
+
+export function shouldCollectExtraBenchSample(
+  samples: number[],
+  minSamples = BENCHMARK_MIN_SAMPLES,
+  maxSamples = BENCHMARK_MAX_SAMPLES,
+): boolean {
+  if (samples.length < minSamples) return true;
+  if (samples.length >= maxSamples) return false;
+  return relativeSampleSpread(samples) >= BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT;
+}
+
 /**
  * Noise-aware override: when a candidate's sample dispersion is tight and
  * the gain vs best is a multiple of that noise, the measurement is
@@ -1581,8 +1739,11 @@ export function buildAgentPrompt(
       ? "HARVEST"
       : "ADVANCE";
 
-  const phaseBudgetBlock = options.primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
+    : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
 
   const echoWarning = context
@@ -1634,7 +1795,7 @@ ${plan}
 ## Current Checked-Out Code (build on this code)
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(currentBest.bandwidthUtil, currentBest.bandwidthSamples, "%", 1)}
-- output: "${currentBest.outputText}" (coherence tested with 3 prompts on 7 models after every change)
+- output: "${currentBest.outputText}" (coherence tested with ${COHERENCE_CHECKS.length} prompts on ${COHERENCE_MODELS.length} models after every change)
 - This is the performance of the code currently checked out in the worktree.
 
 ## Best Accepted Performance Checkpoint
@@ -1648,7 +1809,7 @@ ${currentVsBestNote}
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}
@@ -1703,7 +1864,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
    - If you are uncertain, add a tiny enabling or measurement step instead of another large speculative refactor.
 
 5. **Test on remote node:**
-   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
    ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 6. **Shader compilation:** glslc --target-env=vulkan1.3 -fshader-stage=compute file.comp -o file.spv
@@ -1770,8 +1931,11 @@ export function buildPivotPrompt(
         })
         .join("\n") || "  (none)"
     : "  (state unavailable)";
-  const phaseBudgetBlock = primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
+    : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
   const knownFlatBlock = options.knownFlatCategories?.length
     ? options.knownFlatCategories.map((entry, i) => `${i + 1}. ${entry}`).join("\n")
@@ -1798,7 +1962,7 @@ ${plan}
 - ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
 ## Committed Foundations From Recent Cycles
 ${committedFoundations}
 
@@ -1825,7 +1989,7 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 - enablement (only if you measured flag-on in this same cycle)
 
 ## Test on Remote Node
-rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig). You may also remove files that a revert would remove.
@@ -1853,9 +2017,9 @@ function coherenceMaxTokensForModel(modelTarget: ModelTarget): number {
   return modelTarget.coherenceMaxTokens ?? 30;
 }
 
-function zincCliArgs(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
+export function zincCliArgs(modelTarget: Pick<ModelTarget, "path" | "promptMode">, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
   const chatFlag = promptMode === "chat" ? " --chat" : "";
-  return `-m ${shellQuote(modelTarget.path)}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
+  return `-m ${shellQuote(modelTarget.path)} -d ${REMOTE_VULKAN_DEVICE_INDEX}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
 }
 
 function zincRemoteCommand(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
@@ -1979,13 +2143,19 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
   }
 
   const parseMetric = metricParserForSpec(effortSpec);
+  const samplePlan = BENCHMARK_MAX_SAMPLES > BENCHMARK_MIN_SAMPLES
+    ? `${BENCHMARK_MIN_SAMPLES}-${BENCHMARK_MAX_SAMPLES}`
+    : `${BENCHMARK_MIN_SAMPLES}`;
   console.log(c(
     "2",
-    `  Benchmarking (${BENCHMARK_SAMPLES} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
+    `  Benchmarking (${samplePlan} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
   ));
   const tokPerSecSamples: number[] = [];
   const bandwidthSamples: number[] = [];
-  for (let sample = 0; sample < BENCHMARK_SAMPLES; sample++) {
+  for (let sample = 0; sample < BENCHMARK_MAX_SAMPLES; sample++) {
+    if (sample >= BENCHMARK_MIN_SAMPLES && !shouldCollectExtraBenchSample(tokPerSecSamples)) {
+      break;
+    }
     let benchOutput: string;
     try {
       benchOutput = await ssh(
@@ -2010,9 +2180,12 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     const bw = effortSpec.metricMode === "decode" ? parseBandwidthUtil(benchOutput) : null;
     if (tps != null) tokPerSecSamples.push(tps);
     if (bw != null) bandwidthSamples.push(bw);
+    const sampleLabel = sample < BENCHMARK_MIN_SAMPLES
+      ? `${sample + 1}/${BENCHMARK_MIN_SAMPLES}`
+      : `extra ${sample + 1}/${BENCHMARK_MAX_SAMPLES}`;
     console.log(c(
       "2",
-      `    sample ${sample + 1}/${BENCHMARK_SAMPLES}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
+      `    sample ${sampleLabel}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
     ));
   }
 
@@ -2044,9 +2217,13 @@ function coherenceCaseLabel(model: string, prompt: string): string {
 }
 
 function formatCoherenceFailure(failure: CoherenceFailure): string {
-  return failure.kind === "crash"
-    ? `${failure.label}: crashed`
-    : `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
+  if (failure.kind === "crash") {
+    const detail = failure.outputText.trim().replace(/\s+/g, " ");
+    return detail
+      ? `${failure.label}: crashed (${trunc(detail, 90)})`
+      : `${failure.label}: crashed`;
+  }
+  return `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
 }
 
 export function formatCoherenceFailureList(failures: CoherenceFailure[]): string {
@@ -2063,45 +2240,83 @@ export function summarizeCoherenceRegression(
   return `New coherence failures vs accepted baseline: ${formatCoherenceFailureList(regressions)}`;
 }
 
+async function runCoherenceCase(testCase: CoherenceCase, timeoutMs: number): Promise<CoherenceFailure | null> {
+  try {
+    const out = await ssh(
+      zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode),
+      timeoutMs,
+    );
+    const textMatch = out.match(/Output text:\s*(.+)/i);
+    const outputText = textMatch ? textMatch[1].trim() : "";
+    const pass = testCase.check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
+    if (pass) return null;
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText,
+      kind: "mismatch",
+    };
+  } catch (e) {
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText: String(e).slice(-500),
+      kind: "crash",
+    };
+  }
+}
+
 async function runCoherenceSweep(): Promise<CoherenceSweep> {
-  const failures: CoherenceFailure[] = [];
+  const cases: CoherenceCase[] = [];
   for (const modelTarget of COHERENCE_MODELS) {
     const promptMode = coherencePromptModeForModel(modelTarget);
     const maxTokens = coherenceMaxTokensForModel(modelTarget);
     for (const check of COHERENCE_CHECKS) {
       const prompt = coherencePromptForMode(check, promptMode);
-      const label = coherenceCaseLabel(modelTarget.name, prompt);
-      try {
-        const out = await ssh(
-          zincRemoteCommand(modelTarget, prompt, maxTokens, promptMode),
-          120_000,
-        );
-        const textMatch = out.match(/Output text:\s*(.+)/i);
-        const outputText = textMatch ? textMatch[1].trim() : "";
-        const pass = check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
-        if (!pass) {
-          failures.push({
-            id: coherenceCaseId(modelTarget.name, prompt),
-            label,
-            model: modelTarget.name,
-            prompt,
-            outputText,
-            kind: "mismatch",
-          });
-        }
-      } catch (e) {
-        failures.push({
-          id: coherenceCaseId(modelTarget.name, prompt),
-          label,
-          model: modelTarget.name,
-          prompt,
-          outputText: "",
-          kind: "crash",
-        });
-      }
+      cases.push({
+        modelTarget,
+        check,
+        promptMode,
+        maxTokens,
+        prompt,
+        label: coherenceCaseLabel(modelTarget.name, prompt),
+        id: coherenceCaseId(modelTarget.name, prompt),
+      });
     }
+  }
+
+  let failures: CoherenceFailure[] = [];
+  for (const testCase of cases) {
+    const failure = await runCoherenceCase(testCase, 180_000);
+    if (failure) failures.push(failure);
+  }
+
+  const crashedIds = new Set(failures.filter((failure) => failure.kind === "crash").map((failure) => failure.id));
+  if (crashedIds.size > 0) {
+    console.log(c("1;33", `  Coherence saw ${crashedIds.size} crash/timeout case(s); cleaning RDNA node and retrying crashed cases once...`));
+    await cleanRemoteBenchmarkNode();
+    const stableFailures = failures.filter((failure) => failure.kind !== "crash");
+    const retriedFailures: CoherenceFailure[] = [];
+    for (const testCase of cases) {
+      if (!crashedIds.has(testCase.id)) continue;
+      const failure = await runCoherenceCase(testCase, 240_000);
+      if (failure) retriedFailures.push(failure);
+    }
+    failures = [...stableFailures, ...retriedFailures];
+  }
+
+  for (const modelTarget of COHERENCE_MODELS) {
     if (!failures.some((failure) => failure.model === modelTarget.name)) {
       console.log(c("2", `    ${modelTarget.name}: all ${COHERENCE_CHECKS.length} prompts OK`));
+    } else {
+      const crashCount = failures.filter((failure) => failure.model === modelTarget.name && failure.kind === "crash").length;
+      if (crashCount > 0) {
+        console.log(c("1;33", `    ${modelTarget.name}: ${crashCount} crash/timeout case(s) after retry`));
+      }
     }
   }
   return {
@@ -2539,19 +2754,22 @@ async function saveLoopState(state: LoopState): Promise<void> {
   await writeFile(statePathForEffort(state.effort), JSON.stringify(state, null, 2));
 }
 
-export function benchmarkSignatureForSpec(spec: EffortSpec): string {
+export function benchmarkSignatureForSpec(spec: EffortSpec, modelKey?: string, modelPath?: string): string {
+  const selectedModelKey = modelKey ?? spec.defaultModel ?? null;
   return JSON.stringify({
     doc: spec.doc,
     metricMode: spec.metricMode,
     primaryMetricLabel: spec.primaryMetricLabel,
+    modelKey: selectedModelKey,
+    modelPath: modelPath ?? (selectedModelKey ? MODELS[selectedModelKey]?.path ?? null : null),
     benchmarkPrompt: spec.benchmarkPrompt,
     benchmarkMaxTokens: spec.benchmarkMaxTokens,
     benchmarkMethod: spec.benchmarkMethod,
   });
 }
 
-export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec): boolean {
-  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec);
+export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec, modelKey?: string, modelPath?: string): boolean {
+  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec, modelKey, modelPath);
 }
 
 function createInitialState(
@@ -2737,12 +2955,13 @@ async function revertAgentChanges(): Promise<void> {
 // -- Main loop ---------------------------------------------------------------
 
 async function main() {
-  const { effort, cycles, dryRun, model, resume, agent, analyze } = parseArgs();
-  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
+  const { effort, cycles, dryRun, model: requestedModel, modelExplicit, resume, agent, analyze } = parseArgs();
   const effortSpec = getEffortSpec(effort);
   if (!effortSpec) {
     throw new Error(`Unknown effort: ${effort}`);
   }
+  const model = modelExplicit ? requestedModel : (effortSpec.defaultModel ?? requestedModel);
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const effortFile = effortSpec.doc;
   const plan = await readFile(join(EFFORTS_DIR, effortFile), "utf8");
 
@@ -2779,6 +2998,7 @@ async function main() {
 
   // Step 1: Sync and get baseline
   console.log(c("1;33", "\u2500\u2500 Baseline " + "\u2500".repeat(54)));
+  await cleanRemoteBenchmarkNode();
   await rsyncToRemote();
   const originalBaseline = await buildAndBench(modelTarget, effortSpec);
 
@@ -2788,6 +3008,20 @@ async function main() {
   }
   if (!originalBaseline.correct) {
     console.error(c("1;31", `Baseline output incorrect: "${originalBaseline.outputText}". Fix correctness first.`));
+    process.exit(1);
+  }
+  if (originalBaseline.tokPerSec == null) {
+    console.error(c("1;31", `Baseline ${effortSpec.primaryMetricLabel} was not parseable. Fix the benchmark command or parser before starting optimization cycles.`));
+    process.exit(1);
+  }
+  const minHealthyTokPerSec = minHealthyTokPerSecForSpec(effortSpec);
+  if (minHealthyTokPerSec != null && originalBaseline.tokPerSec < minHealthyTokPerSec) {
+    console.error(c(
+      "1;31",
+      `Baseline ${effortSpec.primaryMetricLabel} ${originalBaseline.tokPerSec.toFixed(2)} tok/s is below the ${minHealthyTokPerSec.toFixed(2)} tok/s health floor.`,
+    ));
+    console.error(c("1;31", "This usually means the RDNA node is contaminated, the GPU path is not active, or the driver/runtime state is unhealthy. Clean/reboot/fix the node before burning agent cycles."));
+    console.error(c("2", "Set ZINC_MIN_HEALTHY_TPS=0 only if you intentionally want to optimize from this degraded baseline."));
     process.exit(1);
   }
 
@@ -2805,7 +3039,7 @@ async function main() {
     }
   }
 
-  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec);
+  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec, model, modelTarget.path);
   let currentCode = originalBaseline;
   let bestPerf = originalBaseline;
   let bestTokPerSec = bestPerf.tokPerSec ?? 0;
@@ -2818,7 +3052,7 @@ async function main() {
   if (resume) {
     const saved = await loadLoopState(effort);
     if (saved) {
-      if (!isResumeStateCompatible(saved, effortSpec)) {
+      if (!isResumeStateCompatible(saved, effortSpec, model, modelTarget.path)) {
         console.log(c(
           "1;33",
           "  Resume note: saved state uses an older or different benchmark signature. Ignoring it and starting fresh for this effort.",
@@ -2970,6 +3204,7 @@ async function main() {
 
     // Sync and benchmark — with up to 2 fix-up retries if build fails
     console.log(c("2", "  Syncing changes..."));
+    await cleanRemoteBenchmarkNode();
     await rsyncToRemote();
     let result = await buildAndBench(modelTarget, effortSpec);
 
@@ -2988,7 +3223,7 @@ ${result.buildOutput.slice(-2000)}
 - The code must compile: zig build -Doptimize=ReleaseFast must succeed on the remote node.
 - Do not use sub-agents, delegation, spawn_agent, or wait_agent.
 - Re-read the file right before patching it; do not patch against stale context.
-- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 - Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
 - Shader compilation: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"`;
 

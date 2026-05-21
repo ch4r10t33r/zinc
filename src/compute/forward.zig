@@ -117,6 +117,12 @@ const ProfilePhase = enum(u8) {
     flash_attn_kernel,
     ssm,
     ssm_proj,
+    ssm_proj_norm_ab,
+    ssm_proj_qkv,
+    ssm_proj_z,
+    ssm_proj_alpha,
+    ssm_proj_beta,
+    ssm_proj_qkv_z,
     ssm_conv,
     ssm_delta,
     ssm_gated_norm,
@@ -149,6 +155,8 @@ const ProfilePhase = enum(u8) {
     // outer dense_ffn bucket; the GPU timestamps are independent so the
     // sub-bucket sums won't double-count the outer total.
     dense_ffn_gateup,
+    dense_ffn_gate,
+    dense_ffn_up,
     dense_ffn_down,
     final_tail,
     final_norm,
@@ -163,6 +171,12 @@ const ProfilePhase = enum(u8) {
             .flash_attn_kernel => "flash_attn",
             .ssm => "ssm",
             .ssm_proj => "ssm_proj",
+            .ssm_proj_norm_ab => "ssm_proj_norm_ab",
+            .ssm_proj_qkv => "ssm_proj_qkv",
+            .ssm_proj_z => "ssm_proj_z",
+            .ssm_proj_alpha => "ssm_proj_alpha",
+            .ssm_proj_beta => "ssm_proj_beta",
+            .ssm_proj_qkv_z => "ssm_proj_qkv_z",
             .ssm_conv => "ssm_conv",
             .ssm_delta => "ssm_delta",
             .ssm_gated_norm => "ssm_gnorm",
@@ -181,6 +195,8 @@ const ProfilePhase = enum(u8) {
             .shared_gate_acc => "shared_gate",
             .dense_ffn => "dense_ffn",
             .dense_ffn_gateup => "dense_ffn_gateup",
+            .dense_ffn_gate => "dense_ffn_gate",
+            .dense_ffn_up => "dense_ffn_up",
             .dense_ffn_down => "dense_ffn_down",
             .final_tail => "tail",
             .final_norm => "tail_norm",
@@ -1090,6 +1106,11 @@ pub const InferenceEngine = struct {
     // the SwiGLU fold which removes the gate_buf/up_buf write+read pair
     // entirely, a structurally distinct change.
     use_fused_dense_ffn: bool = false,
+    // Default-on only for Qwen3.6-27B's wide dense FFN shape. Uses the
+    // NUM_ROWS=1 specialization of the fused gate+up+SwiGLU Q4_K shader
+    // instead of widening the regular NUM_ROWS=2 path that previously
+    // regressed this target. Disable with ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0.
+    use_qwen36_dense_fused_row1: bool = false,
     // Effort-11 cycle-17: fused split-K flash attention merge + o_proj
     // DMMV-acc. When ZINC_FUSED_OPROJ_MERGE=1 (and split-K is active), the
     // o_proj dispatch site uses a single dmmv_q4k_o_proj_merge dispatch
@@ -1151,6 +1172,9 @@ pub const InferenceEngine = struct {
     // n_tokens >= 16 — the BN=16 tile is saturated and the same A-tile
     // is reused across N, which the chunked kpar shader cannot do.
     use_mul_mm_proj: bool = false,
+    // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Uses a
+    // tiled Q4_K gate+up+SwiGLU GEMM to avoid gate/up scratch writes.
+    use_qwen36_batched_fused_gateup: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -1293,7 +1317,15 @@ pub const InferenceEngine = struct {
     dense_prefill_validate_norm_ref: ?Buffer = null,
     dense_prefill_validate_pre_hidden_ref: ?Buffer = null,
     dense_prefill_validate_post_hidden_ref: ?Buffer = null,
+    dense_prefill_validate_gate_ref: ?Buffer = null,
+    dense_prefill_validate_up_ref: ?Buffer = null,
+    dense_prefill_validate_swiglu_ref: ?Buffer = null,
+    dense_prefill_validate_down_ref: ?Buffer = null,
     dense_prefill_validate_staging: ?Buffer = null,
+    // Same flag also enables a selected SSM-layer validator: capture
+    // norm/qkv/z/alpha/beta plus conv_out, per-token delta_out, gated norm,
+    // and pre/post SSM hidden. After prefill it replays qkv/z, one batched
+    // delta_net chunk, gated norm, and ssm_out, then diffs.
     use_qwen36_ssm_prefill_validate: bool = false,
     ssm_prefill_validate_captured_tokens: u32 = 0,
     ssm_prefill_validate_norm_ref: ?Buffer = null,
@@ -1301,6 +1333,13 @@ pub const InferenceEngine = struct {
     ssm_prefill_validate_z_ref: ?Buffer = null,
     ssm_prefill_validate_alpha_ref: ?Buffer = null,
     ssm_prefill_validate_beta_ref: ?Buffer = null,
+    ssm_prefill_validate_conv_ref: ?Buffer = null,
+    ssm_prefill_validate_delta_ref: ?Buffer = null,
+    ssm_prefill_validate_delta_replay: ?Buffer = null,
+    ssm_prefill_validate_gnorm_ref: ?Buffer = null,
+    ssm_prefill_validate_pre_hidden_ref: ?Buffer = null,
+    ssm_prefill_validate_post_hidden_ref: ?Buffer = null,
+    ssm_prefill_validate_state_backup: ?Buffer = null,
     ssm_prefill_validate_staging: ?Buffer = null,
 
     // A3b production enablement: layer-major prefill needs to replay one
@@ -1320,6 +1359,9 @@ pub const InferenceEngine = struct {
     partial_decode_stop_after_ffn_norm: bool = false,
     partial_decode_ffn_norm_out: ?vk.c.VkBuffer = null,
     partial_decode_ffn_norm_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_stop_after_ssm_gnorm: bool = false,
+    partial_decode_ssm_gnorm_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_gnorm_out_offset: vk.c.VkDeviceSize = 0,
     partial_ssm_preproj_layer: u32 = std.math.maxInt(u32),
     partial_ssm_preproj_token_idx: u32 = 0,
     partial_ssm_preproj_qkv: ?vk.c.VkBuffer = null,
@@ -2249,6 +2291,17 @@ pub const InferenceEngine = struct {
         } else if (fused_dense_ffn_explicitly_off) {
             log.info("Fused dense gate+up+SwiGLU DISABLED via ZINC_FUSED_DENSE_FFN=0", .{});
         }
+        const qwen36_dense_row1_env = std.posix.getenv("ZINC_QWEN36_27B_DENSE_FUSED_ROW1");
+        const qwen36_dense_row1_explicitly_off = qwen36_dense_row1_env != null and
+            std.mem.eql(u8, qwen36_dense_row1_env.?, "0");
+        const qwen36_dense_row1_enabled = !qwen36_dense_row1_explicitly_off and
+            dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_dense_row1_enabled) {
+            log.info("Qwen3.6-27B dense fused gate+up+SwiGLU row1 path ENABLED (default for matching shape, set ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0 to disable)", .{});
+        } else if (qwen36_dense_row1_explicitly_off) {
+            log.info("Qwen3.6-27B dense fused gate+up+SwiGLU row1 path DISABLED via ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0", .{});
+        }
 
         // Fused split-K merge + o_proj DMMV-acc (effort-11 cycle 17). When
         // ZINC_FUSED_OPROJ_MERGE=1 AND split-K is active, the o_proj site
@@ -2417,6 +2470,18 @@ pub const InferenceEngine = struct {
             log.info("Q4_K projection mul_mm path ENABLED (default; set ZINC_MUL_MM_PROJ=0 to disable)", .{});
         } else if (mul_mm_proj_explicitly_off) {
             log.info("Q4_K projection mul_mm path DISABLED via ZINC_MUL_MM_PROJ=0; using kpar/serial batch shaders", .{});
+        }
+
+        const qwen36_batched_gateup_env = std.posix.getenv("ZINC_QWEN36_27B_BATCH_FUSED_GATEUP");
+        const qwen36_batched_gateup_explicitly_off = qwen36_batched_gateup_env != null and
+            std.mem.eql(u8, qwen36_batched_gateup_env.?, "0");
+        const qwen36_batched_gateup_enabled = !qwen36_batched_gateup_explicitly_off and
+            dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_batched_gateup_enabled) {
+            log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path ENABLED (default, set ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0 to disable)", .{});
+        } else if (qwen36_batched_gateup_explicitly_off) {
+            log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path DISABLED via ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0", .{});
         }
 
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
@@ -2648,6 +2713,10 @@ pub const InferenceEngine = struct {
         var dense_prefill_validate_norm_ref: ?Buffer = null;
         var dense_prefill_validate_pre_hidden_ref: ?Buffer = null;
         var dense_prefill_validate_post_hidden_ref: ?Buffer = null;
+        var dense_prefill_validate_gate_ref: ?Buffer = null;
+        var dense_prefill_validate_up_ref: ?Buffer = null;
+        var dense_prefill_validate_swiglu_ref: ?Buffer = null;
+        var dense_prefill_validate_down_ref: ?Buffer = null;
         var dense_prefill_validate_staging: ?Buffer = null;
         if (dense_prefill_validate_requested and
             config.n_experts == 0 and
@@ -2657,7 +2726,7 @@ pub const InferenceEngine = struct {
             inter_val > 0)
         {
             const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
-            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 8 else 8;
+            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 16 else 16;
             dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), @as(u32, 16));
             const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
             const parsed_layer = if (raw_layer) |raw| std.fmt.parseInt(u32, raw, 10) catch 0 else 0;
@@ -2666,6 +2735,10 @@ pub const InferenceEngine = struct {
             const hidden_capture_bytes: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
                 @as(vk.c.VkDeviceSize, config.hidden_dim) *
+                @sizeOf(f32);
+            const inter_capture_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                @as(vk.c.VkDeviceSize, inter_val) *
                 @sizeOf(f32);
             const usage_ref = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -2676,8 +2749,16 @@ pub const InferenceEngine = struct {
             errdefer if (dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
             dense_prefill_validate_post_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
             errdefer if (dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
+            dense_prefill_validate_gate_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_gate_ref) |*b| b.deinit();
+            dense_prefill_validate_up_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_up_ref) |*b| b.deinit();
+            dense_prefill_validate_swiglu_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_swiglu_ref) |*b| b.deinit();
+            dense_prefill_validate_down_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+            errdefer if (dense_prefill_validate_down_ref) |*b| b.deinit();
 
-            const staging_bytes = hidden_capture_bytes * 3;
+            const staging_bytes = hidden_capture_bytes * 4 + inter_capture_bytes * 6;
             dense_prefill_validate_staging = try Buffer.init(
                 instance,
                 staging_bytes,
@@ -2694,7 +2775,7 @@ pub const InferenceEngine = struct {
                 }
             }
             dense_prefill_validate_enabled = true;
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B", .{
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B (replays chunks 4/8/16 when captured)", .{
                 dense_prefill_validate_layer,
                 dense_prefill_validate_max_tokens,
                 config.hidden_dim,
@@ -2711,6 +2792,13 @@ pub const InferenceEngine = struct {
         var ssm_prefill_validate_z_ref: ?Buffer = null;
         var ssm_prefill_validate_alpha_ref: ?Buffer = null;
         var ssm_prefill_validate_beta_ref: ?Buffer = null;
+        var ssm_prefill_validate_conv_ref: ?Buffer = null;
+        var ssm_prefill_validate_delta_ref: ?Buffer = null;
+        var ssm_prefill_validate_delta_replay: ?Buffer = null;
+        var ssm_prefill_validate_gnorm_ref: ?Buffer = null;
+        var ssm_prefill_validate_pre_hidden_ref: ?Buffer = null;
+        var ssm_prefill_validate_post_hidden_ref: ?Buffer = null;
+        var ssm_prefill_validate_state_backup: ?Buffer = null;
         var ssm_prefill_validate_staging: ?Buffer = null;
         if (dense_prefill_validate_enabled and config.ssm_d_inner > 0 and config.ssm_dt_rank > 0) {
             const full_attn_interval_v: u32 = if (config.full_attn_interval > 0) config.full_attn_interval else 1;
@@ -2739,6 +2827,22 @@ pub const InferenceEngine = struct {
                     @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
                     @as(vk.c.VkDeviceSize, config.ssm_dt_rank) *
                     @sizeOf(f32);
+                const head_v_dim_validate = config.ssm_d_inner / config.ssm_dt_rank;
+                const state_bytes_validate: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, config.ssm_dt_rank) *
+                    @as(vk.c.VkDeviceSize, head_v_dim_validate) *
+                    @as(vk.c.VkDeviceSize, head_v_dim_validate) *
+                    @sizeOf(f32);
+                const can_delta_replay_validate =
+                    elementwise.pipeline_ssm_delta_net != null and
+                    instance.push_descriptor_fn != null and
+                    dense_prefill_validate_layer < gpu_ssm_states.len and
+                    gpu_ssm_states[dense_prefill_validate_layer].handle != null and
+                    state_bytes_validate <= gpu_ssm_states[dense_prefill_validate_layer].size;
+                const can_output_replay_validate =
+                    can_delta_replay_validate and
+                    elementwise.pipeline_ssm_gated_norm != null and
+                    lt_validate.ssm_out != null;
                 const usage_ref = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                     vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                     vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -2752,10 +2856,30 @@ pub const InferenceEngine = struct {
                 errdefer if (ssm_prefill_validate_alpha_ref) |*b| b.deinit();
                 ssm_prefill_validate_beta_ref = try Buffer.initDeviceLocal(instance, ab_capture_bytes, usage_ref);
                 errdefer if (ssm_prefill_validate_beta_ref) |*b| b.deinit();
+                if (can_delta_replay_validate) {
+                    ssm_prefill_validate_conv_ref = try Buffer.initDeviceLocal(instance, qkv_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_conv_ref) |*b| b.deinit();
+                    ssm_prefill_validate_delta_ref = try Buffer.initDeviceLocal(instance, z_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_delta_ref) |*b| b.deinit();
+                    ssm_prefill_validate_delta_replay = try Buffer.initDeviceLocal(instance, z_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_delta_replay) |*b| b.deinit();
+                    ssm_prefill_validate_state_backup = try Buffer.initDeviceLocal(instance, state_bytes_validate, usage_ref);
+                    errdefer if (ssm_prefill_validate_state_backup) |*b| b.deinit();
+                }
+                if (can_output_replay_validate) {
+                    ssm_prefill_validate_gnorm_ref = try Buffer.initDeviceLocal(instance, z_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_gnorm_ref) |*b| b.deinit();
+                    ssm_prefill_validate_pre_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_pre_hidden_ref) |*b| b.deinit();
+                    ssm_prefill_validate_post_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+                    errdefer if (ssm_prefill_validate_post_hidden_ref) |*b| b.deinit();
+                }
 
                 const staging_bytes = hidden_capture_bytes +
                     2 * (qkv_capture_bytes + z_capture_bytes) +
-                    2 * ab_capture_bytes;
+                    2 * ab_capture_bytes +
+                    (if (can_delta_replay_validate) 2 * z_capture_bytes else 0) +
+                    (if (can_output_replay_validate) (3 * hidden_capture_bytes + 2 * z_capture_bytes) else 0);
                 ssm_prefill_validate_staging = try Buffer.init(
                     instance,
                     staging_bytes,
@@ -2772,13 +2896,15 @@ pub const InferenceEngine = struct {
                     }
                 }
                 ssm_prefill_validate_enabled = true;
-                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM proj validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} staging={d} B (batched qkv/z replay)", .{
+                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} delta_replay={} output_replay={} staging={d} B (batched qkv/z/delta/ssm_out replay, chunks 4/8/16 when captured)", .{
                     dense_prefill_validate_layer,
                     dense_prefill_validate_max_tokens,
                     config.hidden_dim,
                     conv_channels_validate,
                     config.ssm_d_inner,
                     config.ssm_dt_rank,
+                    can_delta_replay_validate,
+                    can_output_replay_validate,
                     staging_bytes,
                 });
             } else {
@@ -2805,6 +2931,7 @@ pub const InferenceEngine = struct {
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
             .use_ssm_delta_normed_qk = ssm_delta_normed_qk_enabled,
             .use_fused_dense_ffn = fused_dense_ffn_enabled,
+            .use_qwen36_dense_fused_row1 = qwen36_dense_row1_enabled,
             .use_fused_oproj_merge = fused_oproj_merge_enabled,
             .use_fused_qk_kv = fused_qk_kv_enabled,
             .fa_profile_layer = fa_profile_layer_enabled,
@@ -2820,6 +2947,7 @@ pub const InferenceEngine = struct {
             .use_capture_routing = capture_flag and routing_capture_buf.handle != null,
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
             .use_mul_mm_proj = mul_mm_proj_enabled,
+            .use_qwen36_batched_fused_gateup = qwen36_batched_gateup_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -2843,6 +2971,10 @@ pub const InferenceEngine = struct {
             .dense_prefill_validate_norm_ref = dense_prefill_validate_norm_ref,
             .dense_prefill_validate_pre_hidden_ref = dense_prefill_validate_pre_hidden_ref,
             .dense_prefill_validate_post_hidden_ref = dense_prefill_validate_post_hidden_ref,
+            .dense_prefill_validate_gate_ref = dense_prefill_validate_gate_ref,
+            .dense_prefill_validate_up_ref = dense_prefill_validate_up_ref,
+            .dense_prefill_validate_swiglu_ref = dense_prefill_validate_swiglu_ref,
+            .dense_prefill_validate_down_ref = dense_prefill_validate_down_ref,
             .dense_prefill_validate_staging = dense_prefill_validate_staging,
             .use_qwen36_ssm_prefill_validate = ssm_prefill_validate_enabled,
             .ssm_prefill_validate_norm_ref = ssm_prefill_validate_norm_ref,
@@ -2850,6 +2982,13 @@ pub const InferenceEngine = struct {
             .ssm_prefill_validate_z_ref = ssm_prefill_validate_z_ref,
             .ssm_prefill_validate_alpha_ref = ssm_prefill_validate_alpha_ref,
             .ssm_prefill_validate_beta_ref = ssm_prefill_validate_beta_ref,
+            .ssm_prefill_validate_conv_ref = ssm_prefill_validate_conv_ref,
+            .ssm_prefill_validate_delta_ref = ssm_prefill_validate_delta_ref,
+            .ssm_prefill_validate_delta_replay = ssm_prefill_validate_delta_replay,
+            .ssm_prefill_validate_gnorm_ref = ssm_prefill_validate_gnorm_ref,
+            .ssm_prefill_validate_pre_hidden_ref = ssm_prefill_validate_pre_hidden_ref,
+            .ssm_prefill_validate_post_hidden_ref = ssm_prefill_validate_post_hidden_ref,
+            .ssm_prefill_validate_state_backup = ssm_prefill_validate_state_backup,
             .ssm_prefill_validate_staging = ssm_prefill_validate_staging,
             .routing_capture_buf = routing_capture_buf,
             .routing_capture_slot_bytes = routing_capture_slot_bytes,
@@ -3951,6 +4090,44 @@ pub const InferenceEngine = struct {
         try self.elementwise.recordRmsNorm(&self.decode_cmd, ds, hidden_dim, n_tokens, eps);
     }
 
+    fn dispatchRmsNormStoreHidden(
+        self: *InferenceEngine,
+        hidden_buf: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        weight_buf: vk.c.VkBuffer,
+        weight_size: vk.c.VkDeviceSize,
+        norm_out_buf: vk.c.VkBuffer,
+        norm_out_offset: vk.c.VkDeviceSize,
+        norm_out_size: vk.c.VkDeviceSize,
+        hidden_out_buf: vk.c.VkBuffer,
+        hidden_out_offset: vk.c.VkDeviceSize,
+        hidden_out_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        eps: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_rms_norm_store_hidden orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors or self.instance.push_descriptor_fn == null) return error.ShaderNotLoaded;
+        const push = RmsNormPush{
+            .N = hidden_dim,
+            .eps_bits = @bitCast(eps),
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = hidden_buf, .offset = 0, .range = hidden_size },
+            .{ .buffer = weight_buf, .offset = 0, .range = weight_size },
+            .{ .buffer = norm_out_buf, .offset = norm_out_offset, .range = norm_out_size },
+            .{ .buffer = hidden_out_buf, .offset = hidden_out_offset, .range = hidden_out_size },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            1,
+            1,
+            1,
+        );
+    }
+
     /// Fused RMS norm + f32 router DMMV. Reads `hidden_buf`, normalizes
     /// it once with `ffn_norm_w`, writes the normalized vector to
     /// `ffn_norm_buf` (so downstream MoE expert dispatches can consume
@@ -4884,6 +5061,7 @@ pub const InferenceEngine = struct {
             has_partial_hidden_in or
             has_partial_hidden_out or
             !self.partial_decode_advance_position;
+        var partial_hidden_out_written_by_stop = false;
 
         // Log MoE dimensions once (first decode)
         if (state.generated_tokens.items.len == 0 and is_moe) {
@@ -6395,7 +6573,7 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_ssm_delta_net != null and
                     self.elementwise.pipeline_ssm_gated_norm != null;
                 if (state.position == 0 and layer == 0) {
-                    log.info("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
+                    log.debug("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
                         use_gpu_ssm,
                         @tagName(config.architecture),
                         self.elementwise.pipeline_ssm_conv1d != null,
@@ -6424,6 +6602,9 @@ pub const InferenceEngine = struct {
                     try self.runSsmLayerCpu(state, layer, layer_idx);
                 }
                 self.endProfilePhase(.ssm, ssm_phase);
+                if (self.partial_decode_stop_after_ssm_gnorm) {
+                    break;
+                }
             }
 
             // Prefill last-layer shortcut: at the final layer of a non-terminal prefill
@@ -6464,6 +6645,31 @@ pub const InferenceEngine = struct {
                 lt.ffn_gate_inp_bias == null and
                 lt.ffn_gate_inp_scale == null and
                 (hidden_dim % 4) == 0;
+            const can_store_partial_stop = self.partial_decode_stop_after_ffn_norm and
+                !can_fuse_rms_router and
+                self.prefill_active and
+                self.qwen36DensePrefillPartialStoreEnabled() and
+                self.partial_decode_ffn_norm_out != null and
+                self.partial_decode_hidden_out != null and
+                (hidden_dim % 4) == 0;
+            if (can_store_partial_stop) {
+                try self.dispatchRmsNormStoreHidden(
+                    self.hidden_buf.handle,
+                    hidden_size,
+                    ffn_norm_tensor.gpu_buffer.handle,
+                    ffn_norm_tensor.gpu_buffer.size,
+                    self.partial_decode_ffn_norm_out.?,
+                    self.partial_decode_ffn_norm_out_offset,
+                    hidden_size,
+                    self.partial_decode_hidden_out.?,
+                    self.partial_decode_hidden_out_offset,
+                    hidden_size,
+                    hidden_dim,
+                    rms_norm_eps,
+                );
+                partial_hidden_out_written_by_stop = true;
+                break;
+            }
             if (!can_fuse_rms_router) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
@@ -8305,7 +8511,11 @@ pub const InferenceEngine = struct {
                     self.prefill_current_token_idx < self.dense_prefill_validate_max_tokens and
                     self.dense_prefill_validate_norm_ref != null and
                     self.dense_prefill_validate_pre_hidden_ref != null and
-                    self.dense_prefill_validate_post_hidden_ref != null;
+                    self.dense_prefill_validate_post_hidden_ref != null and
+                    self.dense_prefill_validate_gate_ref != null and
+                    self.dense_prefill_validate_up_ref != null and
+                    self.dense_prefill_validate_swiglu_ref != null and
+                    self.dense_prefill_validate_down_ref != null;
                 if (dense_prefill_validate_capture) {
                     const tok_idx = self.prefill_current_token_idx;
                     const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
@@ -8318,13 +8528,19 @@ pub const InferenceEngine = struct {
                     self.dense_prefill_validate_captured_tokens = @max(self.dense_prefill_validate_captured_tokens, tok_idx + 1);
                 }
 
+                const qwen36_row1_dense_eligible = self.use_qwen36_dense_fused_row1 and
+                    self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null and
+                    self.isQwen36DenseHybrid27B() and
+                    hidden_dim == 5120 and
+                    inter_dim == 17408;
                 const fused_dense_ffn_eligible = self.use_fused_dense_ffn and
                     self.dmmv.pipeline_q4k_fused_gate_up_swiglu != null and
                     config.architecture != .gemma and
                     config.architecture != .gpt_oss and
+                    !dense_prefill_validate_capture and
                     gate_tensor.info.type_ == .q4_k and
                     up_tensor.info.type_ == .q4_k and
-                    inter_dim <= 12288 and
+                    (inter_dim <= 12288 or qwen36_row1_dense_eligible) and
                     (hidden_dim % 4) == 0 and
                     (hidden_dim % 256) == 0;
 
@@ -8333,13 +8549,29 @@ pub const InferenceEngine = struct {
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else {
+                    const dense_ffn_gate_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(gate_tensor, self.ffn_norm_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
+                    const dense_ffn_up_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(up_tensor, self.ffn_norm_buf, hidden_size, self.up_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
                     const dense_gateup_ranges = [_]CommandBuffer.BufferRange{
                         .{ .buffer = self.gate_buf.handle, .size = self.gate_buf.size },
                         .{ .buffer = self.up_buf.handle, .size = self.up_buf.size },
                     };
                     self.decode_cmd.computeBuffersBarrier(&dense_gateup_ranges);
+
+                    if (dense_prefill_validate_capture) {
+                        const tok_idx = self.prefill_current_token_idx;
+                        const inter_size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
+                        const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * inter_size;
+                        self.decode_cmd.computeAndTransferBarrier();
+                        const gate_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = inter_size };
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.dense_prefill_validate_gate_ref.?.handle, 1, &gate_region);
+                        const up_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = inter_size };
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.up_buf.handle, self.dense_prefill_validate_up_ref.?.handle, 1, &up_region);
+                        self.decode_cmd.transferToComputeBarrier();
+                    }
 
                     try self.dispatchFfnActivation(
                         self.gate_buf.handle,
@@ -8351,6 +8583,15 @@ pub const InferenceEngine = struct {
                         inter_dim,
                     );
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
+                    if (dense_prefill_validate_capture) {
+                        const tok_idx = self.prefill_current_token_idx;
+                        const inter_size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
+                        const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * inter_size;
+                        self.decode_cmd.computeAndTransferBarrier();
+                        const swiglu_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = inter_size };
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.dense_prefill_validate_swiglu_ref.?.handle, 1, &swiglu_region);
+                        self.decode_cmd.transferToComputeBarrier();
+                    }
                 }
                 self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
 
@@ -8362,7 +8603,7 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_rms_norm_add != null and
                     !self.validation_diagnostics_enabled;
                 const dense_ffn_down_phase = self.beginProfilePhase();
-                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled) {
+                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled and !dense_prefill_validate_capture) {
                     // Fused: down DMMV accumulates directly into hidden_buf,
                     // eliminating separate scale_acc dispatch + barrier
                     try self.dispatchDmmvAcc(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.hidden_buf, hidden_dim, inter_dim);
@@ -8400,6 +8641,15 @@ pub const InferenceEngine = struct {
                             rms_norm_eps,
                         );
                         self.decode_cmd.computeBarrier();
+                    }
+
+                    if (dense_prefill_validate_capture) {
+                        const tok_idx = self.prefill_current_token_idx;
+                        const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                        self.decode_cmd.computeAndTransferBarrier();
+                        const down_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = dst_off, .size = hidden_size };
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.dense_prefill_validate_down_ref.?.handle, 1, &down_region);
+                        self.decode_cmd.transferToComputeBarrier();
                     }
 
                     if (state.position == 0 and self.validation_diagnostics_enabled and layer == 0 and inter_dim <= 8192) {
@@ -8792,14 +9042,16 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.final_copy, final_copy_phase);
             self.endProfilePhase(.final_tail, final_tail_phase);
         }
-        if (self.partial_decode_hidden_out) |hidden_out| {
-            self.decode_cmd.computeToTransferBarrier();
-            const region = vk.c.VkBufferCopy{
-                .srcOffset = 0,
-                .dstOffset = self.partial_decode_hidden_out_offset,
-                .size = hidden_size,
-            };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &region);
+        if (!partial_hidden_out_written_by_stop) {
+            if (self.partial_decode_hidden_out) |hidden_out| {
+                self.decode_cmd.computeToTransferBarrier();
+                const region = vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = self.partial_decode_hidden_out_offset,
+                    .size = hidden_size,
+                };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &region);
+            }
         }
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
@@ -9251,8 +9503,14 @@ pub const InferenceEngine = struct {
         const KPAR_MAX_COLS: u32 = 40;
         const f32_bytes: u32 = @sizeOf(f32);
         var chunk_start: u32 = 0;
+        const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
+            tensor.info.type_ == .q6_k and
+            M == self.model.config.hidden_dim and
+            K == self.model.config.intermediate_dim and
+            n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
+            if (prefer_serial_qwen36_dense_down) break :blk null;
             switch (tensor.info.type_) {
                 .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
                 .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
@@ -9318,6 +9576,10 @@ pub const InferenceEngine = struct {
         const norm_ref = self.dense_prefill_validate_norm_ref orelse return;
         const pre_hidden_ref = self.dense_prefill_validate_pre_hidden_ref orelse return;
         const post_hidden_ref = self.dense_prefill_validate_post_hidden_ref orelse return;
+        const gate_ref = self.dense_prefill_validate_gate_ref orelse return;
+        const up_ref = self.dense_prefill_validate_up_ref orelse return;
+        const swiglu_ref = self.dense_prefill_validate_swiglu_ref orelse return;
+        const down_ref = self.dense_prefill_validate_down_ref orelse return;
         const staging = self.dense_prefill_validate_staging orelse return;
         const lt = self.layer_tensors[self.dense_prefill_validate_layer];
         const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
@@ -9329,8 +9591,14 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, hidden_dim) *
             @sizeOf(f32);
+        const inter_capture_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
         const hidden_elems: usize = @intCast(@as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim));
-        if (hidden_capture_bytes * 3 > staging.size) return error.BufferTooSmall;
+        const inter_elems: usize = @intCast(@as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, inter_dim));
+        const staging_needed = hidden_capture_bytes * 4 + inter_capture_bytes * 6;
+        if (staging_needed > staging.size) return error.BufferTooSmall;
 
         try self.ensureBatchedScratchCapacity(n_tokens);
         const scratch_gate = self.batched_scratch_gate.?;
@@ -9356,44 +9624,95 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeBarrier();
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
         self.decode_cmd.computeToTransferBarrier();
-        const copies = [_]vk.c.VkBufferCopy{
-            .{ .srcOffset = 0, .dstOffset = 0, .size = hidden_capture_bytes },
-            .{ .srcOffset = 0, .dstOffset = hidden_capture_bytes, .size = hidden_capture_bytes },
-            .{ .srcOffset = 0, .dstOffset = hidden_capture_bytes * 2, .size = hidden_capture_bytes },
-        };
-        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, pre_hidden_ref.handle, staging.handle, 1, &copies[0]);
-        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, post_hidden_ref.handle, staging.handle, 1, &copies[1]);
-        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, staging.handle, 1, &copies[2]);
+
+        const pre_off: vk.c.VkDeviceSize = 0;
+        const post_off: vk.c.VkDeviceSize = pre_off + hidden_capture_bytes;
+        const down_ref_off: vk.c.VkDeviceSize = post_off + hidden_capture_bytes;
+        const down_batch_off: vk.c.VkDeviceSize = down_ref_off + hidden_capture_bytes;
+        const gate_ref_off: vk.c.VkDeviceSize = down_batch_off + hidden_capture_bytes;
+        const up_ref_off: vk.c.VkDeviceSize = gate_ref_off + inter_capture_bytes;
+        const swiglu_ref_off: vk.c.VkDeviceSize = up_ref_off + inter_capture_bytes;
+        const gate_batch_off: vk.c.VkDeviceSize = swiglu_ref_off + inter_capture_bytes;
+        const up_batch_off: vk.c.VkDeviceSize = gate_batch_off + inter_capture_bytes;
+        const swiglu_batch_off: vk.c.VkDeviceSize = up_batch_off + inter_capture_bytes;
+
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, pre_hidden_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = pre_off, .size = hidden_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, post_hidden_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = post_off, .size = hidden_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, down_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = down_ref_off, .size = hidden_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = down_batch_off, .size = hidden_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, gate_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = gate_ref_off, .size = inter_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, up_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = up_ref_off, .size = inter_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, swiglu_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = swiglu_ref_off, .size = inter_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_gate.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = gate_batch_off, .size = inter_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_up.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = up_batch_off, .size = inter_capture_bytes });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_swiglu.handle, staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = swiglu_batch_off, .size = inter_capture_bytes });
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
+        const DiffStats = struct {
+            max_abs: f32 = 0,
+            max_idx: usize = 0,
+
+            fn compute(ref_vals: []const f32, got_vals: []const f32) @This() {
+                var out: @This() = .{};
+                for (ref_vals, got_vals, 0..) |r, g, i| {
+                    const diff = @abs(r - g);
+                    if (diff > out.max_abs) {
+                        out.max_abs = diff;
+                        out.max_idx = i;
+                    }
+                }
+                return out;
+            }
+        };
+
         const base: [*]const f32 = @ptrCast(@alignCast(staging.mapped.?));
-        const pre = base[0..hidden_elems];
-        const post = base[hidden_elems..][0..hidden_elems];
-        const down = base[(hidden_elems * 2)..][0..hidden_elems];
-        var max_abs: f32 = 0;
-        var max_idx: usize = 0;
+        const pre = base[@intCast(pre_off / @sizeOf(f32))..][0..hidden_elems];
+        const post = base[@intCast(post_off / @sizeOf(f32))..][0..hidden_elems];
+        const down_ref_f = base[@intCast(down_ref_off / @sizeOf(f32))..][0..hidden_elems];
+        const down_batch_f = base[@intCast(down_batch_off / @sizeOf(f32))..][0..hidden_elems];
+        const gate_ref_f = base[@intCast(gate_ref_off / @sizeOf(f32))..][0..inter_elems];
+        const up_ref_f = base[@intCast(up_ref_off / @sizeOf(f32))..][0..inter_elems];
+        const swiglu_ref_f = base[@intCast(swiglu_ref_off / @sizeOf(f32))..][0..inter_elems];
+        const gate_batch_f = base[@intCast(gate_batch_off / @sizeOf(f32))..][0..inter_elems];
+        const up_batch_f = base[@intCast(up_batch_off / @sizeOf(f32))..][0..inter_elems];
+        const swiglu_batch_f = base[@intCast(swiglu_batch_off / @sizeOf(f32))..][0..inter_elems];
+        var post_diff: DiffStats = .{};
         for (0..hidden_elems) |i| {
-            const candidate = pre[i] + down[i];
+            const candidate = pre[i] + down_batch_f[i];
             const diff = @abs(candidate - post[i]);
-            if (diff > max_abs) {
-                max_abs = diff;
-                max_idx = i;
+            if (diff > post_diff.max_abs) {
+                post_diff.max_abs = diff;
+                post_diff.max_idx = i;
             }
         }
-        const token_idx = max_idx / hidden_dim;
-        const elem_idx = max_idx % hidden_dim;
-        const candidate_at_max = pre[max_idx] + down[max_idx];
+        const gate_diff = DiffStats.compute(gate_ref_f, gate_batch_f);
+        const up_diff = DiffStats.compute(up_ref_f, up_batch_f);
+        const swiglu_diff = DiffStats.compute(swiglu_ref_f, swiglu_batch_f);
+        const down_diff = DiffStats.compute(down_ref_f, down_batch_f);
+        const token_idx = post_diff.max_idx / hidden_dim;
+        const elem_idx = post_diff.max_idx % hidden_dim;
+        const candidate_at_max = pre[post_diff.max_idx] + down_batch_f[post_diff.max_idx];
         const tol: f32 = 3e-3;
+        const max_intermediate = @max(@max(gate_diff.max_abs, up_diff.max_abs), @max(swiglu_diff.max_abs, down_diff.max_abs));
+        const max_abs = @max(post_diff.max_abs, max_intermediate);
         const verdict: []const u8 = if (max_abs <= tol) "PASS" else "FAIL";
-        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense_ffn layer={d} tokens={d} verdict={s} post_hidden max_abs_diff={e:.6} tok={d} elem={d} ref={d:.6} batched={d:.6} tol={e:.3}", .{
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense_ffn layer={d} tokens={d} verdict={s} post_hidden={e:.6}@tok{d}/elem{d} gate={e:.6}@{d} up={e:.6}@{d} swiglu={e:.6}@{d} down={e:.6}@{d} ref_post={d:.6} batched_post={d:.6} tol={e:.3}", .{
             self.dense_prefill_validate_layer,
             n_tokens,
             verdict,
-            max_abs,
+            post_diff.max_abs,
             token_idx,
             elem_idx,
-            post[max_idx],
+            gate_diff.max_abs,
+            gate_diff.max_idx,
+            up_diff.max_abs,
+            up_diff.max_idx,
+            swiglu_diff.max_abs,
+            swiglu_diff.max_idx,
+            down_diff.max_abs,
+            down_diff.max_idx,
+            post[post_diff.max_idx],
             candidate_at_max,
             tol,
         });
@@ -9411,6 +9730,13 @@ pub const InferenceEngine = struct {
         const alpha_ref = self.ssm_prefill_validate_alpha_ref orelse return;
         const beta_ref = self.ssm_prefill_validate_beta_ref orelse return;
         const staging = self.ssm_prefill_validate_staging orelse return;
+        const conv_ref = self.ssm_prefill_validate_conv_ref;
+        const delta_ref = self.ssm_prefill_validate_delta_ref;
+        const delta_replay = self.ssm_prefill_validate_delta_replay;
+        const gnorm_ref = self.ssm_prefill_validate_gnorm_ref;
+        const pre_hidden_ref = self.ssm_prefill_validate_pre_hidden_ref;
+        const post_hidden_ref = self.ssm_prefill_validate_post_hidden_ref;
+        const state_backup = self.ssm_prefill_validate_state_backup;
         const lt = self.layer_tensors[self.dense_prefill_validate_layer];
         const wqkv_t = lt.attn_qkv orelse return error.TensorNotFound;
         const z_t = lt.attn_gate orelse return error.TensorNotFound;
@@ -9421,6 +9747,7 @@ pub const InferenceEngine = struct {
         const d_inner = cfg.ssm_d_inner;
         const dt_rank = cfg.ssm_dt_rank;
         const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+        const hidden_size: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
         const hidden_capture_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, hidden_dim) *
@@ -9433,25 +9760,188 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, d_inner) *
             @sizeOf(f32);
+        const z_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
         const ab_total_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, dt_rank) *
             @sizeOf(f32);
-        const staging_needed = hidden_capture_bytes + 2 * (qkv_total_bytes + z_total_bytes) + 2 * ab_total_bytes;
+        const head_v_dim: u32 = d_inner / dt_rank;
+        const state_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, dt_rank) *
+            @as(vk.c.VkDeviceSize, head_v_dim) *
+            @as(vk.c.VkDeviceSize, head_v_dim) *
+            @sizeOf(f32);
+        const use_delta_cols8_replay = self.use_ssm_delta_cols8 and
+            head_v_dim == 128 and
+            cfg.ssm_d_state == 128 and
+            self.elementwise.pipeline_ssm_delta_net_cols8 != null;
+        const delta_replay_ready = conv_ref != null and
+            delta_ref != null and
+            delta_replay != null and
+            state_backup != null and
+            (self.elementwise.pipeline_ssm_delta_net != null or use_delta_cols8_replay) and
+            self.instance.push_descriptor_fn != null and
+            self.dense_prefill_validate_layer < self.gpu_ssm_states.len and
+            self.gpu_ssm_states[self.dense_prefill_validate_layer].handle != null and
+            self.gpu_ssm_states[self.dense_prefill_validate_layer].size >= state_bytes and
+            state_backup.?.size >= state_bytes and
+            conv_ref.?.size >= qkv_total_bytes and
+            delta_ref.?.size >= z_total_bytes and
+            delta_replay.?.size >= z_total_bytes;
+        const output_capture_allocated = pre_hidden_ref != null and
+            post_hidden_ref != null and
+            gnorm_ref != null and
+            pre_hidden_ref.?.size >= hidden_capture_bytes and
+            post_hidden_ref.?.size >= hidden_capture_bytes and
+            gnorm_ref.?.size >= z_total_bytes;
+        const staging_needed = hidden_capture_bytes +
+            2 * (qkv_total_bytes + z_total_bytes) +
+            2 * ab_total_bytes +
+            (if (delta_replay_ready) 2 * z_total_bytes else 0) +
+            (if (output_capture_allocated) (3 * hidden_capture_bytes + 2 * z_total_bytes) else 0);
         if (staging_needed > staging.size) return error.BufferTooSmall;
 
         try self.ensureBatchedScratchCapacity(n_tokens);
         const scratch_qkv = self.batched_scratch_gate orelse return error.BufferTooSmall;
         const scratch_z = self.batched_scratch_up orelse return error.BufferTooSmall;
+        const scratch_gnorm = self.batched_scratch_swiglu orelse return error.BufferTooSmall;
+        const scratch_ssm_out = self.batched_scratch_down orelse return error.BufferTooSmall;
         if (qkv_total_bytes > scratch_qkv.size or z_total_bytes > scratch_z.size) return error.BufferTooSmall;
+        const output_replay_ready = output_capture_allocated and
+            delta_replay_ready and
+            self.elementwise.pipeline_ssm_gated_norm != null and
+            self.elementwise.pipeline_ssm_gated_norm.?.uses_push_descriptors and
+            lt.ssm_out != null and
+            z_total_bytes <= scratch_gnorm.size and
+            hidden_capture_bytes <= scratch_ssm_out.size;
 
         if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
-        self.decode_cmd.transferToComputeBarrier();
+        if (delta_replay_ready) {
+            const state_buf = self.gpu_ssm_states[self.dense_prefill_validate_layer];
+            self.decode_cmd.computeToTransferBarrier();
+            const state_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = state_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, state_buf.handle, state_backup.?.handle, 1, &state_region);
+            self.decode_cmd.transferToTransferBarrier();
+            vk.c.vkCmdFillBuffer(self.decode_cmd.handle, state_buf.handle, 0, state_bytes, 0);
+            self.decode_cmd.transferToComputeBarrier();
+        } else {
+            self.decode_cmd.transferToComputeBarrier();
+        }
         try self.dispatchProjectionBatched(wqkv_t, norm_ref, scratch_qkv, conv_channels, hidden_dim, n_tokens);
         try self.dispatchProjectionBatched(z_t, norm_ref, scratch_z, d_inner, hidden_dim, n_tokens);
+        if (delta_replay_ready) {
+            const dt_bias_t = lt.ssm_dt_bias;
+            const ssm_a_t = lt.ssm_a;
+            const dt_bias_buf = if (dt_bias_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const dt_bias_size = if (dt_bias_t) |t| t.gpu_buffer.size else (@as(vk.c.VkDeviceSize, dt_rank) * @sizeOf(f32));
+            const ssm_a_buf = if (ssm_a_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const ssm_a_size = if (ssm_a_t) |t| t.gpu_buffer.size else (@as(vk.c.VkDeviceSize, dt_rank) * @sizeOf(f32));
+            const push = SsmDeltaNetPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .n_group = cfg.ssm_n_group,
+                .ssm_a_is_f16 = if (ssm_a_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .dt_bias_is_f16 = if (dt_bias_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .has_dt_bias = if (dt_bias_t != null) 1 else 0,
+                .has_ssm_a = if (ssm_a_t != null) 1 else 0,
+                .n_tok = n_tokens,
+                .conv_stride_tok = conv_channels,
+                .ab_stride_tok = dt_rank,
+                .y_stride_tok = d_inner,
+            };
+            const pip = if (use_delta_cols8_replay)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8.?)
+            else
+                &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
+            const row_blocks = if (use_delta_cols8_replay)
+                (head_v_dim + 3) / 4
+            else
+                head_v_dim;
+            self.pushDispatch7(
+                pip,
+                std.mem.asBytes(&push),
+                conv_ref.?.handle,
+                qkv_total_bytes,
+                dt_bias_buf,
+                dt_bias_size,
+                alpha_ref.handle,
+                ab_total_bytes,
+                beta_ref.handle,
+                ab_total_bytes,
+                ssm_a_buf,
+                ssm_a_size,
+                self.gpu_ssm_states[self.dense_prefill_validate_layer].handle,
+                state_bytes,
+                delta_replay.?.handle,
+                z_total_bytes,
+                dt_rank,
+                row_blocks,
+                1,
+            );
+        }
+        if (output_replay_ready) {
+            const norm_tensor = lt.ssm_norm;
+            const norm_elems: u32 = if (norm_tensor) |t| @intCast(t.info.numElements()) else 0;
+            const norm_per_head = norm_elems >= d_inner;
+            const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_bytes;
+            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm.?);
+            const gnorm_push = SsmGatedNormPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .norm_per_head = if (norm_per_head) 1 else 0,
+            };
+            self.decode_cmd.computeBufferBarrier(delta_replay.?.handle, z_total_bytes);
+            var tok_idx_replay: u32 = 0;
+            while (tok_idx_replay < n_tokens) : (tok_idx_replay += 1) {
+                const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx_replay) * z_bytes;
+                const infos = [4]vk.c.VkDescriptorBufferInfo{
+                    .{ .buffer = delta_replay.?.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = z_ref.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                    .{ .buffer = scratch_gnorm.handle, .offset = z_off, .range = z_bytes },
+                };
+                self.decode_cmd.pushDescAndDispatch(
+                    gnorm_pip,
+                    self.instance.push_descriptor_fn,
+                    infos[0..],
+                    std.mem.asBytes(&gnorm_push),
+                    dt_rank,
+                    1,
+                    1,
+                );
+            }
+            self.decode_cmd.computeBufferBarrier(scratch_gnorm.handle, z_total_bytes);
+            const ssm_out_tensor = lt.ssm_out.?;
+            tok_idx_replay = 0;
+            while (tok_idx_replay < n_tokens) : (tok_idx_replay += 1) {
+                const x_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx_replay) * z_bytes;
+                const y_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx_replay) * hidden_size;
+                try self.dispatchDmmvInner(
+                    ssm_out_tensor,
+                    scratch_gnorm,
+                    scratch_gnorm.size,
+                    scratch_ssm_out,
+                    hidden_dim,
+                    @intCast(d_inner),
+                    0,
+                    @intCast(x_off),
+                    @intCast(y_off),
+                    0,
+                );
+            }
+        }
         self.decode_cmd.computeToTransferBarrier();
+        if (delta_replay_ready) {
+            const state_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = state_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, state_backup.?.handle, self.gpu_ssm_states[self.dense_prefill_validate_layer].handle, 1, &state_region);
+        }
         const norm_ref_off: vk.c.VkDeviceSize = 0;
         const qkv_ref_off: vk.c.VkDeviceSize = norm_ref_off + hidden_capture_bytes;
         const z_ref_off: vk.c.VkDeviceSize = qkv_ref_off + qkv_total_bytes;
@@ -9459,6 +9949,20 @@ pub const InferenceEngine = struct {
         const beta_ref_off: vk.c.VkDeviceSize = alpha_ref_off + ab_total_bytes;
         const qkv_batch_off: vk.c.VkDeviceSize = beta_ref_off + ab_total_bytes;
         const z_batch_off: vk.c.VkDeviceSize = qkv_batch_off + qkv_total_bytes;
+        var next_stage_off: vk.c.VkDeviceSize = z_batch_off + z_total_bytes;
+        const delta_ref_off: vk.c.VkDeviceSize = next_stage_off;
+        if (delta_replay_ready) next_stage_off += z_total_bytes;
+        const delta_replay_off: vk.c.VkDeviceSize = next_stage_off;
+        if (delta_replay_ready) next_stage_off += z_total_bytes;
+        const pre_hidden_off: vk.c.VkDeviceSize = next_stage_off;
+        if (output_replay_ready) next_stage_off += hidden_capture_bytes;
+        const post_hidden_off: vk.c.VkDeviceSize = next_stage_off;
+        if (output_replay_ready) next_stage_off += hidden_capture_bytes;
+        const gnorm_ref_off: vk.c.VkDeviceSize = next_stage_off;
+        if (output_replay_ready) next_stage_off += z_total_bytes;
+        const gnorm_replay_off: vk.c.VkDeviceSize = next_stage_off;
+        if (output_replay_ready) next_stage_off += z_total_bytes;
+        const ssm_out_replay_off: vk.c.VkDeviceSize = next_stage_off;
         const copies = [_]vk.c.VkBufferCopy{
             .{ .srcOffset = 0, .dstOffset = norm_ref_off, .size = hidden_capture_bytes },
             .{ .srcOffset = 0, .dstOffset = qkv_ref_off, .size = qkv_total_bytes },
@@ -9475,6 +9979,24 @@ pub const InferenceEngine = struct {
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, beta_ref.handle, staging.handle, 1, &copies[4]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_qkv.handle, staging.handle, 1, &copies[5]);
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_z.handle, staging.handle, 1, &copies[6]);
+        if (delta_replay_ready) {
+            const r_delta_ref = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = delta_ref_off, .size = z_total_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, delta_ref.?.handle, staging.handle, 1, &r_delta_ref);
+            const r_delta_replay = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = delta_replay_off, .size = z_total_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, delta_replay.?.handle, staging.handle, 1, &r_delta_replay);
+        }
+        if (output_replay_ready) {
+            const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = pre_hidden_off, .size = hidden_capture_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, pre_hidden_ref.?.handle, staging.handle, 1, &r_pre_hidden);
+            const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = post_hidden_off, .size = hidden_capture_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, post_hidden_ref.?.handle, staging.handle, 1, &r_post_hidden);
+            const r_gnorm_ref = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = gnorm_ref_off, .size = z_total_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, gnorm_ref.?.handle, staging.handle, 1, &r_gnorm_ref);
+            const r_gnorm_replay = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = gnorm_replay_off, .size = z_total_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_gnorm.handle, staging.handle, 1, &r_gnorm_replay);
+            const r_ssm_out_replay = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = ssm_out_replay_off, .size = hidden_capture_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_ssm_out.handle, staging.handle, 1, &r_ssm_out_replay);
+        }
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
@@ -9503,6 +10025,34 @@ pub const InferenceEngine = struct {
         const beta_ref_f = base[@intCast(beta_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(ab_total_bytes / @sizeOf(f32)))];
         const qkv_batch_f = base[@intCast(qkv_batch_off / @sizeOf(f32))..][0..@as(usize, @intCast(qkv_total_bytes / @sizeOf(f32)))];
         const z_batch_f = base[@intCast(z_batch_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))];
+        const delta_ref_f = if (delta_replay_ready)
+            base[@intCast(delta_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const delta_replay_f = if (delta_replay_ready)
+            base[@intCast(delta_replay_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const pre_hidden_f = if (output_replay_ready)
+            base[@intCast(pre_hidden_off / @sizeOf(f32))..][0..@as(usize, @intCast(hidden_capture_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const post_hidden_f = if (output_replay_ready)
+            base[@intCast(post_hidden_off / @sizeOf(f32))..][0..@as(usize, @intCast(hidden_capture_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const gnorm_ref_f = if (output_replay_ready)
+            base[@intCast(gnorm_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const gnorm_replay_f = if (output_replay_ready)
+            base[@intCast(gnorm_replay_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
+        const ssm_out_replay_f = if (output_replay_ready)
+            base[@intCast(ssm_out_replay_off / @sizeOf(f32))..][0..@as(usize, @intCast(hidden_capture_bytes / @sizeOf(f32)))]
+        else
+            base[0..0];
 
         const mmap = self.model.mmap_data orelse return error.NoMmapData;
         const row_buf = try self.allocator.alloc(f32, hidden_dim);
@@ -9531,6 +10081,27 @@ pub const InferenceEngine = struct {
         var z_diff: DiffStats = .{};
         const qkv_batch_diff = DiffStats.compute(qkv_ref_f, qkv_batch_f);
         const z_batch_diff = DiffStats.compute(z_ref_f, z_batch_f);
+        const delta_diff = if (delta_replay_ready) DiffStats.compute(delta_ref_f, delta_replay_f) else DiffStats{};
+        const gnorm_diff = if (output_replay_ready) DiffStats.compute(gnorm_ref_f, gnorm_replay_f) else DiffStats{};
+        var ssm_out_diff: DiffStats = .{};
+        var post_hidden_diff: DiffStats = .{};
+        if (output_replay_ready) {
+            for (0..post_hidden_f.len) |i| {
+                const ref_out = post_hidden_f[i] - pre_hidden_f[i];
+                const got_out = ssm_out_replay_f[i];
+                const out_diff = @abs(ref_out - got_out);
+                if (out_diff > ssm_out_diff.max_abs) {
+                    ssm_out_diff.max_abs = out_diff;
+                    ssm_out_diff.max_idx = i;
+                }
+                const got_post = pre_hidden_f[i] + got_out;
+                const post_diff = @abs(post_hidden_f[i] - got_post);
+                if (post_diff > post_hidden_diff.max_abs) {
+                    post_hidden_diff.max_abs = post_diff;
+                    post_hidden_diff.max_idx = i;
+                }
+            }
+        }
         var alpha_diff: DiffStats = .{};
         var beta_diff: DiffStats = .{};
         const qkv_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + wqkv_t.info.offset);
@@ -9572,13 +10143,25 @@ pub const InferenceEngine = struct {
                 UpdateDiff.run(&beta_diff, idx, @floatCast(dot), beta_ref_f[idx]);
             }
         }
-        const max_abs = @max(@max(qkv_batch_diff.max_abs, z_batch_diff.max_abs), @max(@max(qkv_diff.max_abs, z_diff.max_abs), @max(alpha_diff.max_abs, beta_diff.max_abs)));
-        const tol: f32 = 3e-3;
-        const verdict: []const u8 = if (max_abs <= tol) "PASS" else "FAIL";
-        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm_proj batched_replay layer={d} tokens={d} verdict={s} max_abs batch_qkv={e:.6}@{d} batch_z={e:.6}@{d} sampled_cpu qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} tol={e:.3}", .{
+        const proj_max_abs = @max(@max(qkv_batch_diff.max_abs, z_batch_diff.max_abs), @max(@max(qkv_diff.max_abs, z_diff.max_abs), @max(alpha_diff.max_abs, beta_diff.max_abs)));
+        const output_max_abs = @max(gnorm_diff.max_abs, @max(ssm_out_diff.max_abs, post_hidden_diff.max_abs));
+        const proj_tol: f32 = 3e-3;
+        const delta_tol: f32 = 1e-2;
+        const output_tol: f32 = 1e-2;
+        const delta_ok = !delta_replay_ready or delta_diff.max_abs <= delta_tol;
+        const output_ok = !output_replay_ready or output_max_abs <= output_tol;
+        const verdict: []const u8 = if (proj_max_abs <= proj_tol and delta_ok and output_ok) "PASS" else "FAIL";
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm layer={d} tokens={d} verdict={s} proj_max={e:.6} delta_replay={} delta_variant={s} delta_max={e:.6}@{d} output_replay={} output_max={e:.6} max_abs batch_qkv={e:.6}@{d} batch_z={e:.6}@{d} sampled_cpu qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} gnorm={e:.6}@{d} ssm_out={e:.6}@{d} post_hidden={e:.6}@{d} proj_tol={e:.3} delta_tol={e:.3} output_tol={e:.3}", .{
             self.dense_prefill_validate_layer,
             n_tokens,
             verdict,
+            proj_max_abs,
+            delta_replay_ready,
+            if (use_delta_cols8_replay) "cols8" else "generic",
+            delta_diff.max_abs,
+            delta_diff.max_idx,
+            output_replay_ready,
+            output_max_abs,
             qkv_batch_diff.max_abs,
             qkv_batch_diff.max_idx,
             z_batch_diff.max_abs,
@@ -9591,7 +10174,15 @@ pub const InferenceEngine = struct {
             alpha_diff.max_idx,
             beta_diff.max_abs,
             beta_diff.max_idx,
-            tol,
+            gnorm_diff.max_abs,
+            gnorm_diff.max_idx,
+            ssm_out_diff.max_abs,
+            ssm_out_diff.max_idx,
+            post_hidden_diff.max_abs,
+            post_hidden_diff.max_idx,
+            proj_tol,
+            delta_tol,
+            output_tol,
         });
     }
 
@@ -9624,7 +10215,15 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
     ) !void {
-        const pip = &(self.dmmv.pipeline_q4k_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
+        const use_row1 = self.use_qwen36_dense_fused_row1 and
+            self.isQwen36DenseHybrid27B() and
+            M == 17408 and
+            K == 5120 and
+            self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1 != null;
+        const pip = if (use_row1)
+            if (self.dmmv.pipeline_q4k_fused_gate_up_swiglu_row1) |*p| p else return error.ShaderNotLoaded
+        else
+            &(self.dmmv.pipeline_q4k_fused_gate_up_swiglu orelse return error.ShaderNotLoaded);
         const push = DmmvPushConstants{
             .M = M,
             .K = K,
@@ -9633,8 +10232,7 @@ pub const InferenceEngine = struct {
             .y_offset = 0,
             .acc_mode = 0,
         };
-        // NUM_ROWS=2 in the shader; one workgroup per row pair.
-        const wg_x: u32 = (M + 1) / 2;
+        const wg_x: u32 = if (use_row1) M else (M + 1) / 2;
         self.pushDispatch4(
             pip,
             std.mem.asBytes(&push),
@@ -10702,6 +11300,7 @@ pub const InferenceEngine = struct {
         const ab_bytes = @as(vk.c.VkDeviceSize, dt_rank) * @sizeOf(f32);
         const use_delta_cols8 = self.use_ssm_delta_cols8 and
             !self.use_a3b_validate and
+            !self.use_qwen36_ssm_prefill_validate and
             head_v_dim == 128 and
             d_state == 128 and
             self.elementwise.pipeline_ssm_delta_net_cols8 != null;
@@ -10720,7 +11319,7 @@ pub const InferenceEngine = struct {
         if (state.position == 0 and layer == 0) {
             const conv_tensor = lt.ssm_conv1d orelse return;
             const ssm_out_tensor = lt.ssm_out orelse return;
-            log.info("FASTPATH: ssm qkv={s} gate={s} alpha={s} beta={s} conv={s} out={s}", .{
+            log.debug("FASTPATH: ssm qkv={s} gate={s} alpha={s} beta={s} conv={s} out={s}", .{
                 @tagName(wqkv_tensor.info.type_),
                 @tagName(z_tensor.info.type_),
                 @tagName(alpha_tensor.info.type_),
@@ -10748,6 +11347,7 @@ pub const InferenceEngine = struct {
             // merged) +1 dispatch (no standalone rms_norm) +1 barrier
             // (no rms_norm → SSM proj fence) per SSM layer.
             const attn_norm = lt.attn_norm orelse return error.TensorNotFound;
+            const ssm_proj_norm_ab_phase = self.beginProfilePhase();
             try self.dispatchRmsNormDmmvQ4kAlphaBeta(
                 self.hidden_buf.handle,
                 hidden_size,
@@ -10767,6 +11367,7 @@ pub const InferenceEngine = struct {
                 hidden_dim,
                 self.model.config.rms_norm_eps,
             );
+            self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
             // Barrier: wqkv/z DMMVs only read norm_buf (the fused shader's
             // single-writer WG-0 output). The alpha/beta outputs go to
             // router_logits_buf / down_buf, which are explicitly resynced
@@ -10790,7 +11391,9 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = qkv_bytes,
                     };
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (use_prebatched_z and !is_dead_tail) {
                     const z_src_off: vk.c.VkDeviceSize =
@@ -10801,17 +11404,24 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = z_bytes,
                     };
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
                 self.decode_cmd.transferToComputeBarrier();
                 if (!use_prebatched_qkv) {
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (!is_dead_tail and !use_prebatched_z) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             } else if (can_fuse_qkv_z) {
                 self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
                     z_tensor,
@@ -10825,11 +11435,16 @@ pub const InferenceEngine = struct {
                     @intCast(d_inner),
                     hidden_dim,
                 );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else {
                 self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
+                const ssm_proj_qkv_phase = self.beginProfilePhase();
                 try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 if (!is_dead_tail) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             }
             // alpha + beta already produced by the fused shader.
@@ -10849,7 +11464,9 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = qkv_bytes,
                     };
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (use_prebatched_z and !is_dead_tail) {
                     const z_src_off: vk.c.VkDeviceSize =
@@ -10860,16 +11477,23 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = z_bytes,
                     };
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
                 self.decode_cmd.transferToComputeBarrier();
                 if (!use_prebatched_qkv) {
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (!is_dead_tail and !use_prebatched_z) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             } else if (can_fuse_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
                     z_tensor,
@@ -10883,17 +11507,26 @@ pub const InferenceEngine = struct {
                     @intCast(d_inner),
                     hidden_dim,
                 );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else {
+                const ssm_proj_qkv_phase = self.beginProfilePhase();
                 try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 // Skip z (gate) DMMV in dead-tail: gate_buf is only consumed by
                 // gated_norm, which is also skipped below. wqkv/alpha/beta still
                 // run because conv1d/delta_net update SSM state for future tokens.
                 if (!is_dead_tail) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             }
+            const ssm_proj_alpha_phase = self.beginProfilePhase();
             try self.dispatchDmmv(alpha_tensor, self.norm_buf, hidden_size, self.router_logits_buf, dt_rank, hidden_dim);
+            self.endProfilePhase(.ssm_proj_alpha, ssm_proj_alpha_phase);
+            const ssm_proj_beta_phase = self.beginProfilePhase();
             try self.dispatchDmmv(beta_tensor, self.norm_buf, hidden_size, self.down_buf, dt_rank, hidden_dim);
+            self.endProfilePhase(.ssm_proj_beta, ssm_proj_beta_phase);
             // Note: tried fusing alpha+beta into one fused-gate-up dispatch
             // (commit considered but reverted) — no measurable change because
             // the four SSM proj DMMVs already overlap on RDNA4. See
@@ -10910,6 +11543,13 @@ pub const InferenceEngine = struct {
             self.ssm_prefill_validate_z_ref != null and
             self.ssm_prefill_validate_alpha_ref != null and
             self.ssm_prefill_validate_beta_ref != null;
+        const ssm_prefill_validate_delta_capture = ssm_prefill_validate_capture and
+            self.ssm_prefill_validate_conv_ref != null and
+            self.ssm_prefill_validate_delta_ref != null;
+        const ssm_prefill_validate_output_capture = ssm_prefill_validate_delta_capture and
+            self.ssm_prefill_validate_gnorm_ref != null and
+            self.ssm_prefill_validate_pre_hidden_ref != null and
+            self.ssm_prefill_validate_post_hidden_ref != null;
         if (ssm_prefill_validate_capture) {
             self.decode_cmd.computeAndTransferBarrier();
             const tok_idx = self.prefill_current_token_idx;
@@ -11010,7 +11650,7 @@ pub const InferenceEngine = struct {
             };
             self.pushDispatch1(pip, std.mem.asBytes(&push), self.swiglu_buf.handle, qkv_bytes, n_group, 1, 1);
         }
-        if (a3b_capture_this_layer) {
+        if (a3b_capture_this_layer or ssm_prefill_validate_delta_capture) {
             self.decode_cmd.computeAndTransferBarrier();
         } else {
             const conv_to_delta_ranges = [_]CommandBuffer.BufferRange{
@@ -11054,6 +11694,12 @@ pub const InferenceEngine = struct {
                 const r_gate = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = gate_dst_off, .size = z_bytes };
                 vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.a3b_gate_capture.?.handle, 1, &r_gate);
             }
+        }
+        if (ssm_prefill_validate_delta_capture) {
+            const tok_idx = self.prefill_current_token_idx;
+            const conv_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * qkv_bytes;
+            const r_conv = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = conv_dst_off, .size = qkv_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_conv_ref.?.handle, 1, &r_conv);
         }
 
         // --- GPU SSM diagnostic: readback conv1d output at layer 0 for comparison with CPU SSM_DBG ---
@@ -11198,7 +11844,7 @@ pub const InferenceEngine = struct {
             self.a3b_per_token_delta_out != null and
             self.prefill_current_token_idx < self.a3b_capture_max_tokens;
         if (!is_dead_tail) {
-            if (a3b_capture_output) {
+            if (a3b_capture_output or ssm_prefill_validate_delta_capture) {
                 self.decode_cmd.computeAndTransferBarrier();
             } else {
                 const delta_to_gnorm_ranges = [_]CommandBuffer.BufferRange{
@@ -11216,6 +11862,12 @@ pub const InferenceEngine = struct {
             const r_out = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = out_dst_off, .size = z_bytes };
             vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.a3b_per_token_delta_out.?.handle, 1, &r_out);
         }
+        if (ssm_prefill_validate_delta_capture) {
+            const tok_idx = self.prefill_current_token_idx;
+            const out_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+            const r_out = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = out_dst_off, .size = z_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.ssm_prefill_validate_delta_ref.?.handle, 1, &r_out);
+        }
         self.endProfilePhase(.ssm_delta, ssm_delta_phase);
 
         // Dead-tail SSM exits here: gated_norm and ssm_out only feed
@@ -11232,7 +11884,13 @@ pub const InferenceEngine = struct {
         const norm_per_head = norm_elems >= d_inner;
         const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
         const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_bytes;
+        const stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm and
+            self.prefill_active and
+            self.partial_decode_ssm_gnorm_out != null;
         const ssm_gated_norm_phase = self.beginProfilePhase();
+        const direct_ssm_gnorm_store = stop_after_ssm_gnorm and
+            !ssm_prefill_validate_output_capture and
+            self.qwen36DensePrefillSsmGnormDirectStoreEnabled();
         {
             const pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
             const push = SsmGatedNormPush{
@@ -11243,7 +11901,25 @@ pub const InferenceEngine = struct {
                 .norm_per_head = if (norm_per_head) 1 else 0,
             };
             if (pip.uses_push_descriptors) {
-                self.pushDispatch4(pip, std.mem.asBytes(&push), self.attn_out_buf.handle, z_bytes, self.gate_buf.handle, z_bytes, norm_buf_handle, norm_buf_size, self.swiglu_buf.handle, z_bytes, dt_rank, 1, 1);
+                if (direct_ssm_gnorm_store) {
+                    const infos = [4]vk.c.VkDescriptorBufferInfo{
+                        .{ .buffer = self.attn_out_buf.handle, .offset = 0, .range = z_bytes },
+                        .{ .buffer = self.gate_buf.handle, .offset = 0, .range = z_bytes },
+                        .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                        .{ .buffer = self.partial_decode_ssm_gnorm_out.?, .offset = self.partial_decode_ssm_gnorm_out_offset, .range = z_bytes },
+                    };
+                    self.decode_cmd.pushDescAndDispatch(
+                        pip,
+                        self.instance.push_descriptor_fn,
+                        infos[0..],
+                        std.mem.asBytes(&push),
+                        dt_rank,
+                        1,
+                        1,
+                    );
+                } else {
+                    self.pushDispatch4(pip, std.mem.asBytes(&push), self.attn_out_buf.handle, z_bytes, self.gate_buf.handle, z_bytes, norm_buf_handle, norm_buf_size, self.swiglu_buf.handle, z_bytes, dt_rank, 1, 1);
+                }
             } else {
                 const ds = try self.allocDescSet(pip.descriptor_set_layout);
                 self.writeDescSet4(
@@ -11260,14 +11936,44 @@ pub const InferenceEngine = struct {
                 try self.elementwise.recordSsmGatedNorm(&self.decode_cmd, ds, push);
             }
         }
-        self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, z_bytes);
+        if (ssm_prefill_validate_output_capture or (stop_after_ssm_gnorm and !direct_ssm_gnorm_store)) {
+            const tok_idx = self.prefill_current_token_idx;
+            const z_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+            const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.decode_cmd.computeAndTransferBarrier();
+            if (ssm_prefill_validate_output_capture) {
+                const r_gnorm = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = z_dst_off, .size = z_bytes };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_gnorm_ref.?.handle, 1, &r_gnorm);
+                const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_pre_hidden_ref.?.handle, 1, &r_pre_hidden);
+            }
+            if (stop_after_ssm_gnorm) {
+                const gnorm_copy = vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = self.partial_decode_ssm_gnorm_out_offset,
+                    .size = z_bytes,
+                };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.partial_decode_ssm_gnorm_out.?, 1, &gnorm_copy);
+            }
+        } else if (!direct_ssm_gnorm_store) {
+            self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, z_bytes);
+        }
         self.endProfilePhase(.ssm_gated_norm, ssm_gated_norm_phase);
+        if (stop_after_ssm_gnorm) return;
 
         // --- GPU: ssm_out DMMV + residual (fused: accumulate directly into hidden_buf) ---
         const ssm_out_tensor = lt.ssm_out orelse return;
         const ssm_out_phase = self.beginProfilePhase();
         try self.dispatchDmmvAcc(ssm_out_tensor, self.swiglu_buf, z_bytes, self.hidden_buf, hidden_dim, @intCast(d_inner));
-        self.decode_cmd.computeBufferBarrier(self.hidden_buf.handle, hidden_size);
+        if (ssm_prefill_validate_output_capture) {
+            const tok_idx = self.prefill_current_token_idx;
+            const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.decode_cmd.computeAndTransferBarrier();
+            const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_post_hidden_ref.?.handle, 1, &r_post_hidden);
+        } else {
+            self.decode_cmd.computeBufferBarrier(self.hidden_buf.handle, hidden_size);
+        }
         self.endProfilePhase(.ssm_out, ssm_out_phase);
     }
 
@@ -11307,6 +12013,22 @@ pub const InferenceEngine = struct {
             std.mem.eql(u8, mode, "z");
     }
 
+    fn qwen36DensePrefillPartialStoreEnabled(self: *const InferenceEngine) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return self.instance.push_descriptor_fn != null and
+            self.elementwise.pipeline_rms_norm_store_hidden != null;
+    }
+
+    fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return self.instance.push_descriptor_fn != null and
+            self.elementwise.pipeline_ssm_gated_norm != null;
+    }
+
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
         if (self.partial_ssm_preproj_layer != layer) return false;
         const has_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
@@ -11316,6 +12038,7 @@ pub const InferenceEngine = struct {
 
     fn qwen36DensePrefillPrefixLayers(self: *const InferenceEngine, prompt_len: usize) u32 {
         if (prompt_len < 2 or self.validation_diagnostics_enabled) return 0;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
 
         const mode = std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL");
         if (mode != null and std.mem.eql(u8, mode.?, "0")) return 0;
@@ -11341,6 +12064,418 @@ pub const InferenceEngine = struct {
         }
         if (layers == 0) return 0;
         return @min(layers, cfg.n_layers - 1);
+    }
+
+    fn qwen36DensePrefillTailPipelineEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (n_tokens < 2) return false;
+        if (self.validation_diagnostics_enabled or self.profile_enabled) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE")) |mode| {
+            return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+        }
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return n_tokens >= 16;
+    }
+
+    const qwen36_dense_prefill_max_segments = 64;
+
+    fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[qwen36_dense_prefill_max_segments]u32, count: *usize, layer: u32, prefix_layers: u32) void {
+        const cfg = self.model.config;
+        if (count.* >= out.len) return;
+        if (layer <= prefix_layers) return;
+        if (layer + 1 >= cfg.n_layers) return;
+        for (out[0..count.*]) |existing| {
+            if (existing == layer) return;
+        }
+        out[count.*] = layer;
+        count.* += 1;
+    }
+
+    fn qwen36DensePrefillSegmentLayers(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32, out: *[qwen36_dense_prefill_max_segments]u32) usize {
+        if (prompt_len < 16 or self.validation_diagnostics_enabled) return 0;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
+        if (!self.isQwen36DenseHybrid27B()) return 0;
+        if (!self.isAmdRdna()) return 0;
+
+        const cfg = self.model.config;
+        if (prefix_layers + 1 >= cfg.n_layers) return 0;
+
+        var count: usize = 0;
+        if (std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT")) |raw| {
+            if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return 0;
+            if (std.mem.eql(u8, raw, "1")) {
+                const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+                var candidate = prefix_layers;
+                while (candidate + 1 < cfg.n_layers) : (candidate += 1) {
+                    if (((candidate + 1) % full_attn_interval) == 0) break;
+                }
+                self.appendQwen36DensePrefillSegment(out, &count, candidate, prefix_layers);
+                return count;
+            }
+
+            var it = std.mem.splitScalar(u8, raw, ',');
+            while (it.next()) |part_raw| {
+                const part = std.mem.trim(u8, part_raw, " \t\r\n");
+                if (part.len == 0) continue;
+                const parsed = std.fmt.parseInt(u32, part, 10) catch continue;
+                self.appendQwen36DensePrefillSegment(out, &count, parsed, prefix_layers);
+            }
+            return count;
+        }
+
+        const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+        if (full_attn_interval == 4 and cfg.n_layers > 52) {
+            // Measured on the 27B Coding Review prefill: layers 4-62 keep
+            // dense FFN work layer-major without repeating the rejected SSM
+            // projection replay path. Layer 3 still adds setup overhead.
+            var segment_layer: u32 = 4;
+            while (segment_layer <= 62) : (segment_layer += 1) {
+                self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
+            }
+            return count;
+        }
+        var segment_layer: u32 = full_attn_interval - 1;
+        while (segment_layer + 1 < cfg.n_layers and count < out.len) : (segment_layer += full_attn_interval) {
+            self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
+        }
+        return count;
+    }
+
+    fn prefillQwen36RunPartialTokenLoop(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        prompt_tokens: []const u32,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        start_layer: u32,
+        end_layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: ?Buffer,
+        copy_hidden_out: bool,
+        stop_after_ffn_norm: bool,
+        advance_position: bool,
+        allow_final_tail_last: bool,
+        pipeline_enabled: bool,
+    ) !void {
+        if (n_tokens == 0) return;
+        if (end_layer != 0 and start_layer >= end_layer) return;
+
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
+        var tok_idx: u32 = 0;
+        while (tok_idx < n_tokens) : (tok_idx += 1) {
+            const collect_output = allow_final_tail_last and tok_idx + 1 == n_tokens;
+            const pipeline_this = pipeline_enabled and !collect_output;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
+            const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.prefill_current_token_idx = tok_idx;
+            state.position = base_token + tok_idx;
+            self.partial_decode_start_layer = start_layer;
+            self.partial_decode_end_layer = end_layer;
+            self.partial_decode_hidden_in = scratch_hidden.handle;
+            self.partial_decode_hidden_in_offset = hidden_offset;
+            self.partial_decode_hidden_out = if (copy_hidden_out) scratch_hidden.handle else null;
+            self.partial_decode_hidden_out_offset = hidden_offset;
+            self.partial_decode_advance_position = advance_position;
+            self.partial_decode_allow_final_tail = collect_output;
+            self.partial_decode_stop_after_ffn_norm = stop_after_ffn_norm;
+            if (stop_after_ffn_norm) {
+                const norm_buf = scratch_norm orelse return error.BufferTooSmall;
+                self.partial_decode_ffn_norm_out = norm_buf.handle;
+                self.partial_decode_ffn_norm_out_offset = hidden_offset;
+            } else {
+                self.partial_decode_ffn_norm_out = null;
+                self.partial_decode_ffn_norm_out_offset = 0;
+            }
+
+            try self.decodeStep(state, prompt_tokens[tok_idx], collect_output);
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
+        }
+    }
+
+    fn prefillQwen36RunSsmLayerToFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        prompt_tokens: []const u32,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        d_inner: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_norm: Buffer,
+        pipeline_enabled: bool,
+    ) !void {
+        if (n_tokens == 0) return;
+        const lt = self.layer_tensors[layer];
+        const ssm_out_t = lt.ssm_out orelse return error.TensorNotFound;
+        const ffn_norm_t = lt.ffn_norm orelse
+            lt.post_attention_norm orelse return error.TensorNotFound;
+        const z_bytes = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
+
+        const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
+        const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
+        const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
+        defer {
+            self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
+            self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
+            self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
+        }
+
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
+        var tok_idx: u32 = 0;
+        while (tok_idx < n_tokens) : (tok_idx += 1) {
+            const pipeline_this = pipeline_enabled;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
+            const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.prefill_current_token_idx = tok_idx;
+            state.position = base_token + tok_idx;
+            self.partial_decode_start_layer = layer;
+            self.partial_decode_end_layer = layer + 1;
+            self.partial_decode_hidden_in = scratch_hidden.handle;
+            self.partial_decode_hidden_in_offset = hidden_offset;
+            self.partial_decode_hidden_out = null;
+            self.partial_decode_hidden_out_offset = 0;
+            self.partial_decode_advance_position = false;
+            self.partial_decode_allow_final_tail = false;
+            self.partial_decode_stop_after_ffn_norm = false;
+            self.partial_decode_ffn_norm_out = null;
+            self.partial_decode_ffn_norm_out_offset = 0;
+            self.partial_decode_stop_after_ssm_gnorm = true;
+            self.partial_decode_ssm_gnorm_out = scratch_swiglu.handle;
+            self.partial_decode_ssm_gnorm_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+
+            try self.decodeStep(state, prompt_tokens[tok_idx], false);
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
+        }
+
+        self.partial_decode_stop_after_ssm_gnorm = false;
+        self.partial_decode_ssm_gnorm_out = null;
+        self.partial_decode_ssm_gnorm_out_offset = 0;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        if (self.qwen36DensePrefillSsmGnormDirectStoreEnabled()) {
+            self.decode_cmd.computeBufferBarrier(
+                scratch_swiglu.handle,
+                @as(vk.c.VkDeviceSize, n_tokens) * z_bytes,
+            );
+        } else {
+            self.decode_cmd.transferToComputeBarrier();
+        }
+
+        const ssm_phase = self.beginProfilePhase();
+        const ssm_out_phase = self.beginProfilePhase();
+        var out_tok: u32 = 0;
+        while (out_tok < n_tokens) : (out_tok += 1) {
+            const x_offset = out_tok * d_inner * @sizeOf(f32);
+            const y_offset = out_tok * hidden_dim * @sizeOf(f32);
+            try self.dispatchDmmvInner(
+                ssm_out_t,
+                scratch_swiglu,
+                scratch_swiglu.size,
+                scratch_hidden,
+                hidden_dim,
+                d_inner,
+                0,
+                x_offset,
+                y_offset,
+                1,
+            );
+        }
+        self.endProfilePhase(.ssm_out, ssm_out_phase);
+        self.endProfilePhase(.ssm, ssm_phase);
+        self.decode_cmd.computeBarrier();
+        try self.dispatchRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            ffn_norm_t.gpu_buffer.handle,
+            ffn_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_dim,
+            n_tokens,
+            self.model.config.rms_norm_eps,
+        );
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+    }
+
+    fn prefillQwen36RunBatchedDenseFfnLayer(
+        self: *InferenceEngine,
+        layer: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        inter_dim: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_gate: Buffer,
+        scratch_up: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+    ) !void {
+        const lt = self.layer_tensors[layer];
+        const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
+        const up_t = lt.ffn_up orelse return error.TensorNotFound;
+        const down_t = lt.ffn_down orelse return error.TensorNotFound;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        if (self.qwen36DensePrefillPartialStoreEnabled()) {
+            self.decode_cmd.computeBarrier();
+        } else {
+            self.decode_cmd.transferToComputeBarrier();
+        }
+        const dense_ffn_phase = self.beginProfilePhase();
+        const dense_ffn_gateup_phase = self.beginProfilePhase();
+        const use_fused_gateup = self.use_qwen36_batched_fused_gateup and
+            self.isQwen36DenseHybrid27B() and
+            gate_t.info.type_ == .q4_k and
+            up_t.info.type_ == .q4_k and
+            n_tokens >= 16 and
+            (hidden_dim & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null;
+        if (use_fused_gateup) {
+            try self.dmmv.recordMulMmQ4KGateUpSwiglu(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                inter_dim,
+                n_tokens,
+                hidden_dim,
+                hidden_dim,
+                inter_dim,
+                0,
+                0,
+                0,
+            );
+        } else {
+            const dense_ffn_gate_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
+            const dense_ffn_up_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
+            self.decode_cmd.computeBarrier();
+            try self.dispatchFfnActivation(
+                scratch_gate.handle,
+                scratch_gate.size,
+                scratch_up.handle,
+                scratch_up.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                n_tokens * inter_dim,
+            );
+        }
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
+        const dense_ffn_down_phase = self.beginProfilePhase();
+        try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        self.decode_cmd.computeBarrier();
+        try self.dispatchScaleAcc(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            scratch_down.handle,
+            scratch_down.size,
+            n_tokens * hidden_dim,
+            1.0,
+        );
+        self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
+        self.endProfilePhase(.dense_ffn, dense_ffn_phase);
+        const layer_output_scale = self.layer_output_scales[layer];
+        if (layer_output_scale != 1.0) {
+            self.decode_cmd.computeBarrier();
+            try self.dispatchScaleInPlace(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                n_tokens * hidden_dim,
+                layer_output_scale,
+            );
+        }
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
     }
 
     fn prefillQwen36DenseFfnPrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, prefix_layers: u32) !void {
@@ -11417,21 +12552,17 @@ pub const InferenceEngine = struct {
         const prebatch_ssm_z = std.mem.eql(u8, ssm_preproj_mode, "1") or
             std.mem.eql(u8, ssm_preproj_mode, "both") or
             std.mem.eql(u8, ssm_preproj_mode, "z");
-        var embeddings_copied_to_scratch = false;
-        if (use_ssm_preproj) {
-            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-            try self.decode_cmd.reset();
-            try self.decode_cmd.beginOneTime();
-            const region = vk.c.VkBufferCopy{
-                .srcOffset = 0,
-                .dstOffset = 0,
-                .size = total_embed_bytes,
-            };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &region);
-            try self.decode_cmd.end();
-            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-            embeddings_copied_to_scratch = true;
-        }
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        const embed_region = vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_embed_bytes,
+        };
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &embed_region);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
         self.prefill_token_samples = 0;
         self.prefill_cpu_embed_ns = 0;
@@ -11439,6 +12570,21 @@ pub const InferenceEngine = struct {
         self.prefill_submit_wait_ns = 0;
         self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
         self.prefill_gpu_total_ns = 0;
+        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
+        const profile_was_enabled = self.profile_enabled;
+        const enable_gpu_phase_timing = self.timestamp_query_pool != null and want_gpu_phases;
+        if (enable_gpu_phase_timing) self.profile_enabled = true;
+        defer {
+            if (enable_gpu_phase_timing) {
+                for (0..profile_phase_count) |p| {
+                    self.prefill_gpu_phase_ns[p] = self.profile_total_counters.gpu_phase_ns[p];
+                }
+                self.prefill_gpu_total_ns = @intFromFloat(@max(self.profile_total_gpu_ms * 1_000_000.0, 0.0));
+                self.resetProfilingSamples();
+                self.profile_enabled = profile_was_enabled;
+            }
+        }
         self.prefill_active = true;
         defer self.prefill_active = false;
 
@@ -11453,6 +12599,9 @@ pub const InferenceEngine = struct {
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
+        const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
+        const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
         const saved_ssm_preproj_layer = self.partial_ssm_preproj_layer;
         const saved_ssm_preproj_token_idx = self.partial_ssm_preproj_token_idx;
         const saved_ssm_preproj_qkv = self.partial_ssm_preproj_qkv;
@@ -11473,6 +12622,9 @@ pub const InferenceEngine = struct {
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
+            self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
+            self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
             self.partial_ssm_preproj_layer = saved_ssm_preproj_layer;
             self.partial_ssm_preproj_token_idx = saved_ssm_preproj_token_idx;
             self.partial_ssm_preproj_qkv = saved_ssm_preproj_qkv;
@@ -11513,7 +12665,7 @@ pub const InferenceEngine = struct {
                     if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
                     try self.decode_cmd.reset();
                     try self.decode_cmd.beginOneTime();
-                    if (layer == 0 and embeddings_copied_to_scratch) {
+                    if (layer == 0) {
                         self.decode_cmd.transferToComputeBarrier();
                     } else {
                         self.decode_cmd.computeBarrier();
@@ -11554,90 +12706,188 @@ pub const InferenceEngine = struct {
                 }
             }
 
-            var tok_idx: u32 = 0;
-            while (tok_idx < n_tokens) : (tok_idx += 1) {
-                const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
-                self.prefill_current_token_idx = tok_idx;
-                self.partial_ssm_preproj_token_idx = tok_idx;
-                state.position = base_token + tok_idx;
-                self.partial_decode_start_layer = layer;
-                self.partial_decode_end_layer = layer + 1;
-                self.partial_decode_hidden_in = if (layer == 0 and !embeddings_copied_to_scratch) self.prefill_embed_big.?.handle else scratch_hidden.handle;
-                self.partial_decode_hidden_in_offset = hidden_offset;
-                self.partial_decode_hidden_out = scratch_hidden.handle;
-                self.partial_decode_hidden_out_offset = hidden_offset;
-                self.partial_decode_advance_position = false;
-                self.partial_decode_allow_final_tail = false;
-                self.partial_decode_stop_after_ffn_norm = true;
-                self.partial_decode_ffn_norm_out = scratch_norm.handle;
-                self.partial_decode_ffn_norm_out_offset = hidden_offset;
-                try self.decodeStep(state, prompt_tokens[tok_idx], false);
+            if (!is_full_attn and !use_ssm_preproj) {
+                try self.prefillQwen36RunSsmLayerToFfnNorm(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.ssm_d_inner,
+                    hidden_size,
+                    layer,
+                    scratch_hidden,
+                    scratch_swiglu,
+                    scratch_norm,
+                    false,
+                );
+            } else {
+                var tok_idx: u32 = 0;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.prefill_current_token_idx = tok_idx;
+                    self.partial_ssm_preproj_token_idx = tok_idx;
+                    state.position = base_token + tok_idx;
+                    self.partial_decode_start_layer = layer;
+                    self.partial_decode_end_layer = layer + 1;
+                    self.partial_decode_hidden_in = scratch_hidden.handle;
+                    self.partial_decode_hidden_in_offset = hidden_offset;
+                    self.partial_decode_hidden_out = scratch_hidden.handle;
+                    self.partial_decode_hidden_out_offset = hidden_offset;
+                    self.partial_decode_advance_position = false;
+                    self.partial_decode_allow_final_tail = false;
+                    self.partial_decode_stop_after_ffn_norm = true;
+                    self.partial_decode_ffn_norm_out = scratch_norm.handle;
+                    self.partial_decode_ffn_norm_out_offset = hidden_offset;
+                    try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                }
             }
 
-            const lt = self.layer_tensors[layer];
-            const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
-            const up_t = lt.ffn_up orelse return error.TensorNotFound;
-            const down_t = lt.ffn_down orelse return error.TensorNotFound;
+            try self.prefillQwen36RunBatchedDenseFfnLayer(
+                layer,
+                n_tokens,
+                hidden_dim,
+                inter_dim,
+                scratch_hidden,
+                scratch_norm,
+                scratch_gate,
+                scratch_up,
+                scratch_swiglu,
+                scratch_down,
+            );
+        }
 
-            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-            try self.decode_cmd.reset();
-            try self.decode_cmd.beginOneTime();
-            self.decode_cmd.transferToComputeBarrier();
-            try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
-            try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
-            self.decode_cmd.computeBarrier();
-            try self.dispatchFfnActivation(
-                scratch_gate.handle,
-                scratch_gate.size,
-                scratch_up.handle,
-                scratch_up.size,
-                scratch_swiglu.handle,
-                scratch_swiglu.size,
-                n_tokens * inter_dim,
-            );
-            self.decode_cmd.computeBarrier();
-            try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
-            self.decode_cmd.computeBarrier();
-            try self.dispatchScaleAcc(
-                scratch_hidden.handle,
-                scratch_hidden.size,
-                scratch_down.handle,
-                scratch_down.size,
-                n_tokens * hidden_dim,
-                1.0,
-            );
-            const layer_output_scale = self.layer_output_scales[layer];
-            if (layer_output_scale != 1.0) {
-                self.decode_cmd.computeBarrier();
-                try self.dispatchScaleInPlace(
-                    scratch_hidden.handle,
-                    scratch_hidden.size,
-                    n_tokens * hidden_dim,
-                    layer_output_scale,
+        const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);
+        var tail_start_layer = prefix_layers;
+        var segment_layers: [qwen36_dense_prefill_max_segments]u32 = undefined;
+        const n_segment_layers = self.qwen36DensePrefillSegmentLayers(prompt_tokens.len, prefix_layers, &segment_layers);
+        for (segment_layers[0..n_segment_layers]) |segment_layer| {
+            if (segment_layer < tail_start_layer) continue;
+            log.debug("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
+                segment_layer,
+                tail_start_layer,
+            });
+            if (segment_layer > tail_start_layer) {
+                try self.prefillQwen36RunPartialTokenLoop(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    tail_start_layer,
+                    segment_layer,
+                    scratch_hidden,
+                    null,
+                    true,
+                    false,
+                    false,
+                    false,
+                    pipeline_tail,
                 );
             }
-            self.decode_cmd.computeToTransferBarrier();
-            try self.decode_cmd.end();
-            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            const segment_is_full_attn = ((segment_layer + 1) % full_attn_interval) == 0;
+            if (!segment_is_full_attn) {
+                try self.prefillQwen36RunSsmLayerToFfnNorm(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.ssm_d_inner,
+                    hidden_size,
+                    segment_layer,
+                    scratch_hidden,
+                    scratch_swiglu,
+                    scratch_norm,
+                    pipeline_tail,
+                );
+            } else {
+                try self.prefillQwen36RunPartialTokenLoop(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    segment_layer,
+                    segment_layer + 1,
+                    scratch_hidden,
+                    scratch_norm,
+                    true,
+                    true,
+                    false,
+                    false,
+                    pipeline_tail,
+                );
+            }
+            try self.prefillQwen36RunBatchedDenseFfnLayer(
+                segment_layer,
+                n_tokens,
+                hidden_dim,
+                inter_dim,
+                scratch_hidden,
+                scratch_norm,
+                scratch_gate,
+                scratch_up,
+                scratch_swiglu,
+                scratch_down,
+            );
+            tail_start_layer = segment_layer + 1;
         }
 
         self.partial_decode_stop_after_ffn_norm = false;
         self.partial_decode_ffn_norm_out = null;
         self.partial_decode_ffn_norm_out_offset = 0;
-        self.partial_decode_start_layer = prefix_layers;
+        self.partial_decode_start_layer = tail_start_layer;
         self.partial_decode_end_layer = 0;
         self.partial_decode_hidden_in = scratch_hidden.handle;
         self.partial_decode_hidden_out = null;
         self.partial_decode_advance_position = true;
 
+        // The prefix path runs the first layer(s) layer-major, then returns to
+        // token-major decode for the remainder. Reuse prefillBatch's two-slot
+        // command-buffer pipeline for that remainder when explicitly requested.
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
         var tok_idx: u32 = 0;
         while (tok_idx < n_tokens) : (tok_idx += 1) {
             const collect_output = tok_idx + 1 == n_tokens;
+            const pipeline_this = pipeline_tail and !collect_output;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
             self.prefill_current_token_idx = tok_idx;
             state.position = base_token + tok_idx;
             self.partial_decode_hidden_in_offset = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
             self.partial_decode_allow_final_tail = collect_output;
             try self.decodeStep(state, prompt_tokens[tok_idx], collect_output);
+
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
         }
     }
 
@@ -12340,15 +13590,37 @@ pub const InferenceEngine = struct {
 
         if (self.use_qwen36_dense_prefill_validate and self.dense_prefill_validate_captured_tokens > 0) {
             const n_validate = @min(self.dense_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
-            self.validateDensePrefillFfnChunk(n_validate) catch |err| {
-                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay skipped: {s}", .{@errorName(err)});
-            };
+            const validate_chunks = [_]u32{ 4, 8, 16 };
+            var ran_exact_chunk = false;
+            for (validate_chunks) |chunk| {
+                if (chunk > n_validate) continue;
+                if (chunk == n_validate) ran_exact_chunk = true;
+                self.validateDensePrefillFfnChunk(chunk) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+                };
+            }
+            if (!ran_exact_chunk) {
+                self.validateDensePrefillFfnChunk(n_validate) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
+                };
+            }
         }
         if (self.use_qwen36_ssm_prefill_validate and self.ssm_prefill_validate_captured_tokens > 0) {
             const n_validate = @min(self.ssm_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
-            self.validateSsmPrefillProjectionChunk(n_validate) catch |err| {
-                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay skipped: {s}", .{@errorName(err)});
-            };
+            const validate_chunks = [_]u32{ 4, 8, 16 };
+            var ran_exact_chunk = false;
+            for (validate_chunks) |chunk| {
+                if (chunk > n_validate) continue;
+                if (chunk == n_validate) ran_exact_chunk = true;
+                self.validateSsmPrefillProjectionChunk(chunk) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+                };
+            }
+            if (!ran_exact_chunk) {
+                self.validateSsmPrefillProjectionChunk(n_validate) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
+                };
+            }
         }
 
         // Effort-6 cycle 123 (A3b all-layer extension): batched
@@ -13275,12 +14547,23 @@ pub const InferenceEngine = struct {
         if (self.dense_prefill_validate_norm_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_gate_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_up_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_swiglu_ref) |*b| b.deinit();
+        if (self.dense_prefill_validate_down_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_staging) |*b| b.deinit();
         if (self.ssm_prefill_validate_norm_ref) |*b| b.deinit();
         if (self.ssm_prefill_validate_qkv_ref) |*b| b.deinit();
         if (self.ssm_prefill_validate_z_ref) |*b| b.deinit();
         if (self.ssm_prefill_validate_alpha_ref) |*b| b.deinit();
         if (self.ssm_prefill_validate_beta_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_conv_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_delta_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_delta_replay) |*b| b.deinit();
+        if (self.ssm_prefill_validate_gnorm_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_pre_hidden_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_post_hidden_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_state_backup) |*b| b.deinit();
         if (self.ssm_prefill_validate_staging) |*b| b.deinit();
         // KV cache + page table
         self.freeActiveKvPages();
@@ -13540,14 +14823,26 @@ pub fn generate(
                 },
             );
             const ssm_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj)];
+            const ssm_proj_norm_ab_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_norm_ab)];
+            const ssm_proj_qkv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv)];
+            const ssm_proj_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_z)];
+            const ssm_proj_alpha_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_alpha)];
+            const ssm_proj_beta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_beta)];
+            const ssm_proj_qkv_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv_z)];
             const ssm_conv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_conv)];
             const ssm_delta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_delta)];
             const ssm_gnorm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_gated_norm)];
             const ssm_out_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out)];
             log.info(
-                "Prefill SSM subphases totals: proj={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} ms",
+                "Prefill SSM subphases totals: proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} alpha={d:.1} beta={d:.1} qkv_z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} ms",
                 .{
                     to_ms(ssm_proj_ns),
+                    to_ms(ssm_proj_norm_ab_ns),
+                    to_ms(ssm_proj_qkv_ns),
+                    to_ms(ssm_proj_z_ns),
+                    to_ms(ssm_proj_alpha_ns),
+                    to_ms(ssm_proj_beta_ns),
+                    to_ms(ssm_proj_qkv_z_ns),
                     to_ms(ssm_conv_ns),
                     to_ms(ssm_delta_ns),
                     to_ms(ssm_gnorm_ns),
@@ -13555,11 +14850,15 @@ pub fn generate(
                 },
             );
             const dense_gateup_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup)];
+            const dense_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gate)];
+            const dense_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_up)];
             const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
             log.info(
-                "Prefill dense_ffn subphases totals: gateup={d:.1} down={d:.1} ms",
+                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} ms",
                 .{
                     to_ms(dense_gateup_ns),
+                    to_ms(dense_gate_ns),
+                    to_ms(dense_up_ns),
                     to_ms(dense_down_ns),
                 },
             );
@@ -13684,8 +14983,14 @@ pub fn generate(
                 avg_dense_ffn_phase_ms,
                 avg_tail_phase_ms,
             });
-            log.info("PROFILE: avg SSM subphases proj={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
+            log.info("PROFILE: avg SSM subphases proj={d:.2} ms norm_ab={d:.2} ms qkv={d:.2} ms z={d:.2} ms alpha={d:.2} ms beta={d:.2} ms qkv_z={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.ssm_proj),
+                engine.avgProfilePhaseMs(.ssm_proj_norm_ab),
+                engine.avgProfilePhaseMs(.ssm_proj_qkv),
+                engine.avgProfilePhaseMs(.ssm_proj_z),
+                engine.avgProfilePhaseMs(.ssm_proj_alpha),
+                engine.avgProfilePhaseMs(.ssm_proj_beta),
+                engine.avgProfilePhaseMs(.ssm_proj_qkv_z),
                 engine.avgProfilePhaseMs(.ssm_conv),
                 engine.avgProfilePhaseMs(.ssm_delta),
                 engine.avgProfilePhaseMs(.ssm_gated_norm),
@@ -13705,8 +15010,10 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.shared_down),
                 engine.avgProfilePhaseMs(.shared_gate_acc),
             });
-            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms down={d:.2} ms", .{
+            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.dense_ffn_gateup),
+                engine.avgProfilePhaseMs(.dense_ffn_gate),
+                engine.avgProfilePhaseMs(.dense_ffn_up),
                 engine.avgProfilePhaseMs(.dense_ffn_down),
             });
             log.info("PROFILE: avg tail subphases norm={d:.2} ms lm_head={d:.2} ms argmax={d:.2} ms copy={d:.2} ms", .{
