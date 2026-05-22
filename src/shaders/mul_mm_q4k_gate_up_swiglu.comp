@@ -200,10 +200,9 @@ void main() {
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
                 float v = 0.0;
                 if (col_ok) {
-                    const uint k_global = k_outer + k_in_tile_b + i;
-                    if (k_global < K) {
-                        v = b_data[b_col_base + k_global];
-                    }
+                    // Host-side dispatch rejects non-256-aligned K; with
+                    // BK=32 this inner index is always in range.
+                    v = b_data[b_col_base + k_outer + k_in_tile_b + i];
                 }
                 buf_b[base_b + i] = v;
             }
