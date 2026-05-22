@@ -12137,11 +12137,11 @@ pub const InferenceEngine = struct {
     }
 
     fn qwen36DensePrefillPartialStoreEnabled(self: *const InferenceEngine) bool {
-        if (self.validation_diagnostics_enabled) return false;
-        if (!self.isQwen36DenseHybrid27B()) return false;
-        if (!self.isAmdRdna()) return false;
-        return self.instance.push_descriptor_fn != null and
-            self.elementwise.pipeline_rms_norm_store_hidden != null;
+        // The RMS+hidden snapshot helper was measured negative on the 27B
+        // Coding Review prefill prompt; keep the normal RMS + transfer-copy
+        // handoff as the default path.
+        _ = self;
+        return false;
     }
 
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
