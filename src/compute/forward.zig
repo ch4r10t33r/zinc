@@ -9571,24 +9571,66 @@ pub const InferenceEngine = struct {
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q6k != null)
         {
-            try self.dmmv.recordMulMmQ6K(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                tensor.gpu_buffer.handle,
-                tensor.gpu_buffer.size,
-                x_buf.handle,
-                x_buf.size,
-                y_buf.handle,
-                y_buf.size,
-                M,
-                n_tokens,
-                K,
-                K,
-                M,
-                0,
-                0,
-                0,
-            );
+            const full_cols = n_tokens & ~@as(u32, 31);
+            if (full_cols > 0 and (M & 31) == 0 and self.dmmv.pipeline_mul_mm_q6k_full != null) {
+                try self.dmmv.recordMulMmQ6KFull(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    full_cols,
+                    K,
+                    K,
+                    M,
+                    0,
+                    0,
+                    0,
+                );
+                if (full_cols < n_tokens) {
+                    try self.dmmv.recordMulMmQ6K(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        x_buf.handle,
+                        x_buf.size,
+                        y_buf.handle,
+                        y_buf.size,
+                        M,
+                        n_tokens - full_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        full_cols * K,
+                        full_cols * M,
+                    );
+                }
+            } else {
+                try self.dmmv.recordMulMmQ6K(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    n_tokens,
+                    K,
+                    K,
+                    M,
+                    0,
+                    0,
+                    0,
+                );
+            }
             return;
         }
         while (chunk_start < n_tokens) {
