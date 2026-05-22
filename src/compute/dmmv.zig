@@ -859,7 +859,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q6k != null) {
-            log.info("mul_mm_q6k pipeline loaded (Qwen3.6-27B batched dense down)", .{});
+            log.info("mul_mm_q6k pipeline loaded (Qwen3.6-27B batched Q6_K prefill projections)", .{});
         }
 
         return DmmvDispatch{
@@ -1399,6 +1399,7 @@ pub const DmmvDispatch = struct {
     }
 
     /// Tiled Q6_K dense GEMM. Same push/layout as recordMulMmQ4K.
+    /// Used by Qwen3.6-27B layer-major prefill for dense-down and SSM wqkv.
     pub fn recordMulMmQ6K(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,

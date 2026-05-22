@@ -1178,9 +1178,10 @@ pub const InferenceEngine = struct {
     // tiled Q4_K gate+up+SwiGLU GEMM to avoid gate/up scratch writes.
     use_qwen36_batched_fused_gateup: bool = false,
     // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Routes
-    // the Q6_K dense-down projection through a tiled GEMM instead of the
-    // serial batched DMMV chunks. Disable with ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0.
-    use_qwen36_q6_down_mul_mm: bool = false,
+    // large Q6_K prefill projections through a tiled GEMM instead of the
+    // serial/kpar batched DMMV chunks. Covers dense-down and SSM wqkv. Disable
+    // with ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0.
+    use_qwen36_q6_prefill_mul_mm: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -2499,16 +2500,16 @@ pub const InferenceEngine = struct {
             log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path DISABLED via ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0", .{});
         }
 
-        const qwen36_q6_down_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q6_DOWN_MUL_MM");
-        const qwen36_q6_down_mul_mm_explicitly_off = qwen36_q6_down_mul_mm_env != null and
-            std.mem.eql(u8, qwen36_q6_down_mul_mm_env.?, "0");
-        const qwen36_q6_down_mul_mm_enabled = !qwen36_q6_down_mul_mm_explicitly_off and
+        const qwen36_q6_prefill_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q6_DOWN_MUL_MM");
+        const qwen36_q6_prefill_mul_mm_explicitly_off = qwen36_q6_prefill_mul_mm_env != null and
+            std.mem.eql(u8, qwen36_q6_prefill_mul_mm_env.?, "0");
+        const qwen36_q6_prefill_mul_mm_enabled = !qwen36_q6_prefill_mul_mm_explicitly_off and
             dmmv.pipeline_mul_mm_q6k != null and
             instance.push_descriptor_fn != null;
-        if (qwen36_q6_down_mul_mm_enabled) {
-            log.info("Qwen3.6-27B Q6_K dense-down mul_mm path ENABLED (default, set ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0 to disable)", .{});
-        } else if (qwen36_q6_down_mul_mm_explicitly_off) {
-            log.info("Qwen3.6-27B Q6_K dense-down mul_mm path DISABLED via ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0", .{});
+        if (qwen36_q6_prefill_mul_mm_enabled) {
+            log.info("Qwen3.6-27B Q6_K prefill mul_mm path ENABLED for dense-down/SSM-wqkv (default, set ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0 to disable)", .{});
+        } else if (qwen36_q6_prefill_mul_mm_explicitly_off) {
+            log.info("Qwen3.6-27B Q6_K prefill mul_mm path DISABLED via ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0", .{});
         }
 
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
@@ -2975,7 +2976,7 @@ pub const InferenceEngine = struct {
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
             .use_mul_mm_proj = mul_mm_proj_enabled,
             .use_qwen36_batched_fused_gateup = qwen36_batched_gateup_enabled,
-            .use_qwen36_q6_down_mul_mm = qwen36_q6_down_mul_mm_enabled,
+            .use_qwen36_q6_prefill_mul_mm = qwen36_q6_prefill_mul_mm_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -9498,10 +9499,16 @@ pub const InferenceEngine = struct {
         const KPAR_MAX_COLS: u32 = 40;
         const f32_bytes: u32 = @sizeOf(f32);
         var chunk_start: u32 = 0;
+        const cfg = self.model.config;
         const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
             tensor.info.type_ == .q6_k and
-            M == self.model.config.hidden_dim and
-            K == self.model.config.intermediate_dim and
+            M == cfg.hidden_dim and
+            K == cfg.intermediate_dim and
+            n_tokens >= 16;
+        const qwen36_ssm_qkv_shape = self.isQwen36DenseHybrid27B() and
+            tensor.info.type_ == .q6_k and
+            M == cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state and
+            K == cfg.hidden_dim and
             n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
@@ -9556,11 +9563,10 @@ pub const InferenceEngine = struct {
             );
             return;
         }
-        if (self.use_qwen36_q6_down_mul_mm and
+        if (self.use_qwen36_q6_prefill_mul_mm and
             tensor.info.type_ == .q6_k and
             self.isQwen36DenseHybrid27B() and
-            M == self.model.config.hidden_dim and
-            K == self.model.config.intermediate_dim and
+            (prefer_serial_qwen36_dense_down or qwen36_ssm_qkv_shape) and
             n_tokens >= 16 and
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q6k != null)
