@@ -131,6 +131,13 @@ Interpretation:
   checkpoint. The source/build tree was restored to the rebased cycle-32
   source (`dba5bdf`), and the controller should revert both `build.zig`
   and `src/` for future rejected agent changes.
+- After the cycle-94 restart check, clean builds of the saved best
+  commit did not install `mul_mm_q6k.spv` even though the accepted Q6_K
+  dense-down path probes that pipeline at runtime. Some previous remote
+  measurements depended on stale files in `zig-out/share/zinc/shaders`.
+  The harness now clears the installed shader directory before each
+  remote build, and `build.zig` installs `mul_mm_q6k` explicitly so the
+  dense-down path is reproducible instead of artifact-dependent.
 
 ## Decode phase budget
 

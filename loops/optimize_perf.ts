@@ -2064,6 +2064,7 @@ async function collectPhaseBudget(modelTarget: ModelTarget, effortSpec: EffortSp
 async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<BenchResult> {
   console.log(c("2", "  Compiling shaders..."));
   try {
+    await ssh(`cd ${REMOTE_DIR} && rm -rf zig-out/share/zinc/shaders`, 30_000);
     await ssh(`cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute $f -o \${f%.comp}.spv 2>&1; done`, 60_000);
   } catch (e) {
     return {

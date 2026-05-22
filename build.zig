@@ -200,6 +200,7 @@ pub fn build(b: *std.Build) void {
         // pivot. See loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md.
         "mul_mm_q4k",
         "mul_mm_q4k_gate_up_swiglu",
+        "mul_mm_q6k",
         "count_experts",
     };
 
