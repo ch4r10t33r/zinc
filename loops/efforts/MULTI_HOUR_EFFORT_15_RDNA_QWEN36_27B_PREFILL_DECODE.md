@@ -124,6 +124,13 @@ Interpretation:
   dense kernel change that explains VGPR/occupancy/memory behavior, or
   a validated SSM projection dataflow change. Another blind tile-shape
   sweep is unlikely to clear the new `+~0.65 tok/s` keep threshold.
+- After cycle 85, the controller had `best=64.87` but current code had
+  fallen to about `63.28 tok/s`. Root cause: rejected cycles were only
+  reverting `src/`, so a `build.zig` shader-install edit could leak
+  across cycles and make the local checkout diverge from the accepted
+  checkpoint. The source/build tree was restored to the rebased cycle-32
+  source (`dba5bdf`), and the controller should revert both `build.zig`
+  and `src/` for future rejected agent changes.
 
 ## Decode phase budget
 

@@ -785,8 +785,11 @@ const BLOCKED_GIT_OPS = [
   "Bash(git push:*)", "Bash(git commit:*)",
 ];
 
-// Directories the agent may change (used for selective revert)
-const REVERTABLE_PATHS = ["src/"];
+// Paths the agent may change (used for selective revert). Keep this aligned
+// with the prompt's "Files you may edit" block; otherwise rejected cycles can
+// leak non-src edits, such as build.zig shader-install changes, into later
+// baselines.
+const REVERTABLE_PATHS = ["build.zig", "src/"];
 
 function isPrefillMetricLabel(label: string | undefined): boolean {
   return /\bprefill\b/i.test(label ?? "");
@@ -1883,6 +1886,7 @@ Files you may edit:
 - src/server/chat.html
 - src/shaders/*.comp (GLSL compute shaders)
 - src/main.zig
+- build.zig (only when a shader/pipeline change needs the build to install a new artifact)
 
 ## Output Format
 After making your change, print these lines:
@@ -2000,7 +2004,7 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
-Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig). You may also remove files that a revert would remove.
+Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig, and build.zig only when a shader/pipeline change needs build installation). You may also remove files that a revert would remove.
 
 ## Output Format
 @@@DESCRIPTION: <one-line summary of the pivot action you took>
@@ -2585,8 +2589,11 @@ export function parseAgentReport(stdout: string): AgentReport {
 }
 
 async function listChangedFiles(): Promise<string[]> {
-  const tracked = await runCommand("git", ["diff", "--name-only", "--", "src/"], { cwd: REPO_ROOT });
-  const untracked = await runCommand("git", ["ls-files", "--others", "--exclude-standard", "src/"], { cwd: REPO_ROOT });
+  const tracked = await runCommand("git", ["diff", "--name-only", "--", ...REVERTABLE_PATHS], { cwd: REPO_ROOT });
+  const untrackedArgs = REVERTABLE_PATHS.filter((path) => path.endsWith("/"));
+  const untracked = untrackedArgs.length > 0
+    ? await runCommand("git", ["ls-files", "--others", "--exclude-standard", ...untrackedArgs], { cwd: REPO_ROOT })
+    : { stdout: "" };
   const files = [
     ...tracked.stdout.split("\n"),
     ...untracked.stdout.split("\n"),
@@ -2946,18 +2953,22 @@ export async function loadPreviousRun(effort: number): Promise<{
   return { history, bestTokPerSec, lastCycle, bestCycle, bestCommitHash };
 }
 
-// -- Selective revert (only src/, not loops/ or config) ----------------------
+// -- Selective revert (only agent-editable perf paths, not loops/site/docs) ---
 
 async function revertAgentChanges(): Promise<void> {
   for (const path of REVERTABLE_PATHS) {
     await runCommand("git", ["checkout", "--", path], { cwd: REPO_ROOT });
   }
-  // Also clean any new untracked files the agent may have created in src/
-  const { stdout: untracked } = await runCommand("git", ["ls-files", "--others", "--exclude-standard", "src/"], { cwd: REPO_ROOT });
+  // Also clean any new untracked files the agent may have created under
+  // revertable directories.
+  const untrackedArgs = REVERTABLE_PATHS.filter((path) => path.endsWith("/"));
+  const { stdout: untracked } = untrackedArgs.length > 0
+    ? await runCommand("git", ["ls-files", "--others", "--exclude-standard", ...untrackedArgs], { cwd: REPO_ROOT })
+    : { stdout: "" };
   for (const f of untracked.split("\n").filter(Boolean)) {
     await runCommand("rm", ["-f", f], { cwd: REPO_ROOT });
   }
-  console.log(c("2", "  Reverted agent changes (src/ only)."));
+  console.log(c("2", "  Reverted agent changes (build.zig/src only)."));
 }
 
 // -- Main loop ---------------------------------------------------------------
