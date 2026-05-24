@@ -928,6 +928,8 @@ fn buildSmallTensorF32Cache(
             lt.attn_k_norm,
             lt.ffn_norm,
             lt.post_attention_norm,
+            lt.post_ffw_norm,
+            lt.pre_ffw_norm_2,
             lt.ssm_norm,
             lt.ssm_dt_bias,
             lt.ssm_a,
@@ -4986,8 +4988,9 @@ fn applyRope(data: []f32, stride: u32, rope_dim: u32, n_heads: u32, position: u3
     // per (head, freq). `position` is constant across heads at a given attn
     // layer, so the trig values are loop-invariant in `h`; the hot decode path
     // pays for these trig calls 10 attn layers × (n_heads + n_kv_heads) ×
-    // half-rope times per token otherwise.
-    var trig_buf: [256]f32 = undefined;
+    // half-rope times per token otherwise. 1024 entries cover head_dim ≤ 1024
+    // (Gemma 4 31B global layers use head_dim=512 → trig_needed=512).
+    var trig_buf: [1024]f32 = undefined;
     const trig_needed: usize = @as(usize, @intCast(half)) * 2;
     if (trig_needed > trig_buf.len) {
         // Fallback for unexpectedly large rope: inline trig per element.
