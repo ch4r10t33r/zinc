@@ -1182,6 +1182,12 @@ pub const InferenceEngine = struct {
     // serial/kpar batched DMMV chunks. Covers dense-down and SSM wqkv. Disable
     // with ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0.
     use_qwen36_q6_prefill_mul_mm: bool = false,
+    // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Routes
+    // the Q5_K SSM out projection through a tiled GEMM (mul_mm_q5k) instead of
+    // the dmmv_q5k one-WG-per-row + subgroup-reduction batched path — the last
+    // batched projection still on the slower dmmv path. Disable with
+    // ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM=0.
+    use_qwen36_q5_ssm_out_mul_mm: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -2512,6 +2518,18 @@ pub const InferenceEngine = struct {
             log.info("Qwen3.6-27B Q6_K prefill mul_mm path DISABLED via ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0", .{});
         }
 
+        const qwen36_q5_ssm_out_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM");
+        const qwen36_q5_ssm_out_mul_mm_explicitly_off = qwen36_q5_ssm_out_mul_mm_env != null and
+            std.mem.eql(u8, qwen36_q5_ssm_out_mul_mm_env.?, "0");
+        const qwen36_q5_ssm_out_mul_mm_enabled = !qwen36_q5_ssm_out_mul_mm_explicitly_off and
+            dmmv.pipeline_mul_mm_q5k != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_q5_ssm_out_mul_mm_enabled) {
+            log.info("Qwen3.6-27B Q5_K prefill mul_mm path ENABLED for SSM-out (default, set ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM=0 to disable)", .{});
+        } else if (qwen36_q5_ssm_out_mul_mm_explicitly_off) {
+            log.info("Qwen3.6-27B Q5_K prefill mul_mm path DISABLED via ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM=0", .{});
+        }
+
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
         const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
         const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
@@ -2977,6 +2995,7 @@ pub const InferenceEngine = struct {
             .use_mul_mm_proj = mul_mm_proj_enabled,
             .use_qwen36_batched_fused_gateup = qwen36_batched_gateup_enabled,
             .use_qwen36_q6_prefill_mul_mm = qwen36_q6_prefill_mul_mm_enabled,
+            .use_qwen36_q5_ssm_out_mul_mm = qwen36_q5_ssm_out_mul_mm_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -9510,6 +9529,14 @@ pub const InferenceEngine = struct {
             M == cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state and
             K == cfg.hidden_dim and
             n_tokens >= 16;
+        // SSM out projection: hidden_dim x d_inner Q5_K. This is the last
+        // batched projection still falling through to dmmv_q5k (one WG per row
+        // + subgroup reduction); route it through the tiled mul_mm_q5k GEMM.
+        const qwen36_ssm_out_shape = self.isQwen36DenseHybrid27B() and
+            tensor.info.type_ == .q5_k and
+            M == cfg.hidden_dim and
+            K == cfg.ssm_d_inner and
+            n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
             if (prefer_serial_qwen36_dense_down) break :blk null;
@@ -9631,6 +9658,31 @@ pub const InferenceEngine = struct {
                     0,
                 );
             }
+            return;
+        }
+        if (self.use_qwen36_q5_ssm_out_mul_mm and
+            qwen36_ssm_out_shape and
+            (K & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q5k != null)
+        {
+            try self.dmmv.recordMulMmQ5K(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                x_buf.handle,
+                x_buf.size,
+                y_buf.handle,
+                y_buf.size,
+                M,
+                n_tokens,
+                K,
+                K, // stride_b: per-col floats in B (one column = K elements)
+                M, // stride_d: per-col floats in D (one column = M elements)
+                0, // a_offset (bytes)
+                0, // b_offset (floats)
+                0, // d_offset (floats)
+            );
             return;
         }
         while (chunk_start < n_tokens) {
