@@ -5423,6 +5423,10 @@ pub const Tokenizer = struct {
     eos_id: u32,
     bos_id: ?u32,
     add_bos: bool,
+    /// Gemma 4 (and other SentencePiece-flavoured vocabs) encode spaces as ▁
+    /// (U+2581) and store raw UTF-8 in the vocab table, rather than the GPT-2
+    /// byte-to-unicode mapping used by Qwen-family BPE.
+    is_sentencepiece: bool,
 
     /// Build a tokenizer by reading `tokenizer.ggml.tokens` and
     /// `tokenizer.ggml.eos_token_id` out of `gf`. Defaults the EOS id to `2`
@@ -5456,6 +5460,11 @@ pub const Tokenizer = struct {
         const arch_str = gf.getString("general.architecture") orelse "";
         const default_add_bos = std.mem.startsWith(u8, arch_str, "gemma");
         const add_bos = gf.getBool("tokenizer.ggml.add_bos_token") orelse default_add_bos;
+        const tokenizer_model = gf.getString("tokenizer.ggml.model") orelse "";
+        const pre_name = gf.getString("tokenizer.ggml.pre") orelse "";
+        const is_sentencepiece = std.mem.eql(u8, tokenizer_model, "gemma4") or
+            std.mem.eql(u8, tokenizer_model, "llama") or
+            std.mem.eql(u8, pre_name, "gemma4");
         return .{
             .allocator = allocator,
             .vocab = vocab,
@@ -5463,6 +5472,7 @@ pub const Tokenizer = struct {
             .eos_id = gf.getU32("tokenizer.ggml.eos_token_id") orelse 2,
             .bos_id = bos_id,
             .add_bos = add_bos and bos_id != null,
+            .is_sentencepiece = is_sentencepiece,
         };
     }
 
@@ -5515,14 +5525,33 @@ pub const Tokenizer = struct {
         return try tokens.toOwnedSlice(allocator);
     }
 
+    /// Prepare `text` into a byte stream the longest-match scanner consumes.
+    /// SentencePiece vocabs (Gemma 4, llama) substitute spaces with the
+    /// SPIECE underline (▁, U+2581) and pass raw UTF-8 through unchanged;
+    /// GPT-2-flavour vocabs (Qwen) remap every byte through the byte-to-
+    /// unicode table so the scanner sees vocab-shaped pieces.
+    fn prepBytesForEncode(self: *const Tokenizer, text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        if (self.is_sentencepiece) {
+            for (text) |byte| {
+                if (byte == ' ') {
+                    try out.appendSlice(allocator, "\xe2\x96\x81");
+                } else {
+                    try out.append(allocator, byte);
+                }
+            }
+        } else {
+            for (text) |byte| {
+                const mapped = gpt2ByteToUnicode(byte);
+                const n = std.mem.indexOfScalar(u8, &mapped, 0) orelse mapped.len;
+                try out.appendSlice(allocator, mapped[0..n]);
+            }
+        }
+    }
+
     fn encodePromptNoBos(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
         var encoded: std.ArrayList(u8) = .{};
         defer encoded.deinit(allocator);
-        for (text) |byte| {
-            const mapped = gpt2ByteToUnicode(byte);
-            const n = std.mem.indexOfScalar(u8, &mapped, 0) orelse mapped.len;
-            try encoded.appendSlice(allocator, mapped[0..n]);
-        }
+        try self.prepBytesForEncode(text, &encoded, allocator);
         var tokens: std.ArrayList(u32) = .{};
         errdefer tokens.deinit(allocator);
         var pos: usize = 0;
@@ -5558,11 +5587,7 @@ pub const Tokenizer = struct {
     pub fn encodePrompt(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
         var encoded: std.ArrayList(u8) = .{};
         defer encoded.deinit(allocator);
-        for (text) |byte| {
-            const mapped = gpt2ByteToUnicode(byte);
-            const n = std.mem.indexOfScalar(u8, &mapped, 0) orelse mapped.len;
-            try encoded.appendSlice(allocator, mapped[0..n]);
-        }
+        try self.prepBytesForEncode(text, &encoded, allocator);
 
         var tokens: std.ArrayList(u32) = .{};
         errdefer tokens.deinit(allocator);
@@ -5613,6 +5638,18 @@ pub const Tokenizer = struct {
                 i += 1;
                 continue;
             };
+            if (self.is_sentencepiece) {
+                if (cp == 0x2581) {
+                    buf[out] = ' ';
+                    out += 1;
+                } else {
+                    const n = @min(cp_len, buf.len - out);
+                    @memcpy(buf[out..][0..n], token[i..][0..n]);
+                    out += n;
+                }
+                i += cp_len;
+                continue;
+            }
             const byte = gpt2UnicodeToByte(cp) orelse {
                 const n = @min(cp_len, buf.len - out);
                 @memcpy(buf[out..][0..n], token[i..][0..n]);
