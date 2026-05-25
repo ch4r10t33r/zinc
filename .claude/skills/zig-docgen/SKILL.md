@@ -36,20 +36,28 @@ Use this when you touch `src/**/*.zig` and the public surface should stay extrac
    - If it should be documented, promote it to top level or extend the loader and tests.
 
 6. Reuse the existing section names unless you are intentionally changing the docs taxonomy.
-   Current sections:
+   Current sections (must match `SECTION_META` slugs in `site/src/lib/zig-api-loader.ts`):
    - `CLI & Entrypoints`
    - `Model Format & Loading`
    - `Tokenization`
    - `Decode Planning`
    - `Inference Runtime`
+   - `Sampling`
    - `Shader Dispatch`
    - `Hardware Detection`
    - `Vulkan Runtime`
+   - `Metal Runtime`
+   - `Managed Models`
+   - `Scheduler`
+   - `API Server`
+   - `Tool Calling`
 
 7. If you add a new section name or a new public declaration pattern, update `site/src/lib/zig-api-loader.ts` and its tests in `site/src/lib/zig-api-loader.test.ts` in the same change.
 
 8. Keep raw bindings and generated glue out of the authored API surface.
-   `src/vulkan/vk.zig` is intentionally excluded from generated docs.
+   `src/vulkan/vk.zig` and `src/regression_tests.zig` are intentionally excluded from generated docs (`EXCLUDED_MODULES` in the loader).
+
+9. Files that import build-system modules (`@import("gguf")`, `@import("zinc_rt")`, etc.) cannot have their struct runtime layout (`@sizeOf` / `@alignOf` / `@offsetOf`) extracted by the standalone analyzer, because `zig run` does not resolve those imports. Add such files to `EXCLUDED_STRUCT_EXTRACTOR_MODULES` in the loader so the rest of the struct-layout extraction still succeeds. Their doc summary, field declarations, params, and returns continue to render.
 
 ## Good Pattern
 
