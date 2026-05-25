@@ -1,0 +1,47 @@
+#version 460
+// ZINC - grouped MoE route packing helper.
+// Vulkan counterpart to metal/moe_route_pack.metal. One invocation scans all
+// token route slots for one expert and appends matching route indices into a
+// fixed expert-major ids table.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint n_experts;
+    uint k;
+    uint routing_stride;
+    uint ids_stride;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Routing {
+    uint routing[];
+};
+
+layout(set = 0, binding = 1) buffer Counts {
+    uint counts[];
+};
+
+layout(set = 0, binding = 2) buffer Ids {
+    uint ids[];
+};
+
+void main() {
+    uint expert_id = gl_LocalInvocationID.x;
+    if (expert_id >= pc.n_experts) {
+        return;
+    }
+
+    uint n = 0u;
+    for (uint token = 0u; token < pc.n_tokens; token++) {
+        uint row = token * pc.routing_stride;
+        for (uint slot = 0u; slot < pc.k; slot++) {
+            if (routing[row + slot] == expert_id) {
+                ids[expert_id * pc.ids_stride + n] = token * pc.k + slot;
+                n++;
+            }
+        }
+    }
+
+    counts[expert_id] = n;
+}
