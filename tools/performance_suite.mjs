@@ -1409,15 +1409,15 @@ export function defaultMetalCases(modelRoot) {
       notes: ["Large-model Metal path"],
     },
     {
-      id: "qwen3-8b-q4k-m",
-      model_id: "qwen3-8b-q4k-m",
-      label: "Qwen 3 8B Q4_K_M",
-      family: "Qwen 3",
+      id: "qwen35-9b-q4k-m",
+      model_id: "qwen35-9b-q4k-m",
+      label: "Qwen 3.5 9B Q4_K_M",
+      family: "Qwen 3.5",
       quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen3-8b-q4k-m"),
+      model_path: modelPath(modelRoot, "qwen35-9b-q4k-m"),
       prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen3-8b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen3-8b-q4k-m"),
+      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
       notes: ["Raw decode path to avoid visible think blocks in CLI output"],
     },
     {
@@ -1715,14 +1715,14 @@ export function defaultRdnaCases(modelRoot) {
 export function defaultIntelCases(modelRoot) {
   return [
     {
-      id: "qwen3-8b-q4k-m",
-      label: "Qwen 3 8B Q4_K_M",
-      family: "Qwen 3",
+      id: "qwen35-9b-q4k-m",
+      label: "Qwen 3.5 9B Q4_K_M",
+      family: "Qwen 3.5",
       quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen3-8b-q4k-m"),
+      model_path: modelPath(modelRoot, "qwen35-9b-q4k-m"),
       prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen3-8b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen3-8b-q4k-m"),
+      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
       notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
     },
   ];

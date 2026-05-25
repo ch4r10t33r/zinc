@@ -170,6 +170,5 @@ For the long-form story of why ZINC_RT exists at all, the head-to-head architect
 
 - `docs/ZINC_RT_DESIGN.md` — the canonical ZINC_RT design
 - The blog post "ROCm vs Vulkan vs ZINC_RT: inside the decision to write our own GPU runtime for local LLM inference on AMD RDNA4" at `/blog/inside-the-decision-to-write-our-own-gpu-runtime-for-local-llm-inference`
-- `docs/RDNA4_PERFORMANCE_JOURNEY.md` — the historical 11 → 117 tok/s sequence of fixes and wins
 
 The two backends will both ship indefinitely. The cross-backend logit-equality test in CI is what keeps them honest.

@@ -138,7 +138,7 @@ async function testModels(base: string): Promise<string> {
   // /v1/models returns the whole catalog (installed + available). Pick the
   // entry with active=true — it is the one currently loaded in VRAM. The
   // old behavior (data[0]) picked whatever happened to sort first, which
-  // on this catalog is gpt-oss-20b — triggering a multi-GB model switch
+  // can be an uninstalled model — triggering a multi-GB model switch
   // on every chat request and timing out before first token.
   const model = data.data.find((m) => m.active === true) ?? data.data[0]!;
   assert(typeof model.id === "string" && model.id.length > 0, "Model missing id");

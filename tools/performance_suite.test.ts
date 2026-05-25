@@ -40,7 +40,7 @@ test("parseArgs reads suite options", () => {
     "--warmup",
     "2",
     "--models",
-    "gemma4-12b-q4k-m,qwen3-8b-q4k-m",
+    "gemma4-12b-q4k-m,qwen35-9b-q4k-m",
     "--llama-cli",
     "/tmp/llama-cli",
     "--llama-server",
@@ -57,7 +57,7 @@ test("parseArgs reads suite options", () => {
   expect(args.llamaServer).toBe("/tmp/llama-server");
   expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
-  expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen3-8b-q4k-m"]);
+  expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen35-9b-q4k-m"]);
 });
 
 test("parseArgs reads Intel suite options", () => {
@@ -107,9 +107,9 @@ test("Gemma uses the chat prompt path in the performance suite", () => {
   expect(prefersChatPrompt("gemma4-12b-q4k-m")).toBe(true);
   expect(defaultPromptForModelId("gemma4-12b-q4k-m")).toContain("benchmark screenshots");
   expect(defaultMaxTokensForModelId("gemma4-12b-q4k-m")).toBe(96);
-  expect(prefersChatPrompt("qwen3-8b-q4k-m")).toBe(false);
-  expect(defaultPromptForModelId("qwen3-8b-q4k-m")).toContain("Developer question");
-  expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(96);
+  expect(prefersChatPrompt("qwen35-9b-q4k-m")).toBe(false);
+  expect(defaultPromptForModelId("qwen35-9b-q4k-m")).toContain("Developer question");
+  expect(defaultMaxTokensForModelId("qwen35-9b-q4k-m")).toBe(96);
 });
 
 test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
@@ -136,9 +136,9 @@ test("default RDNA cases include Qwen 3.6 27B dense", () => {
 
 test("default Intel cases use the remote managed cache layout", () => {
   const cases = defaultIntelCases("/remote/cache");
-  const qwen = cases.find((entry) => entry.id === "qwen3-8b-q4k-m");
+  const qwen = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
 
-  expect(qwen?.model_path).toBe("/remote/cache/qwen3-8b-q4k-m/model.gguf");
+  expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
   expect(qwen?.prompt_mode).toBe("raw");
 });
 
@@ -153,13 +153,13 @@ test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
 
 test("local ZINC command prefers managed model ids when using the default cache", () => {
   const cmd = localZincCommand({
-    model_id: "qwen3-8b-q4k-m",
-    model_path: `${DEFAULT_LOCAL_MODEL_ROOT}/qwen3-8b-q4k-m/model.gguf`,
+    model_id: "qwen35-9b-q4k-m",
+    model_path: `${DEFAULT_LOCAL_MODEL_ROOT}/qwen35-9b-q4k-m/model.gguf`,
     prompt_mode: "raw",
     prompt: "The capital of France is",
     max_tokens: 8,
   });
-  expect(cmd).toContain("--model-id qwen3-8b-q4k-m");
+  expect(cmd).toContain("--model-id qwen35-9b-q4k-m");
   expect(cmd).not.toContain(" -m ");
 });
 
@@ -183,7 +183,7 @@ test("RDNA ZINC command preserves chat prompt mode", () => {
 
 test("Intel ZINC command does not inject RDNA-specific environment", () => {
   const cmd = intelZincCommand({
-    model_path: "/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
+    model_path: "/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
     prompt_mode: "raw",
     prompt: "The capital of France is",
     max_tokens: 8,
@@ -221,7 +221,7 @@ test("benchmark failure reasons do not publish shell commands", () => {
 });
 
 test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {
-  const qwen = defaultScenarioDefsForModel("qwen3-8b-q4k-m", "raw", defaultPromptForModelId("qwen3-8b-q4k-m"));
+  const qwen = defaultScenarioDefsForModel("qwen35-9b-q4k-m", "raw", defaultPromptForModelId("qwen35-9b-q4k-m"));
   expect(qwen.map((scenario) => scenario.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
   expect(qwen.map((scenario) => scenario.label)).toEqual(["Quick Chat", "Coding Review", "Incident Context", "Long Coding Draft"]);
   expect(qwen[1]?.prompt).not.toBe(qwen[0]?.prompt);
@@ -459,7 +459,7 @@ test("compareModelsByName normalizes published model label variants", () => {
   const models = [
     { id: "qwen36-35b-a3b-q4k-xl", label: "Qwen36 35B A3B Q4K XL" },
     { id: "qwen36-27b-q4k-m", label: "Qwen 3.6 27B Dense Q4_K_M" },
-    { id: "qwen3-8b-q4k-m", label: "Qwen3 8B Q4K M" },
+    { id: "qwen35-9b-q4k-m", label: "Qwen3.5 9B Q4K M" },
     { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
     { id: "gemma4-12b-q4k-m", label: "Gemma4 12B Q4_K_M" },
   ];
@@ -467,7 +467,7 @@ test("compareModelsByName normalizes published model label variants", () => {
   expect(models.sort(compareModelsByName).map((model) => model.id)).toEqual([
     "gemma4-12b-q4k-m",
     "gemma4-31b-q4k-m",
-    "qwen3-8b-q4k-m",
+    "qwen35-9b-q4k-m",
     "qwen36-27b-q4k-m",
     "qwen36-35b-a3b-q4k-xl",
   ]);

@@ -471,7 +471,7 @@ pub fn build(b: *std.Build) void {
     // In partial mode (`full_tests = false`) restrict `bun test` to the
     // fast unit-test files. The slow `tests/test_qwen_smoke.test.ts`
     // file launches multiple managed servers and loads three GGUFs
-    // (qwen3-8b + 35b + 36b), which together run ~225s on this Mac
+    // (qwen3.5-9b + 35b + 36b), which together run ~225s on this Mac
     // Studio — well past the harness's 120s `runCommand` timeout for
     // `zig build test`, so even though the smoke tests themselves pass
     // the parent spawn was being killed and `testExitCode` came back

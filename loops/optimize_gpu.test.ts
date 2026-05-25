@@ -40,12 +40,12 @@ describe("optimize_gpu args and model resolution", () => {
   test("allows env to choose the default model preset", () => {
     const opts = parseArgsFrom([], {
       ...env,
-      ZINC_GPU_MODEL: "qwen3-8b-q4k-m",
+      ZINC_GPU_MODEL: "qwen35-9b-q4k-m",
     });
     const target = resolveModelTarget(opts);
 
-    expect(opts.model).toBe("qwen3-8b-q4k-m");
-    expect(target.label).toBe("Qwen3 8B Q4_K_M");
+    expect(opts.model).toBe("qwen35-9b-q4k-m");
+    expect(target.label).toBe("Qwen3.5 9B Q4_K_M");
   });
 
   test("rejects reusing a run id with a different model target", () => {
@@ -53,8 +53,8 @@ describe("optimize_gpu args and model resolution", () => {
     const target = resolveModelTarget(opts);
     const previous = {
       options: {
-        modelKey: "qwen3-8b-q4k-m",
-        modelPath: "/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
+        modelKey: "qwen35-9b-q4k-m",
+        modelPath: "/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
         metric: "decode",
         host: "gpu.local",
         user: "tempuser",
@@ -63,7 +63,7 @@ describe("optimize_gpu args and model resolution", () => {
       },
     };
 
-    expect(stateTargetMismatchReason(previous, target, opts)).toContain("run was created for qwen3-8b-q4k-m");
+    expect(stateTargetMismatchReason(previous, target, opts)).toContain("run was created for qwen35-9b-q4k-m");
   });
 
   test("supports agent, resume, and model selection", () => {
@@ -71,7 +71,7 @@ describe("optimize_gpu args and model resolution", () => {
       "--agent", "claude",
       "--resume",
       ".gpu_optimize/old-run",
-      "--model-id", "qwen3-8b-q4k-m",
+      "--model-id", "qwen35-9b-q4k-m",
       "--metric", "prefill",
       "--context", "4096",
       "--cycles", "7",
@@ -83,7 +83,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.agent).toBe("claude");
     expect(opts.resume).toBe(true);
     expect(opts.resumeDir).toBe(".gpu_optimize/old-run");
-    expect(opts.modelId).toBe("qwen3-8b-q4k-m");
+    expect(opts.modelId).toBe("qwen35-9b-q4k-m");
     expect(opts.metric).toBe("prefill");
     expect(opts.contextTokens).toBe(4096);
     expect(opts.cycles).toBe(7);
@@ -93,15 +93,15 @@ describe("optimize_gpu args and model resolution", () => {
   });
 
   test("maps managed model ids to the ZINC cache layout", () => {
-    expect(managedCachePath("/cache", "qwen3-8b-q4k-m")).toBe("/cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf");
+    expect(managedCachePath("/cache", "qwen35-9b-q4k-m")).toBe("/cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf");
   });
 
   test("resolves presets to same-machine GGUF paths", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m"], env);
+    const opts = parseArgsFrom(["--model", "qwen35-9b-q4k-m"], env);
     const target = resolveModelTarget(opts);
 
-    expect(target.modelId).toBe("qwen3-8b-q4k-m");
-    expect(target.modelPath).toBe("/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf");
+    expect(target.modelId).toBe("qwen35-9b-q4k-m");
+    expect(target.modelPath).toBe("/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf");
     expect(target.promptMode).toBe("raw");
     expect(target.maxTokens).toBe(128);
     expect(target.prompt).toContain("Important fact: Paris is the capital of France.");
@@ -149,39 +149,39 @@ describe("optimize_gpu args and model resolution", () => {
 
 describe("optimize_gpu remote commands", () => {
   test("builds a managed ZINC command with model-id and raw mode", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--remote-env", "ZINC_DEBUG=1", "--context", "4096"], env);
+    const opts = parseArgsFrom(["--model", "qwen35-9b-q4k-m", "--remote-env", "ZINC_DEBUG=1", "--context", "4096"], env);
     const target = resolveModelTarget(opts);
     const command = buildRemoteZincCommand(opts, target);
 
     expect(command).toContain("cd '/home/tempuser/zinc-loop'");
     expect(command).toContain("XDG_CACHE_HOME='/home/tempuser/.cache'");
     expect(command).toContain("ZINC_DEBUG=1");
-    expect(command).toContain("--model-id 'qwen3-8b-q4k-m'");
+    expect(command).toContain("--model-id 'qwen35-9b-q4k-m'");
     expect(command).toContain("--raw");
     expect(command).toContain("-n 128");
     expect(command).toContain("-c 4096");
   });
 
   test("builds llama-bench against the same resolved model file", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--samples", "5"], env);
+    const opts = parseArgsFrom(["--model", "qwen35-9b-q4k-m", "--samples", "5"], env);
     const target = resolveModelTarget(opts);
     const command = buildRemoteLlamaBenchCommand(opts, target);
 
     expect(command).toContain("/home/tempuser/llama.cpp/build/bin/llama-bench");
-    expect(command).toContain("-m '/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf'");
+    expect(command).toContain("-m '/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf'");
     expect(command).toContain("-r 5");
     expect(command).toContain("-fa 1");
   });
 
   test("builds same-prompt llama.cpp command by default", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--context", "4096"], env);
+    const opts = parseArgsFrom(["--model", "qwen35-9b-q4k-m", "--context", "4096"], env);
     const target = resolveModelTarget(opts);
     const command = buildRemoteLlamaCliCommand(opts, target);
 
     expect(command).toContain("llama-completion");
     expect(command).toContain("llama-cli");
     expect(command).toContain("--no-conversation");
-    expect(command).toContain("-m '/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf'");
+    expect(command).toContain("-m '/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf'");
     expect(command).toContain("-p 'Benchmark context only.");
     expect(command).toContain("-n 128");
     expect(command).toContain("--device Vulkan0");
@@ -284,7 +284,7 @@ describe("optimize_gpu dirty-tree helpers", () => {
 
 describe("optimize_gpu agent prompt", () => {
   test("includes remote target and guardrails", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m"], env);
+    const opts = parseArgsFrom(["--model", "qwen35-9b-q4k-m"], env);
     const target = resolveModelTarget(opts);
     const baseline = {
       metric: "decode",
@@ -321,7 +321,7 @@ describe("optimize_gpu agent prompt", () => {
     const prompt = buildAgentPrompt(state, opts, target, baseline, state.llamaBaseline);
 
     expect(prompt).toContain("remote: tempuser@gpu.local:8888 /home/tempuser/zinc-loop");
-    expect(prompt).toContain("Objective: beat llama.cpp on both sustained decode and prompt prefill for Qwen3 8B Q4_K_M.");
+    expect(prompt).toContain("Objective: beat llama.cpp on both sustained decode and prompt prefill for Qwen3.5 9B Q4_K_M.");
     expect(prompt).toContain("Current attack metric: prefill");
     expect(prompt).toContain("All-cycle memory:");
     expect(prompt).toContain("decode=75.00 [74.00, 75.00, 76.00]");

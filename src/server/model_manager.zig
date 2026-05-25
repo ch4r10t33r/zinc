@@ -566,8 +566,8 @@ test "collectCatalogView marks active managed model" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/test.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen3-8b-q4k-m"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3 8B Q4_K_M"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-9b-q4k-m"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 9B Q4_K_M"),
         .weights_bytes = 20 * 1024 * 1024 * 1024,
         .runtime_device_local_bytes = 1024 * 1024 * 1024,
         .context_reserved_bytes = 768 * 1024 * 1024,
@@ -592,11 +592,11 @@ test "collectCatalogView marks active managed model" {
     try std.testing.expect(view.data.len >= 1);
     var saw_active = false;
     for (view.data) |entry| {
-        if (std.mem.eql(u8, entry.id, "qwen3-8b-q4k-m")) {
+        if (std.mem.eql(u8, entry.id, "qwen35-9b-q4k-m")) {
             saw_active = true;
             try std.testing.expect(entry.active);
             try std.testing.expect(entry.supports_thinking_toggle);
-            try std.testing.expectEqualStrings("2025-04-29", entry.release_date);
+            try std.testing.expectEqualStrings("2026-02-28", entry.release_date);
         }
     }
     try std.testing.expect(saw_active);

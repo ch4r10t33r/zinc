@@ -918,7 +918,7 @@ test "active selection roundtrip via explicit config path" {
         var close_file = file;
         close_file.close();
     }
-    try file.writeAll("{\"active_model_id\":\"qwen3-8b-q4k-m\",\"selected_at_unix\":42}");
+    try file.writeAll("{\"active_model_id\":\"qwen35-9b-q4k-m\",\"selected_at_unix\":42}");
 
     const opened = try std.fs.openFileAbsolute(config_path, .{});
     defer {
@@ -927,7 +927,7 @@ test "active selection roundtrip via explicit config path" {
     }
     const data = try opened.readToEndAlloc(std.testing.allocator, 256);
     defer std.testing.allocator.free(data);
-    try std.testing.expectEqualStrings("qwen3-8b-q4k-m", extractJsonStringField(data, "active_model_id").?);
+    try std.testing.expectEqualStrings("qwen35-9b-q4k-m", extractJsonStringField(data, "active_model_id").?);
     try std.testing.expectEqual(@as(?i64, 42), extractJsonI64Field(data, "selected_at_unix"));
 }
 
@@ -968,7 +968,7 @@ test "extractUpstreamArtifactMetadata reads x-linked headers from redirect respo
 }
 
 test "preflightCatalogDrift fails fast on upstream drift" {
-    const entry = catalog.find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const entry = catalog.find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     const drifted = UpstreamArtifactMetadata{
         .size_bytes = entry.size_bytes + 1,
         .sha256_hex = canonicalizeSha256Header("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?,
@@ -984,7 +984,7 @@ test "preflightCatalogDrift fails fast on upstream drift" {
 }
 
 test "preflightCatalogDrift allows size-only drift" {
-    const entry = catalog.find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const entry = catalog.find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     const drifted = UpstreamArtifactMetadata{
         .size_bytes = entry.size_bytes + 1,
         .sha256_hex = canonicalizeSha256Header(entry.sha256).?,
@@ -1005,7 +1005,7 @@ test "removeInstalledModelAtPaths deletes known artifacts and empty dir" {
 
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
-    const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen3-8b-q4k-m" });
+    const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen35-9b-q4k-m" });
     defer std.testing.allocator.free(model_dir);
     try std.fs.cwd().makePath(model_dir);
 
@@ -1044,7 +1044,7 @@ test "removeInstalledModelAtPaths keeps non-empty directory" {
 
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
-    const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen3-8b-q4k-m" });
+    const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen35-9b-q4k-m" });
     defer std.testing.allocator.free(model_dir);
     try std.fs.cwd().makePath(model_dir);
 
@@ -1078,7 +1078,7 @@ test "active selection pointing to non-catalog model is detectable" {
     try std.testing.expect(catalog.find(stale_id) == null);
 
     // A valid catalog model should be findable.
-    const valid_id = "qwen3-8b-q4k-m";
+    const valid_id = "qwen35-9b-q4k-m";
     try std.testing.expect(catalog.find(valid_id) != null);
 }
 
@@ -1197,14 +1197,14 @@ test "readInstalledManifest tolerates old format without offloadable_vram_bytes"
             close_file.close();
         }
         try file.writeAll(
-            \\{"id":"qwen3-8b-q4k-m","display_name":"Qwen3 8B","installed_at_unix":1700000000,"size_bytes":5027784512,"required_vram_bytes":6442450944,"sha256":"","download_url":"local"}
+            \\{"id":"qwen35-9b-q4k-m","display_name":"Qwen 3.5 9B","installed_at_unix":1700000000,"size_bytes":5650000000,"required_vram_bytes":6442450944,"sha256":"","download_url":"local"}
         );
     }
 
     var manifest = (try readInstalledManifest(manifest_path, std.testing.allocator)) orelse return error.TestExpectedEqual;
     defer manifest.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u64, 5_027_784_512), manifest.size_bytes);
+    try std.testing.expectEqual(@as(u64, 5_650_000_000), manifest.size_bytes);
     try std.testing.expectEqual(@as(?u64, 6_442_450_944), manifest.required_vram_bytes);
     try std.testing.expectEqual(@as(?u64, null), manifest.offloadable_vram_bytes);
 }

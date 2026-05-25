@@ -44,7 +44,7 @@ export const QWEN_SMOKE_CASES: Array<{
   {
     label: "Qwen3 8B smoke",
     envName: "ZINC_QWEN3_8B_MODEL",
-    managedId: "qwen3-8b-q4k-m",
+    managedId: "qwen35-9b-q4k-m",
     expectedFirstToken: 12095,
     expectedTextSubstrings: ["Paris"],
   },

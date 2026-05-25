@@ -172,7 +172,6 @@ docs/                            # Technical documentation (published to site)
 ├── AMD_GPU_REFERENCE.md         # RDNA3/RDNA4 hardware reference
 ├── HARDWARE_REQUIREMENTS.md     # GPU and host sizing guidance
 ├── METAL_PERFORMANCE_PLAN.md    # Metal performance work plan
-├── RDNA4_PERFORMANCE_JOURNEY.md # RDNA4 optimization log
 ├── RDNA4_TUNING.md              # RDNA4-specific optimizations
 ├── ROADMAP.md                   # Project roadmap
 ├── RUNNING_ZINC.md              # CLI usage and server mode

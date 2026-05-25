@@ -9,7 +9,7 @@
  *
  * Examples:
  *   bun loops/optimize_gpu.ts --agent codex --cycles 20
- *   bun loops/optimize_gpu.ts --model qwen3-8b-q4k-m --agent codex --cycles 20
+ *   bun loops/optimize_gpu.ts --model qwen35-9b-q4k-m --agent codex --cycles 20
  *   bun loops/optimize_gpu.ts --model-id qwen36-27b-q4k-m --metric prefill --resume
  *   bun loops/optimize_gpu.ts --model-path /models/foo.gguf --skip-llama --dry-run
  */
@@ -74,10 +74,10 @@ const QWEN3_8B_COMPARISON_PROMPT = [
 ].join(" ");
 
 const MODEL_PRESETS: Record<string, ModelPreset> = {
-  "qwen3-8b-q4k-m": {
-    key: "qwen3-8b-q4k-m",
-    label: "Qwen3 8B Q4_K_M",
-    modelId: "qwen3-8b-q4k-m",
+  "qwen35-9b-q4k-m": {
+    key: "qwen35-9b-q4k-m",
+    label: "Qwen3.5 9B Q4_K_M",
+    modelId: "qwen35-9b-q4k-m",
     promptMode: "raw",
     prompt: QWEN3_8B_COMPARISON_PROMPT,
     maxTokens: 128,
@@ -117,15 +117,6 @@ const MODEL_PRESETS: Record<string, ModelPreset> = {
     promptMode: "chat",
     prompt: "What is the capital of France? Answer in one word.",
     maxTokens: 48,
-    expect: ["Paris"],
-  },
-  "gpt-oss-20b-q4k-m": {
-    key: "gpt-oss-20b-q4k-m",
-    label: "GPT-OSS 20B Q4_K_M",
-    modelId: "gpt-oss-20b-q4k-m",
-    promptMode: "chat",
-    prompt: "What is the capital of France? Answer in one word.",
-    maxTokens: 96,
     expect: ["Paris"],
   },
 };

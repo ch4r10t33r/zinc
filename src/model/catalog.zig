@@ -110,18 +110,18 @@ pub const entries = [_]CatalogEntry{
         },
     },
     .{
-        .id = "qwen3-8b-q4k-m",
-        .display_name = "Qwen3 8B Q4_K_M",
-        .release_date = "2025-04-29",
-        .family = "qwen3",
+        .id = "qwen35-9b-q4k-m",
+        .display_name = "Qwen 3.5 9B Q4_K_M",
+        .release_date = "2026-02-28",
+        .family = "qwen3.5",
         .format = "gguf",
         .quantization = "Q4_K_M",
-        .file_name = "Qwen3-8B-Q4_K_M.gguf",
-        .homepage_url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF",
-        .download_url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf?download=true",
-        .sha256 = "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
-        .size_bytes = 5_027_784_512,
-        .required_vram_bytes = 6 * 1024 * 1024 * 1024,
+        .file_name = "Qwen3.5-9B-Q4_K_M.gguf",
+        .homepage_url = "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF",
+        .download_url = "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
+        .sha256 = "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+        .size_bytes = 5_680_522_464,
+        .required_vram_bytes = 7 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
@@ -305,6 +305,7 @@ pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budg
 pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
     const families = .{
         .{ "qwen3.6", "qwen35" },
+        .{ "qwen3.5", "qwen3" },
         .{ "qwen3", "qwen3" },
         .{ "qwen2.5", "qwen2" },
         .{ "qwen2", "qwen2" },
@@ -352,9 +353,9 @@ test "find returns null for unknown model" {
 }
 
 test "find returns known entry" {
-    const entry = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("Qwen3 8B Q4_K_M", entry.display_name);
-    try std.testing.expectEqualStrings("2025-04-29", entry.release_date);
+    const entry = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Qwen 3.5 9B Q4_K_M", entry.display_name);
+    try std.testing.expectEqualStrings("2026-02-28", entry.release_date);
 }
 
 test "find returns known qwen3.6 entry" {
@@ -452,7 +453,7 @@ test "fitState distinguishes fits, fits_with_offload, does_not_fit" {
 }
 
 test "fitState for dense model never returns fits_with_offload" {
-    const dense = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const dense = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     // Fits in 8 GiB.
     try std.testing.expectEqual(FitState.fits, fitState(dense.*, 8 * 1024 * 1024 * 1024));
     // Doesn't fit in 4 GiB and can't be helped by offload (no expert tensors).
@@ -475,7 +476,7 @@ test "requiredVramWithOffload subtracts offloadable share" {
 }
 
 test "requiredVramWithOffload returns required_vram_bytes for dense models" {
-    const dense = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const dense = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(dense.required_vram_bytes, requiredVramWithOffload(dense.*));
 }
 
@@ -487,7 +488,7 @@ test "supportedOnCurrentGpu requires both tested profile and fit" {
 }
 
 test "qwen thinking stability flags track validated chat behavior" {
-    const qwen3 = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const qwen3 = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen3.recommended_for_chat);
     try std.testing.expect(qwen3.thinking_stable);
 

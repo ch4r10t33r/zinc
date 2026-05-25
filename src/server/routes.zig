@@ -3018,9 +3018,9 @@ test "shouldForceDisableThinking keeps qwen thinking enabled" {
         "Qwen3.6-35B-A3B-UD-Q4_K_XL",
     ));
     try std.testing.expect(!shouldForceDisableThinking(
-        "qwen3-8b-q4k-m",
-        "/Users/test/Library/Caches/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
-        "Qwen3-8B-Q4_K_M",
+        "qwen35-9b-q4k-m",
+        "/Users/test/Library/Caches/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
+        "Qwen3.5-9B-Q4_K_M",
     ));
 }
 

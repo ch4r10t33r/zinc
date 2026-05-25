@@ -125,15 +125,6 @@ const MODELS: Record<string, ModelTarget> = {
     promptMode: "chat",
     envVar: "ZINC_RDNA_GEMMA4_12B_MODEL",
   },
-  gptoss20b: {
-    key: "gptoss20b",
-    name: "GPT-OSS-20B",
-    path: envOrDefault("ZINC_RDNA_GPT_OSS_20B_MODEL", "/root/models/openai_gpt-oss-20b-Q4_K_M.gguf"),
-    promptMode: "chat",
-    envVar: "ZINC_RDNA_GPT_OSS_20B_MODEL",
-    // GPT-OSS emits analysis/final channel scaffolding before the concise answer.
-    coherenceMaxTokens: 96,
-  },
 };
 
 const MODEL_KEYS = Object.keys(MODELS).join(", ");
@@ -745,7 +736,6 @@ const COHERENCE_MODELS: ModelTarget[] = [
   MODELS.qwen8b,
   MODELS.gemma431b,
   MODELS.gemma412b,
-  MODELS.gptoss20b,
 ];
 
 type CoherenceFailure = {

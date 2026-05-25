@@ -46,14 +46,14 @@
         "fastest_model_id": "qwen36-35b-a3b-q4k-xl",
         "fastest_model_label": "Qwen 3.6 35B A3B UD Q4_K_XL",
         "fastest_decode_tps": 128.52,
-        "benchmarked_models": 6,
-        "successful_models": 6,
-        "average_decode_tps": 78.20333333333333,
-        "average_prompt_tps": 92.65833333333335,
-        "average_end_to_end_tps": 19.554602718376756,
-        "average_total_latency_ms": 8623.343034666645,
-        "compared_models": 6,
-        "average_pct_of_llama": 78.41412579569638
+        "benchmarked_models": 5,
+        "successful_models": 5,
+        "average_decode_tps": 75.72999999999999,
+        "average_prompt_tps": 92.636,
+        "average_end_to_end_tps": 18.069954029932354,
+        "average_total_latency_ms": 9065.477824999989,
+        "compared_models": 5,
+        "average_pct_of_llama": 84.88882143402044
       },
       "models": [
         {
@@ -5842,14 +5842,14 @@
         "fastest_model_id": "qwen3-8b-q4k-m",
         "fastest_model_label": "Qwen 3 8B Q4_K_M",
         "fastest_decode_tps": 43.9,
-        "benchmarked_models": 6,
-        "successful_models": 2,
-        "average_decode_tps": 37.47,
-        "average_prompt_tps": 42.305,
-        "average_end_to_end_tps": 7.0314368218892,
-        "average_total_latency_ms": 4271.939770499943,
-        "compared_models": 2,
-        "average_pct_of_llama": 87.61478719650418
+        "benchmarked_models": 5,
+        "successful_models": 1,
+        "average_decode_tps": 43.9,
+        "average_prompt_tps": 49.1,
+        "average_end_to_end_tps": 5.46780248733294,
+        "average_total_latency_ms": 2377.554790999973,
+        "compared_models": 1,
+        "average_pct_of_llama": 108.40850906255103
       },
       "models": [
         {

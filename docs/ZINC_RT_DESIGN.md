@@ -94,7 +94,7 @@ ZINC_RT is RDNA-first, but its IR is hardware-vendor-neutral. M7 brings up Intel
 
 ### 2.1 Where the time actually goes on RDNA4
 
-From `docs/RDNA4_PERFORMANCE_JOURNEY.md` and the in-tree GPU profiler, the per-token decode budget on Qwen 3.6 35B-A3B at the current 110-117 tok/s peak is approximately:
+From the in-tree GPU profiler, the per-token decode budget on Qwen 3.6 35B-A3B at the current 110-117 tok/s peak is approximately:
 
 ```
 GPU compute ........................... 7.8 ms (87 %)

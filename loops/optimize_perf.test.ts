@@ -446,7 +446,7 @@ describe("controller helpers", () => {
     expect(prompt).toContain("37.28 tok/s [37.00, 37.30, 37.40]");
     expect(prompt).toContain("must beat the best accepted performance checkpoint");
     expect(prompt).toContain("Failed Approaches");
-    expect(prompt).toContain("coherence tested with 3 prompts on 6 models");
+    expect(prompt).toContain("coherence tested with 3 prompts on 5 models");
     expect(prompt).toContain("@@@DESCRIPTION:");
   });
 
@@ -921,7 +921,6 @@ describe("config", () => {
     expect(src).toContain("ZINC_RDNA_QWEN3_8B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_31B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_12B_MODEL");
-    expect(src).toContain("ZINC_RDNA_GPT_OSS_20B_MODEL");
   });
 
   test("coherence checks include multiple prompts", async () => {
@@ -931,19 +930,18 @@ describe("config", () => {
     expect(src).toContain("first four planets");
   });
 
-  test("all six models are listed for coherence", async () => {
+  test("all five models are listed for coherence", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
     expect(src).toContain("Qwen3.6-35B");
     expect(src).toContain("Qwen3.6-27B");
     expect(src).toContain("Qwen3-8B");
     expect(src).toContain("Gemma4-31B");
     expect(src).toContain("Gemma4-12B");
-    expect(src).toContain("GPT-OSS-20B");
   });
 
-  test("GPT-OSS coherence sweep gets extra token budget", async () => {
+  test("coherence sweep supports a per-model token budget", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
-    expect(src).toContain("coherenceMaxTokens: 96");
+    expect(src).toContain("coherenceMaxTokens?: number");
     expect(src).toContain("coherenceMaxTokensForModel");
     expect(src).toContain("zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode)");
   });
