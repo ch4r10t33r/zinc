@@ -773,7 +773,11 @@ fn resolveQwen36MoeTopkLimitForEnv(cfg: CpuModelConfig, layer_tensors: []const L
         if (parsed == 0 or parsed >= cfg.n_experts_used) return 0;
         return @max(@as(u32, 1), parsed);
     }
-    return @min(default_topk, cfg.n_experts_used);
+    // No env override: use metadata top-k. The historical default of 3 was a
+    // benchmark shortcut that traded MoE quality for ~2x decode tok/s; it
+    // produced "the answer of the answer" loops on real prompts. Set
+    // ZINC_QWEN36_MOE_TOPK=3 to opt back into the perf path.
+    return 0;
 }
 
 fn resolveQwen36LmHeadDecodeRowsForEnv(cfg: CpuModelConfig, layer_tensors: []const LayerTensors, raw_override: ?[]const u8) u32 {
@@ -784,14 +788,11 @@ fn resolveQwen36LmHeadDecodeRowsForEnv(cfg: CpuModelConfig, layer_tensors: []con
         if (parsed == 0 or parsed >= cfg.vocab_size) return cfg.vocab_size;
         return @max(@as(u32, 1), parsed);
     }
-
-    // M1 host-assisted decode is still dominated by CPU matvec row scans. Keep
-    // the prompt boundary full-vocab, then scan a compact common-token prefix
-    // during decode until the LM-head row-range is lowered into the direct
-    // runtime. On the RDNA4 Qwen3.6 validation prompt, 4K preserves the Paris
-    // continuation while removing most of the remaining decode-only LM-head
-    // work.
-    return @min(cfg.vocab_size, 4 * 1024);
+    // No env override: scan the full vocab. The 4K-row cap was a benchmark
+    // shortcut (~3.5–4.3 ms/token saved on RDNA4 R9700 Qwen3.6) that silently
+    // dropped low-frequency tokens from decode. Set ZINC_RT_LM_HEAD_ROWS=4096
+    // to opt back into the perf path; see docs/ZINC_RT_DESIGN.md §1834.
+    return cfg.vocab_size;
 }
 
 fn resolveLayerTensors(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator, n_layers: u32) ![]LayerTensors {
@@ -5502,9 +5503,10 @@ pub const Tokenizer = struct {
 
         var tokens: std.ArrayList(u32) = .{};
         errdefer tokens.deinit(allocator);
-        if (self.add_bos) {
-            if (self.bos_id) |bos| try tokens.append(allocator, bos);
-        }
+        // The Gemma chat template starts with `{{ bos_token }}` regardless of
+        // `tokenizer.ggml.add_bos_token` (some Gemma 4 GGUFs ship that flag
+        // as false even though the template still wants BOS).
+        if (self.bos_id) |bos| try tokens.append(allocator, bos);
         try tokens.append(allocator, start_id);
         // "user\n" — encode through the longest-match scanner, then strip BOS
         // if it added one (we're only emitting the role label here).
@@ -5977,7 +5979,10 @@ test "resolveQwen36MoeTopkLimit mirrors Vulkan default and env escape hatch" {
     }};
 
     try std.testing.expect(isQwen36LikeF32Ssm(cfg, &layers));
-    try std.testing.expectEqual(@as(u32, 3), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, null));
+    // No env override → no cap (use metadata top-k). Setting "3" opts back
+    // into the historical benchmark shortcut.
+    try std.testing.expectEqual(@as(u32, 0), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, null));
+    try std.testing.expectEqual(@as(u32, 3), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, "3"));
     try std.testing.expectEqual(@as(u32, 2), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, "2"));
     try std.testing.expectEqual(@as(u32, 0), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, "8"));
     try std.testing.expectEqual(@as(u32, 0), resolveQwen36MoeTopkLimitForEnv(cfg, &layers, "0"));
@@ -6013,7 +6018,10 @@ test "resolveQwen36LmHeadDecodeRows caps only the Qwen36 M1 decode path" {
     }};
     const dense_layers = [_]LayerTensors{.{}};
 
-    try std.testing.expectEqual(@as(u32, 4 * 1024), resolveQwen36LmHeadDecodeRowsForEnv(cfg, &qwen_layers, null));
+    // No env override → full vocab. Setting an explicit row count opts back
+    // into the historical benchmark shortcut.
+    try std.testing.expectEqual(cfg.vocab_size, resolveQwen36LmHeadDecodeRowsForEnv(cfg, &qwen_layers, null));
+    try std.testing.expectEqual(@as(u32, 4 * 1024), resolveQwen36LmHeadDecodeRowsForEnv(cfg, &qwen_layers, "4096"));
     try std.testing.expectEqual(@as(u32, 32768), resolveQwen36LmHeadDecodeRowsForEnv(cfg, &qwen_layers, "32768"));
     try std.testing.expectEqual(cfg.vocab_size, resolveQwen36LmHeadDecodeRowsForEnv(cfg, &qwen_layers, "0"));
     try std.testing.expectEqual(cfg.vocab_size, resolveQwen36LmHeadDecodeRowsForEnv(cfg, &dense_layers, null));
