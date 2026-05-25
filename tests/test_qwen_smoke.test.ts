@@ -9,7 +9,7 @@ import { runSuite } from "./test_openai_sdk";
 const MANAGED_MODEL_ROOT = join(homedir(), "Library", "Caches", "zinc", "models", "models");
 const SERVER_MODEL_IDS = [
   "qwen35-9b-q4k-m",
-  "gemma4-12b-q4k-m",
+  "gemma4-26b-a4b-q4k-m",
   "gemma4-31b-q4k-m",
 ];
 const QWEN_CHAT_MODEL_IDS = [

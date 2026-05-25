@@ -1,7 +1,7 @@
 # Effort 15 — running notes
 
 Local machine: Apple M1 Max, 32 GPU cores, 32 GB UMA, MTLGPUFamilyApple7.
-Model: `gemma4-12b-q4k-m` (Gemma 4 26B-A4B MoE, ~4B active, Q4_K_M,
+Model: `gemma4-26b-a4b-q4k-m` (Gemma 4 26B-A4B MoE, ~4B active, Q4_K_M,
 16.9 GB on disk). Chat mode only — raw completion is not a valid coherence
 gate for this model.
 

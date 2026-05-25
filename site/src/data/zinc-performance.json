@@ -57,7 +57,7 @@
       },
       "models": [
         {
-          "id": "gemma4-12b-q4k-m",
+          "id": "gemma4-26b-a4b-q4k-m",
           "label": "Gemma 4 26B-A4B MoE Q4_K_M",
           "family": "Gemma 4",
           "quant": "Q4K_M",
@@ -5853,7 +5853,7 @@
       },
       "models": [
         {
-          "id": "gemma4-12b-q4k-m",
+          "id": "gemma4-26b-a4b-q4k-m",
           "label": "Gemma 4 26B-A4B MoE Q4_K_M",
           "family": "Gemma 4",
           "quant": "Q4K_M",
@@ -9328,7 +9328,7 @@
       },
       "models": [
         {
-          "id": "gemma4-12b-q4k-m",
+          "id": "gemma4-26b-a4b-q4k-m",
           "label": "Gemma 4 26B-A4B MoE Q4_K_M",
           "family": "Gemma 4",
           "quant": "Q4_K_M",

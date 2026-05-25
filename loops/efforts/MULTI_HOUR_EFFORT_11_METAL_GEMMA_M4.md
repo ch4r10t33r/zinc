@@ -9,14 +9,14 @@ in the Gemma MoE fallback path.
 
 Primary model for this effort:
 
-- `gemma4-12b-q4k-m` from the managed cache.
+- `gemma4-26b-a4b-q4k-m` from the managed cache.
 - Local machine: Apple GPU family Apple9 / M4, unified memory.
 - Prompt mode: chat template, not raw completion.
 
 Run the loop with:
 
 ```bash
-ZINC_MODEL_ID=gemma4-12b-q4k-m \
+ZINC_MODEL_ID=gemma4-26b-a4b-q4k-m \
 ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="What is the capital of France?" \
 ZINC_MAX_TOKENS=12 \
@@ -112,7 +112,7 @@ Conclusion:
 Measured locally before this effort file was created:
 
 ```text
-./zig-out/bin/zinc --model-id gemma4-12b-q4k-m \
+./zig-out/bin/zinc --model-id gemma4-26b-a4b-q4k-m \
   --prompt "What is the capital of France?" --chat -n 12 --profile
 
 Output: The capital of France is **Paris**.
@@ -191,7 +191,7 @@ Stretch milestone:
 Do not start by changing kernels. First make sure the loop is running the
 right benchmark:
 
-- `ZINC_MODEL_ID=gemma4-12b-q4k-m`
+- `ZINC_MODEL_ID=gemma4-26b-a4b-q4k-m`
 - `ZINC_PROMPT_MODE=chat`
 - `ZINC_TEST_PROMPT="What is the capital of France?"`
 - `ZINC_MAX_TOKENS=12`
@@ -386,7 +386,7 @@ without repeating the Q8 retune basin." Use this order now:
    from that low sample. Re-run or profile the accepted code.
 2. Do not edit a production kernel until the exact-shape benchmark covers the
    target shape and shows a plausible win. Use:
-   `zig build bench-metal-shapes -- --model ~/Library/Caches/zinc/models/models/gemma4-12b-q4k-m/model.gguf --case <case> --iterations 100 --warmup 10`.
+   `zig build bench-metal-shapes -- --model ~/Library/Caches/zinc/models/models/gemma4-26b-a4b-q4k-m/model.gguf --case <case> --iterations 100 --warmup 10`.
 3. First measurement gap: shared expert now has exact-shape data. The raw
    `shared_dual` kernel is slower than two separate DMMVs, but cycle 43 showed
    verifier improvement from fewer dispatches. Do not simply disable pairing;
@@ -466,7 +466,7 @@ Every kept change must include:
 ```bash
 zig build test
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zinc --model-id gemma4-12b-q4k-m \
+./zig-out/bin/zinc --model-id gemma4-26b-a4b-q4k-m \
   --prompt "What is the capital of France?" --chat -n 12 --profile
 ```
 

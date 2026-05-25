@@ -40,7 +40,7 @@ test("parseArgs reads suite options", () => {
     "--warmup",
     "2",
     "--models",
-    "gemma4-12b-q4k-m,qwen35-9b-q4k-m",
+    "gemma4-26b-a4b-q4k-m,qwen35-9b-q4k-m",
     "--llama-cli",
     "/tmp/llama-cli",
     "--llama-server",
@@ -57,7 +57,7 @@ test("parseArgs reads suite options", () => {
   expect(args.llamaServer).toBe("/tmp/llama-server");
   expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
-  expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen35-9b-q4k-m"]);
+  expect(args.models && [...args.models]).toEqual(["gemma4-26b-a4b-q4k-m", "qwen35-9b-q4k-m"]);
 });
 
 test("parseArgs reads Intel suite options", () => {
@@ -104,9 +104,9 @@ test("resolveLocalLlamaServer prefers explicit path, then PATH, then docker fall
 });
 
 test("Gemma uses the chat prompt path in the performance suite", () => {
-  expect(prefersChatPrompt("gemma4-12b-q4k-m")).toBe(true);
-  expect(defaultPromptForModelId("gemma4-12b-q4k-m")).toContain("benchmark screenshots");
-  expect(defaultMaxTokensForModelId("gemma4-12b-q4k-m")).toBe(96);
+  expect(prefersChatPrompt("gemma4-26b-a4b-q4k-m")).toBe(true);
+  expect(defaultPromptForModelId("gemma4-26b-a4b-q4k-m")).toContain("benchmark screenshots");
+  expect(defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m")).toBe(96);
   expect(prefersChatPrompt("qwen35-9b-q4k-m")).toBe(false);
   expect(defaultPromptForModelId("qwen35-9b-q4k-m")).toContain("Developer question");
   expect(defaultMaxTokensForModelId("qwen35-9b-q4k-m")).toBe(96);
@@ -461,11 +461,11 @@ test("compareModelsByName normalizes published model label variants", () => {
     { id: "qwen36-27b-q4k-m", label: "Qwen 3.6 27B Dense Q4_K_M" },
     { id: "qwen35-9b-q4k-m", label: "Qwen3.5 9B Q4K M" },
     { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
-    { id: "gemma4-12b-q4k-m", label: "Gemma4 12B Q4_K_M" },
+    { id: "gemma4-26b-a4b-q4k-m", label: "Gemma 4 26B-A4B MoE Q4_K_M" },
   ];
 
   expect(models.sort(compareModelsByName).map((model) => model.id)).toEqual([
-    "gemma4-12b-q4k-m",
+    "gemma4-26b-a4b-q4k-m",
     "gemma4-31b-q4k-m",
     "qwen35-9b-q4k-m",
     "qwen36-27b-q4k-m",

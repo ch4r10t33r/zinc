@@ -157,7 +157,7 @@ pub const entries = [_]CatalogEntry{
         },
     },
     .{
-        .id = "gemma4-12b-q4k-m",
+        .id = "gemma4-26b-a4b-q4k-m",
         .display_name = "Gemma 4 26B-A4B MoE Q4_K_M",
         .release_date = "2026-04-02",
         .family = "gemma4",
@@ -305,7 +305,10 @@ pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budg
 pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
     const families = .{
         .{ "qwen3.6", "qwen35" },
-        .{ "qwen3.5", "qwen3" },
+        // Qwen 3.5 is a dense SSM+attention hybrid (the GGUF declares the
+        // "qwen35" architecture), the same family ZINC drives for Qwen 3.6 —
+        // not a plain transformer.
+        .{ "qwen3.5", "qwen35" },
         .{ "qwen3", "qwen3" },
         .{ "qwen2.5", "qwen2" },
         .{ "qwen2", "qwen2" },

@@ -31,9 +31,9 @@ describe("optimize_gpu args and model resolution", () => {
     const opts = parseArgsFrom([], env);
     const target = resolveModelTarget(opts);
 
-    expect(opts.model).toBe("gemma4-12b-q4k-m");
-    expect(target.label).toBe("Gemma 4 12B Q4_K_M");
-    expect(target.modelId).toBe("gemma4-12b-q4k-m");
+    expect(opts.model).toBe("gemma4-26b-a4b-q4k-m");
+    expect(target.label).toBe("Gemma 4 26B-A4B MoE Q4_K_M");
+    expect(target.modelId).toBe("gemma4-26b-a4b-q4k-m");
     expect(target.promptMode).toBe("chat");
   });
 

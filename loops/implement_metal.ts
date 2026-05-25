@@ -1726,7 +1726,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
 
   const gemmaRun = isGemmaRun(state);
   const modelContext = gemmaRun ? [
-    "## Model (Gemma 4 12B Q4_K_M)",
+    "## Model (Gemma 4 26B-A4B MoE Q4_K_M)",
     "- 30 layers, all current profile steps are attention + Gemma MoE (`mix/step: attn 30.0 gpu-moe 30.0`).",
     "- hidden_dim=2816, n_heads=16, n_kv_heads=8, vocab=262144.",
     "- MoE FFN: 128 experts, 8 active per token, intermediate=704, shared expert=2112.",

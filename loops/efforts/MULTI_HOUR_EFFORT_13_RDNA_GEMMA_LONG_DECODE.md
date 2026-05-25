@@ -101,10 +101,10 @@ MoE it is much closer to llama.cpp (86% on decode-extended), while Gemma
 Use the same workload family as the published site matrix:
 
 ```bash
-bun loops/optimize_perf.ts --effort 13 --model gemma412b --cycles 999
+bun loops/optimize_perf.ts --effort 13 --model gemma426ba4b --cycles 999
 ```
 
-The `gemma412b` key is legacy naming in the harness; it points at
+The `gemma426ba4b` key is legacy naming in the harness; it points at
 `/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf`.
 
 Baseline must record:

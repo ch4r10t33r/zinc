@@ -94,7 +94,7 @@ Today, ZINC's managed catalog contains two MoE entries:
 | Model | Catalog status | What it is in practice | ZINC notes |
 | --- | --- | --- | --- |
 | `qwen35-35b-a3b-q4k-xl` | supported | Qwen3.5 35B-A3B hybrid MoE with SSM + full-attention scheduling and a shared expert path | Validated managed model on RDNA4 and Apple Silicon |
-| `gemma4-12b-q4k-m` | experimental | Gemma 4 26B-A4B MoE with Gemma-specific norms and GEGLU FFN activation | Managed, but still marked experimental |
+| `gemma4-26b-a4b-q4k-m` | experimental | Gemma 4 26B-A4B MoE with Gemma-specific norms and GEGLU FFN activation | Managed, but still marked experimental |
 
 There is an important nuance here.
 

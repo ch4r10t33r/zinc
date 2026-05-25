@@ -156,7 +156,7 @@ qwen3-8b-q4k-m                 2025-04-29   supported     yes    yes         yes
 qwen36-35b-a3b-q4k-xl          2026-04-15   supported     yes    no          no       tested + exact fit
 qwen36-27b-q4k-m               2026-04-22   experimental  yes    no          no       tested + catalog fit
 gemma4-31b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
-gemma4-12b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
+gemma4-26b-a4b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
 ```
 
 For machine-readable output (useful for AI agents and scripts):

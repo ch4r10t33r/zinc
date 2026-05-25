@@ -844,7 +844,7 @@ describe("buildPrompt", () => {
       outputText: "The capital of France is Paris.",
     });
     const prompt = buildPrompt(state, result);
-    expect(prompt).toContain("Model (Gemma 4 12B Q4_K_M)");
+    expect(prompt).toContain("Model (Gemma 4 26B-A4B MoE Q4_K_M)");
     expect(prompt).toContain("hidden_dim=2816");
   });
 

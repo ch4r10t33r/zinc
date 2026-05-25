@@ -202,6 +202,18 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q4k_gate_up_swiglu",
         "mul_mm_q6k",
         "count_experts",
+        // Previously-orphaned shaders: these .comp files were added by their
+        // cycles (dmmv_f32_dual_batch + ssm_conv1d_batched in effort-15 cycle 9;
+        // mul_mm_q6k_full + mul_mm_q4k_gate_up_swiglu_full in cycles 43/44) and
+        // wired into forward.zig/dmmv.zig, but were never added here — so clean
+        // builds silently ran fallback kernels and the benchmark measured the
+        // wrong code (the effort-15 79.63 tok/s artifact). The shader-install
+        // parity guard in loops/optimize_perf.ts now fails loud if any
+        // src/shaders/*.comp is missing from this list.
+        "dmmv_f32_dual_batch",
+        "ssm_conv1d_batched",
+        "mul_mm_q6k_full",
+        "mul_mm_q4k_gate_up_swiglu_full",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;

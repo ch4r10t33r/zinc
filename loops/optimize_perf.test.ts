@@ -754,9 +754,9 @@ describe("controller memory helpers", () => {
           kind: "crash" as const,
         },
         {
-          id: "Gemma4-12B::What is 2+2?",
-          label: "Gemma4-12B [What is 2+2?]",
-          model: "Gemma4-12B",
+          id: "Gemma4-26B-A4B::What is 2+2?",
+          label: "Gemma4-26B-A4B [What is 2+2?]",
+          model: "Gemma4-26B-A4B",
           prompt: "What is 2+2?",
           outputText: "What is 5-3?",
           kind: "mismatch" as const,
@@ -764,7 +764,7 @@ describe("controller memory helpers", () => {
       ],
       failureIds: [
         "Qwen3-8B::The capital of France is",
-        "Gemma4-12B::What is 2+2?",
+        "Gemma4-26B-A4B::What is 2+2?",
       ],
     };
 
@@ -815,9 +815,9 @@ describe("controller memory helpers", () => {
         kind: "crash" as const,
       },
       {
-        id: "Gemma4-12B::What is 2+2?",
-        label: "Gemma4-12B [What is 2+2?]",
-        model: "Gemma4-12B",
+        id: "Gemma4-26B-A4B::What is 2+2?",
+        label: "Gemma4-26B-A4B [What is 2+2?]",
+        model: "Gemma4-26B-A4B",
         prompt: "What is 2+2?",
         outputText: "What is 5-3?",
         kind: "mismatch" as const,
@@ -826,7 +826,7 @@ describe("controller memory helpers", () => {
 
     expect(formatted).toContain("Qwen3-8B [The capital of France is]: crashed");
     expect(formatted).toContain("timeout after 120000ms");
-    expect(formatted).toContain('Gemma4-12B [What is 2+2?]: "What is 5-3?"');
+    expect(formatted).toContain('Gemma4-26B-A4B [What is 2+2?]: "What is 5-3?"');
   });
 
   test("buildAnalysisReport summarizes kept and reverted cycles", () => {
@@ -936,7 +936,7 @@ describe("config", () => {
     expect(src).toContain("Qwen3.6-27B");
     expect(src).toContain("Qwen3-8B");
     expect(src).toContain("Gemma4-31B");
-    expect(src).toContain("Gemma4-12B");
+    expect(src).toContain("Gemma4-26B-A4B");
   });
 
   test("coherence sweep supports a per-model token budget", async () => {

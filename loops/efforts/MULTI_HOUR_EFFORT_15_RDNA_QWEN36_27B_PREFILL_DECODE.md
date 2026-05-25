@@ -825,12 +825,21 @@ ordered so that trust is re-established before any new perf claim.
 These are the highest-ROI changes; the 27B kernel ideas are worthless
 while measurement can silently run stale code.
 
-1. **Shader source/install parity guard.** Before every benchmark, assert
-   that each `src/shaders/*.comp` has a matching, freshly compiled `.spv`
-   in the installed dir (hash or mtime check), and abort the cycle if not.
-   Better: have `build.zig` glob `src/shaders/*.comp` instead of the
-   hand-maintained `shader_sources` tuple, so a new shader cannot be
-   forgotten.
+1. **Shader source/install parity guard. [DONE 2026-05-24]** `buildAndBench`
+   in `loops/optimize_perf.ts` now asserts, after `zig build`, that every
+   `src/shaders/*.comp` has a matching `.spv` in `zig-out/share/zinc/shaders`,
+   and returns `buildOk:false` (error `shader install parity mismatch`)
+   listing any that are missing. The audit that motivated this found FOUR
+   orphaned shaders never added to `shader_sources`: `dmmv_f32_dual_batch`
+   and `ssm_conv1d_batched` (cycle 9) plus `mul_mm_q6k_full` and
+   `mul_mm_q4k_gate_up_swiglu_full` (cycles 43/44) — so the entire effort-15
+   staircase from cycle 9 on was measured against partially-stale shaders.
+   All four were added to `shader_sources` in `build.zig` so HEAD now installs
+   exactly what the Zig wiring references; the first re-baseline will report
+   the honest number (expect well below the artifact 79.63 — cycle 47 measured
+   ~63.71 once the `_full` pair was actually installed). Follow-up still open:
+   replacing the hand-maintained `shader_sources` tuple with a `build.zig`
+   glob of `src/shaders/*.comp` would make drift structurally impossible.
 2. **Variance-aware keep threshold.** The cyc44 samples spanned
    `77.25–80.25` while the keep threshold was `~0.8 tok/s` — inside noise.
    Gate keeps on `n·stddev` of `tokPerSecSamples`, not a flat delta.

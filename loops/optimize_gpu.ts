@@ -101,10 +101,10 @@ const MODEL_PRESETS: Record<string, ModelPreset> = {
     maxTokens: 32,
     expect: ["Paris"],
   },
-  "gemma4-12b-q4k-m": {
-    key: "gemma4-12b-q4k-m",
-    label: "Gemma 4 12B Q4_K_M",
-    modelId: "gemma4-12b-q4k-m",
+  "gemma4-26b-a4b-q4k-m": {
+    key: "gemma4-26b-a4b-q4k-m",
+    label: "Gemma 4 26B-A4B MoE Q4_K_M",
+    modelId: "gemma4-26b-a4b-q4k-m",
     promptMode: "chat",
     prompt: "What is the capital of France? Answer in one word.",
     maxTokens: 48,
@@ -121,7 +121,7 @@ const MODEL_PRESETS: Record<string, ModelPreset> = {
   },
 };
 
-const DEFAULT_MODEL = "gemma4-12b-q4k-m";
+const DEFAULT_MODEL = "gemma4-26b-a4b-q4k-m";
 
 type ModelTarget = {
   key: string;

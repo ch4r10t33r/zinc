@@ -620,7 +620,7 @@ If a change touches generic Metal kernels, also run a Gemma-12B smoke
 to make sure Effort 11's gains did not regress:
 
 ```bash
-./zig-out/bin/zinc --model-id gemma4-12b-q4k-m \
+./zig-out/bin/zinc --model-id gemma4-26b-a4b-q4k-m \
   --prompt "What is the capital of France?" --chat -n 12
 ```
 

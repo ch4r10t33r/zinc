@@ -448,7 +448,7 @@ and pointed at the sampler.
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | gemma4-31b-q4k-m        | yes, batched path      | "The capital of France is **Paris**."  |
-| gemma4-12b-q4k-m        | no (MoE gate)          | falls back, correct                   |
+| gemma4-26b-a4b-q4k-m        | no (MoE gate)          | falls back, correct                   |
 
 All 5 still coherent, no regressions.
 

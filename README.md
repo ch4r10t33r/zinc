@@ -253,7 +253,7 @@ Qwen 3.6 27B dense is now available in the managed catalog as an experimental ta
 | Model | ZINC prefill | llama.cpp prefill | ZINC decode | llama.cpp decode | ZINC % decode |
 |---|---:|---:|---:|---:|---:|
 | Qwen 3.6 35B A3B (MoE+SSM) | 25.2 | 130.32 | 38.13 | 79.88 | 48% |
-| Gemma 4 12B (MoE) | 27.4 | 279.51 | 43.68 | 92.17 | 47% |
+| Gemma 4 26B A4B (MoE) | 27.4 | 279.51 | 43.68 | 92.17 | 47% |
 | Qwen 3 8B (dense) | 24.7 | 74.67 | 32.74 | 83.67 | 39% |
 | Gemma 4 31B (dense) | 19.5 | 73.28 | 5.16 | 25.14 | 21% |
 

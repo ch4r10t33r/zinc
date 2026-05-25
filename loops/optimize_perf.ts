@@ -118,9 +118,9 @@ const MODELS: Record<string, ModelTarget> = {
     promptMode: "chat",
     envVar: "ZINC_RDNA_GEMMA4_31B_MODEL",
   },
-  gemma412b: {
-    key: "gemma412b",
-    name: "Gemma4-12B",
+  gemma426ba4b: {
+    key: "gemma426ba4b",
+    name: "Gemma4-26B-A4B",
     path: envOrDefault("ZINC_RDNA_GEMMA4_12B_MODEL", "/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
     promptMode: "chat",
     envVar: "ZINC_RDNA_GEMMA4_12B_MODEL",
@@ -480,7 +480,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     primaryMetricLabel: "Gemma 4 26B long-decode tok/s",
     benchmarkPrompt: GEMMA_LONG_DECODE_PROMPT,
     benchmarkMaxTokens: 32,
-    benchmarkMethod: "32-token chat decode-extended benchmark on Gemma 4 26B A4B, matching the public benchmark matrix shape; run with --model gemma412b",
+    benchmarkMethod: "32-token chat decode-extended benchmark on Gemma 4 26B A4B, matching the public benchmark matrix shape; run with --model gemma426ba4b",
     knownFlatCategories: [
       "Do not optimize the context-long Gemma win first. In the public data, ZINC generated only 2 tokens while llama.cpp generated 8, so it is an early-stop artifact. The primary metric is decode-extended with 32 generated tokens.",
       "Generic DMMV micro-tuning before removing Gemma CPU MoE fallback is the wrong order. The 26B MoE model is at 52% of llama.cpp on sustained decode while dense Gemma 31B is at 86%; the architectural delta points at MoE control flow, not a 1-2% matvec detail.",
@@ -735,7 +735,7 @@ const COHERENCE_MODELS: ModelTarget[] = [
   MODELS.qwen3627b,
   MODELS.qwen8b,
   MODELS.gemma431b,
-  MODELS.gemma412b,
+  MODELS.gemma426ba4b,
 ];
 
 type CoherenceFailure = {
@@ -2098,6 +2098,43 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
       bandwidthUtil: null,
       bandwidthSamples: [],
       error: "build errors",
+    };
+  }
+
+  // Shader-install parity guard. `zig build` only installs the shaders listed
+  // in build.zig's `shader_sources` tuple into share/zinc/shaders, but the
+  // runtime loads its .spv from that install dir. A new src/shaders/*.comp that
+  // is wired into Zig but forgotten in shader_sources gets compiled (above) yet
+  // never installed, so the engine silently falls back to an older kernel and
+  // the benchmark measures the wrong code. That is exactly how effort-15 logged
+  // a 79.63 tok/s "win" that did not survive a clean build. Fail loud here so a
+  // forgotten shader is an obvious build failure, not a stale-measurement trap.
+  let parityOutput: string;
+  try {
+    parityOutput = await ssh(
+      `cd ${REMOTE_DIR} && for f in src/shaders/*.comp; do b=$(basename "$f" .comp); ` +
+        `test -f "zig-out/share/zinc/shaders/$b.spv" || echo "$b.comp"; done`,
+      30_000,
+    );
+  } catch (e) {
+    parityOutput = String(e);
+  }
+  const missingShaders = parityOutput.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (missingShaders.length > 0) {
+    return {
+      buildOk: false,
+      buildOutput:
+        `Shader-install parity check failed: ${missingShaders.length} shader(s) compiled in ` +
+        `src/shaders but NOT installed by build.zig. Add each to the shader_sources tuple in ` +
+        `build.zig (or delete the unused .comp), otherwise the runtime falls back to older ` +
+        `kernels and the benchmark measures the wrong code:\n  ${missingShaders.join("\n  ")}`,
+      tokPerSec: null,
+      tokPerSecSamples: [],
+      correct: false,
+      outputText: "",
+      bandwidthUtil: null,
+      bandwidthSamples: [],
+      error: "shader install parity mismatch",
     };
   }
 

@@ -637,7 +637,7 @@ test "Vulkan forward uses GEGLU activation for Gemma architecture" {
     try expectNotContains(src, "try self.dispatchSwiglu(");
 }
 
-test "Gemma 4 12B MoE catalog entry has correct download URL with UD prefix" {
+test "Gemma 4 26B-A4B MoE catalog entry has correct download URL with UD prefix" {
     const src = @embedFile("model/catalog.zig");
     // The Unsloth Dynamic quantization uses UD- prefix in filenames
     try expectContains(src, "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf");

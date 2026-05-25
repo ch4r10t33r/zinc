@@ -2,7 +2,7 @@
 
 ## Objective
 
-Move local Gemma 4 12B (`gemma4-12b-q4k-m`, the 26B-A4B MoE) decode tok/s on
+Move local Gemma 4 12B (`gemma4-26b-a4b-q4k-m`, the 26B-A4B MoE) decode tok/s on
 this M1 Max as close to local llama.cpp on the same machine and model as
 possible, without regressing correctness or any other platform target.
 
@@ -21,8 +21,8 @@ Stop conditions:
 
 - Machine: local Apple M1 Max, 32 GPU cores, 32 GB unified memory,
   `MTLGPUFamilyApple7`.
-- Model id: `gemma4-12b-q4k-m` (Gemma 4 26B-A4B MoE, ~4B active, Q4_K_M).
-- Model path: `/Users/stepan/Library/Caches/zinc/models/models/gemma4-12b-q4k-m/model.gguf`
+- Model id: `gemma4-26b-a4b-q4k-m` (Gemma 4 26B-A4B MoE, ~4B active, Q4_K_M).
+- Model path: `/Users/stepan/Library/Caches/zinc/models/models/gemma4-26b-a4b-q4k-m/model.gguf`
   (16.9 GB on disk; fits comfortably in 32 GB UMA).
 - Backend: Metal only. Do not touch Vulkan, RDNA shaders, the 35B-A3B path,
   the dense Gemma path, or any non-Metal builder.
@@ -39,7 +39,7 @@ Stop conditions:
 ## Run the loop with
 
 ```bash
-ZINC_MODEL_ID=gemma4-12b-q4k-m \
+ZINC_MODEL_ID=gemma4-26b-a4b-q4k-m \
 ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="What is the capital of France?" \
 ZINC_MAX_TOKENS=128 \
@@ -92,7 +92,7 @@ Run this exactly before every accept/reject decision in any phase.
 3. ZINC command:
    ```bash
    ./zig-out/bin/zinc \
-     --model-id gemma4-12b-q4k-m \
+     --model-id gemma4-26b-a4b-q4k-m \
      --prompt "What is the capital of France?" \
      --chat \
      -n 128 \
@@ -101,7 +101,7 @@ Run this exactly before every accept/reject decision in any phase.
 4. llama.cpp command:
    ```bash
    ~/Workspace/llama.cpp/build-metal/bin/llama-cli \
-     -m /Users/stepan/Library/Caches/zinc/models/models/gemma4-12b-q4k-m/model.gguf \
+     -m /Users/stepan/Library/Caches/zinc/models/models/gemma4-26b-a4b-q4k-m/model.gguf \
      -p "What is the capital of France?" \
      -n 128 -ngl 99 -fa on --temp 0 --no-warmup
    ```
@@ -263,7 +263,7 @@ Why this should help on M1 Max (Apple7) specifically:
   present:
   ```bash
   zig build bench-metal-shapes -- \
-    --model ~/Library/Caches/zinc/models/models/gemma4-12b-q4k-m/model.gguf \
+    --model ~/Library/Caches/zinc/models/models/gemma4-26b-a4b-q4k-m/model.gguf \
     --case <case> --iterations 100 --warmup 10
   ```
 - Gate: microbench must beat the existing kernel by **≥5%** with

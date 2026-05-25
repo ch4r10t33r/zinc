@@ -26,7 +26,7 @@ const qwen36bReady = hasEnv("ZINC_QWEN36_35B_MODEL") || managedExists("qwen36-35
 const hasQwenSmoke = qwen8bReady && qwen36bReady;
 
 const apiServerReady = managedExists("qwen35-9b-q4k-m")
-  || managedExists("gemma4-12b-q4k-m")
+  || managedExists("gemma4-26b-a4b-q4k-m")
   || managedExists("gemma4-31b-q4k-m");
 const hasApiSmoke = hasEnv("ZINC_API_BASE_URL") || apiServerReady;
 

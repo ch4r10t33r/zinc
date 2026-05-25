@@ -82,7 +82,7 @@ router readback + CPU `topKSoftmax` + serial selected-expert dispatch.
 That is now tracked as **Effort 13**:
 
 ```bash
-bun loops/optimize_perf.ts --effort 13 --model gemma412b --cycles 999
+bun loops/optimize_perf.ts --effort 13 --model gemma426ba4b --cycles 999
 ```
 
 Do not fold that work into this prefill effort. Effort 9 remains about

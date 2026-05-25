@@ -1385,15 +1385,15 @@ async function detectMetalMachine() {
 export function defaultMetalCases(modelRoot) {
   return [
     {
-      id: "gemma4-12b-q4k-m",
-      model_id: "gemma4-12b-q4k-m",
-      label: "Gemma 4 12B Q4_K_M",
+      id: "gemma4-26b-a4b-q4k-m",
+      model_id: "gemma4-26b-a4b-q4k-m",
+      label: "Gemma 4 26B-A4B MoE Q4_K_M",
       family: "Gemma 4",
       quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "gemma4-12b-q4k-m"),
+      model_path: modelPath(modelRoot, "gemma4-26b-a4b-q4k-m"),
       prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gemma4-12b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gemma4-12b-q4k-m"),
+      prompt: defaultPromptForModelId("gemma4-26b-a4b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m"),
       notes: ["ISWA / MoE Metal path"],
     },
     {
