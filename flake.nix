@@ -57,7 +57,7 @@
               ZINC is a high-performance LLM inference engine targeting AMD
               RDNA3/RDNA4 GPUs via Vulkan and Apple Silicon via Metal.  It
               speaks the OpenAI-compatible HTTP API and supports GGUF models
-              (Qwen3, Gemma3, GPT-OSS MoE, and more).
+              (Qwen3, Gemma 4 MoE, and more).
             '';
             homepage = "https://github.com/zolotukhin/zinc";
             license = licenses.mit;
