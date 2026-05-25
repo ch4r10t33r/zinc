@@ -159,7 +159,7 @@ Combined, a realistic target on first commit is **350-500 tok/s**. Closing the r
 1. **Scratch buffer lifecycle.** Add `BatchedPrefillScratch` to `InferenceEngine` with the 10 buffers Metal's version needs (`hidden, norm, q, k, v, attn_out, gate, up, swiglu, down`), grown on demand and kept across calls. Sizing: `max_n_tokens * dim * 4`. Use the same `Buffer.initDeviceLocal` the rest of `forward.zig` uses.
 2. **Batched KV write helper.** Thin wrapper around `kv_cache_write.comp` that dispatches `N` blocks × `kv_dim / 16` per-page covers; the existing page-table plumbing already handles the offset arithmetic when pages are consecutive — which they are on a fresh prefill.
 3. **Batched DMMV wrapper.** Add `dispatchDmmvBatched(tensor, x_buf, y_buf, M, K, x_offset, y_offset, num_cols)` that chunks at `MAX_COLS=32` and calls `recordBatchDispatchPush` for each chunk.
-4. **Model gate.** Port `canUseBatchedPrefill` from `forward_metal.zig`: dense attention every layer, dense FFN, Q4_K weights, no biases / attn gate / post-norms / sliding window / sinks, not MoE / SSM / Gemma / gpt-oss. Q/K norms are OK.
+4. **Model gate.** Port `canUseBatchedPrefill` from `forward_metal.zig`: dense attention every layer, dense FFN, Q4_K weights, no biases / attn gate / post-norms / sliding window / sinks, not MoE / SSM / Gemma. Q/K norms are OK.
 5. **Body.** Translate the Metal `prefillBatched` body line-for-line to Vulkan idioms. Use `push_desc_fn` throughout (matches the rest of `forward.zig`'s hot path).
 6. **Gate wiring.** `generateWithMetrics` on the Vulkan side should route through `prefillBatched` the same way Metal's does, so the env flag works end-to-end.
 7. **Validate mode.** Port `ZINC_BATCHED_PREFILL=validate` from Metal — snapshot batched logits, rerun prefillBatch, diff max abs.
@@ -175,7 +175,7 @@ Combined, a realistic target on first commit is **350-500 tok/s**. Closing the r
 
 - A tiled `mul_mm_q4_K_f32` GEMM kernel (matches llama.cpp's structure) — tracked separately, required to fully close the gap to 662 tok/s.
 - Q8 KV batched flash attention on Vulkan — the f32 KV path is sufficient to meet the acceptance target; Q8 is a follow-up.
-- MoE / SSM / Gemma / gpt-oss batched paths — all fall back to `prefillBatch` via `canUseBatchedPrefill`.
+- MoE / SSM / Gemma batched paths — all fall back to `prefillBatch` via `canUseBatchedPrefill`.
 
 ## References
 

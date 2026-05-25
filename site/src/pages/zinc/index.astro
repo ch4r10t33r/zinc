@@ -49,7 +49,6 @@ function beatsBaseline(row: { zinc: number | null | undefined; baseline: number 
 
 function displayModelLabel(label: string) {
   return label
-    .replace(/^OpenAI\s+GPT-OSS\b/i, 'GPT-OSS')
     .replace(/\bQ4_K_XL\b/g, 'Q4K XL')
     .replace(/\bQ4_K_M\b/g, 'Q4K M');
 }

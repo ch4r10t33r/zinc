@@ -59,7 +59,7 @@ After:  tail= 1.64 ms, total=207.54 ms/tok,  5.62 tok/s  (+45%)
 ```
 
 Other catalog models with large vocabs also picked up small decode wins
-(Qwen3-8B vocab 152k, gpt-oss 201k).
+(Qwen3-8B vocab 152k).
 
 ## Follow-on: Gemma MoE long decode
 

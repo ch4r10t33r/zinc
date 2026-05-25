@@ -18,11 +18,11 @@ Make ZINC's `/v1/chat/completions` endpoint correctly handle OpenAI tool-calling
 - Tool result messages (`role: "tool"`, `tool_call_id`) rendered back into the prompt as `<tool_response>...</tool_response>` blocks inside a user turn
 - Hybrid streaming: regular content streams as today, tool calls are buffered atomically and emitted as one tool_calls delta
 - `finish_reason: "tool_calls"` set when generation ends with tool calls
-- Pluggable per-template-kind dispatch — Llama3 / Gemma / gpt-oss fall through to a `NoopToolFormat` that ignores `tools` and behaves exactly like ZINC does today
+- Pluggable per-template-kind dispatch — Llama3 / Gemma fall through to a `NoopToolFormat` that ignores `tools` and behaves exactly like ZINC does today
 
 **Out of scope:**
 
-- Llama3 / Gemma / gpt-oss tool implementations (interface ready, no concrete impls — adding one means writing one file)
+- Llama3 / Gemma tool implementations (interface ready, no concrete impls — adding one means writing one file)
 - Jinja interpreter / GGUF chat_template execution at runtime
 - Tool-call repair / retry on malformed model output (fall back to plain text instead)
 - JSON Schema validation of `parameters` or `arguments`

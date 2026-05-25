@@ -531,8 +531,6 @@ function mergeTargetForPartialRun(existingTarget, incomingTarget) {
 export function normalizedModelName(model) {
   return (model?.label ?? model?.id ?? "")
     .toLowerCase()
-    .replace(/^openai\s+/, "")
-    .replace(/\bgpt[-_\s]*oss\b/g, "gpt oss")
     .replace(/\bgemma4\b/g, "gemma 4")
     .replace(/\bqwen36\b/g, "qwen 3.6")
     .replace(/\bqwen3\b/g, "qwen 3")
@@ -1387,18 +1385,6 @@ async function detectMetalMachine() {
 export function defaultMetalCases(modelRoot) {
   return [
     {
-      id: "gpt-oss-20b-q4k-m",
-      model_id: "gpt-oss-20b-q4k-m",
-      label: "OpenAI GPT-OSS 20B Q4_K_M",
-      family: "GPT-OSS",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "gpt-oss-20b-q4k-m"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gpt-oss-20b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gpt-oss-20b-q4k-m"),
-      notes: ["Harmony chat-template path on local Metal", "Uses a larger decode budget so the final answer channel is reached"],
-    },
-    {
       id: "gemma4-12b-q4k-m",
       model_id: "gemma4-12b-q4k-m",
       label: "Gemma 4 12B Q4_K_M",
@@ -1498,7 +1484,6 @@ export function canonicalModelIdFromPath(modelFile) {
 export function guessFamily(id) {
   if (id.startsWith("gemma4")) return "Gemma 4";
   if (id.startsWith("gemma")) return "Gemma";
-  if (id.startsWith("gpt-oss")) return "GPT-OSS";
   if (id.startsWith("qwen36")) return "Qwen 3.6";
   if (id.startsWith("qwen35")) return "Qwen 3.5";
   if (id.startsWith("qwen3")) return "Qwen 3";
@@ -1512,7 +1497,7 @@ function guessQuant(id) {
 }
 
 export function prefersChatPrompt(id) {
-  return id.startsWith("gemma") || id.startsWith("gpt-oss");
+  return id.startsWith("gemma");
 }
 
 export function defaultPromptForModelId(id) {
@@ -1522,7 +1507,7 @@ export function defaultPromptForModelId(id) {
 }
 
 export function defaultMaxTokensForModelId(id) {
-  return id.startsWith("gpt-oss") ? 128 : 96;
+  return 96;
 }
 
 const CODING_REVIEW_SNIPPET = [

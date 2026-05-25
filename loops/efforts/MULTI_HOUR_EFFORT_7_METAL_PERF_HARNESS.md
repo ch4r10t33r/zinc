@@ -228,7 +228,7 @@ Primary files:
 Tasks:
 
 - Run the full `--target metal --models
-  gemma4-12b-q4k-m,gemma4-31b-q4k-m,gpt-oss-20b-q4k-m,qwen3-8b-q4k-m,qwen36-35b-a3b-q4k-xl,qwen36-35b-a3b-q4k-xl`
+  gemma4-12b-q4k-m,gemma4-31b-q4k-m,qwen3-8b-q4k-m,qwen36-35b-a3b-q4k-xl,qwen36-35b-a3b-q4k-xl`
   suite.
 - Confirm wall-clock is ≥ 30 minutes shorter than the pre-effort
   baseline (the April 18 run took 3 h 14 min).

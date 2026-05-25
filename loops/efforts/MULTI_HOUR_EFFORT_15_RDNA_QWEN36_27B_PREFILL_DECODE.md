@@ -139,6 +139,44 @@ Interpretation:
   remote build, and `build.zig` installs `mul_mm_q6k` explicitly so the
   dense-down path is reproducible instead of artifact-dependent.
 
+2026-05-24 50-cycle codex run post-mortem:
+
+- A 50-cycle codex run (`--effort 15 --model qwen3627b`) was driven off a
+  fresh post-shader-clean baseline of `58.83 tok/s` on the site-aligned
+  Coding Review prefill prompt. It reported `best=79.63 tok/s`
+  (`bestCycle=44`, HEAD `63dc951`, `+35.4%`). Run shape: 6 perf keeps,
+  1 foundation keep, 37 reverts, 5 no-op cycles.
+- Real accepted staircase: cyc4 `59.89`, cyc9 `68.06` (default-on
+  layer-major SSM projection/conv), cyc39 `69.89`, cyc40 `72.06` (edits to
+  the already-installed `mul_mm_q4k`/`mul_mm_q6k`), cyc43 `73.98`,
+  cyc44 `79.63`.
+- **The `79.63` headline is almost certainly a stale-shader artifact and
+  must not be quoted as the reproducible number.** Cycles 43 and 44 added
+  `src/shaders/mul_mm_q6k_full.comp` and
+  `src/shaders/mul_mm_q4k_gate_up_swiglu_full.comp`, but neither is in the
+  `shader_sources` tuple in `build.zig`, so glsl→spv never compiles or
+  installs them. A clean build loads the older fallback kernels, meaning
+  the cyc44 benchmark did not run the branchless full-tile path it claimed
+  to add.
+- Corroboration: cycle 47 did exactly the missing install ("so clean RDNA
+  builds load the existing fast paths"), and the number dropped to
+  `63.71 tok/s`, so it was reverted as a regression. The branchless
+  full-tile path is therefore a regression versus the installed kernels,
+  and the recorded staircase from cyc43 on overstates reproducible perf.
+- This is the same failure class as the violent `~59 ↔ ~68 tok/s`
+  oscillation in cycles 9–30, where cycles 12/16/21/25 each re-discovered
+  that new batched SSM shaders were not installed. The `eb6c768` fix
+  (clear install dir + install `mul_mm_q6k`) was incomplete: **every new
+  `.comp` must be hand-added to `shader_sources` in `build.zig`, and the
+  agent repeatedly forgot.** Until that is automated, every measured win
+  that adds a new shader is suspect.
+- `bandwidthUtil` was `0.0` for all 50 cycles — the metric is dead and
+  gives the loop no roofline signal.
+- Cycles 45–50 were unproductive: 45–47 regressed below `79.63`, and
+  48–50 were no-ops because codex hit its usage limit (resets
+  2026-05-26 11:33). Those 3 dead cycles still incremented `stall` and
+  triggered the cycle-50 pivot.
+
 ## Decode phase budget
 
 A clean single-stream profile on a 48-token decode prompt produced:
@@ -284,6 +322,7 @@ reason the prior failure mode no longer applies.
 | Forcing separate SSM alpha/beta path (`ZINC_FUSED_SSM_AB=0`) | immediate `QueueSubmitFailed` on Qwen 3.6 27B | do not use as a prerequisite for 27B prefill work |
 | Layer-major dense segment lower-bound additions | layer-1 extension measured old 4-62 override at `50.16 tok/s` vs new layer-1 schedule at `50.07 tok/s`; earlier prefix/layer-depth sweeps were flat or worse | rejected unless a new profile proves lower layers are hot |
 | Partial hidden scratch copy fused with first attention RMS norm at segment handoff (`ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE`) | OFF median `49.96 tok/s` `[51.32, 49.82, 49.96]`; ON median `49.53 tok/s` `[49.53, 49.42, 49.62]`; also moved attention RMS outside the normal phase timer | rejected |
+| Branchless full-tile Q6_K GEMM (`mul_mm_q6k_full.comp`) and Q4_K gate/up/SwiGLU (`mul_mm_q4k_gate_up_swiglu_full.comp`) for dense prefill (cyc43/cyc44) | reported `73.98`→`79.63 tok/s`, but the new shaders were never added to `shader_sources` in `build.zig`; clean builds ran fallback kernels. When the install was actually wired (cyc47) the number fell to `63.71 tok/s` | rejected as stale-shader artifact; delete the orphan `.comp` files or re-measure honestly with them installed |
 
 Rejected matrix details:
 
@@ -759,6 +798,58 @@ is a top bucket on the 27B long-context prompt.
    no-new-best pressure. They remain valuable information, but a long
    run of measured-dead cycles should trigger pivot prompts and refreshed
    phase budgets instead of printing `stall=0`.
+
+## Next enhancements after the 2026-05-24 post-mortem
+
+The 50-cycle run proved the loop can chase the controller prompt into
+local maxima that do not survive a clean build. The next enhancements are
+ordered so that trust is re-established before any new perf claim.
+
+### A. Re-establish a trustworthy number (do this first)
+
+1. Run a clean RDNA build + ZINC-only matrix at HEAD `63dc951` using the
+   measurement contract above. This is the only way to know what HEAD
+   actually does versus the artifact-inflated `79.63`.
+2. Decide the fate of the two orphan shaders:
+   - If `mul_mm_q6k_full.comp` / `mul_mm_q4k_gate_up_swiglu_full.comp`
+     are dead (cyc47 says they regress to `63.71`), delete the `.comp`
+     files and the cyc43/cyc44 wiring in `forward.zig`/`dmmv.zig`, then
+     re-measure so HEAD matches what it claims.
+   - If a corrected full-tile kernel is still wanted, add it to
+     `shader_sources`, confirm `mul_mm_*_full.spv` lands in
+     `share/zinc/shaders`, and only then measure.
+3. Record the corrected baseline in this doc before the next loop starts.
+
+### B. Harness changes (stop the artifact class entirely)
+
+These are the highest-ROI changes; the 27B kernel ideas are worthless
+while measurement can silently run stale code.
+
+1. **Shader source/install parity guard.** Before every benchmark, assert
+   that each `src/shaders/*.comp` has a matching, freshly compiled `.spv`
+   in the installed dir (hash or mtime check), and abort the cycle if not.
+   Better: have `build.zig` glob `src/shaders/*.comp` instead of the
+   hand-maintained `shader_sources` tuple, so a new shader cannot be
+   forgotten.
+2. **Variance-aware keep threshold.** The cyc44 samples spanned
+   `77.25–80.25` while the keep threshold was `~0.8 tok/s` — inside noise.
+   Gate keeps on `n·stddev` of `tokPerSecSamples`, not a flat delta.
+3. **Usage-limit backoff.** Detect the agent's "usage limit" error and
+   pause/sleep to reset time instead of burning no-op cycles that inflate
+   `stall` and trigger false pivots.
+4. **Fix or remove `bandwidthUtil`.** It is `0.0` every cycle. For a
+   prefill GEMM workload, surface achieved GB/s and ALU occupancy from
+   `RADV_DEBUG=shaderstats` instead, so the loop has a roofline signal.
+
+### C. Return to the structural plan, not more micro-fusions
+
+The whole back half of the run was single-shader Q4/Q6 tile/branch
+fiddling — exactly what the 64.87 guidance and the failed-attempts table
+warned is played out. The unspent lever is still Tracks 1–3: the
+default-off layer-major dense-FFN + SSM-projection prefill validator and
+batched path. Restart there, with the new parity guard in place so each
+keep is real. Do not let the loop spend more than ~3 cycles on isolated
+shader micro-fusions before requiring `shaderstats` evidence.
 
 ## Suggested cycle schedule
 

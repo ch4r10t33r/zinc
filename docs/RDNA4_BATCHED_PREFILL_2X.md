@@ -447,11 +447,10 @@ and pointed at the sampler.
 | qwen3-8b-q4k-m          | yes, batched path   | "The capital of France is **Paris**." |
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
-| gpt-oss-20b-q4k-m       | no (architecture gate) | falls back, `<\|channel\|>analysis...`  |
 | gemma4-31b-q4k-m        | yes, batched path      | "The capital of France is **Paris**."  |
 | gemma4-12b-q4k-m        | no (MoE gate)          | falls back, correct                   |
 
-All 6 still coherent, no regressions.
+All 5 still coherent, no regressions.
 
 **Gemma-4 31B dense update:** the architecture gate came off in `0cc4c3c`
 after two Gemma-specific bugs landed. (1) Gemma 4 applies a plain
@@ -569,10 +568,10 @@ The reason the per-token kpar shader beats the serial batched shader
 in the first place is this instruction; the reason the kpar *batched*
 shader compounds the win is the weight-read-once + subgroupAdd combo.
 
-## What's next for the other 5 catalog models
+## What's next for the other 4 catalog models
 
-Four of the six catalog entries still hit the gate's other guards
-(MoE, SSM, Gemma architecture, gpt-oss architecture) and fall back to
+Three of the five catalog entries still hit the gate's other guards
+(MoE, SSM, Gemma architecture) and fall back to
 per-token:
 
 - Qwen3.5/3.6 35B-A3B: MoE+SSM hybrid. Needs batched MoE router +
@@ -581,8 +580,6 @@ per-token:
   took more than a one-line gate relaxation, because V had to be projected
   independently of K on the use_k_as_v layers and unit-normed per head.
 - Gemma-4 12B MoE: same MoE situation as Qwen.
-- gpt-oss-20B: gated out by `architecture == .gpt_oss`. Has attention
-  sinks that need special handling in the batched flash-attn path.
 
 **Update:** `dmmv_q6k_batch_kpar.comp` landed in `b12b511` and does
 exactly this. 3-run median went from 143.1 → **172.9 tok/s** — the

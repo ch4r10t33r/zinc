@@ -221,8 +221,7 @@ shapes differ. Treat it as a measured follow-up, not a default.
 Required before keeping a change:
 
 - `zig build test`
-- coherence sweep green across Qwen3.6 35B, Qwen3 8B, Gemma 26B/31B,
-  and GPT-OSS 20B
+- coherence sweep green across Qwen3.6 35B, Qwen3 8B, and Gemma 26B/31B
 - Gemma 26B decode-extended output remains coherent for the benchmark prompt
 - no crash on Gemma 31B dense path
 - no regression >2% on Qwen3.6 35B decode

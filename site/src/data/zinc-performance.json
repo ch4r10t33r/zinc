@@ -9315,16 +9315,16 @@
         "warmup_runs": 1
       },
       "summary": {
-        "fastest_model_label": "OpenAI GPT-OSS 20B Q4_K_M",
-        "fastest_decode_tps": 78.58,
-        "benchmarked_models": 6,
-        "successful_models": 6,
-        "average_decode_tps": 44.22,
-        "average_prompt_tps": 116.06666666666666,
-        "average_end_to_end_tps": 29.62033149288059,
-        "average_total_latency_ms": 7382.9936386666695,
-        "compared_models": 6,
-        "average_pct_of_llama": 63.975856871313304
+        "fastest_model_label": "Qwen 3 8B Q4_K_M",
+        "fastest_decode_tps": 73.93,
+        "benchmarked_models": 5,
+        "successful_models": 5,
+        "average_decode_tps": 37.348,
+        "average_prompt_tps": 121.9,
+        "average_end_to_end_tps": 26.722156098466126,
+        "average_total_latency_ms": 8365.386908000004,
+        "compared_models": 5,
+        "average_pct_of_llama": 65.2475212449736
       },
       "models": [
         {

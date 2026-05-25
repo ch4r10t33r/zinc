@@ -143,7 +143,7 @@ Best next directions for 90+:
    must prove the candidate input equals the token-major input before replacing
    production work.
 7. After another default-on prefill jump, re-run the installed-model coherence
-   sweep for Qwen 8B, Qwen 35B, Qwen 27B, Gemma 12B/31B, and GPT-OSS 20B.
+   sweep for Qwen 8B, Qwen 35B, Qwen 27B, and Gemma 12B/31B.
    The loop's Paris gate is necessary but not sufficient for all-model safety.
 
 Known facts before the first Effort 16 baseline:

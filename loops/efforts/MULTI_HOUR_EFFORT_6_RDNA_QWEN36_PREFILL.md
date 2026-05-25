@@ -766,7 +766,7 @@ inner dot uses hardware integer-dot.
 
 After #1-4 land:
 - For dense FFN (Gemma 4 31B): use `mul_mm_q4k` with N=N_tokens.
-- For MoE FFN (Qwen 3.6, Gemma 4 26B, GPT-OSS): use
+- For MoE FFN (Qwen 3.6, Gemma 4 26B): use
   `mul_mm_id_q4k` with `data_ids` from the existing
   `routing_capture_buf` (forward.zig:885) and `data_expert_count`
   from #3.
@@ -817,7 +817,7 @@ cycles on them:
 ## Validation
 
 Every change must pass `ZINC_BATCHED_PREFILL=validate` on every MoE
-catalog model (Qwen 3.6 35B, Qwen 3.6 35B, Gemma 4 26B, GPT-OSS 20B).
+catalog model (Qwen 3.6 35B, Qwen 3.6 35B, Gemma 4 26B).
 Greedy-output check on a 50-token generation must match the per-token
 reference for the first 10 tokens minimum.
 
@@ -825,9 +825,7 @@ reference for the first 10 tokens minimum.
 
 If steps 1-4 ship correctly, Qwen 3.6 35B-A3B prefill on R9700 should
 move from **78 → 150-200 tok/s** (closing 40% → 80-100% of
-llama.cpp). Gemma 4 26B MoE from **41 → 100-130 tok/s**. GPT-OSS
-from **95 → 100-130 tok/s** (smaller relative gain since it's
-already at 79%).
+llama.cpp). Gemma 4 26B MoE from **41 → 100-130 tok/s**.
 
 ## Original plan (preserved below)
 
@@ -1281,7 +1279,7 @@ Concrete microsteps:
 Done when:
 
 - Flagship prefill ≥ **+35%** vs Step 10 baseline (or ≥ +25% standalone if Step 10 has not landed yet).
-- Coherence sweep green; specifically, run the gpt-oss model that uses SOFTMAX_WEIGHT routing and Gemma 4 MoE that uses the per-expert scale tensor (ensure routing semantics survive the permute path).
+- Coherence sweep green; specifically, run the Gemma 4 MoE that uses the per-expert scale tensor (ensure routing semantics survive the permute path).
 
 Risk note: Grouped MoE has the highest correctness blast radius of any bet here. Misrouting a single token can pass the loop's coherence check but fail subtle outputs. Add a flag-gated CPU reference path that runs alongside on a single prompt and asserts per-token output L2 difference is below a tight threshold (`< 1e-4`) for the first few cycles after wiring.
 

@@ -509,8 +509,6 @@ function displayModelLabel(modelOrLabel: any) {
     ? modelOrLabel
     : (modelOrLabel?.label ?? modelOrLabel?.id ?? 'n/a');
   return label
-    .replace(/^OpenAI\s+GPT-OSS\b/i, 'GPT-OSS')
-    .replace(/^GPT OSS\b/i, 'GPT-OSS')
     .replace(/^Gemma4\b/i, 'Gemma 4')
     .replace(/^Qwen36\b/i, 'Qwen 3.6')
     .replace(/^Qwen3\b/i, 'Qwen 3')
@@ -521,8 +519,6 @@ function displayModelLabel(modelOrLabel: any) {
 function normalizedModelName(model: any) {
   return displayModelLabel(model)
     .toLowerCase()
-    .replace(/^openai\s+/, '')
-    .replace(/\bgpt[-_\s]*oss\b/g, 'gpt oss')
     .replace(/\bgemma4\b/g, 'gemma 4')
     .replace(/\bqwen36\b/g, 'qwen 3.6')
     .replace(/\bqwen3\b/g, 'qwen 3')

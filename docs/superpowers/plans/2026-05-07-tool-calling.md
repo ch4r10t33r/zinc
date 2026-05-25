@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add OpenAI-compatible `tools` / `tool_choice` / `tool_calls` semantics to ZINC's `/v1/chat/completions` endpoint for ChatML-family models (Qwen3, Qwen3.5, Qwen3.6) so agentic clients (opencode, openai-python) can use ZINC as a drop-in backend. Other template kinds (Llama3, Gemma, gpt-oss) silently ignore `tools` and behave exactly as today.
+**Goal:** Add OpenAI-compatible `tools` / `tool_choice` / `tool_calls` semantics to ZINC's `/v1/chat/completions` endpoint for ChatML-family models (Qwen3, Qwen3.5, Qwen3.6) so agentic clients (opencode, openai-python) can use ZINC as a drop-in backend. Other template kinds (Llama3, Gemma) silently ignore `tools` and behave exactly as today.
 
 **Architecture:** A new `src/server/tool_format.zig` module exposes a `ToolFormat` vtable interface with two concrete implementations: `ChatMLToolFormat` (Qwen3 verbatim tool prompt + parser + streaming state machine) and `NoopToolFormat` (silent fallback). Routes.zig and tokenizer.zig get small integration changes — tool concerns are dispatched through `tool_format.forTemplate(template_kind)` with no per-kind branching at call sites.
 

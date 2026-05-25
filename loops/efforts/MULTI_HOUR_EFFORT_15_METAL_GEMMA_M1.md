@@ -309,7 +309,7 @@ Why this should help on M1 Max (Apple7) specifically:
 
 - [ ] Is the file under one of the Metal scopes listed in rule 5?
 - [ ] Will this change affect only the Gemma 4 MoE path, or is it
-      shape/arch-routed so the dense Gemma, Qwen, gpt-oss, and 35B-A3B paths
+      shape/arch-routed so the dense Gemma, Qwen, and 35B-A3B paths
       keep their current kernels?
 - [ ] Is there a kill-switch (flag or shape gate) to revert at runtime if a
       regression surfaces later?

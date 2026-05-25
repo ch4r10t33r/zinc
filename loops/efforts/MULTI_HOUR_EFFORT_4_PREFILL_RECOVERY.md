@@ -140,7 +140,7 @@ Prioritize:
 Acceptance:
 
 - measurable prefill gain on the benchmark prompt
-- no coherence regressions on Qwen, Gemma, or GPT-OSS
+- no coherence regressions on Qwen or Gemma
 
 ### Step 5: Attack the real MoE prefill cost
 

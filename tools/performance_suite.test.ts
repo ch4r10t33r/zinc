@@ -103,10 +103,10 @@ test("resolveLocalLlamaServer prefers explicit path, then PATH, then docker fall
   expect(resolveLocalLlamaServer({ llamaServer: null }, null, "/tmp/docker")).toBe("/tmp/docker");
 });
 
-test("GPT-OSS uses the chat prompt path in the performance suite", () => {
-  expect(prefersChatPrompt("gpt-oss-20b-q4k-m")).toBe(true);
-  expect(defaultPromptForModelId("gpt-oss-20b-q4k-m")).toContain("benchmark screenshots");
-  expect(defaultMaxTokensForModelId("gpt-oss-20b-q4k-m")).toBe(128);
+test("Gemma uses the chat prompt path in the performance suite", () => {
+  expect(prefersChatPrompt("gemma4-12b-q4k-m")).toBe(true);
+  expect(defaultPromptForModelId("gemma4-12b-q4k-m")).toContain("benchmark screenshots");
+  expect(defaultMaxTokensForModelId("gemma4-12b-q4k-m")).toBe(96);
   expect(prefersChatPrompt("qwen3-8b-q4k-m")).toBe(false);
   expect(defaultPromptForModelId("qwen3-8b-q4k-m")).toContain("Developer question");
   expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(96);
@@ -231,10 +231,6 @@ test("benchmark suite uses a multi-scenario matrix instead of a single prompt", 
   expect(qwen[2]?.max_tokens).toBe(128);
   expect(qwen[3]?.prompt).toContain("stable benchmark preset");
   expect(qwen[3]?.max_tokens).toBe(256);
-
-  const gptoss = defaultScenarioDefsForModel("gpt-oss-20b-q4k-m", "chat", defaultPromptForModelId("gpt-oss-20b-q4k-m"));
-  expect(gptoss[0]?.max_tokens).toBe(128);
-  expect(gptoss[3]?.max_tokens).toBe(256);
 });
 
 test("benchmark suite measures all ZINC scenarios before starting baselines", () => {
@@ -463,7 +459,6 @@ test("compareModelsByName normalizes published model label variants", () => {
   const models = [
     { id: "qwen36-35b-a3b-q4k-xl", label: "Qwen36 35B A3B Q4K XL" },
     { id: "qwen36-27b-q4k-m", label: "Qwen 3.6 27B Dense Q4_K_M" },
-    { id: "gpt-oss-20b-q4k-m", label: "OpenAI GPT-OSS 20B Q4_K_M" },
     { id: "qwen3-8b-q4k-m", label: "Qwen3 8B Q4K M" },
     { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
     { id: "gemma4-12b-q4k-m", label: "Gemma4 12B Q4_K_M" },
@@ -472,7 +467,6 @@ test("compareModelsByName normalizes published model label variants", () => {
   expect(models.sort(compareModelsByName).map((model) => model.id)).toEqual([
     "gemma4-12b-q4k-m",
     "gemma4-31b-q4k-m",
-    "gpt-oss-20b-q4k-m",
     "qwen3-8b-q4k-m",
     "qwen36-27b-q4k-m",
     "qwen36-35b-a3b-q4k-xl",

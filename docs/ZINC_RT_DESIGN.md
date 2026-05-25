@@ -196,7 +196,6 @@ Closing the documented gap on hybrid MoE+SSM models (currently 88 tok/s vs llama
 | Qwen 3 8B dense | 115 | 180 | 84 |
 | Qwen 3.6 35B-A3B MoE+SSM | 88 | 280 | 182 |
 | Gemma 4 31B dense | 44 | 145 | 139 |
-| GPT-OSS 20B MoE | 82 | 320 | 271 |
 
 ### 3.4 Time-to-first-token (TTFT)
 

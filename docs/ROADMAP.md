@@ -29,7 +29,7 @@ Near-term work:
 - better profiling and graph/runtime inspection
 - more contributor-friendly benchmark workflows
 - broader model validation across supported GGUF architectures
-- expand the perf suite catalog beyond the current Qwen 3.6, Gemma 4, and GPT-OSS targets
+- expand the perf suite catalog beyond the current Qwen 3.6 and Gemma 4 targets
 - stronger CI coverage across more environments
 - more complete API compatibility and client examples
 

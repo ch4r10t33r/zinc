@@ -201,14 +201,13 @@ The current runtime is designed around the model families ZINC is actively valid
 
 - **Qwen3 / Qwen3.5 / Qwen3.6**
 - **Gemma 4**
-- **OpenAI GPT-OSS**
 
 At the execution-model level, that means ZINC handles:
 
 - dense transformer layers
 - MoE feed-forward blocks
 - SSM-hybrid paths used by Qwen3.5-style models and related experimental families
-- model-specific routing rules such as GPT-OSS selected-only softmax weighting
+- model-specific MoE routing rules such as per-expert scale weighting
 
 The architecture-normalization layer is in `src/model/architecture.zig` and `src/model/config.zig`.
 
