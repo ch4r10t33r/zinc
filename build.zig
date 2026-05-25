@@ -214,6 +214,9 @@ pub fn build(b: *std.Build) void {
         "ssm_conv1d_batched",
         "mul_mm_q6k_full",
         "mul_mm_q4k_gate_up_swiglu_full",
+        // Vulkan port of the Metal MoE route-pack kernel; the .comp was added
+        // without registering it here, so the parity guard flagged it.
+        "moe_route_pack",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;
