@@ -47,45 +47,41 @@ int signed_i8(uint b) {
     return int(b) - (b >= 128u ? 256 : 0);
 }
 
-float load_q6k(uint byte_off, uint k_in_block) {
-    const uint half_id = k_in_block >> 7;
-    const uint rem = k_in_block & 127u;
-    const uint group = rem >> 5;
-    const uint l = rem & 31u;
-    const uint is = l >> 4;
+// Dequantize a 16-wide run of Q6_K weights kb..kb+15 from one super-block.
+// kb is always 16-aligned here (k_outer is a multiple of BK=32 and the
+// half-tile offset is 0 or 16), so the whole run shares half_id, group,
+// qh_shift, scale_idx and the super-block scale d. Hoisting those out of the
+// per-weight loop removes index math the compiler cannot prove invariant, and
+// presenting ql/qh as consecutive byte reads lets RADV coalesce them into
+// dword loads. Bit-exact with the old per-weight load_q6k.
+void load_q6k_run(uint byte_off, uint kb, out float vals[16]) {
+    const uint half_id = kb >> 7;
+    const uint rem0 = kb & 127u;
+    const uint group = rem0 >> 5;
+    const uint l0 = rem0 & 31u;          // 0 or 16
+    const uint is = l0 >> 4;             // 0 or 1
 
     const uint ql_base = byte_off + half_id * 64u;
     const uint qh_base = byte_off + 128u + half_id * 32u;
     const uint sc_base = byte_off + 192u + half_id * 8u;
 
+    const bool hi_nibble = (group >= 2u);
+    const uint ql_off = ql_base + l0 + (((group & 1u) != 0u) ? 32u : 0u);
+    const uint qh_off = qh_base + l0;
+    const uint qh_shift = group * 2u;          // 0, 2, 4, 6
+    const uint scale_idx = is + group * 2u;    // is, is+2, is+4, is+6
+
     const uint d_bits = uint(a_data[byte_off + 208u]) | (uint(a_data[byte_off + 209u]) << 8);
     const float d = unpackHalf2x16(d_bits).x;
-
-    uint ql_byte;
-    uint qh_shift;
-    uint scale_idx;
-    if (group == 0u) {
-        ql_byte = uint(a_data[ql_base + l]) & 0xFu;
-        qh_shift = 0u;
-        scale_idx = is;
-    } else if (group == 1u) {
-        ql_byte = uint(a_data[ql_base + l + 32u]) & 0xFu;
-        qh_shift = 2u;
-        scale_idx = is + 2u;
-    } else if (group == 2u) {
-        ql_byte = uint(a_data[ql_base + l]) >> 4;
-        qh_shift = 4u;
-        scale_idx = is + 4u;
-    } else {
-        ql_byte = uint(a_data[ql_base + l + 32u]) >> 4;
-        qh_shift = 6u;
-        scale_idx = is + 6u;
-    }
-
-    const uint qh_v = uint(a_data[qh_base + l]);
-    const int q = int(ql_byte | (((qh_v >> qh_shift) & 3u) << 4)) - 32;
     const float s = d * float(signed_i8(uint(a_data[sc_base + scale_idx])));
-    return s * float(q);
+
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        const uint ql_raw = uint(a_data[ql_off + i]);
+        const uint ql_nib = hi_nibble ? (ql_raw >> 4) : (ql_raw & 0xFu);
+        const uint qh_raw = uint(a_data[qh_off + i]);
+        const int q = int(ql_nib | (((qh_raw >> qh_shift) & 3u) << 4)) - 32;
+        vals[i] = s * float(q);
+    }
 }
 
 void main() {
@@ -118,9 +114,7 @@ void main() {
             const uint k_block_base = k_base & 255u;
 
             float vals[16];
-            [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                vals[i] = load_q6k(byte_off, k_block_base + i);
-            }
+            load_q6k_run(byte_off, k_block_base, vals);
 
             const uint base_a = row_local * STRIDE_A + k_in_tile;
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
