@@ -98,6 +98,81 @@ interface ParsedComment extends ZigApiDocBlock { }
 
 const EXCLUDED_MODULES = new Set(['vulkan/vk.zig', 'regression_tests.zig']);
 
+// Named imports the standalone struct analyzer cannot resolve because they
+// only exist as build-graph modules (`@import("gguf")`, `@import("zinc_rt")`).
+// Any file that directly or transitively reaches one of these is excluded
+// from struct-layout extraction. Their doc summary, field declarations,
+// params, and returns still render from the source parser — only the runtime
+// `@sizeOf` / `@alignOf` / `@offsetOf` numbers are skipped.
+//
+// We compute the exclusion closure at load time rather than hand-listing,
+// so adding a new gguf-using file doesn't silently re-break struct extraction
+// for every other module (Zig errors on the first failing @import in the
+// analyzer's compilation, taking down all the others with it).
+const STRUCT_EXTRACTOR_TAINTED_IMPORTS = new Set(['gguf', 'zinc_rt', 'forward_zinc_rt']);
+
+const ZIG_IMPORT_RE = /@import\(\s*"([^"]+)"\s*\)/g;
+
+// Resolve a `@import("rel/path.zig")` from `fromSourcePath` to a sourcePath
+// of the form `src/...`. Returns null for non-path imports (named modules,
+// stdlib).
+function resolveZigRelativeImport(fromSourcePath: string, importTarget: string): string | null {
+  if (!importTarget.endsWith('.zig')) return null;
+  if (importTarget.startsWith('/')) return null;
+  const fromDir = fromSourcePath.split('/').slice(0, -1);
+  const parts = importTarget.split('/');
+  for (const part of parts) {
+    if (part === '..') fromDir.pop();
+    else if (part === '.') continue;
+    else fromDir.push(part);
+  }
+  return fromDir.join('/');
+}
+
+// Compute the closure of source files whose struct layouts cannot be
+// extracted by the standalone analyzer. A file is excluded if:
+//   (a) it `@import`s any name in STRUCT_EXTRACTOR_TAINTED_IMPORTS, or
+//   (b) it `@import`s a relative path resolving to a file already excluded.
+// BFS until the set stops growing.
+function computeStructExtractorExcluded(fileContents: Map<string, string>): Set<string> {
+  const importsByFile = new Map<string, { named: string[]; relative: string[] }>();
+  for (const [path, content] of fileContents) {
+    const named: string[] = [];
+    const relative: string[] = [];
+    for (const match of content.matchAll(ZIG_IMPORT_RE)) {
+      const target = match[1];
+      if (target.endsWith('.zig')) {
+        const resolved = resolveZigRelativeImport(path, target);
+        if (resolved) relative.push(resolved);
+      } else {
+        named.push(target);
+      }
+    }
+    importsByFile.set(path, { named, relative });
+  }
+
+  const excluded = new Set<string>();
+  // Seed: files importing a tainted named module.
+  for (const [path, imports] of importsByFile) {
+    if (imports.named.some(name => STRUCT_EXTRACTOR_TAINTED_IMPORTS.has(name))) {
+      excluded.add(path);
+    }
+  }
+  // BFS: anything importing an excluded file is also excluded.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [path, imports] of importsByFile) {
+      if (excluded.has(path)) continue;
+      if (imports.relative.some(r => excluded.has(r))) {
+        excluded.add(path);
+        grew = true;
+      }
+    }
+  }
+  return excluded;
+}
+
 const SECTION_META = new Map<string, { title: string; description: string; order: number }>([
   [
     'cli-entrypoints',
@@ -201,6 +276,14 @@ const SECTION_META = new Map<string, { title: string; description: string; order
       title: 'API Server',
       description: 'OpenAI-compatible HTTP server, route dispatch, SSE streaming, and session management for serving inference over the network.',
       order: 12,
+    },
+  ],
+  [
+    'tool-calling',
+    {
+      title: 'Tool Calling',
+      description: 'Tool-use protocol helpers: chat-template-aware tool definitions, argument parsing, and response formatting for function-calling-capable models.',
+      order: 13,
     },
   ],
 ]);
@@ -986,6 +1069,7 @@ export function renderZigApiAgentText(api: ZigApiIndex, siteUrl: string): string
 async function loadZigApiImpl(): Promise<ZigApiIndex> {
   const files = await collectZigFiles(SRC_ROOT);
   const modules: ZigApiModule[] = [];
+  const fileContents = new Map<string, string>();
   let latestMtime = 0;
 
   for (const relativePath of files) {
@@ -997,11 +1081,17 @@ async function loadZigApiImpl(): Promise<ZigApiIndex> {
     latestMtime = Math.max(latestMtime, fileStat.mtimeMs);
 
     const parsed = parseZigModuleContent(content, relativePath);
-    if (parsed) modules.push(parsed);
+    if (parsed) {
+      modules.push(parsed);
+      fileContents.set(parsed.sourcePath, content);
+    }
   }
+
+  const structExtractorExcluded = computeStructExtractorExcluded(fileContents);
 
   const structSymbols: { modulePath: string; qualifiedName: string; symbol: ZigApiSymbol }[] = [];
   for (const mod of modules) {
+    if (structExtractorExcluded.has(mod.sourcePath)) continue;
     for (const sym of mod.symbols) {
       if (sym.symbolKind === 'struct') {
         structSymbols.push({ modulePath: sym.sourcePath, qualifiedName: sym.qualifiedName, symbol: sym });
