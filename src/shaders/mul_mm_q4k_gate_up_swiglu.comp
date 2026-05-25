@@ -128,9 +128,15 @@ void main() {
                 uint qs3 = gate_u32[qs_u32_idx + 3u];
                 [[unroll]] for (uint w = 0u; w < 4u; w++) {
                     uint qs_word = (w == 0u) ? qs0 : (w == 1u) ? qs1 : (w == 2u) ? qs2 : qs3;
+                    // Select the low/high nibble plane for all 4 packed bytes once
+                    // instead of extracting both nibbles per byte and discarding
+                    // one. nibble_choice is workgroup-uniform, so hoisting the
+                    // select cuts integer VALU on this VALU-bound dequant.
+                    // Bit-exact with the per-byte form.
+                    uint plane = (nibble_choice == 0u) ? (qs_word & 0x0F0F0F0Fu)
+                                                       : ((qs_word >> 4) & 0x0F0F0F0Fu);
                     [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                        uint byte_v = (qs_word >> (b * 8u)) & 0xFFu;
-                        uint nibble = (nibble_choice == 0u) ? (byte_v & 0xFu) : ((byte_v >> 4) & 0xFu);
+                        uint nibble = (plane >> (b * 8u)) & 0xFu;
                         vals_gate[w * 4u + b] = factor * float(nibble) - bias;
                     }
                 }
@@ -169,9 +175,10 @@ void main() {
                 qs3 = up_u32[qs_u32_idx + 3u];
                 [[unroll]] for (uint w = 0u; w < 4u; w++) {
                     uint qs_word = (w == 0u) ? qs0 : (w == 1u) ? qs1 : (w == 2u) ? qs2 : qs3;
+                    uint plane = (nibble_choice == 0u) ? (qs_word & 0x0F0F0F0Fu)
+                                                       : ((qs_word >> 4) & 0x0F0F0F0Fu);
                     [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                        uint byte_v = (qs_word >> (b * 8u)) & 0xFFu;
-                        uint nibble = (nibble_choice == 0u) ? (byte_v & 0xFu) : ((byte_v >> 4) & 0xFu);
+                        uint nibble = (plane >> (b * 8u)) & 0xFu;
                         vals_up[w * 4u + b] = factor * float(nibble) - bias;
                     }
                 }
