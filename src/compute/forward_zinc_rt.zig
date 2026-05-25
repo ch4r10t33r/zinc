@@ -16,8 +16,17 @@ const log = std.log.scoped(.zinc_rt_forward);
 /// Decode-token budget used by the M0 smoke tail and by benchmarks that want a
 /// short, bounded run on the scalar reference path. The full M1 forward respects
 /// the caller-supplied `max_tokens` and uses this only as a hard ceiling when no
-/// other budget is in scope.
-pub const m0_max_decode_tokens: u32 = 8;
+/// other budget is in scope. Override via ZINC_RT_MAX_DECODE_TOKENS.
+pub const m0_max_decode_tokens_default: u32 = 8;
+
+fn m0MaxDecodeTokens() u32 {
+    if (std.posix.getenv("ZINC_RT_MAX_DECODE_TOKENS")) |raw| {
+        if (std.fmt.parseInt(u32, raw, 10) catch null) |parsed| {
+            if (parsed > 0) return parsed;
+        }
+    }
+    return m0_max_decode_tokens_default;
+}
 
 const WeightView = struct {
     raw: []const u8,
@@ -1213,7 +1222,7 @@ fn generateNoLayer(
     eos_token_id: u32,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
-    const effective_max_tokens = @min(max_tokens, m0_max_decode_tokens);
+    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
 
@@ -1463,7 +1472,7 @@ fn generateScalarHybrid(
     allocator: std.mem.Allocator,
     options: GenerateOptions,
 ) !GenerateResult {
-    const effective_max_tokens = @min(max_tokens, m0_max_decode_tokens);
+    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
     const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
     defer state.deinit();
@@ -1673,7 +1682,7 @@ fn generateScalarDense(
     options: GenerateOptions,
 ) !GenerateResult {
     _ = options;
-    const effective_max_tokens = @min(max_tokens, m0_max_decode_tokens);
+    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
     const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
     defer state.deinit();
@@ -3168,6 +3177,7 @@ fn runMoeLayer(
             state.up[0..cfg.intermediate_dim],
             state.swiglu[0..cfg.intermediate_dim],
             state.down,
+            cfg.is_gemma,
         );
         for (state.hidden, state.down) |*h, v| h.* += weight * v;
     }
@@ -3188,6 +3198,7 @@ fn runMoeLayer(
             state.up[0..inter],
             state.swiglu[0..inter],
             state.down,
+            cfg.is_gemma,
         );
         for (state.hidden, state.down) |*h, v| h.* += sp.scale * v;
     }
@@ -3289,6 +3300,8 @@ const MoeExpertWorker = struct {
     up: []f32,
     swiglu_out: []f32,
     down: []f32,
+    // Gemma 4 experts run with gelu(gate) * up instead of silu(gate) * up.
+    use_gelu: bool = false,
     failed: bool = false,
 };
 
@@ -3361,6 +3374,7 @@ fn runMoeExpertsParallel(
             .up = slotSlice(state.moe_worker_up, i, inter_stride, inter_len),
             .swiglu_out = slotSlice(state.moe_worker_swiglu, i, inter_stride, inter_len),
             .down = slotSlice(state.moe_worker_down, i, down_stride_f32, down_stride_f32),
+            .use_gelu = cfg.is_gemma,
         };
     }
     if (shared) |sp| {
@@ -3380,6 +3394,7 @@ fn runMoeExpertsParallel(
             .up = slotSlice(state.moe_worker_up, i, inter_stride, shared_inter),
             .swiglu_out = slotSlice(state.moe_worker_swiglu, i, inter_stride, shared_inter),
             .down = slotSlice(state.moe_worker_down, i, down_stride_f32, down_stride_f32),
+            .use_gelu = cfg.is_gemma,
         };
     }
 
@@ -3462,6 +3477,7 @@ fn moeExpertWorkerMain(params: *MoeExpertWorker) void {
         params.up,
         params.swiglu_out,
         params.down,
+        params.use_gelu,
     ) catch {
         params.failed = true;
     };
@@ -3493,7 +3509,11 @@ fn runSharedExpertOnly(state: *ScalarDecodeState, cfg: CpuModelConfig, sp: MoeSh
         try matvecRaw(state.pool, sp.up_raw, sp.up_type, state.ffn_norm, sp.inter, state.row_scratch, state.up[0..inter]);
     }
 
-    swiglu(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    if (cfg.is_gemma) {
+        geluGate(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    } else {
+        swiglu(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    }
     try matvecRaw(state.pool, sp.down_raw, sp.down_type, state.swiglu[0..inter], cfg.hidden_dim, state.row_scratch, state.down);
     for (state.hidden, state.down) |*h, v| h.* += sp.scale * v;
 }
@@ -3527,7 +3547,11 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
 
     var down: [moe_expert_parallel_max_workers]MultiInputFusedSegment = undefined;
     for (params, 0..) |*param, i| {
-        swiglu(param.gate, param.up, param.swiglu_out);
+        if (param.use_gelu) {
+            geluGate(param.gate, param.up, param.swiglu_out);
+        } else {
+            swiglu(param.gate, param.up, param.swiglu_out);
+        }
         if (!canDotDirect(param.down_type, param.intermediate_dim) or needsInputSum32(param.down_type)) return false;
         down[i] = .{
             .raw = param.down_raw,
@@ -3556,6 +3580,7 @@ fn runMoeExpert(
     up: []f32,
     swiglu_out: []f32,
     down: []f32,
+    use_gelu: bool,
 ) !void {
     // Inner expert matvecs stay serial because these run from pool worker
     // threads; `matvecRawDirect` only parallelizes through an explicit pool.
@@ -3580,7 +3605,11 @@ fn runMoeExpert(
         try matvecRaw(null, gate_raw, gate_type, ffn_norm, intermediate_dim, scratch, gate[0..intermediate_dim]);
         try matvecRaw(null, up_raw, up_type, ffn_norm, intermediate_dim, scratch, up[0..intermediate_dim]);
     }
-    swiglu(gate[0..intermediate_dim], up[0..intermediate_dim], swiglu_out[0..intermediate_dim]);
+    if (use_gelu) {
+        geluGate(gate[0..intermediate_dim], up[0..intermediate_dim], swiglu_out[0..intermediate_dim]);
+    } else {
+        swiglu(gate[0..intermediate_dim], up[0..intermediate_dim], swiglu_out[0..intermediate_dim]);
+    }
     try matvecRaw(null, down_raw, down_type, swiglu_out[0..intermediate_dim], hidden_dim, scratch, down[0..hidden_dim]);
 }
 
@@ -5392,6 +5421,8 @@ pub const Tokenizer = struct {
     vocab: []const []const u8,
     token_to_id: std.StringHashMapUnmanaged(u32),
     eos_id: u32,
+    bos_id: ?u32,
+    add_bos: bool,
 
     /// Build a tokenizer by reading `tokenizer.ggml.tokens` and
     /// `tokenizer.ggml.eos_token_id` out of `gf`. Defaults the EOS id to `2`
@@ -5419,11 +5450,19 @@ pub const Tokenizer = struct {
             try token_to_id.put(allocator, token, @intCast(index));
         }
 
+        const bos_id = gf.getU32("tokenizer.ggml.bos_token_id");
+        // Default for Gemma 4: prepend BOS unless metadata says otherwise.
+        // For other architectures, default to false (most don't prepend).
+        const arch_str = gf.getString("general.architecture") orelse "";
+        const default_add_bos = std.mem.startsWith(u8, arch_str, "gemma");
+        const add_bos = gf.getBool("tokenizer.ggml.add_bos_token") orelse default_add_bos;
         return .{
             .allocator = allocator,
             .vocab = vocab,
             .token_to_id = token_to_id,
             .eos_id = gf.getU32("tokenizer.ggml.eos_token_id") orelse 2,
+            .bos_id = bos_id,
+            .add_bos = add_bos and bos_id != null,
         };
     }
 
@@ -5437,6 +5476,77 @@ pub const Tokenizer = struct {
     /// Return the stop token id the caller should pass to `generate`.
     pub fn eosId(self: *const Tokenizer) u32 {
         return self.eos_id;
+    }
+
+    /// Wrap the user prompt with Gemma's chat-turn special tokens so the
+    /// instruction-tuned model has the expected scaffolding. Returns null when
+    /// the vocab doesn't carry the Gemma `<start_of_turn>` / `<end_of_turn>`
+    /// special-token strings (i.e. the model isn't Gemma-templated).
+    pub fn encodeGemmaChat(self: *const Tokenizer, user_text: []const u8, allocator: std.mem.Allocator) !?[]u32 {
+        // Gemma 2/3 use <start_of_turn>/<end_of_turn>. Gemma 4 uses <|turn>/<turn|>.
+        const start_id = self.token_to_id.get("<|turn>") orelse
+            self.token_to_id.get("<start_of_turn>") orelse return null;
+        const end_id = self.token_to_id.get("<turn|>") orelse
+            self.token_to_id.get("<end_of_turn>") orelse return null;
+        const newline_id = self.token_to_id.get("\n") orelse self.token_to_id.get("Ċ"); // GPT-2 mapping of '\n'
+
+        var tokens: std.ArrayList(u32) = .{};
+        errdefer tokens.deinit(allocator);
+        if (self.add_bos) {
+            if (self.bos_id) |bos| try tokens.append(allocator, bos);
+        }
+        try tokens.append(allocator, start_id);
+        // "user\n" — encode through the longest-match scanner, then strip BOS
+        // if it added one (we're only emitting the role label here).
+        const user_label_tokens = try self.encodePromptNoBos("user", allocator);
+        defer allocator.free(user_label_tokens);
+        for (user_label_tokens) |t| try tokens.append(allocator, t);
+        if (newline_id) |nid| try tokens.append(allocator, nid);
+        const body_tokens = try self.encodePromptNoBos(user_text, allocator);
+        defer allocator.free(body_tokens);
+        for (body_tokens) |t| try tokens.append(allocator, t);
+        try tokens.append(allocator, end_id);
+        if (newline_id) |nid| try tokens.append(allocator, nid);
+        try tokens.append(allocator, start_id);
+        const model_label_tokens = try self.encodePromptNoBos("model", allocator);
+        defer allocator.free(model_label_tokens);
+        for (model_label_tokens) |t| try tokens.append(allocator, t);
+        if (newline_id) |nid| try tokens.append(allocator, nid);
+        return try tokens.toOwnedSlice(allocator);
+    }
+
+    fn encodePromptNoBos(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
+        var encoded: std.ArrayList(u8) = .{};
+        defer encoded.deinit(allocator);
+        for (text) |byte| {
+            const mapped = gpt2ByteToUnicode(byte);
+            const n = std.mem.indexOfScalar(u8, &mapped, 0) orelse mapped.len;
+            try encoded.appendSlice(allocator, mapped[0..n]);
+        }
+        var tokens: std.ArrayList(u32) = .{};
+        errdefer tokens.deinit(allocator);
+        var pos: usize = 0;
+        while (pos < encoded.items.len) {
+            var best_id: ?u32 = null;
+            var best_len: usize = 0;
+            var end = encoded.items.len;
+            while (end > pos) : (end -= 1) {
+                const piece = encoded.items[pos..end];
+                if (self.token_to_id.get(piece)) |id| {
+                    best_id = id;
+                    best_len = piece.len;
+                    break;
+                }
+            }
+            if (best_id) |id| {
+                try tokens.append(allocator, id);
+                pos += best_len;
+            } else {
+                try tokens.append(allocator, 0);
+                pos += 1;
+            }
+        }
+        return tokens.toOwnedSlice(allocator);
     }
 
     /// Encode `text` into a token id stream using a longest-match scan over
@@ -5456,6 +5566,9 @@ pub const Tokenizer = struct {
 
         var tokens: std.ArrayList(u32) = .{};
         errdefer tokens.deinit(allocator);
+        if (self.add_bos) {
+            if (self.bos_id) |bos| try tokens.append(allocator, bos);
+        }
         var pos: usize = 0;
         while (pos < encoded.items.len) {
             var best_id: ?u32 = null;

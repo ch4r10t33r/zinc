@@ -24,6 +24,7 @@ const CliOptions = struct {
     model_path: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     max_tokens: u32 = 256,
+    chat: bool = false,
 };
 
 /// Process entrypoint for the `zinc` binary built with `-Dbackend=zinc_rt`.
@@ -112,6 +113,12 @@ fn parseArgs(args: []const []const u8) !CliOptions {
             options.max_tokens = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.startsWith(u8, arg, "--max-tokens=")) {
             options.max_tokens = try std.fmt.parseInt(u32, arg["--max-tokens=".len..], 10);
+        } else if (std.mem.eql(u8, arg, "-n")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            options.max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--chat")) {
+            options.chat = true;
         } else if (optionTakesValue(arg)) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
@@ -171,7 +178,7 @@ fn runPromptMode(rt: *const engine.Engine, options: CliOptions) !void {
                 "info(zinc_rt): forward_zinc_rt M1 host-assisted path with direct token-boundary gate\n",
             );
             try stdout.interface.flush();
-            try runForwardPrompt(rt.tier, model_path, prompt, options.max_tokens);
+            try runForwardPrompt(rt.tier, model_path, prompt, options.max_tokens, options.chat);
             return;
         }
     }
@@ -205,7 +212,7 @@ fn printTierStartupAndSmoke(stdout: anytype, tier: engine.Tier) !void {
     }
 }
 
-fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u8, max_tokens: u32) !void {
+fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u8, max_tokens: u32, chat: bool) !void {
     const allocator = std.heap.page_allocator;
 
     var model = try forward_zinc_rt.Model.load(model_path, allocator);
@@ -214,7 +221,15 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
     var tokenizer = try forward_zinc_rt.initTokenizer(&model, allocator);
     defer tokenizer.deinit();
 
-    const prompt_tokens = try tokenizer.encodePrompt(prompt, allocator);
+    const prompt_tokens = blk: {
+        if (chat) {
+            if (try tokenizer.encodeGemmaChat(prompt, allocator)) |toks| {
+                std.log.info("zinc_rt: Gemma chat template applied ({d} prompt tokens)", .{toks.len});
+                break :blk toks;
+            }
+        }
+        break :blk try tokenizer.encodePrompt(prompt, allocator);
+    };
     defer allocator.free(prompt_tokens);
 
     var result = try forward_zinc_rt.generateWithOptions(
