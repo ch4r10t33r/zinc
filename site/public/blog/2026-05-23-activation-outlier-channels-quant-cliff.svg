@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 600" role="img" aria-labelledby="title desc">
+<title id="title">A few outlier channels make activations far harder to quantize than weights</title>
+<desc id="desc">Two-panel data visualization on a warm off-white paper background. Left: a per-channel activation magnitude bar chart, a low flat field of small teal bars with three tall vermilion outlier spikes labeled as roughly 0.1 percent of features running tens to one hundred thousand times the median. Right: two horizontal bars comparing the cost of zeroing the 0.1 percent outlier features (perplexity plus 600 to 1000 percent, top-1 attention mass minus 20 percent) against zeroing a random 0.1 percent (negligible).</desc>
+<style>
+ .ink{fill:#23303a} .soft{fill:#5d6b72} .faint{fill:#8a9097}
+ .t{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+ .m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .title{font-size:18px;font-weight:600}
+ .sub{font-size:12.5px}
+ .ptitle{font-size:14px;font-weight:600}
+ .lab{font-size:12px} .labs{font-size:11px} .labf{font-size:10px}
+ .bold{font-weight:600}
+</style>
+<rect width="980" height="600" fill="#f4f1e8"/>
+<text class="t title ink" x="40" y="44">Weights quantize. Activations have spikes.</text>
+<text class="t sub soft" x="40" y="66">Per-channel activation magnitude in one transformer hidden state, and the cost of quantizing as if the spikes were not there.</text>
+<line x1="512" y1="86" x2="512" y2="556" stroke="#ddd6c4" stroke-width="1"/>
+<text class="t ptitle ink" x="40" y="108">Per-channel activation magnitude, one hidden state</text>
+<line x1="60" y1="478" x2="482" y2="478" stroke="#e7e1d2" stroke-width="1"/>
+<line x1="60" y1="398" x2="482" y2="398" stroke="#e7e1d2" stroke-width="1"/>
+<line x1="60" y1="318" x2="482" y2="318" stroke="#e7e1d2" stroke-width="1"/>
+<line x1="60" y1="238" x2="482" y2="238" stroke="#e7e1d2" stroke-width="1"/>
+<line x1="60" y1="158" x2="482" y2="158" stroke="#e7e1d2" stroke-width="1"/>
+<rect x="66.0" y="465.0" width="6" height="13" fill="#1f7a82" rx="1"/>
+<rect x="75.9" y="471.0" width="6" height="7" fill="#1f7a82" rx="1"/>
+<rect x="85.7" y="458.0" width="6" height="20" fill="#1f7a82" rx="1"/>
+<rect x="95.6" y="470.0" width="6" height="8" fill="#1f7a82" rx="1"/>
+<rect x="105.4" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="115.3" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="125.1" y="466.0" width="6" height="12" fill="#1f7a82" rx="1"/>
+<rect x="135.0" y="464.0" width="6" height="14" fill="#1f7a82" rx="1"/>
+<rect x="144.9" y="166.0" width="6" height="312" fill="#c8402c" rx="1"/>
+<rect x="154.7" y="470.0" width="6" height="8" fill="#1f7a82" rx="1"/>
+<rect x="164.6" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="174.4" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="184.3" y="468.0" width="6" height="10" fill="#1f7a82" rx="1"/>
+<rect x="194.1" y="466.0" width="6" height="12" fill="#1f7a82" rx="1"/>
+<rect x="204.0" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="213.9" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="223.7" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="233.6" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="243.4" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="253.3" y="468.0" width="6" height="10" fill="#1f7a82" rx="1"/>
+<rect x="263.1" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="273.0" y="466.0" width="6" height="12" fill="#1f7a82" rx="1"/>
+<rect x="282.9" y="212.0" width="6" height="266" fill="#c8402c" rx="1"/>
+<rect x="292.7" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="302.6" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="312.4" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="322.3" y="464.0" width="6" height="14" fill="#1f7a82" rx="1"/>
+<rect x="332.1" y="468.0" width="6" height="10" fill="#1f7a82" rx="1"/>
+<rect x="342.0" y="470.0" width="6" height="8" fill="#1f7a82" rx="1"/>
+<rect x="351.9" y="470.0" width="6" height="8" fill="#1f7a82" rx="1"/>
+<rect x="361.7" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="371.6" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="381.4" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="391.3" y="190.0" width="6" height="288" fill="#c8402c" rx="1"/>
+<rect x="401.1" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<rect x="411.0" y="458.0" width="6" height="20" fill="#1f7a82" rx="1"/>
+<rect x="420.9" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="430.7" y="468.0" width="6" height="10" fill="#1f7a82" rx="1"/>
+<rect x="440.6" y="467.0" width="6" height="11" fill="#1f7a82" rx="1"/>
+<rect x="450.4" y="466.0" width="6" height="12" fill="#1f7a82" rx="1"/>
+<rect x="460.3" y="471.0" width="6" height="7" fill="#1f7a82" rx="1"/>
+<rect x="470.1" y="469.0" width="6" height="9" fill="#1f7a82" rx="1"/>
+<line x1="60" y1="478" x2="482" y2="478" stroke="#bdb6a3" stroke-width="1.5"/>
+<text class="t labs faint" x="60" y="496">hidden dimension channel →</text>
+<text class="t labs faint" x="46" y="150">magnitude</text>
+<text class="t labf faint" x="66" y="540">Vertical axis compressed; the spikes run far past the top of the panel.</text>
+<path d="M138.9 146 L138.9 138 L403.3 138 L403.3 146" fill="none" stroke="#c8402c" stroke-width="1.4" stroke-dasharray="4 3"/>
+<text class="t labs bold" fill="#c8402c" x="271.1" y="132" text-anchor="middle">outliers ≈ 0.1% of features</text>
+<text class="t labs ink" x="196" y="262">a few fixed channels run</text>
+<text class="t labs ink bold" x="196" y="279">10x to ~100,000x the median</text>
+<text class="t labf soft" x="196" y="296">LLM.int8(), Massive Activations</text>
+<text class="t labs soft" x="66" y="524">Weights, by contrast, fill a tight bell with no spike, so a single scale fits them.</text>
+<text class="t ptitle ink" x="536" y="108">The cost of quantizing as if the spikes were not there</text>
+<text class="t lab ink bold" x="560" y="186">Zero the 0.1% outlier features</text>
+<rect x="560" y="196" width="360" height="50" fill="#c8402c" rx="3"/>
+<text class="t labs bold" fill="#ffffff" x="572" y="217">perplexity +600 to 1000%</text>
+<text class="t labs" fill="#fce8e2" x="572" y="235">top-1 attention mass −20%</text>
+<text class="t lab ink bold" x="560" y="310">Zero a random 0.1% of features</text>
+<rect x="560" y="320" width="16" height="50" fill="#1f7a82" rx="3"/>
+<text class="t labs ink" x="586" y="351">negligible</text>
+<line x1="560" y1="180" x2="560" y2="390" stroke="#bdb6a3" stroke-width="1.5"/>
+<text class="t labs faint" x="560" y="412">relative damage to the model →</text>
+<text class="t labs ink" x="536" y="468">Same count of features removed. The 0.1% that matters</text>
+<text class="t labs ink" x="536" y="485">is the spiky 0.1%, which is why one low-bit scale fails:</text>
+<text class="t labs ink bold" x="536" y="502">it spends its range on the giants and starves the field.</text>
+<text class="t labf faint" x="40" y="580">Left bar heights are illustrative of the documented pattern; the degradation figures are measured in LLM.int8() on transformer language models.</text>
+</svg>

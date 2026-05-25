@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 600" role="img" aria-labelledby="title desc">
+<title id="title">YaRN stretches Qwen3 RoPE frequencies, and applying it statically taxes every short prompt</title>
+<desc id="desc">A two-panel data visualization on a deep petrol-teal background. Left: how YaRN stretches the RoPE frequency spectrum, with a native row of sine waves and a static YaRN factor four row whose high-frequency waves are preserved and low-frequency waves stretched four times. Right: the static tax, a line chart of effective rope scaling versus prompt length, with a flat static line at factor four and a length-aware line that stays at factor one until 32768 then ramps to four at 131072, the gap between them shaded as the tax.</desc>
+<style>
+ .bg{fill:#0d2026}
+ .ink{fill:#e8f2f0} .soft{fill:#9bbab7} .fnt{fill:#5f8581}
+ .t{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+ .m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .title{font-size:19px;font-weight:600}
+ .sub{font-size:12.5px}
+ .ptitle{font-size:14px;font-weight:600}
+ .lab{font-size:12px} .labs{font-size:11px} .labf{font-size:10.5px}
+ .cyan{stroke:#4fd1c5} .amber{stroke:#f2a541}
+ .cyanf{fill:#4fd1c5} .amberf{fill:#f2a541}
+ .grid{stroke:#214248;stroke-width:1}
+ .axis{stroke:#3a6168;stroke-width:1.4}
+ .wave{fill:none;stroke-width:2.4}
+ .dash{stroke-dasharray:5 5}
+</style>
+<rect class="bg" x="0" y="0" width="980" height="600" rx="14"/>
+<text class="t ink title" x="40" y="42">Qwen3 reaches 131,072 tokens with one static YaRN factor</text>
+<text class="t soft sub" x="40" y="66">Left: the rotation math YaRN changes.   Right: the price of freezing that change instead of scaling it per request.</text>
+<line x1="505" y1="92" x2="505" y2="560" class="grid"/>
+<text class="t ink ptitle" x="40" y="116">How YaRN stretches the RoPE frequency spectrum</text>
+<text class="t fnt labf" x="70" y="140">high freq · local order</text>
+<text class="t fnt labf" x="470" y="140" text-anchor="end">low freq · long range</text>
+<line x1="70" y1="150" x2="468" y2="150" class="axis"/>
+<path d="M470 150 l-8 -3.6 l0 7.2 z" fill="#3a6168" stroke="none"/>
+<text class="t soft lab" x="70" y="184">native · trained to 32,768</text>
+<line x1="70" y1="210" x2="470" y2="210" class="grid"/>
+<path d="M70.0 210.0 L72.0 199.1 L74.0 190.6 L76.0 186.4 L78.0 186.9 L80.0 191.8 L82.0 200.0 L84.0 209.8 L86.0 219.5 L88.0 227.5 L90.0 232.5 L92.0 234.0 L94.0 231.8 L96.0 226.5 L98.0 219.0 L100.0 210.3 L102.0 201.8 L104.0 194.4 L106.0 189.0 L108.0 186.3 L110.0 186.4 L112.0 189.2 L114.0 194.3 L116.0 201.0 L118.0 208.5 L120.0 216.2 L122.0 223.1 L124.0 228.6 L126.0 232.3 L128.0 233.9 L130.0 233.4 L132.0 230.8 L134.0 226.4 L136.0 220.8 L138.0 214.3 L140.0 207.6 L142.0 201.1 L144.0 195.4 L146.0 190.8 L148.0 187.7 L150.0 186.1 L152.0 186.3 L154.0 188.1 L156.0 191.3 L158.0 195.6 L160.0 200.9 L162.0 206.6 L164.0 212.6 L166.0 218.3 L168.0 223.4 L170.0 227.7 L172.0 231.0 L174.0 233.1 L176.0 234.0 L178.0 233.5 L180.0 231.9 L182.0 229.1 L184.0 225.4 L186.0 221.0 L188.0 216.1 L190.0 211.0 L192.0 205.8 L194.0 200.9 L196.0 196.4 L198.0 192.6 L200.0 189.6 L202.0 187.4 L204.0 186.2 L206.0 186.0 L208.0 186.8 L210.0 188.5 L212.0 191.0 L214.0 194.2 L216.0 198.0 L218.0 202.2 L220.0 206.7 L222.0 211.2 L224.0 215.7 L226.0 219.9 L228.0 223.8 L230.0 227.1 L232.0 229.9 L234.0 232.0 L236.0 233.3 L238.0 234.0 L240.0 233.8 L242.0 233.0 L244.0 231.4 L246.0 229.2 L248.0 226.5 L250.0 223.2 L252.0 219.7 L254.0 215.9 L256.0 211.9 L258.0 208.0 L260.0 204.1 L262.0 200.4 L264.0 196.9 L266.0 193.9 L268.0 191.2 L270.0 189.1 L272.0 187.5 L274.0 186.5 L276.0 186.0 L278.0 186.1 L280.0 186.8 L282.0 188.1 L284.0 189.8 L286.0 192.0 L288.0 194.5 L290.0 197.4 L292.0 200.6 L294.0 203.9 L296.0 207.4 L298.0 210.9 L300.0 214.3 L302.0 217.6 L304.0 220.8 L306.0 223.7 L308.0 226.4 L310.0 228.7 L312.0 230.6 L314.0 232.1 L316.0 233.2 L318.0 233.8 L320.0 234.0 L322.0 233.8 L324.0 233.1 L326.0 232.0 L328.0 230.5 L330.0 228.7 L332.0 226.5 L334.0 224.1 L336.0 221.5 L338.0 218.7 L340.0 215.7 L342.0 212.7 L344.0 209.7 L346.0 206.6 L348.0 203.7 L350.0 200.8 L352.0 198.1 L354.0 195.6 L356.0 193.4 L358.0 191.4 L360.0 189.7 L362.0 188.3 L364.0 187.2 L366.0 186.5 L368.0 186.1 L370.0 186.0 L372.0 186.3 L374.0 186.9 L376.0 187.8 L378.0 189.1 L380.0 190.6 L382.0 192.3 L384.0 194.3 L386.0 196.5 L388.0 198.8 L390.0 201.3 L392.0 203.9 L394.0 206.5 L396.0 209.2 L398.0 211.9 L400.0 214.5 L402.0 217.1 L404.0 219.5 L406.0 221.9 L408.0 224.1 L410.0 226.1 L412.0 227.9 L414.0 229.5 L416.0 230.9 L418.0 232.0 L420.0 232.9 L422.0 233.5 L424.0 233.9 L426.0 234.0 L428.0 233.8 L430.0 233.4 L432.0 232.8 L434.0 231.9 L436.0 230.7 L438.0 229.4 L440.0 227.9 L442.0 226.2 L444.0 224.3 L446.0 222.3 L448.0 220.2 L450.0 218.0 L452.0 215.7 L454.0 213.4 L456.0 211.1 L458.0 208.7 L460.0 206.4 L462.0 204.1 L464.0 201.9 L466.0 199.8 L468.0 197.8 L470.0 195.9" class="wave cyan"/>
+<text class="t soft lab" x="70" y="306">static YaRN · factor 4 → 131,072</text>
+<line x1="70" y1="360" x2="470" y2="360" class="grid"/>
+<path d="M70.0 360.0 L72.0 349.1 L74.0 340.6 L76.0 336.4 L78.0 336.9 L80.0 341.8 L82.0 350.0 L84.0 359.8 L86.0 369.5 L88.0 377.5 L90.0 382.5 L92.0 384.0 L94.0 381.8 L96.0 376.5 L98.0 369.0 L100.0 360.3 L102.0 351.8 L104.0 344.4 L106.0 339.0 L108.0 336.3 L110.0 336.4 L112.0 339.2 L114.0 344.3 L116.0 351.0 L118.0 358.5 L120.0 366.2 L122.0 373.1 L124.0 378.6 L126.0 382.3 L128.0 383.9 L130.0 383.4 L132.0 380.8 L134.0 376.4 L136.0 370.8 L138.0 364.3 L140.0 357.6 L142.0 351.1 L144.0 345.4 L146.0 340.8 L148.0 337.7 L150.0 336.1 L152.0 336.3 L154.0 338.1 L156.0 341.3 L158.0 345.6 L160.0 350.9 L162.0 356.6 L164.0 362.6 L166.0 368.3 L168.0 373.4 L170.0 377.7 L172.0 381.0 L174.0 383.1 L176.0 384.0 L178.0 383.5 L180.0 381.9 L182.0 379.1 L184.0 375.4 L186.0 371.0 L188.0 366.1 L190.0 361.0 L192.0 355.8 L194.0 350.9 L196.0 346.4 L198.0 342.6 L200.0 339.6 L202.0 337.4 L204.0 336.2 L206.0 336.0 L208.0 336.8 L210.0 338.5 L212.0 341.0 L214.0 344.2 L216.0 348.0 L218.0 352.2 L220.0 356.7 L222.0 361.2 L224.0 365.7 L226.0 369.9 L228.0 373.8 L230.0 377.1 L232.0 379.9 L234.0 382.0 L236.0 383.3 L238.0 383.6" class="wave cyan"/>
+<path d="M238.0 383.6 L240.0 383.7 L242.0 383.9 L244.0 384.0 L246.0 384.0 L248.0 384.0 L250.0 383.9 L252.0 383.8 L254.0 383.7 L256.0 383.5 L258.0 383.3 L260.0 383.1 L262.0 382.8 L264.0 382.5 L266.0 382.1 L268.0 381.7 L270.0 381.3 L272.0 380.8 L274.0 380.3 L276.0 379.8 L278.0 379.3 L280.0 378.7 L282.0 378.1 L284.0 377.5 L286.0 376.9 L288.0 376.2 L290.0 375.6 L292.0 374.9 L294.0 374.2 L296.0 373.5 L298.0 372.7 L300.0 372.0 L302.0 371.2 L304.0 370.5 L306.0 369.7 L308.0 368.9 L310.0 368.1 L312.0 367.3 L314.0 366.5 L316.0 365.7 L318.0 364.9 L320.0 364.1 L322.0 363.3 L324.0 362.5 L326.0 361.7 L328.0 360.9 L330.0 360.1 L332.0 359.4 L334.0 358.6 L336.0 357.8 L338.0 357.0 L340.0 356.3 L342.0 355.5 L344.0 354.7 L346.0 354.0 L348.0 353.3 L350.0 352.6 L352.0 351.8 L354.0 351.2 L356.0 350.5 L358.0 349.8 L360.0 349.1 L362.0 348.5 L364.0 347.9 L366.0 347.2 L368.0 346.6 L370.0 346.1 L372.0 345.5 L374.0 344.9 L376.0 344.4 L378.0 343.9 L380.0 343.3 L382.0 342.9 L384.0 342.4 L386.0 341.9 L388.0 341.5 L390.0 341.1 L392.0 340.6 L394.0 340.3 L396.0 339.9 L398.0 339.5 L400.0 339.2 L402.0 338.9 L404.0 338.6 L406.0 338.3 L408.0 338.0 L410.0 337.8 L412.0 337.5 L414.0 337.3 L416.0 337.1 L418.0 336.9 L420.0 336.8 L422.0 336.6 L424.0 336.5 L426.0 336.4 L428.0 336.3 L430.0 336.2 L432.0 336.1 L434.0 336.1 L436.0 336.0 L438.0 336.0 L440.0 336.0 L442.0 336.0 L444.0 336.0 L446.0 336.1 L448.0 336.1 L450.0 336.2 L452.0 336.3 L454.0 336.4 L456.0 336.5 L458.0 336.6 L460.0 336.8 L462.0 336.9 L464.0 337.1 L466.0 337.3 L468.0 337.5 L470.0 337.7" class="wave amber"/>
+<line x1="238.0" y1="172" x2="238.0" y2="392" class="amber dash" stroke-width="1.3"/>
+<text class="t fnt labf" x="238.0" y="410" text-anchor="middle">NTK-by-parts boundary</text>
+<text class="t cyanf labs" x="74" y="392">high-freq dims preserved</text>
+<text class="t amberf labs" x="466" y="330" text-anchor="end">low-freq dims interpolated 4×</text>
+<text class="t ink ptitle" x="540" y="116">The static tax: scaling factor vs prompt length</text>
+<line x1="600" y1="510.0" x2="915" y2="510.0" class="grid"/>
+<text class="m fnt labf" x="592" y="513.0" text-anchor="end">1×</text>
+<line x1="600" y1="390.0" x2="915" y2="390.0" class="grid"/>
+<text class="m fnt labf" x="592" y="393.0" text-anchor="end">2×</text>
+<line x1="600" y1="270.0" x2="915" y2="270.0" class="grid"/>
+<text class="m fnt labf" x="592" y="273.0" text-anchor="end">3×</text>
+<line x1="600" y1="150.0" x2="915" y2="150.0" class="grid"/>
+<text class="m fnt labf" x="592" y="153.0" text-anchor="end">4×</text>
+<text class="t fnt labf" x="556" y="330" transform="rotate(-90 556 330)" text-anchor="middle">effective scaling factor</text>
+<line x1="600" y1="510" x2="915" y2="510" class="axis"/>
+<line x1="619.7" y1="510" x2="619.7" y2="515" class="axis"/>
+<text class="m fnt labf" x="619.7" y="528" text-anchor="middle">8k</text>
+<line x1="678.8" y1="510" x2="678.8" y2="515" class="axis"/>
+<text class="m fnt labf" x="678.8" y="528" text-anchor="middle">32k</text>
+<line x1="757.5" y1="510" x2="757.5" y2="515" class="axis"/>
+<text class="m fnt labf" x="757.5" y="528" text-anchor="middle">64k</text>
+<line x1="915.0" y1="510" x2="915.0" y2="515" class="axis"/>
+<text class="m fnt labf" x="915.0" y="528" text-anchor="middle">128k</text>
+<text class="t fnt labf" x="758" y="546" text-anchor="middle">prompt length (tokens)</text>
+<text class="t fnt labf" x="619.7" y="144" text-anchor="middle">typical</text>
+<line x1="678.8" y1="150" x2="678.8" y2="510" class="grid dash"/>
+<polygon points="600.0,150.0 915.0,150.0 915.0,150.0 757.5,390.0 678.8,510.0 600.0,510.0" fill="#f2a541" fill-opacity="0.13" stroke="none"/>
+<text class="t amberf labs" x="650" y="322" font-weight="600">the tax</text>
+<text class="t fnt labf" x="650" y="340">short prompts pay</text>
+<text class="t fnt labf" x="650" y="354">full stretch unused</text>
+<line x1="600" y1="150.0" x2="915" y2="150.0" class="amber" stroke-width="2.6"/>
+<text class="t amberf labs" x="608" y="167.0">static YaRN — every prompt</text>
+<path d="M600.0 510.0 L678.8 510.0 L757.5 390.0 L915.0 150.0" fill="none" class="cyan" stroke-width="2.6"/>
+<circle cx="600.0" cy="510.0" r="3" class="cyanf"/>
+<circle cx="678.8" cy="510.0" r="3" class="cyanf"/>
+<circle cx="757.5" cy="390.0" r="3" class="cyanf"/>
+<circle cx="915.0" cy="150.0" r="3" class="cyanf"/>
+<text class="t cyanf labs" x="773.0" y="402.0">length-aware (dynamic)</text>
+<text class="t fnt labf" x="40" y="584">Mechanism per YaRN (Peng et al., 2309.00071); wave periods illustrative. Native and factor values from the Qwen3-8B model card. Dynamic: factor = max(1, len / 32768).</text>
+</svg>
