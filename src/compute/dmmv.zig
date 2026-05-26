@@ -201,6 +201,26 @@ pub const MulMmQ4KPush = extern struct {
     d_offset: u32,
 };
 
+/// Push constants for the int8 DP4a full-tile Q6_K dense-down GEMM.
+pub const MulMmQ6KDp4aPush = extern struct {
+    M: u32,
+    N: u32,
+    K: u32,
+    stride_b_packed: u32, // per-column uints in the packed int8 activation (K/4)
+    stride_b_scale: u32, // per-column floats in the activation scale (K/32)
+    stride_d: u32, // per-column floats in output (M)
+    a_offset: u32, // byte offset into Q6_K weights
+    d_offset: u32, // float offset into output
+};
+
+/// Push constants for the one-shot per-32-block activation int8 quantizer.
+pub const QuantizeActPush = extern struct {
+    n_tokens: u32,
+    K: u32,
+    blocks_per_token: u32,
+    total_blocks: u32,
+};
+
 /// Size in bytes of a single Q8_1 output block (32 int8 values + f16 d + f16 d*sum).
 pub const Q8_1_BLOCK_BYTES: u32 = 36;
 
@@ -413,6 +433,10 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q6k_full: ?Pipeline,
     /// Tiled Q5_K dense GEMM for Qwen3.6-27B batched SSM out projection prefill.
     pipeline_mul_mm_q5k: ?Pipeline,
+    /// int8 DP4a full-tile Q6_K dense-down GEMM (Qwen3.6-27B prefill).
+    pipeline_mul_mm_q6k_full_dp4a: ?Pipeline,
+    /// One-shot per-32-block activation int8 quantizer for the DP4a down path.
+    pipeline_quantize_act_q8: ?Pipeline,
     /// Descriptor pool for this dispatch.
     descriptor_pool: vk.c.VkDescriptorPool,
     /// Logical device.
@@ -891,6 +915,25 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q5k != null) {
             log.info("mul_mm_q5k pipeline loaded (Qwen3.6-27B batched Q5_K SSM-out prefill projection)", .{});
         }
+        // int8 DP4a dense-down: 4-binding GEMM (weights/packed-acts/scales/out) and
+        // the 3-binding activation quantizer. Both only succeed when the device
+        // enabled shaderIntegerDotProduct; otherwise the host path falls back to f32.
+        const mul_mm_q6k_full_dp4a_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k_full_dp4a.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k_full_dp4a = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a != null) {
+            log.info("mul_mm_q6k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B dense-down prefill)", .{});
+        }
+        const quantize_act_q8_path = std.fmt.bufPrint(&path_buf, "{s}/quantize_act_q8.spv", .{shader_dir}) catch unreachable;
+        const pipeline_quantize_act_q8 = pipeline_mod.createFromSpirvWithOptions(instance, quantize_act_q8_path, 3, @sizeOf(QuantizeActPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("quantize_act_q8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_quantize_act_q8 != null) {
+            log.info("quantize_act_q8 pipeline loaded (DP4a activation quantizer)", .{});
+        }
 
         return DmmvDispatch{
             .pipeline_q4k = pipeline_q4k,
@@ -947,6 +990,8 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mul_mm_q4k_gate_up_swiglu_full,
             .pipeline_mul_mm_q6k = pipeline_mul_mm_q6k,
             .pipeline_mul_mm_q6k_full = pipeline_mul_mm_q6k_full,
+            .pipeline_mul_mm_q6k_full_dp4a = pipeline_mul_mm_q6k_full_dp4a,
+            .pipeline_quantize_act_q8 = pipeline_quantize_act_q8,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
@@ -1639,6 +1684,101 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Quantize an f32 activation matrix to packed int8 + per-32-block scales
+    /// (one shot, no per-tile redundancy) for the int8 DP4a dense-down GEMM.
+    /// @param src_buf token-major f32 activation [n_tokens][K].
+    /// @param dst_packed_buf token-major packed int8 [n_tokens][K/4] (4 lanes/uint).
+    /// @param dst_scale_buf token-major f32 scale [n_tokens][K/32].
+    pub fn recordQuantizeActQ8(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        src_buf: vk.c.VkBuffer,
+        src_size: vk.c.VkDeviceSize,
+        dst_packed_buf: vk.c.VkBuffer,
+        dst_packed_size: vk.c.VkDeviceSize,
+        dst_scale_buf: vk.c.VkBuffer,
+        dst_scale_size: vk.c.VkDeviceSize,
+        n_tokens: u32,
+        K: u32,
+    ) !void {
+        const pip = if (self.pipeline_quantize_act_q8) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 31) != 0 or n_tokens == 0) return error.InvalidArgument;
+        const blocks_per_token = K / 32;
+        const total_blocks = n_tokens * blocks_per_token;
+        const push = QuantizeActPush{
+            .n_tokens = n_tokens,
+            .K = K,
+            .blocks_per_token = blocks_per_token,
+            .total_blocks = total_blocks,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = src_buf, .offset = 0, .range = src_size },
+            .{ .buffer = dst_packed_buf, .offset = 0, .range = dst_packed_size },
+            .{ .buffer = dst_scale_buf, .offset = 0, .range = dst_scale_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            (total_blocks + 255) / 256,
+            1,
+            1,
+        );
+    }
+
+    /// Record the int8 DP4a full-tile Q6_K dense-down GEMM. Weights are Q6_K;
+    /// the activation arrives pre-quantized (packed int8 + per-32-block f32 scale)
+    /// from recordQuantizeActQ8. Output is token-major f32 [N][M].
+    pub fn recordMulMmQ6KFullDp4a(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_buf: vk.c.VkBuffer,
+        b_scale_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ6KDp4aPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d = M,
+            .a_offset = a_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_buf, .offset = 0, .range = b_scale_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
     /// Destroy the loaded pipelines and descriptor pool.
     /// @param self Dispatch wrapper to tear down in place.
     pub fn deinit(self: *DmmvDispatch) void {
@@ -1693,6 +1833,8 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();
+        if (self.pipeline_quantize_act_q8) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }

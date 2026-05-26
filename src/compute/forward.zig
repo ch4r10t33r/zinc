@@ -1408,6 +1408,10 @@ pub const InferenceEngine = struct {
     batched_scratch_up: ?Buffer = null,
     batched_scratch_swiglu: ?Buffer = null,
     batched_scratch_down: ?Buffer = null,
+    // int8 DP4a dense-down prefill: packed int8 SwiGLU activations (4 lanes/uint)
+    // and per-32-block f32 scales (see quantize_act_q8.comp / mul_mm_q6k_full_dp4a.comp).
+    batched_scratch_swiglu_i8: ?Buffer = null,
+    batched_scratch_swiglu_scale: ?Buffer = null,
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
@@ -3270,6 +3274,14 @@ pub const InferenceEngine = struct {
         try growSlot(self.instance, &self.batched_scratch_up, inter_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_swiglu, inter_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_down, hidden_bytes, storage_xfer);
+        // int8 DP4a dense-down scratch: packed int8 acts = inter_dim/4 uints/token,
+        // scales = inter_dim/32 f32/token. Only allocated when the path is enabled.
+        if (self.qwen36Dp4aDownEnabled()) {
+            const inter_i8_bytes = n * (inter_dim / 4) * @sizeOf(u32);
+            const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
+            try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
+        }
 
         self.batched_scratch_capacity_tokens = n_tokens;
     }
@@ -12321,6 +12333,120 @@ pub const InferenceEngine = struct {
         return false;
     }
 
+    /// int8 DP4a dense-down prefill GEMM (Qwen3.6-27B). Default-on when the
+    /// device exposes shaderIntegerDotProduct; disable with
+    /// ZINC_QWEN36_27B_DP4A_DOWN=0. The Q6_K f32-FMA down GEMM is a tuned local
+    /// optimum (cycle 19 + cycle 22 both regressed); int8 dot4 is the only lever
+    /// that raises arithmetic throughput on this coopmat-less RDNA4 node.
+    fn qwen36Dp4aDownEnabled(self: *const InferenceEngine) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (std.posix.getenv("ZINC_QWEN36_27B_DP4A_DOWN")) |v| {
+            if (std.mem.eql(u8, v, "0")) return false;
+        }
+        return true;
+    }
+
+    /// Dense-down projection for Qwen3.6-27B prefill. Uses int8 DP4a (one-shot
+    /// per-32-block activation quant + hardware dot4 GEMM) when enabled and the
+    /// shape qualifies; otherwise the standard f32 Q6_K batched projection. Any
+    /// ragged token tail (n_tokens not a multiple of 32) stays on the f32 checked
+    /// kernel reading the untouched f32 scratch_swiglu, so output layout is
+    /// identical regardless of which path runs.
+    fn dispatchQwen36DenseDown(
+        self: *InferenceEngine,
+        down_t: *const LoadedTensor,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+        hidden_dim: u32,
+        inter_dim: u32,
+        n_tokens: u32,
+    ) !void {
+        // Threshold 128: int8 DP4a regresses on tiny prompts (the one-shot
+        // quantize pre-pass + extra dispatch/barrier outweigh a single 32-col
+        // GEMM block) and only crosses over to a win past ~114 tokens, after
+        // which the per-column dot4 speedup compounds. The 5-token "core"
+        // scenario already falls back via full_cols==0; this guards the
+        // 32..127-token band. The context-medium benchmark is ~277 tokens.
+        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+            down_t.info.type_ == .q6_k and
+            n_tokens >= 128 and
+            (inter_dim & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8 != null and
+            self.dmmv.pipeline_mul_mm_q6k != null and
+            self.batched_scratch_swiglu_i8 != null and
+            self.batched_scratch_swiglu_scale != null;
+        if (dp4a_ok) {
+            const full_cols = n_tokens & ~@as(u32, 31);
+            if (full_cols > 0) {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+                const push_fn = self.instance.push_descriptor_fn;
+                // One-shot quantize of the f32 SwiGLU activation (full cols).
+                try self.dmmv.recordQuantizeActQ8(
+                    &self.decode_cmd,
+                    push_fn,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_scale.handle,
+                    swiglu_scale.size,
+                    full_cols,
+                    inter_dim,
+                );
+                const i8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
+                    .{ .buffer = swiglu_scale.handle, .size = swiglu_scale.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                try self.dmmv.recordMulMmQ6KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_scale.handle,
+                    swiglu_scale.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    hidden_dim,
+                    full_cols,
+                    inter_dim,
+                    0,
+                    0,
+                );
+                if (full_cols < n_tokens) {
+                    try self.dmmv.recordMulMmQ6K(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        hidden_dim,
+                        n_tokens - full_cols,
+                        inter_dim,
+                        inter_dim,
+                        hidden_dim,
+                        0,
+                        full_cols * inter_dim,
+                        full_cols * hidden_dim,
+                    );
+                }
+                return;
+            }
+        }
+        try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+    }
+
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
@@ -13391,7 +13517,7 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_bytes);
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
-        try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
         self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
         try self.dispatchScaleAcc(
             scratch_hidden.handle,
@@ -15594,6 +15720,8 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_up) |*b| b.deinit();
         if (self.batched_scratch_swiglu) |*b| b.deinit();
         if (self.batched_scratch_down) |*b| b.deinit();
+        if (self.batched_scratch_swiglu_i8) |*b| b.deinit();
+        if (self.batched_scratch_swiglu_scale) |*b| b.deinit();
         self.cmd_pool.deinit();
         self.* = undefined;
     }

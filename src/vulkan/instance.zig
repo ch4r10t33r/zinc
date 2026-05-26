@@ -41,6 +41,8 @@ pub const DeviceCapabilities = struct {
     cooperative_matrix: bool = false,
     /// Push descriptors are supported by the device extension list.
     push_descriptor: bool = false,
+    /// Shader integer dot product (DP4a / v_dot4_i32_i8) is supported and enabled.
+    integer_dot_product: bool = false,
 
     /// Return whether a compute shader can request the given subgroup size.
     pub fn supportsRequiredSubgroupSize(self: DeviceCapabilities, size: u32) bool {
@@ -222,9 +224,14 @@ pub const Instance = struct {
             .storagePushConstant16 = vk.c.VK_FALSE,
             .storageInputOutput16 = vk.c.VK_FALSE,
         };
+        var integer_dot_features = vk.c.VkPhysicalDeviceShaderIntegerDotProductFeatures{
+            .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+            .pNext = &storage_16bit_features,
+            .shaderIntegerDotProduct = if (device_caps.integer_dot_product) vk.c.VK_TRUE else vk.c.VK_FALSE,
+        };
         var shader_float16_int8_features = vk.c.VkPhysicalDeviceShaderFloat16Int8Features{
             .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-            .pNext = &storage_16bit_features,
+            .pNext = &integer_dot_features,
             .shaderFloat16 = if (device_caps.shader_float16) vk.c.VK_TRUE else vk.c.VK_FALSE,
             .shaderInt8 = vk.c.VK_FALSE,
         };
@@ -389,9 +396,14 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .storagePushConstant16 = vk.c.VK_FALSE,
         .storageInputOutput16 = vk.c.VK_FALSE,
     };
+    var integer_dot_features = vk.c.VkPhysicalDeviceShaderIntegerDotProductFeatures{
+        .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+        .pNext = &storage_16bit_features,
+        .shaderIntegerDotProduct = vk.c.VK_FALSE,
+    };
     var shader_float16_int8_features = vk.c.VkPhysicalDeviceShaderFloat16Int8Features{
         .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-        .pNext = &storage_16bit_features,
+        .pNext = &integer_dot_features,
         .shaderFloat16 = vk.c.VK_FALSE,
         .shaderInt8 = vk.c.VK_FALSE,
     };
@@ -426,6 +438,7 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .subgroup_extended_types = subgroup_extended_types_features.shaderSubgroupExtendedTypes == vk.c.VK_TRUE,
         .cooperative_matrix = coop_extension_supported and cooperative_matrix_features.cooperativeMatrix == vk.c.VK_TRUE,
         .push_descriptor = push_descriptor_supported,
+        .integer_dot_product = integer_dot_features.shaderIntegerDotProduct == vk.c.VK_TRUE,
     };
 }
 
