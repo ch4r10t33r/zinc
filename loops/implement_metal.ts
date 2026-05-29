@@ -23,7 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
@@ -84,6 +84,22 @@ const BENCHMARK_CONFIRM_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_CONFIRM_RUNS"
 // broke output to "!!!!"; recording it lets the prompt redirect the agent at
 // localizing the divergent layer instead of rediscovering the same dead end.
 const NEAR_MISS_MIN_GAIN_PCT = parsePositiveFloatEnv("ZINC_NEAR_MISS_MIN_GAIN_PCT", 2);
+// Extra environment variables applied to a single diagnostic inference run
+// after the keep verdict on cycles where `bestIncorrect` is set. The diagnostic
+// run never affects the keep gate; its stdout/stderr (last 4 KB) is captured
+// into `state.lastNearMissDiagnostic` and surfaced in the next cycle's prompt.
+//
+// This breaks the chicken-and-egg from Effort 16 run 2: the kept tree had the
+// fast path default-OFF, so the route-pack validator the agent built was dead
+// code — it could never run under the harness's official measurement, so
+// successive cycles got no per-tensor evidence even though the validator
+// existed in source. Setting e.g.
+//   ZINC_NEAR_MISS_DIAGNOSTIC_ENV="ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT=1 ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1"
+// lets the validator fire against the kept tree without the harness reverting
+// for broken output (because the diagnostic run is not graded).
+//
+// Format: space-separated KEY=VALUE pairs. Empty = no diagnostic.
+const NEAR_MISS_DIAGNOSTIC_ENV_RAW = process.env.ZINC_NEAR_MISS_DIAGNOSTIC_ENV ?? "";
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
 const RECENT_PROGRESS_WINDOW = 10;
@@ -968,6 +984,7 @@ async function runCommand(
     streamOutput?: boolean;
     stdoutLineFormatter?: (line: string) => string | null;
     stderrLineFormatter?: (line: string) => string | null;
+    env?: Record<string, string>;
   } = {},
 ): Promise<RunResult> {
   return new Promise((res) => {
@@ -975,6 +992,7 @@ async function runCommand(
       cwd: opts.cwd ?? REPO_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
       timeout: opts.timeout,
+      env: opts.env ? { ...process.env, ...opts.env } : process.env,
     });
     let stdout = "", stderr = "", lineBuffer = "", stderrLineBuffer = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -1839,6 +1857,18 @@ export function buildNearMissDirective(
     lines.push("2. Run the existing validator at the suspect layer (`ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT=1 ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER=<L>`) and report the first diverging tensor name and max-abs diff. (The OUTER HARNESS runs the model — describe the change as wiring the validator into the prefill path and leave the actual run to the harness.)");
     lines.push("3. Fix the divergence at its source (match the validated slow-path scalar / reduction order) and KEEP the cap-based partial enablement if full enablement still drifts — partial is still a real win.");
   }
+  // If the harness has captured a diagnostic run (validator output under
+  // ZINC_NEAR_MISS_DIAGNOSTIC_ENV), splice the last 2 KB of it into the
+  // directive. This is the evidence prior cycles lacked.
+  const diag = state.lastNearMissDiagnostic;
+  if (diag && diag.output) {
+    lines.push("");
+    lines.push(`**Latest near-miss diagnostic** (cycle ${diag.cycle}, env: ${diag.envApplied.join(", ")}). Read this BEFORE choosing your change — it shows what the validator saw with the fast path enabled:`);
+    lines.push("```");
+    lines.push(diag.output.slice(-2000));
+    lines.push("```");
+  }
+
   lines.push("");
   lines.push("Report which layer/tensor diverged (or which env knob isolated it) in `@@@SELF_ANALYSIS` even if you don't fully fix it this cycle — that evidence is what unblocks the next cycle.");
   return lines;
@@ -2272,6 +2302,11 @@ export type RunState = {
   bestIncorrect?: NearMiss | null;
   lastProfileOutput: string | null;
   lastProfileCycle: number | null;
+  /// Most recent near-miss diagnostic run (see ZINC_NEAR_MISS_DIAGNOSTIC_ENV).
+  /// Captured AFTER the keep verdict, runs the binary with extra env applied so
+  /// validators / probes that the kept tree leaves default-off still fire and
+  /// produce per-tensor/per-layer evidence for the next cycle.
+  lastNearMissDiagnostic?: { cycle: number; envApplied: string[]; output: string } | null;
   reviewSummaries: string[];
   /// Optional multi-hour effort doc (raw markdown) spliced into every agent
   /// prompt. Loaded via `--effort N`, which finds `MULTI_HOUR_EFFORT_N_*.md`
@@ -2322,6 +2357,45 @@ async function runProfileBenchmark(): Promise<string> {
   );
   const combined = (run.stderr + run.stdout).slice(-4000);
   console.log(clr("2", "    profile captured"));
+  return combined;
+}
+
+/**
+ * Parse the ZINC_NEAR_MISS_DIAGNOSTIC_ENV string ("KEY1=VALUE1 KEY2=VALUE2") into
+ * a {KEY: VALUE} record. Empty / malformed pairs are skipped. Exported for tests.
+ */
+export function parseDiagnosticEnv(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(/\s+/).filter((s) => s.length > 0)) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    const key = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (key && value) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Run the model once with extra env vars applied (typically to flip on a
+ * default-off validator) and return the truncated combined output. The result
+ * is NOT scored against the keep gate — it exists only to surface evidence in
+ * the next cycle's prompt. Safe to call on the kept tree because the diagnostic
+ * env never persists past this subprocess.
+ */
+async function runNearMissDiagnostic(
+  maxTokens: number,
+  extraEnv: Record<string, string>,
+): Promise<string> {
+  const keys = Object.keys(extraEnv);
+  console.log(clr("1;35", `  🔬 Near-miss diagnostic run (env: ${keys.join(", ")})...`));
+  const run = await runCommand(
+    "./zig-out/bin/zinc",
+    [...zincModelArgs(), ...zincPromptArgs(), "-n", String(Math.min(maxTokens, 32))],
+    { timeout: RUN_TIMEOUT_MS, env: extraEnv },
+  );
+  const combined = (run.stderr + run.stdout).slice(-4000);
+  console.log(clr("2", `    diagnostic captured (${combined.length} bytes)`));
   return combined;
 }
 
@@ -2487,10 +2561,36 @@ function findLatestRunDir(): string | null {
   return null;
 }
 
+/**
+ * Move existing run history aside instead of deleting it. A bare (non-`--resume`)
+ * launch used to `rmSync` the whole `.metal_optimize/` directory — that wiped a
+ * 340-cycle Effort-16 run that took ~12h to produce because the operator
+ * forgot `--resume`. Archiving makes a bare launch recoverable: the prior
+ * `state.json` survives under `.metal_optimize.archive/<timestamp>/<run-id>/`
+ * and can be moved back if needed. Cheap rename, no copy.
+ */
 function cleanupOldRuns(): void {
   if (!existsSync(RESULTS_DIR)) return;
-  rmSync(RESULTS_DIR, { recursive: true, force: true });
-  console.log(clr("2", `  Cleaned up old runs: ${RESULTS_DIR}`));
+  // Fast-path: directory is empty — nothing to archive.
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(RESULTS_DIR);
+  } catch {
+    // If we cannot read it, fall back to the old destructive behaviour so a
+    // corrupt directory cannot wedge the launch indefinitely.
+    rmSync(RESULTS_DIR, { recursive: true, force: true });
+    return;
+  }
+  if (entries.length === 0) {
+    rmSync(RESULTS_DIR, { recursive: true, force: true });
+    return;
+  }
+  const archiveRoot = `${RESULTS_DIR}.archive`;
+  mkdirSync(archiveRoot, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const dest = join(archiveRoot, stamp);
+  renameSync(RESULTS_DIR, dest);
+  console.log(clr("2", `  Archived old runs (${entries.length} dir(s)) to ${dest}`));
 }
 
 async function main() {
@@ -2602,6 +2702,7 @@ async function main() {
     state.effortId ??= null;
     state.effortFile ??= null;
     state.bestIncorrect ??= null;
+    state.lastNearMissDiagnostic ??= null;
     normalizeStateBestTokPerSec(state);
     // Seed the near-miss target from history for runs predating bestIncorrect.
     if (backfillNearMiss(state) && state.bestIncorrect) {
@@ -2652,6 +2753,7 @@ async function main() {
       bestTokPerSec: 0,
       lastProfileOutput: null,
       lastProfileCycle: null,
+      lastNearMissDiagnostic: null,
       reviewSummaries: [],
       effortPlan: effortBundle?.plan ?? null,
       effortId: effort,
@@ -2908,6 +3010,34 @@ async function main() {
         await writeFile(join(cycleDir, "profile.log"), state.lastProfileOutput);
       } catch {
         console.log(clr("1;33", "  ⚠ Profile run failed, continuing"));
+      }
+    }
+
+    // Near-miss diagnostic run. Only fires when (a) ZINC_NEAR_MISS_DIAGNOSTIC_ENV
+    // is set, and (b) bestIncorrect exists and is still meaningfully ahead of the
+    // accepted tree (i.e. the directive will fire for the next cycle). Skipped on
+    // build/test failures so we never burn time diagnosing an unbuildable tree.
+    const diagnosticEnv = parseDiagnosticEnv(NEAR_MISS_DIAGNOSTIC_ENV_RAW);
+    const diagEnvKeys = Object.keys(diagnosticEnv);
+    if (
+      diagEnvKeys.length > 0 &&
+      state.bestIncorrect &&
+      verify.buildExitCode === 0 &&
+      verify.testExitCode === 0 &&
+      state.bestIncorrect.tokPerSec >
+        Math.max(currentAcceptedTokPerSec(state), bestKeptCorrectTokPerSec(state)) +
+          Math.max(0.3, bestKeptCorrectTokPerSec(state) * 0.005)
+    ) {
+      try {
+        const diagOutput = await runNearMissDiagnostic(currentMaxTokens, diagnosticEnv);
+        state.lastNearMissDiagnostic = {
+          cycle,
+          envApplied: diagEnvKeys,
+          output: diagOutput,
+        };
+        await writeFile(join(cycleDir, "near_miss_diagnostic.log"), diagOutput);
+      } catch {
+        console.log(clr("1;33", "  ⚠ Near-miss diagnostic run failed, continuing"));
       }
     }
 

@@ -5,6 +5,7 @@ import {
   bestKeptCorrectTokPerSec,
   buildNearMissDirective,
   countNearMissFamilyReverts,
+  parseDiagnosticEnv,
   buildPrompt,
   buildQwen36PrefillPlateauAnalysis,
   buildQwen36PrefillPostBreakthroughAnalysis,
@@ -1297,5 +1298,66 @@ describe("buildNearMissDirective", () => {
     const prompt = buildPrompt(state, result);
     expect(prompt).toContain("KNOWN NEAR-MISS");
     expect(prompt).toContain("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS");
+  });
+});
+
+// ── parseDiagnosticEnv + near-miss diagnostic surfacing ─────────────
+
+describe("parseDiagnosticEnv", () => {
+  test("parses space-separated KEY=VALUE pairs", () => {
+    const env = parseDiagnosticEnv("ZINC_FOO=1 ZINC_BAR=value-with-dash");
+    expect(env).toEqual({ ZINC_FOO: "1", ZINC_BAR: "value-with-dash" });
+  });
+
+  test("collapses whitespace and skips malformed pairs", () => {
+    const env = parseDiagnosticEnv("  ZINC_A=1   nokey nokeyhere==  ZINC_B=2  ");
+    expect(env.ZINC_A).toBe("1");
+    expect(env.ZINC_B).toBe("2");
+    expect(env.nokey).toBeUndefined();
+  });
+
+  test("empty input yields empty record", () => {
+    expect(parseDiagnosticEnv("")).toEqual({});
+    expect(parseDiagnosticEnv("   ")).toEqual({});
+  });
+});
+
+describe("buildNearMissDirective surfaces diagnostic output", () => {
+  test("splices the latest diagnostic into the directive when present", () => {
+    const state = makeState({
+      bestIncorrect: {
+        cycle: 9,
+        tokPerSec: 106.4,
+        gainPctOverAccepted: 4.6,
+        description: "route-pack F32 shared-gate prefix",
+        selfAnalysis: "Cap=3 hit 106.4 but broke output",
+        outputText: "!!!!",
+      },
+      lastNearMissDiagnostic: {
+        cycle: 51,
+        envApplied: ["ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT", "ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL"],
+        output: "TENSOR_DIVERGE layer=3 tensor=moe_route_scatter_shared_residual_gate_f32 max_abs=2.1e-04",
+      },
+    });
+    const lines = buildNearMissDirective(state, 102, false).join("\n");
+    expect(lines).toContain("Latest near-miss diagnostic");
+    expect(lines).toContain("cycle 51");
+    expect(lines).toContain("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT");
+    expect(lines).toContain("TENSOR_DIVERGE layer=3");
+  });
+
+  test("omits the diagnostic section when none captured", () => {
+    const state = makeState({
+      bestIncorrect: {
+        cycle: 9,
+        tokPerSec: 106.4,
+        gainPctOverAccepted: 4.6,
+        description: "route-pack",
+        selfAnalysis: "x",
+        outputText: "!",
+      },
+    });
+    const lines = buildNearMissDirective(state, 102, false).join("\n");
+    expect(lines).not.toContain("Latest near-miss diagnostic");
   });
 });
