@@ -1412,6 +1412,12 @@ pub const InferenceEngine = struct {
     // and per-32-block f32 scales (see quantize_act_q8.comp / mul_mm_q6k_full_dp4a.comp).
     batched_scratch_swiglu_i8: ?Buffer = null,
     batched_scratch_swiglu_scale: ?Buffer = null,
+    // int8 DP4a dense gate+up+SwiGLU prefill: packed int8 hidden activations
+    // (4 lanes/uint) and per-32-block (scale, dsum) vec2 used to subtract the
+    // Q4_K bias term (see quantize_act_q8_1.comp /
+    // mul_mm_q4k_gate_up_swiglu_full_dp4a.comp).
+    batched_scratch_hidden_i8: ?Buffer = null,
+    batched_scratch_hidden_scale_dsum: ?Buffer = null,
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
@@ -3281,6 +3287,13 @@ pub const InferenceEngine = struct {
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
+            // Same path also drives the int8 DP4a dense gate/up prefill (K=hidden_dim),
+            // so size companion scratch for the hidden activation quantize: packed
+            // int8 = hidden_dim/4 uints/token, (scale,dsum) vec2 = hidden_dim/32 * 8 B/token.
+            const hidden_i8_bytes = n * (hidden_dim / 4) * @sizeOf(u32);
+            const hidden_scale_dsum_bytes = n * (hidden_dim / 32) * 2 * f32_sz;
+            try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
         }
 
         self.batched_scratch_capacity_tokens = n_tokens;
@@ -12349,6 +12362,107 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    /// Dense gate+up+SwiGLU prefill projection for Qwen3.6-27B. Uses int8 DP4a
+    /// (one-shot Q8_1-style activation quant + hardware dot4 GEMM with Q4_K
+    /// bias correction) when enabled and the shape qualifies. The ragged token
+    /// tail (n_tokens & 31 ≠ 0) stays on the f32 checked path reading the
+    /// untouched f32 scratch_norm, so the output layout is identical regardless
+    /// of which path runs. Returns true if it emitted a path; false to fall
+    /// through to the existing f32 dispatch.
+    fn dispatchQwen36DenseGateUpDp4a(
+        self: *InferenceEngine,
+        gate_t: *const LoadedTensor,
+        up_t: *const LoadedTensor,
+        scratch_norm: Buffer,
+        scratch_swiglu: Buffer,
+        hidden_dim: u32,
+        inter_dim: u32,
+        n_tokens: u32,
+    ) !bool {
+        // Threshold 128 matches the Q6_K dense-down DP4a path: under ~128 tokens
+        // the one-shot quantize pre-pass + extra dispatch/barrier outweigh the
+        // savings from a single 32-col GEMM block. The 5-token "core" scenario
+        // falls back via full_cols==0; this guards the 32..127-token band where
+        // the existing fused f32 gate+up shader is already efficient.
+        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+            gate_t.info.type_ == .q4_k and
+            up_t.info.type_ == .q4_k and
+            n_tokens >= 128 and
+            (hidden_dim & 255) == 0 and
+            (inter_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null and
+            self.batched_scratch_hidden_i8 != null and
+            self.batched_scratch_hidden_scale_dsum != null;
+        if (!dp4a_ok) return false;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return false;
+        const hidden_i8 = self.batched_scratch_hidden_i8.?;
+        const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
+        const push_fn = self.instance.push_descriptor_fn;
+        // One-shot quantize of the f32 RMS-normed hidden (full cols only).
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            push_fn,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_i8.handle,
+            hidden_i8.size,
+            hidden_sd.handle,
+            hidden_sd.size,
+            full_cols,
+            hidden_dim,
+        );
+        const i8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
+            .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        try self.dmmv.recordMulMmQ4KGateUpSwigluFullDp4a(
+            &self.decode_cmd,
+            push_fn,
+            gate_t.gpu_buffer.handle,
+            gate_t.gpu_buffer.size,
+            up_t.gpu_buffer.handle,
+            up_t.gpu_buffer.size,
+            hidden_i8.handle,
+            hidden_i8.size,
+            hidden_sd.handle,
+            hidden_sd.size,
+            scratch_swiglu.handle,
+            scratch_swiglu.size,
+            inter_dim,
+            full_cols,
+            hidden_dim,
+            0,
+            0,
+        );
+        if (full_cols < n_tokens) {
+            try self.dmmv.recordMulMmQ4KGateUpSwiglu(
+                &self.decode_cmd,
+                push_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                inter_dim,
+                n_tokens - full_cols,
+                hidden_dim,
+                hidden_dim,
+                inter_dim,
+                0,
+                full_cols * hidden_dim,
+                full_cols * inter_dim,
+            );
+        }
+        return true;
+    }
+
     /// Dense-down projection for Qwen3.6-27B prefill. Uses int8 DP4a (one-shot
     /// per-32-block activation quant + hardware dot4 GEMM) when enabled and the
     /// shape qualifies; otherwise the standard f32 Q6_K batched projection. Any
@@ -13425,7 +13539,14 @@ pub const InferenceEngine = struct {
             n_tokens >= 16 and
             (hidden_dim & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null;
-        if (use_fused_gateup) {
+        // int8 DP4a gate+up+SwiGLU short-circuits the f32 path when eligible.
+        const dp4a_done = if (use_fused_gateup)
+            try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens)
+        else
+            false;
+        if (dp4a_done) {
+            // DP4a path already wrote scratch_swiglu; no extra dispatches needed.
+        } else if (use_fused_gateup) {
             const full_cols = n_tokens & ~@as(u32, 31);
             if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full != null) {
                 try self.dmmv.recordMulMmQ4KGateUpSwigluFull(
@@ -15722,6 +15843,8 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_down) |*b| b.deinit();
         if (self.batched_scratch_swiglu_i8) |*b| b.deinit();
         if (self.batched_scratch_swiglu_scale) |*b| b.deinit();
+        if (self.batched_scratch_hidden_i8) |*b| b.deinit();
+        if (self.batched_scratch_hidden_scale_dsum) |*b| b.deinit();
         self.cmd_pool.deinit();
         self.* = undefined;
     }

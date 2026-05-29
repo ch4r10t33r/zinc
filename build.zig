@@ -227,6 +227,8 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q5k",
         "mul_mm_q6k_full_dp4a",
         "quantize_act_q8",
+        "mul_mm_q4k_gate_up_swiglu_full_dp4a",
+        "quantize_act_q8_1",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;
