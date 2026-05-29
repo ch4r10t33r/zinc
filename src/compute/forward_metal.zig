@@ -393,16 +393,17 @@ fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTen
     if (!enabled) return false;
 
     if (K == 2048 and M >= 4096 and
-        (std.mem.endsWith(u8, name, "attn_qkv.weight") or
-            std.mem.endsWith(u8, name, "attn_gate.weight")))
+        std.mem.endsWith(u8, name, "attn_qkv.weight"))
     {
         return true;
     }
-    // ssm_out (M=2048, K=4096) intentionally falls through to the nr=4
-    // `dmmv_q8_0_repacked_k4096_qwen` path that attn_output (identical shape)
-    // already uses: same llama.cpp adjacent-row matvec grouping that won the
-    // cycle-1 LM head route, halving X bandwidth share by reusing each X load
-    // across four adjacent rows in a simdgroup.
+    // ssm_out (M=2048, K=4096) and SSM attn_gate (M=4096, K=2048) intentionally
+    // fall through to the nr=4 `dmmv_q8_0_repacked_k{2048,4096}_qwen` paths
+    // (same llama.cpp adjacent-row matvec grouping that won the cycle-1 LM head
+    // route and cycle-4 ssm_out route). The narrower M=4096 attn_gate produces
+    // 64 workgroups under nr=4 — between ssm_out's 32 WG and qkv's 128 WG —
+    // saturating M4 Max's 40 cores without the qkv-shape over-subscription that
+    // regressed in the equivalent attn_qkv (M=8192) experiment.
     return false;
 }
 
