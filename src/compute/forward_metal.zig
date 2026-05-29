@@ -315,6 +315,19 @@ fn preferApple9QwenSsmRepackedQ8QuadPath(cfg: ModelConfig, tensor: *const metal_
     return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_QUAD") orelse true;
 }
 
+// The Qwen3.6-35B LM head is repacked Q8_0 with M=248320 (vocab) and K=2048.
+// The generic nr=2 repacked path loads the activation vector twice per
+// simdgroup-pair, while the fixed-K nr=4 `dmmv_q8_0_repacked_k2048_qwen.metal`
+// shader reuses the same X load across four adjacent rows, halving the X
+// bandwidth share of the per-token LM head matvec (~520 MB at Q8_0).
+fn preferApple9LmHeadRepackedQ8K2048Quad(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, lm_head: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen2_moe and
+        tensor == lm_head and
+        K == 2048 and
+        M >= 65536 and
+        M % 4 == 0;
+}
+
 fn preferApple9QwenSsmPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     if (!preferApple9QwenSsmRepackedQ8QuadPath(cfg, tensor, M, K)) return false;
     return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_PRIVATE") orelse true;
@@ -7652,6 +7665,16 @@ fn selectQ8RepackedDispatchKindUncached(
         engine.dmmv_q8_0_repacked_quad_pipe.max_threads_per_threadgroup >= 512)
     {
         return .quad_generic;
+    }
+    if (preferApple9LmHeadRepackedQ8K2048Quad(engine.config, tensor, engine.lm_head, M, K) and
+        engine.dmmv_q8_0_repacked_k2048_qwen_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 512)
+    {
+        // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s adjacent-row matvec
+        // grouping to the Qwen3.6 LM head: M=248320 is a multiple of four, so
+        // route through the tail-free repacked K=2048 nr=4 kernel and gain X
+        // reuse over the generic nr=2 path.
+        return .exact_qwen_k2048;
     }
     return .generic;
 }
