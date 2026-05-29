@@ -398,9 +398,11 @@ fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTen
     {
         return true;
     }
-    if (K == 4096 and M >= 2048 and std.mem.endsWith(u8, name, "ssm_out.weight")) {
-        return true;
-    }
+    // ssm_out (M=2048, K=4096) intentionally falls through to the nr=4
+    // `dmmv_q8_0_repacked_k4096_qwen` path that attn_output (identical shape)
+    // already uses: same llama.cpp adjacent-row matvec grouping that won the
+    // cycle-1 LM head route, halving X bandwidth share by reusing each X load
+    // across four adjacent rows in a simdgroup.
     return false;
 }
 
