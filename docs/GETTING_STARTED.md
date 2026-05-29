@@ -19,6 +19,8 @@ ZINC currently targets:
 - **macOS** with Apple Silicon (M1 through M5) through Metal
 - **GGUF models** (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, MXFP4, F16, F32 quantizations)
 
+**Windows is not supported.** There is no native Windows build today, and WSL is not on the test matrix. If you are on Windows, you will need a Linux host (or VM with GPU passthrough) for the AMD/Intel paths, or a Mac for the Metal path.
+
 ### Supported models
 
 This list is intentionally narrow. It shows the exact GGUFs that have been validated end-to-end.
@@ -100,18 +102,14 @@ This downloads the model into a local cache and verifies the SHA-256 hash.
 
 ## Run your first prompt
 
-The `--chat` flag wraps your prompt in the model's chat template (system prompt, role tags, etc.), which is required for instruct-tuned models to produce proper answers.
+The `--chat` flag wraps your prompt in the model's chat template (system prompt, role tags, etc.), which is required for instruct-tuned models to produce proper answers. Without `--chat`, the model treats the input as raw text completion, which still works but produces less focused output.
+
+**On RDNA4 Linux, the env var below is required** — cooperative matrix is the fast path, and without it you may see slow or incorrect output. macOS users skip the `export` line.
 
 ```bash
-./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
-```
-
-Without `--chat`, the model treats the input as raw text completion, which still works but produces less focused output.
-
-On RDNA4 Linux, remember to set the environment variable:
-
-```bash
+# RDNA4 Linux only — required, not optional. Skip this line on macOS.
 export RADV_PERFTEST=coop_matrix
+
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
 ```
 

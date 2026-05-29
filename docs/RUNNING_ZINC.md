@@ -130,6 +130,60 @@ The warning in all three cases came from the shell environment, not from model f
 RADV_PERFTEST: Not set in current shell [WARN]
 ```
 
+## Troubleshooting (start here if something fails)
+
+If `--check` or the first prompt fails, run these in order. The bottom of this page has a fuller [common-mistakes list](#common-early-mistakes) and a [troubleshooting command reference](#fast-troubleshooting-commands).
+
+### 1. The first prompt is silent, wrong, or extremely slow on RDNA4
+
+Most likely cause: the cooperative-matrix path is not enabled in this shell. Set it and retry:
+
+```bash
+export RADV_PERFTEST=coop_matrix
+./zig-out/bin/zinc --check                               # should report READY [OK] or READY WITH WARNINGS
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "hi" --chat
+```
+
+`--check` prints `RADV_PERFTEST: coop_matrix [OK]` when this is right.
+
+### 2. "no Vulkan device found" / "loader init failed"
+
+The Vulkan driver is missing or the wrong one is installed.
+
+```bash
+sudo apt install -y libvulkan-dev vulkan-tools mesa-vulkan-drivers   # AMD: Mesa/RADV
+vulkaninfo --summary | head -40                                       # confirm the GPU is listed
+./zig-out/bin/zinc --check                                            # rerun
+```
+
+For Intel Arc, ensure a recent Mesa (25.x+) with ANV. For AMD, RADV is the recommended driver — AMDVLK works but is not the primary test target.
+
+### 3. "model does not fit" / OOM during load
+
+The model is too large for current VRAM at the auto-allocated context length. Check the actual usage estimate:
+
+```bash
+./zig-out/bin/zinc --check --model-id qwen35-9b-q4k-m
+# Look for: "VRAM fit (catalog): X.XX / Y.YY GiB device-local (headroom Z.ZZ GiB) [OK|WARN|FAIL]"
+```
+
+If headroom is negative or tight, pick a smaller model from `zinc model list`, lower context length with `--ctx`, or try the KV-cache compression flag described later on this page.
+
+### 4. macOS Metal: build succeeds but `--check` reports no device
+
+Make sure Xcode command-line tools are installed and you're on Apple Silicon (M1+):
+
+```bash
+xcode-select --install
+./zig-out/bin/zinc --check
+```
+
+If you are on Intel Mac, ZINC's Metal path will not initialize — Apple Silicon only.
+
+### 5. Still stuck
+
+Open the [ZINC Discord](https://discord.gg/QRUgWH2aGV) or [file a GitHub issue](https://github.com/zolotukhin/zinc/issues) with the full `--check` output, your GPU model, and `vulkaninfo --summary` (Linux) or `system_profiler SPDisplaysDataType` (macOS).
+
 ## Inspect the managed model catalog
 
 The built-in managed catalog only lists models ZINC has explicitly revalidated for specific GPU profiles. The default `model list` view is strict: a model only appears there if it is both tested for the detected GPU profile and estimated to fit current VRAM.

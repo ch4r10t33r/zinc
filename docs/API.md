@@ -13,6 +13,18 @@ export OPENAI_BASE_URL=http://localhost:8080/v1
 `zinc chat` is a convenience command for the built-in chat UI and defaults to
 port 9090 unless `-p` is provided.
 
+## Status & known gaps (read first)
+
+Before you integrate, know these limits up front. Each is a deliberate state of the engine today, not a bug to file:
+
+- **Decode is serialized.** Concurrent HTTP requests are accepted, but generation runs behind a single engine lock — request N+1 queues until request N finishes. Throughput scales with one stream, not N. Continuous batching is on the roadmap; until then, do not architect around parallel streams.
+- **`/v1/embeddings` is not implemented.** ZINC is a chat/completion engine today; there is no embedding endpoint and no plan to fake one. If you need embeddings for RAG, run them in a separate process (llama.cpp's `llama-embedding`, a hosted API, etc.) and only point chat at ZINC.
+- **`/v1/completions` is non-streaming and ignores sampling controls.** Use `/v1/chat/completions` for anything that needs streaming, `temperature`, `top_p`, or `enable_thinking`.
+- **Client-supplied `stop` sequences are not honored.** Chat generation stops on the model/template end markers (`<|im_end|>`, etc.) only.
+- **No `/v1/audio/*`, no image inputs, no fine-tuning endpoints, no batch API.** These are out of scope; if you need them, ZINC is not the right engine.
+
+Everything else listed in the endpoint table below works as documented.
+
 ## Compatibility Notes
 
 The API intentionally follows the OpenAI response shapes where practical, but

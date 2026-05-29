@@ -721,6 +721,12 @@ const jsonLd = {
             <p class="eyebrow">{target.machine.label}</p>
             <h2>{target.label}</h2>
             <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</p>
+            {(target.summary?.successful_models ?? 0) < (target.summary?.benchmarked_models ?? 0) && (
+              <p class="panel-banner" role="note">
+                <strong>Experimental bring-up.</strong>{' '}
+                Only {(target.summary?.successful_models ?? 0)} of {(target.summary?.benchmarked_models ?? 0)} ZINC runs completed on this node in the current artifact ({formatShortDate(target.generated_at)}); the rest currently fail (see each row's status for the underlying reason). Numbers and averages shown reflect only the rows that completed — treat them as a partial signal, not a head-to-head verdict.
+              </p>
+            )}
           </div>
           <details class="machine-details">
             <summary>Run info</summary>
@@ -1398,6 +1404,27 @@ const jsonLd = {
   .board-head p {
     margin: 0;
     color: var(--color-text-muted);
+  }
+
+  .panel-banner {
+    margin: 0.55rem 0 0;
+    padding: 0.55rem 0.75rem;
+    font-size: 0.82rem;
+    line-height: 1.45;
+    color: var(--color-text);
+    background: color-mix(in srgb, #f59e0b 14%, transparent);
+    border: 1px solid color-mix(in srgb, #f59e0b 38%, transparent);
+    border-radius: 8px;
+  }
+
+  .panel-banner strong {
+    color: #b45309;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .panel-banner strong {
+      color: #fcd34d;
+    }
   }
 
   .hero-stats,

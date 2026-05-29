@@ -1,5 +1,7 @@
 # ZINC_RT — The ZINC Runtime
 
+> **Read this first.** ZINC_RT is **not the default production backend today.** The hot path that ships with ZINC and produces every benchmark number on the public site is the **Vulkan backend**. ZINC_RT is an opt-in alternate runtime (`zig build -Dbackend=zinc_rt`) that exists to escape the per-submit/per-record Vulkan tax for multitenant continuous batching — the long-term home for those use cases. Today's ZINC_RT decode numbers (~80 tok/s on R9700) are produced by a host-assisted, scalar path with explicit shortcuts (LM-head row cap, MoE top-k clamp after prefill); they are not a like-for-like replacement for Vulkan's 115+ tok/s yet. If you are choosing what to build against, default to the Vulkan path. If you are working on the runtime itself, this document is the spec.
+
 **Status:** M0 shipped; M1 in progress — host-assisted scalar decode landing on R9700 at ~80 tok/s (vs Vulkan 115 tok/s) with two PM4 validation probes on the hot-path edge. Effort 15 is frozen at the scalar plateau pending a real direct DMMV row-range kernel (see §1.A and §25.3 below).
 **Audience:** AI coding agents executing on this design; senior contributors reviewing it
 **Last updated:** 2026-05-24

@@ -12369,6 +12369,16 @@ pub const InferenceEngine = struct {
     /// untouched f32 scratch_norm, so the output layout is identical regardless
     /// of which path runs. Returns true if it emitted a path; false to fall
     /// through to the existing f32 dispatch.
+    /// Result of dispatchQwen36DenseGateUpDp4a, signalling to the caller and
+    /// to dispatchQwen36DenseDown which format the SwiGLU activation now lives
+    /// in. The fused-quantize variant short-circuits the standalone
+    /// quantize_act_q8 dispatch in the downstream dense-down DP4a path.
+    const DenseGateUpDp4aResult = enum {
+        not_handled,
+        f32_swiglu,
+        q8_swiglu,
+    };
+
     fn dispatchQwen36DenseGateUpDp4a(
         self: *InferenceEngine,
         gate_t: *const LoadedTensor,
@@ -12378,7 +12388,7 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         inter_dim: u32,
         n_tokens: u32,
-    ) !bool {
+    ) !DenseGateUpDp4aResult {
         // Threshold 128 matches the Q6_K dense-down DP4a path: under ~128 tokens
         // the one-shot quantize pre-pass + extra dispatch/barrier outweigh the
         // savings from a single 32-col GEMM block. The 5-token "core" scenario
@@ -12395,9 +12405,9 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null and
             self.batched_scratch_hidden_i8 != null and
             self.batched_scratch_hidden_scale_dsum != null;
-        if (!dp4a_ok) return false;
+        if (!dp4a_ok) return .not_handled;
         const full_cols = n_tokens & ~@as(u32, 31);
-        if (full_cols == 0) return false;
+        if (full_cols == 0) return .not_handled;
         const hidden_i8 = self.batched_scratch_hidden_i8.?;
         const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
         const push_fn = self.instance.push_descriptor_fn;
@@ -12419,26 +12429,76 @@ pub const InferenceEngine = struct {
             .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
         };
         self.decode_cmd.computeBuffersBarrier(&i8_ranges);
-        try self.dmmv.recordMulMmQ4KGateUpSwigluFullDp4a(
-            &self.decode_cmd,
-            push_fn,
-            gate_t.gpu_buffer.handle,
-            gate_t.gpu_buffer.size,
-            up_t.gpu_buffer.handle,
-            up_t.gpu_buffer.size,
-            hidden_i8.handle,
-            hidden_i8.size,
-            hidden_sd.handle,
-            hidden_sd.size,
-            scratch_swiglu.handle,
-            scratch_swiglu.size,
-            inter_dim,
-            full_cols,
-            hidden_dim,
-            0,
-            0,
-        );
+        // Pick the fused Q8 output variant when the downstream dense-down DP4a
+        // path will consume it AND it's not a validation/diagnostic run. This
+        // is the structural lever: BM=32 in the producer maps 1:1 to the
+        // 32-element Q8_0 quantize block dense-down expects, so reductions
+        // happen in-register and the f32 scratch_swiglu write + the
+        // standalone quantize_act_q8 dispatch + barrier are both elided.
+        //
+        // The shape checks must imply dispatchQwen36DenseDown's dp4a_ok so the
+        // .q8_swiglu signal is safe — if the down path falls back to f32, the
+        // scratch_swiglu buffer is undefined for the full-cols range and the
+        // model output silently corrupts.
+        const fuse_q8 = !self.validation_diagnostics_enabled and
+            !self.use_qwen36_dense_prefill_validate and
+            !self.use_qwen36_ssm_prefill_validate and
+            (inter_dim & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_mul_mm_q6k != null and
+            self.batched_scratch_swiglu_i8 != null and
+            self.batched_scratch_swiglu_scale != null;
+        if (fuse_q8) {
+            const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+            const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+            try self.dmmv.recordMulMmQ4KGateUpSwigluFullDp4aQ8(
+                &self.decode_cmd,
+                push_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                swiglu_i8.handle,
+                swiglu_i8.size,
+                swiglu_scale.handle,
+                swiglu_scale.size,
+                inter_dim,
+                full_cols,
+                hidden_dim,
+                0,
+                0,
+                0,
+            );
+        } else {
+            try self.dmmv.recordMulMmQ4KGateUpSwigluFullDp4a(
+                &self.decode_cmd,
+                push_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                inter_dim,
+                full_cols,
+                hidden_dim,
+                0,
+                0,
+            );
+        }
         if (full_cols < n_tokens) {
+            // Tail tokens always land in f32 scratch_swiglu, where the
+            // dense-down tail fallback expects them.
             try self.dmmv.recordMulMmQ4KGateUpSwiglu(
                 &self.decode_cmd,
                 push_fn,
@@ -12460,7 +12520,7 @@ pub const InferenceEngine = struct {
                 full_cols * inter_dim,
             );
         }
-        return true;
+        return if (fuse_q8) .q8_swiglu else .f32_swiglu;
     }
 
     /// Dense-down projection for Qwen3.6-27B prefill. Uses int8 DP4a (one-shot
@@ -12477,6 +12537,7 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         inter_dim: u32,
         n_tokens: u32,
+        swiglu_already_q8: bool,
     ) !void {
         // Threshold 128: int8 DP4a regresses on tiny prompts (the one-shot
         // quantize pre-pass + extra dispatch/barrier outweigh a single 32-col
@@ -12494,30 +12555,39 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q6k != null and
             self.batched_scratch_swiglu_i8 != null and
             self.batched_scratch_swiglu_scale != null;
+        // Contract with dispatchQwen36DenseGateUpDp4a: when it returned
+        // .q8_swiglu, scratch_swiglu is undefined for full_cols and the swiglu
+        // data lives in swiglu_i8/swiglu_scale instead. The DP4a path here
+        // must run, or the fallback would consume undefined memory.
+        if (swiglu_already_q8 and !dp4a_ok) return error.UnsupportedConfiguration;
         if (dp4a_ok) {
             const full_cols = n_tokens & ~@as(u32, 31);
             if (full_cols > 0) {
                 const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                 const swiglu_scale = self.batched_scratch_swiglu_scale.?;
                 const push_fn = self.instance.push_descriptor_fn;
-                // One-shot quantize of the f32 SwiGLU activation (full cols).
-                try self.dmmv.recordQuantizeActQ8(
-                    &self.decode_cmd,
-                    push_fn,
-                    scratch_swiglu.handle,
-                    scratch_swiglu.size,
-                    swiglu_i8.handle,
-                    swiglu_i8.size,
-                    swiglu_scale.handle,
-                    swiglu_scale.size,
-                    full_cols,
-                    inter_dim,
-                );
-                const i8_ranges = [_]CommandBuffer.BufferRange{
-                    .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
-                    .{ .buffer = swiglu_scale.handle, .size = swiglu_scale.size },
-                };
-                self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                if (!swiglu_already_q8) {
+                    // One-shot quantize of the f32 SwiGLU activation (full cols).
+                    // The fused gate+up+SwiGLU+Q8 path emits this directly, so
+                    // skip the standalone dispatch + barrier when it ran.
+                    try self.dmmv.recordQuantizeActQ8(
+                        &self.decode_cmd,
+                        push_fn,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        swiglu_i8.handle,
+                        swiglu_i8.size,
+                        swiglu_scale.handle,
+                        swiglu_scale.size,
+                        full_cols,
+                        inter_dim,
+                    );
+                    const i8_ranges = [_]CommandBuffer.BufferRange{
+                        .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
+                        .{ .buffer = swiglu_scale.handle, .size = swiglu_scale.size },
+                    };
+                    self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                }
                 try self.dmmv.recordMulMmQ6KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -13540,12 +13610,16 @@ pub const InferenceEngine = struct {
             (hidden_dim & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null;
         // int8 DP4a gate+up+SwiGLU short-circuits the f32 path when eligible.
-        const dp4a_done = if (use_fused_gateup)
+        // .q8_swiglu means the SwiGLU activation was pre-quantized into
+        // swiglu_i8 / swiglu_scale; dense-down then skips its own quantize step.
+        const dp4a_result: DenseGateUpDp4aResult = if (use_fused_gateup)
             try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens)
         else
-            false;
+            .not_handled;
+        const dp4a_done = dp4a_result != .not_handled;
         if (dp4a_done) {
-            // DP4a path already wrote scratch_swiglu; no extra dispatches needed.
+            // DP4a path already wrote the SwiGLU output (f32 to scratch_swiglu
+            // for .f32_swiglu, or packed int8 + scale for .q8_swiglu).
         } else if (use_fused_gateup) {
             const full_cols = n_tokens & ~@as(u32, 31);
             if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full != null) {
@@ -13635,10 +13709,25 @@ pub const InferenceEngine = struct {
                 n_tokens * inter_dim,
             );
         }
-        self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_bytes);
+        // Barrier between gate+up and dense-down. For .q8_swiglu the producer
+        // wrote swiglu_i8 + swiglu_scale (full cols) and scratch_swiglu (tail
+        // only); for .f32_swiglu / fallback the producer wrote scratch_swiglu
+        // for all tokens.
+        if (dp4a_result == .q8_swiglu) {
+            const swiglu_i8_buf = self.batched_scratch_swiglu_i8.?;
+            const swiglu_scale_buf = self.batched_scratch_swiglu_scale.?;
+            const post_gateup_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
+                .{ .buffer = swiglu_scale_buf.handle, .size = swiglu_scale_buf.size },
+                .{ .buffer = scratch_swiglu.handle, .size = swiglu_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+        } else {
+            self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_bytes);
+        }
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
-        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu);
         self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
         try self.dispatchScaleAcc(
             scratch_hidden.handle,
