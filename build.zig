@@ -229,6 +229,7 @@ pub fn build(b: *std.Build) void {
         "quantize_act_q8",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a_q8",
+        "mul_mm_q4k_full_dp4a",
         "quantize_act_q8_1",
         // Effort-15 cycle 16: fuses residual+RMS norm + Q8_1 activation
         // quantize for the Qwen3.6-27B dense FFN prefill DP4a path. Drops the
