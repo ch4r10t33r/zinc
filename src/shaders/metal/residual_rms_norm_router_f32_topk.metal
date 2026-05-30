@@ -160,20 +160,30 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Cycle-51: replace the lane-0-serial 32-add reduction of `shared_partials`
-    // with `simd_sum` on simdgroup 0. With TG_SIZE=1024, N_SIMDGROUPS == 32 ==
-    // SIMD_WIDTH, so all 32 lanes of sg 0 read `shared_partials[lane]` in
-    // parallel and the simdgroup-hardware reduction collapses 32→1 in ~5-10
-    // cycles instead of the ~32 sequential threadgroup-memory loads + adds
-    // the old code paid on lane 0 only. This sits on the critical path through
-    // sg_idx==0, which immediately proceeds into the 8-slot top-k loop below
-    // (the long tail that single-handedly drives kernel exit). The hottest
-    // timed kernel #1 (345.00 ms/req across 1436 calls, 23% of timed kernel
-    // time, single-TG `{1,1,1}` × `{1024,1,1}` dispatch per
-    // `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`) writes the same
-    // mathematical result. Same simdgroup-reduction discipline already used
-    // for the RMS sum_sq reduction at lines 86-93 above.
-    if (sg_idx == 0u) {
+    // Cycle-58: move `shared_partials` reduction + `shared_gate_out` store from
+    // sg 0 to sg 1 so sg 0 can begin the 8-slot top-k loop IMMEDIATELY after the
+    // line-161 barrier. Cycle-51 already collapsed the reduction to a single
+    // `simd_sum` (~5-10 cycles); cycle-52 parallelized the router-GEMM writeback.
+    // The remaining critical path through sg 0 is `simd_sum(shared_partials[])`
+    // (5 shuffle_xor steps + 1 lane-0 global store) followed by the 8-slot
+    // simd_max/simd_min top-k loop (8 slots × ~5 shuffles + accept/reject mask
+    // work = ~400 cycles). Top-k is FAR longer than the shared reduction, and
+    // both work blocks are data-independent — top-k reads `values[]` while the
+    // reduction reads `shared_partials[]` and writes `shared_gate_out[0]`, a
+    // distinct global output buffer. Running them on different simdgroups
+    // (sg 0 ↔ top-k, sg 1 ↔ shared_total) lets the GPU dispatch both wave fronts
+    // in parallel. sg 0's critical path drops by ~15 cycles per kernel call;
+    // sg 1's critical path is only ~17 cycles (well under sg 0's top-k tail),
+    // so the kernel-exit timing is still gated by sg 0 — meaning the savings
+    // are real net gain rather than just shifted. Hot kernel #1
+    // (337 ms/req across 1436 calls, 23% of timed kernel time, single-TG
+    // `{1,1,1}` × `{1024,1,1}` dispatch per
+    // `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`). Bit-equivalent output —
+    // same `simd_sum` math, just executed on a different sg. With TG_SIZE=1024,
+    // sg 1 always exists (N_SIMDGROUPS=32), so this is safe under the same
+    // validation guards (n_experts ≤ MAX_EXPERTS, k ≤ MAX_K_USED) that the
+    // existing kernel relies on.
+    if (sg_idx == 1u) {
         const float shared_total = simd_sum(shared_partials[lane]);
         if (lane == 0u) {
             shared_gate_out[0] = shared_total;
