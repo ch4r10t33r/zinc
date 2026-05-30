@@ -83,10 +83,28 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
+    // Cycle ~76: pack the four final-reduction `simd_sum` calls into one
+    // `simd_sum(float4)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // shuffle_xor instead of four independent 32-bit trees, cutting cross-lane
+    // shuffle traffic ~4× on the per-simdgroup tail of the Qwen3.6 full-attn
+    // output projection fused with attn_gate sigmoid-multiply (M=2048,
+    // K=4096, ~10 calls/token × 256 WGs ≈ 2.5K TGs/token across the 10
+    // full-attn layers per decode token). Gated sibling of cycle 74's
+    // `dmmv_q8_0_repacked_k4096_qwen.metal` pack (which covers the
+    // ungated SSM-out / full-attn-out at 30/token) — same K=4096
+    // exact-repacked Q8 4-row geometry, same float4-packed reduction.
+    // Also mirrors cycle 73 (`dmmv_q8_0_repacked_k2048_qwen` K=2048 sibling)
+    // and cycle 71 (`dmmv_q8_0_k4096_quad` non-repacked K=4096 sibling).
+    // Downstream lane<4 writeback consumes the four sums as simdgroup-uniform
+    // scalars (component access on the simdgroup-uniform float4), so picking
+    // float4 components by lane is bit-equivalent. The dispatch route only
+    // fires for production M=2048 (multiple of 4) via
+    // `canUseQwenGatedAttnOutDmmv` + the `base_row >= p.M` early-return at
+    // line 36 means all four rows owned by this simdgroup are always valid
+    // — no aliasing safety dance needed (matches the existing unconditional
+    // 4-row write below).
+    const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
     // Parallelize the 4-row writeback across lanes 0..3 (cycle-40 sibling of
     // cycle-39's standalone K=4096 lane-parallel writeback). After simd_sum
     // all four sums are present on every lane; base_row+0..+3 are four
@@ -100,10 +118,10 @@ kernel void main0(
     // lane-parallel pattern as cycle-32/38/39 across the standalone
     // Q8_0 exact-repacked kernel family.
     if (lane < 4u) {
-        const float local_sum = (lane == 0u) ? sum0
-                              : (lane == 1u) ? sum1
-                              : (lane == 2u) ? sum2
-                              : sum3;
+        const float local_sum = (lane == 0u) ? sums.x
+                              : (lane == 1u) ? sums.y
+                              : (lane == 2u) ? sums.z
+                              : sums.w;
         output[base_row + lane] = local_sum;
     }
 }
