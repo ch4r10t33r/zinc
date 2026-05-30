@@ -3293,11 +3293,17 @@ pub const InferenceEngine = struct {
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
-            // Same path also drives the int8 DP4a dense gate/up prefill (K=hidden_dim),
-            // so size companion scratch for the hidden activation quantize: packed
-            // int8 = hidden_dim/4 uints/token, (scale,dsum) vec2 = hidden_dim/32 * 8 B/token.
-            const hidden_i8_bytes = n * (hidden_dim / 4) * @sizeOf(u32);
-            const hidden_scale_dsum_bytes = n * (hidden_dim / 32) * 2 * f32_sz;
+            // Same path also drives the int8 DP4a dense gate/up prefill
+            // (K=hidden_dim) AND the Q5_K SSM out prefill (K=d_inner). The
+            // buffer is reused across both passes within one layer's submit;
+            // size for the larger K so the SSM out path actually fits
+            // (Qwen3.6-27B has d_inner=6144 > hidden_dim=5120, so the older
+            // hidden_dim-only size silently disqualified the SSM out DP4a
+            // path at runtime). packed int8 = max_k/4 uints/token,
+            // (scale,dsum) vec2 = max_k/32 * 8 B/token.
+            const max_dp4a_k = @max(hidden_dim, cfg.ssm_d_inner);
+            const hidden_i8_bytes = n * (max_dp4a_k / 4) * @sizeOf(u32);
+            const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
             // Q8_0 norm scratch for the SSM wqkv DP4a path (Q6_K weights, scale-only).
@@ -13019,6 +13025,129 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    /// SSM out projection (Q5_K, K=d_inner, M=hidden_dim) for Qwen3.6-27B
+    /// prefill. Uses int8 DP4a (one-shot Q8_1 per-32-block activation quant of
+    /// scratch_swiglu + hardware dot4 GEMM with Q5_K bias correction) when
+    /// enabled and the shape qualifies; otherwise the caller falls through to
+    /// the f32 batched mul_mm_q5k path. The ragged token tail (n_tokens & 31
+    /// ≠ 0) stays on the f32 Q5_K tiled path reading the untouched f32
+    /// scratch_swiglu, so output layout is identical regardless of which path
+    /// runs. Returns true if the DP4a path was emitted.
+    ///
+    /// Buffer reuse: borrows the dense-FFN's hidden_i8 / hidden_scale_dsum
+    /// Q8_1 scratch — ensureBatchedScratchCapacity now sizes those buffers for
+    /// max(hidden_dim, d_inner) precisely so this path can fit. Qwen3.6-27B
+    /// has d_inner=6144 > hidden_dim=5120, so without the larger sizing the
+    /// runtime guard below silently disqualified the DP4a path on every
+    /// layer. Those buffers were last written for the SSM wqkv/z DP4a shared
+    /// Q8_1 quant of scratch_norm at the start of the SSM segment, but
+    /// nothing downstream of SSM out reads them — the dense FFN's downstream
+    /// residual_rms_norm_quant_q8_1 (run after SSM out) overwrites them with
+    /// the post-SSM scratch_norm before the dense gate+up DP4a consumes them.
+    fn dispatchQwen36SsmOutDp4a(
+        self: *InferenceEngine,
+        ssm_out_t: *const LoadedTensor,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+        hidden_dim: u32,
+        d_inner: u32,
+        n_tokens: u32,
+    ) !bool {
+        // Threshold 128 matches the dense-down/gate-up/wqkv/z DP4a paths: under
+        // ~128 tokens the one-shot quantize pre-pass + extra dispatch/barrier
+        // outweighs the savings from a single 32-col GEMM block. context-medium
+        // prompts on the controller workload land at ~277 tokens, so the path
+        // engages.
+        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+            ssm_out_t.info.type_ == .q5_k and
+            n_tokens >= 128 and
+            (d_inner & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q5k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q5k != null and
+            self.batched_scratch_hidden_i8 != null and
+            self.batched_scratch_hidden_scale_dsum != null;
+        if (!dp4a_ok) return false;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return false;
+        // Make sure the borrowed buffers cover this layer's K=d_inner stride.
+        // hidden_i8 is sized for n*hidden_dim/4 u32; we need n*d_inner/4.
+        // hidden_scale_dsum is sized for n*hidden_dim/32 vec2; we need
+        // n*d_inner/32. With d_inner=4096 < hidden_dim=5120 this is satisfied,
+        // but the runtime check guards against future shape drift.
+        const act_i8 = self.batched_scratch_hidden_i8.?;
+        const act_sd = self.batched_scratch_hidden_scale_dsum.?;
+        const need_i8_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) * @as(vk.c.VkDeviceSize, d_inner / 4) * @sizeOf(u32);
+        const need_sd_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) * @as(vk.c.VkDeviceSize, d_inner / 32) * 2 * @sizeOf(f32);
+        if (act_i8.size < need_i8_bytes or act_sd.size < need_sd_bytes) return false;
+
+        const push_fn = self.instance.push_descriptor_fn;
+        // Q8_1 (scale + dsum) quantize of the f32 gated-norm output. Q5_K
+        // weights have the same dmin*mn bias term as Q4_K, so the DP4a kernel
+        // needs the dsum bias-correction term too — Q8_0 (scale only) would
+        // be insufficient. K=d_inner here, not hidden_dim, so the per-token
+        // strides are d_inner/4 u32 (packed) and d_inner/32 vec2 (scale,dsum).
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            push_fn,
+            scratch_swiglu.handle,
+            scratch_swiglu.size,
+            act_i8.handle,
+            act_i8.size,
+            act_sd.handle,
+            act_sd.size,
+            full_cols,
+            d_inner,
+        );
+        const i8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = act_i8.handle, .size = act_i8.size },
+            .{ .buffer = act_sd.handle, .size = act_sd.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        try self.dmmv.recordMulMmQ5KFullDp4a(
+            &self.decode_cmd,
+            push_fn,
+            ssm_out_t.gpu_buffer.handle,
+            ssm_out_t.gpu_buffer.size,
+            act_i8.handle,
+            act_i8.size,
+            act_sd.handle,
+            act_sd.size,
+            scratch_down.handle,
+            scratch_down.size,
+            hidden_dim,
+            full_cols,
+            d_inner,
+            0,
+            0,
+        );
+        if (full_cols < n_tokens) {
+            // Ragged tail: f32 Q5_K tiled GEMM on the untouched scratch_swiglu.
+            try self.dmmv.recordMulMmQ5K(
+                &self.decode_cmd,
+                push_fn,
+                ssm_out_t.gpu_buffer.handle,
+                ssm_out_t.gpu_buffer.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                scratch_down.handle,
+                scratch_down.size,
+                hidden_dim,
+                n_tokens - full_cols,
+                d_inner,
+                d_inner,
+                hidden_dim,
+                0,
+                full_cols * d_inner,
+                full_cols * hidden_dim,
+            );
+        }
+        return true;
+    }
+
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
@@ -13580,7 +13709,24 @@ pub const InferenceEngine = struct {
                 self.dmmv.pipeline_q5k != null and
                 n_tokens >= 2;
             if (use_batched_q5k_ssm_out) {
-                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
+                // K=d_inner) through the int8 DP4a tiled GEMM when the shape
+                // and runtime flags allow it; fall through to the f32
+                // mul_mm_q5k tiled path otherwise. The DP4a helper handles its
+                // own ragged n_tokens&31 tail on f32 inputs, so the only
+                // caller-visible change is which kernel writes the full-cols
+                // block of scratch_down.
+                const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                    ssm_out_t,
+                    scratch_swiglu,
+                    scratch_down,
+                    hidden_dim,
+                    d_inner,
+                    n_tokens,
+                );
+                if (!wrote_ssm_out_dp4a) {
+                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                }
                 self.decode_cmd.computeBarrier();
                 // Effort-15 cycle 16: when the downstream layer-major dense
                 // FFN call will run its DP4a gate+up path, emit the packed
@@ -13846,7 +13992,24 @@ pub const InferenceEngine = struct {
                 self.dmmv.pipeline_q5k != null and
                 n_tokens >= 2;
             if (use_batched_q5k_ssm_out) {
-                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
+                // K=d_inner) through the int8 DP4a tiled GEMM when the shape
+                // and runtime flags allow it; fall through to the f32
+                // mul_mm_q5k tiled path otherwise. The DP4a helper handles its
+                // own ragged n_tokens&31 tail on f32 inputs, so the only
+                // caller-visible change is which kernel writes the full-cols
+                // block of scratch_down.
+                const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                    ssm_out_t,
+                    scratch_swiglu,
+                    scratch_down,
+                    hidden_dim,
+                    d_inner,
+                    n_tokens,
+                );
+                if (!wrote_ssm_out_dp4a) {
+                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                }
                 self.decode_cmd.computeBarrier();
                 // Effort-15 cycle 16: when the downstream layer-major dense
                 // FFN call will run its DP4a gate+up path, emit the packed
@@ -14014,7 +14177,24 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_q5k != null and
             n_tokens >= 2;
         if (use_batched_q5k_ssm_out) {
-            try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+            // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
+            // K=d_inner) through the int8 DP4a tiled GEMM when the shape and
+            // runtime flags allow it; fall through to the f32 mul_mm_q5k
+            // tiled path otherwise. The DP4a helper handles its own ragged
+            // n_tokens&31 tail on f32 inputs, so the only caller-visible
+            // change is which kernel writes the full-cols block of
+            // scratch_down.
+            const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                ssm_out_t,
+                scratch_swiglu,
+                scratch_down,
+                hidden_dim,
+                d_inner,
+                n_tokens,
+            );
+            if (!wrote_ssm_out_dp4a) {
+                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+            }
             self.decode_cmd.computeBarrier();
             try self.dispatchResidualRmsNorm(
                 scratch_hidden.handle,
