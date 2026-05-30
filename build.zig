@@ -239,6 +239,12 @@ pub fn build(b: *std.Build) void {
         // separate quantize_act_q8_1 dispatch + barrier inside dense_ffn_gateup
         // per SSM-fed layer-major segment.
         "residual_rms_norm_quant_q8_1",
+        // Effort-15 cycle 11: token-batched SSM fused gated norm. Replaces the
+        // per-token pushDescAndDispatch loop in the layer-major SSM segment
+        // (Qwen3.6-27B context-medium prefill) with a single (dt_rank,
+        // n_tokens, 1) dispatch — ~280 dispatch records dropped per SSM
+        // segment.
+        "ssm_gated_norm_batch_tok",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;

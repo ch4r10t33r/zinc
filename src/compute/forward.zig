@@ -13845,7 +13845,6 @@ pub const InferenceEngine = struct {
             const norm_per_head = norm_elems >= d_inner;
             const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
             const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_bytes;
-            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
             const gnorm_push = SsmGatedNormPush{
                 .d_inner = d_inner,
                 .dt_rank = dt_rank,
@@ -13853,24 +13852,48 @@ pub const InferenceEngine = struct {
                 .d_state = cfg.ssm_d_state,
                 .norm_per_head = if (norm_per_head) 1 else 0,
             };
+            // Effort-15 cycle 11: token-batched gated norm dispatch. Replaces
+            // the per-token pushDescAndDispatch loop (n_tokens dispatches per
+            // SSM segment, ~280 per context-medium prefill) with a single
+            // (dt_rank, n_tokens, 1) dispatch. Falls back to the per-token
+            // path when the batched pipeline failed to load.
             var tok_idx: u32 = 0;
-            while (tok_idx < n_tokens) : (tok_idx += 1) {
-                const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+            if (self.elementwise.pipeline_ssm_gated_norm_batch_tok) |*batch_pip| {
                 const infos = [4]vk.c.VkDescriptorBufferInfo{
-                    .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
-                    .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
                     .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
-                    .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_swiglu.handle, .offset = 0, .range = z_total_bytes },
                 };
                 self.decode_cmd.pushDescAndDispatch(
-                    gnorm_pip,
+                    batch_pip,
                     self.instance.push_descriptor_fn,
                     infos[0..],
                     std.mem.asBytes(&gnorm_push),
                     dt_rank,
-                    1,
+                    n_tokens,
                     1,
                 );
+            } else {
+                const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+                    const infos = [4]vk.c.VkDescriptorBufferInfo{
+                        .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
+                        .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                        .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                        .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                    };
+                    self.decode_cmd.pushDescAndDispatch(
+                        gnorm_pip,
+                        self.instance.push_descriptor_fn,
+                        infos[0..],
+                        std.mem.asBytes(&gnorm_push),
+                        dt_rank,
+                        1,
+                        1,
+                    );
+                }
             }
             self.endProfilePhase(.ssm_gated_norm, ssm_gnorm_phase);
 
@@ -14128,7 +14151,6 @@ pub const InferenceEngine = struct {
             const norm_per_head = norm_elems >= d_inner;
             const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
             const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_bytes;
-            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
             const gnorm_push = SsmGatedNormPush{
                 .d_inner = d_inner,
                 .dt_rank = dt_rank,
@@ -14136,24 +14158,47 @@ pub const InferenceEngine = struct {
                 .d_state = cfg.ssm_d_state,
                 .norm_per_head = if (norm_per_head) 1 else 0,
             };
-            tok_idx = 0;
-            while (tok_idx < n_tokens) : (tok_idx += 1) {
-                const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+            // Effort-15 cycle 11: token-batched gated norm dispatch (see
+            // matching block in use_layer_major_ssm_proj branch above). Falls
+            // back to the per-token path when the batched pipeline failed to
+            // load.
+            if (self.elementwise.pipeline_ssm_gated_norm_batch_tok) |*batch_pip| {
                 const infos = [4]vk.c.VkDescriptorBufferInfo{
-                    .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
-                    .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
                     .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
-                    .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_swiglu.handle, .offset = 0, .range = z_total_bytes },
                 };
                 self.decode_cmd.pushDescAndDispatch(
-                    gnorm_pip,
+                    batch_pip,
                     self.instance.push_descriptor_fn,
                     infos[0..],
                     std.mem.asBytes(&gnorm_push),
                     dt_rank,
-                    1,
+                    n_tokens,
                     1,
                 );
+            } else {
+                const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
+                tok_idx = 0;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+                    const infos = [4]vk.c.VkDescriptorBufferInfo{
+                        .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
+                        .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                        .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                        .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                    };
+                    self.decode_cmd.pushDescAndDispatch(
+                        gnorm_pip,
+                        self.instance.push_descriptor_fn,
+                        infos[0..],
+                        std.mem.asBytes(&gnorm_push),
+                        dt_rank,
+                        1,
+                        1,
+                    );
+                }
             }
             self.endProfilePhase(.ssm_gated_norm, ssm_gnorm_phase);
 

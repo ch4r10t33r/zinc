@@ -293,6 +293,12 @@ pub const ElementwiseDispatch = struct {
     pipeline_ssm_delta_net_cols8_normed: ?Pipeline,
     /// SSM GATED NORM pipeline, or null.
     pipeline_ssm_gated_norm: ?Pipeline,
+    /// Effort-15 cycle 11: token-batched SSM GATED NORM pipeline. Identical
+    /// 4-binding semantics to pipeline_ssm_gated_norm but the grid is
+    /// (dt_rank, n_tokens, 1) — each workgroup handles one (head, token) pair
+    /// instead of dispatching the per-token loop from the host. Used by
+    /// prefillQwen36RunSsmLayerToFfnNorm when n_tokens > 1.
+    pipeline_ssm_gated_norm_batch_tok: ?Pipeline,
     /// SOFTMAX TOPK pipeline, or null.
     pipeline_softmax_topk: ?Pipeline,
     /// SOFTMAX TOPK v2 (subgroup-parallel reduction), or null.
@@ -538,6 +544,17 @@ pub const ElementwiseDispatch = struct {
             log.warn("ssm_gated_norm shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        // Effort-15 cycle 11: token-batched SSM gated norm. Same 4-binding
+        // layout and push struct as ssm_gated_norm.spv; only the dispatch grid
+        // differs (Y dim = n_tokens).
+        const gnorm_batch_tok_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_gated_norm_batch_tok.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_gated_norm_batch_tok = pipeline_mod.createFromSpirvWithOptions(instance, gnorm_batch_tok_path, 4, @sizeOf(SsmGatedNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("ssm_gated_norm_batch_tok shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_ssm_gated_norm_batch_tok != null) {
+            log.info("ssm_gated_norm_batch_tok pipeline loaded (Qwen3.6-27B SSM gated norm token-batched dispatch)", .{});
+        }
 
         // Softmax + top-k: 2 bindings (logits, output)
         const topk_path = std.fmt.bufPrint(&path_buf, "{s}/softmax_topk.spv", .{shader_dir}) catch unreachable;
@@ -679,6 +696,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_ssm_delta_net_cols8 = pipeline_ssm_delta_net_cols8,
             .pipeline_ssm_delta_net_cols8_normed = pipeline_ssm_delta_net_cols8_normed,
             .pipeline_ssm_gated_norm = pipeline_ssm_gated_norm,
+            .pipeline_ssm_gated_norm_batch_tok = pipeline_ssm_gated_norm_batch_tok,
             .pipeline_softmax_topk = pipeline_softmax_topk,
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
@@ -1098,6 +1116,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_ssm_delta_net_cols8) |*p| p.deinit();
         if (self.pipeline_ssm_delta_net_cols8_normed) |*p| p.deinit();
         if (self.pipeline_ssm_gated_norm) |*p| p.deinit();
+        if (self.pipeline_ssm_gated_norm_batch_tok) |*p| p.deinit();
         if (self.pipeline_softmax_topk) |*p| p.deinit();
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
