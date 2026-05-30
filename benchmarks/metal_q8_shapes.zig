@@ -125,6 +125,7 @@ const CaseId = enum {
     shared_up,
     shared_down,
     shared_dual,
+    shared_pair_swiglu,
     moe_gate,
     moe_up,
     moe_down,
@@ -166,9 +167,10 @@ const HotCase = struct {
     x_expert_stride: u32 = 0,
     is_router_fused: bool = false,
     is_moe_swiglu_fused: bool = false,
+    is_shared_pair_swiglu: bool = false,
 
     fn isDual(self: @This()) bool {
-        return self.tensor1 != null and !self.is_router_fused and !self.is_moe_swiglu_fused;
+        return self.tensor1 != null and !self.is_router_fused and !self.is_moe_swiglu_fused and !self.is_shared_pair_swiglu;
     }
 
     fn isMoe(self: @This()) bool {
@@ -253,6 +255,7 @@ fn helpText() []const u8 {
     \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
     \\                            | router | router_f32_fused
     \\                            | shared_gate | shared_up | shared_down | shared_dual
+    \\                            | shared_pair_swiglu
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_swiglu
@@ -291,6 +294,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "shared_up")) return .shared_up;
     if (std.mem.eql(u8, arg, "shared_down")) return .shared_down;
     if (std.mem.eql(u8, arg, "shared_dual")) return .shared_dual;
+    if (std.mem.eql(u8, arg, "shared_pair_swiglu")) return .shared_pair_swiglu;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
     if (std.mem.eql(u8, arg, "moe_down")) return .moe_down;
@@ -654,6 +658,33 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .rows0 = inter_dim,
                 .rows1 = inter_dim,
                 .cols = hidden_dim,
+            };
+        },
+        .shared_pair_swiglu => blk: {
+            // Exercises the production `dmmv_q8_0_pair_swiglu` fused kernel
+            // dispatched by `dispatchPairedQ8SwiGLUOnCmd` (forward_metal.zig:7737)
+            // for the Qwen3.6-35B shared expert. Hot kernel #4 in the live
+            // profile (~226 ms across 1436 calls/req = ~16% of timed kernel
+            // time). The existing `shared_dual` case loads the same tensors
+            // but launches them as two separate q8_0_dual matvecs, so it
+            // cannot answer kernel-level questions about the fused path.
+            const inter_dim = model.config.shared_expert_intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const gate = findTensorBySuffixAndShape(model, "ffn_gate_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_gate.weight", .q8_0, inter_dim, hidden_dim) orelse
+                return error.MissingSharedGateTensor;
+            const up = findTensorBySuffixAndShape(model, "ffn_up_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_up.weight", .q8_0, inter_dim, hidden_dim) orelse
+                return error.MissingSharedUpTensor;
+            break :blk .{
+                .key = "shared_pair_swiglu",
+                .label = "Shared expert Q8_0 pair SwiGLU fused",
+                .tensor0 = gate,
+                .tensor1 = up,
+                .rows0 = inter_dim,
+                .rows1 = inter_dim,
+                .cols = hidden_dim,
+                .is_shared_pair_swiglu = true,
             };
         },
         .moe_gate, .moe_gate_cols => blk: {
@@ -1794,6 +1825,147 @@ fn benchmarkMoeGateUpSwigluVariant(
     };
 }
 
+fn runSharedPairSwigluDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    block_size: u32,
+    rows_per_wg: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(model, gate_tensor),
+        .a1_offset = tensorPageOffset(model, up_tensor),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, output_buf };
+    const workgroups = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, 1, 1 },
+            .{ block_size, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(DualQ8DmmvPush),
+            0,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkSharedPairSwigluVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    const up_tensor = hot_case.tensor1 orelse return error.ExpectedDualCase;
+    if (hot_case.tensor0.info.type_ != .q8_0 or up_tensor.info.type_ != .q8_0)
+        return error.ExpectedQ8Tensor;
+
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q8_0_pair_swiglu");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    // Single fused output: y[i] = silu(gate·x[i]) * (up·x[i]) for rows i ∈ [0, M).
+    var output_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    // Mirror the production block sizing in `dispatchPairedQ8SwiGLUOnCmd`:
+    // for the Qwen3.6 shared gate+up shape (M=512, K=2048) the live engine
+    // picks block_size=32 / rows_per_wg=2 so the benchmark exercises the
+    // same WG geometry (256 WGs on M4 Max → 6.4 WG/core).
+    const simd_width: u32 = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else 32;
+    const block_size: u32 = simd_width;
+    const rows_per_wg: u32 = (block_size / simd_width) * 2;
+
+    try runSharedPairSwigluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        block_size,
+        rows_per_wg,
+        warmup_iterations,
+    );
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runSharedPairSwigluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        block_size,
+        rows_per_wg,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    // Streamed weight bytes per iter: gate Q8_0 + up Q8_0, both M×K. Matches
+    // the bytes `dispatchPairedQ8SwiGLUOnCmd` pulls through L1/L2 on every
+    // MoE layer (1× per token) in the Qwen3.6-35B decode loop.
+    const per_tensor_bytes = weightBytesPerIter(.q8_0, hot_case.rows0, hot_case.cols);
+    const weight_bytes: u64 = per_tensor_bytes * 2;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, hot_case.rows0);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "fused",
+        .shader_name = "dmmv_q8_0_pair_swiglu",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = 1,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = block_size,
+        .rows_per_wg = rows_per_wg,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows: u32) ![]f32 {
     const ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     return try allocator.dupe(f32, ptr[0..rows]);
@@ -2464,7 +2636,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -2520,6 +2692,36 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, fused_result.?);
+        } else if (case_id == .shared_pair_swiglu) {
+            const up_tensor = hot_case.tensor1.?;
+            const per_tensor_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
+            try stdout.interface.print(
+                "Case {s}: {s} | tensors={s} + {s} | quant={s} + {s} | M={d} K={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    up_tensor.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    @tagName(up_tensor.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    @as(f64, @floatFromInt(per_tensor_bytes * 2)) / (1024.0 * 1024.0),
+                },
+            );
+
+            var pair_result: ?BenchResult = null;
+            defer if (pair_result) |*result| allocator.free(result.output);
+
+            pair_result = try benchmarkSharedPairSwigluVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, pair_result.?);
         } else if (case_id == .moe_gate_up_swiglu) {
             const up_tensor = hot_case.tensor1.?;
             const per_expert_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
