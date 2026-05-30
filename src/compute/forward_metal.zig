@@ -7723,20 +7723,23 @@ fn dispatchPairedQ8SwiGLUOnCmd(
         K == 2048 and
         std.mem.endsWith(u8, gate.info.name, "ffn_gate_shexp.weight") and
         std.mem.endsWith(u8, up.info.name, "ffn_up_shexp.weight");
-    // Cycle-16: same shape-conditional cliff as cycle-14 (paired K+V at M=512,
-    // K=2048) — the Qwen3.6 shared expert gate+up SwiGLU at M=512 K=2048 under
-    // block=128 yields ceil(512/8)=64 WGs → 1.6 WG/core on the M4 Max's 40
-    // cores. The shared-expert path fires once per MoE layer (40/token),
-    // ~4× more frequent than full-attn K+V (~10/token), so the same
-    // undersubscription fix pays off proportionally more. Drop to block=64
-    // (rows_per_wg=4, 128 WGs → 3.2 WG/core), matching cycle-14's KEPT
-    // pattern. Kernel reads `simdgroups_per_threadgroup` for stride so per-row
-    // SwiGLU math is unchanged. Adapted from llama.cpp `kernel_mul_mv_q8_0_f32_impl`
-    // (ggml-metal.metal) N_SG=2 default for short rows: small M shapes prefer
-    // more workgroups over wider per-WG simdgroup counts.
+    // Cycle-29: extend cycle-16's halving (block=128→64 for Qwen3.6 shared
+    // expert gate+up SwiGLU at M=512 K=2048, taking subscription density
+    // 1.6→3.2 WG/core) one step further to block=32 / rows_per_wg=2 → 256
+    // WGs → 6.4 WG/core on the M4 Max's 40 cores — matching the established
+    // sweet spot of cycle-4 (K=2048 SSM-gate, +0.1 KEPT), cycle-17 (K=512
+    // shared MoE down, +0.x KEPT), and cycle-25 (K=4096 SSM-out, +0.4 KEPT)
+    // all at the 6.4/core density. Each TG holds one simdgroup (32 threads)
+    // processing two rows via `base_row = (tg_id * simdgroups_per_tg + sg_idx)
+    // * 2`; `simdgroups_per_threadgroup` reads as 1 so per-row simd_sum math
+    // is unchanged. Adapted from llama.cpp `kernel_mul_mv_q8_0_f32_impl`
+    // (ggml-metal.metal) N_SG=1 short-row branch: small M=512 prefers the
+    // narrower TG count over wider per-WG simdgroup parallelism. The shared
+    // SwiGLU fires once per MoE layer (40/token), so the per-call WG-density
+    // win compounds 40× per decode token.
     const block_size: u32 = if (is_qwen_shared_gate_up and
-        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= 64)
-        64
+        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= 32)
+        32
     else
         pairedQ8DmmvBlockSize(engine, gate, up);
     const simd_width = if (engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width else @as(u32, 32);
