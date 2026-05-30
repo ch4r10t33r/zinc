@@ -480,6 +480,11 @@ pub const DmmvDispatch = struct {
     /// downstream dense-down DP4a kernel can skip the standalone
     /// quantize_act_q8 dispatch + barrier.
     pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8: ?Pipeline,
+    /// Q8_1 (scale + dsum vec2) sibling of the Q8_0 fused producer. Q4_K-down
+    /// needs the dsum bias-correction term; this variant lets the Q4_K-down
+    /// DP4a (mul_mm_q4k_full_dp4a) skip its standalone quantize_act_q8_1
+    /// dispatch + barrier per Q4_K-down layer.
+    pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1: ?Pipeline,
     /// int8 DP4a full-tile Q4_K single-projection GEMM (no gate, no SwiGLU)
     /// used by the Qwen3.6-27B SSM z prefill projection. Same Q8_1 activation
     /// layout as the gate+up variant; 4 bindings (A weights, B packed, B
@@ -1027,6 +1032,19 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null) {
             log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_0 output)", .{});
         }
+        // Q4_K-down sibling of the Q8_0 fused producer. Same gate/up SSBOs,
+        // same Q8_1 input activation; the only differences are the output
+        // scale buffer (vec2 scale+dsum instead of f32 scale) and the
+        // per-cluster isum reduction so the dsum bias-correction term is
+        // valid for the downstream mul_mm_q4k_full_dp4a (Q4_K-down) kernel.
+        const mul_mm_q4k_gateup_dp4a_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_1_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 != null) {
+            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_1 output for Q4_K-down)", .{});
+        }
         const quantize_act_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/quantize_act_q8_1.spv", .{shader_dir}) catch unreachable;
         const pipeline_quantize_act_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, quantize_act_q8_1_path, 3, @sizeOf(QuantizeActPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("quantize_act_q8_1 shader not loaded: {s}", .{@errorName(err)});
@@ -1118,6 +1136,7 @@ pub const DmmvDispatch = struct {
             .pipeline_quantize_act_q8 = pipeline_quantize_act_q8,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8,
+            .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1,
             .pipeline_mul_mm_q4k_full_dp4a = pipeline_mul_mm_q4k_full_dp4a,
             .pipeline_mul_mm_q5k_full_dp4a = pipeline_mul_mm_q5k_full_dp4a,
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
@@ -2123,6 +2142,72 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Q4_K-down sibling of recordMulMmQ4KGateUpSwigluFullDp4aQ8. Same fused
+    /// gate+up+SwiGLU DP4a GEMM, but emits Q8_1-style activation (packed int8
+    /// + per-32-block (scale, dsum) vec2) so the downstream mul_mm_q4k_full_dp4a
+    /// (Q4_K-down) consumer can skip the standalone quantize_act_q8_1 dispatch
+    /// + barrier. dsum = scale * sum(int8_lanes) is computed inside the kernel
+    /// via subgroupClusteredAdd cluster_size=TPR_M=8, so there's no LDS
+    /// round-trip beyond the GEMM's existing barriers. Caller is responsible
+    /// for sizing d_scale_dsum_buf as 2x the Q8_0 scale buffer (per-block
+    /// vec2 instead of per-block float).
+    pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_dsum_buf: vk.c.VkBuffer,
+        b_scale_dsum_size: vk.c.VkDeviceSize,
+        d_packed_buf: vk.c.VkBuffer,
+        d_packed_size: vk.c.VkDeviceSize,
+        d_scale_dsum_buf: vk.c.VkBuffer,
+        d_scale_dsum_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_packed_offset: u32,
+        d_scale_dsum_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ4KGateUpDp4aQ8Push{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d_packed = M / 4,
+            .stride_d_scale = M / 32,
+            .a_offset = a_offset,
+            .d_packed_offset = d_packed_offset,
+            .d_scale_offset = d_scale_dsum_offset,
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_dsum_buf, .offset = 0, .range = b_scale_dsum_size },
+            .{ .buffer = d_packed_buf, .offset = 0, .range = d_packed_size },
+            .{ .buffer = d_scale_dsum_buf, .offset = 0, .range = d_scale_dsum_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
     /// int8 DP4a full-tile single Q5_K GEMM (no fused activation). Used by the
     /// Qwen3.6-27B SSM out prefill projection (M=hidden_dim, K=d_inner).
     /// Activations arrive pre-quantized (packed int8 + per-32-block (scale,
@@ -2288,6 +2373,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_quantize_act_q8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8_1) |*p| p.deinit();
