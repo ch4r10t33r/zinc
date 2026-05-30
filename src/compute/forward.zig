@@ -14783,20 +14783,52 @@ pub const InferenceEngine = struct {
         // Fused residual+rms_norm for FFN entry:
         //   scratch_hidden[i] += scratch_down[i]
         //   scratch_norm[i]    = rms_norm(scratch_hidden[i]) * ffn_norm
-        try self.dispatchResidualRmsNorm(
-            scratch_hidden.handle,
-            scratch_hidden.size,
-            scratch_down.handle,
-            scratch_down.size,
-            scratch_norm.handle,
-            scratch_norm.size,
-            ffn_norm_t.gpu_buffer.handle,
-            ffn_norm_t.gpu_buffer.size,
-            hidden_dim,
-            n_tokens,
-            eps,
-            1.0,
-        );
+        //
+        // Effort-15 cycle 14: when the downstream dense FFN will run the
+        // DP4a gate+up path, also emit the packed Q8_1 activation
+        // (hidden_i8 + scale_dsum) here in the same submit so the dense
+        // FFN skips its standalone quantize_act_q8_1 dispatch + barrier.
+        // Mirrors the cycle-16 SSM-segment fusion for the new full-attn
+        // layer-major path added in cycle 13. The caller propagates
+        // input_pre_quantized=true to prefillQwen36RunBatchedDenseFfnLayer
+        // via the segment loop's segment_pre_quantized.
+        if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+            const h_i8 = self.batched_scratch_hidden_i8.?;
+            const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+            try self.dispatchResidualRmsNormQuantQ8_1(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                h_i8.handle,
+                h_i8.size,
+                h_sd.handle,
+                h_sd.size,
+                hidden_dim,
+                n_tokens,
+                eps,
+                1.0,
+            );
+        } else {
+            try self.dispatchResidualRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                hidden_dim,
+                n_tokens,
+                eps,
+                1.0,
+            );
+        }
 
         self.decode_cmd.computeToTransferBarrier();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -15377,10 +15409,18 @@ pub const InferenceEngine = struct {
                 );
             }
             const segment_is_full_attn = ((segment_layer + 1) % full_attn_interval) == 0;
-            // Effort-15 cycle 16: fused rms+quant runs only when the SSM
-            // segment path emits scratch_norm; full_attn segments build
-            // scratch_norm via per-token decodeStep and don't fuse.
-            const segment_pre_quantized = !segment_is_full_attn and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
+            // Effort-15 cycle 16 originally restricted fused rms+quant to the
+            // SSM segment path because the per-token full_attn fallback built
+            // scratch_norm token-by-token and could not emit per-32-block
+            // Q8_1 inline. Cycle 14 (run-3) extends the fusion to the new
+            // cycle-13 layer-major full_attn path, which emits scratch_norm
+            // in one batched dispatch and can drop the standalone
+            // quantize_act_q8_1 dispatch + barrier per full_attn dense FFN
+            // (~14/64 layers on Qwen3.6-27B with full_attn_interval=4).
+            const segment_full_attn_layer_major = segment_is_full_attn and
+                self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens);
+            const segment_layer_major = !segment_is_full_attn or segment_full_attn_layer_major;
+            const segment_pre_quantized = segment_layer_major and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
             if (!segment_is_full_attn) {
                 try self.prefillQwen36RunSsmLayerToFfnNorm(
                     state,
@@ -15402,7 +15442,7 @@ pub const InferenceEngine = struct {
                     scratch_down,
                     pipeline_tail,
                 );
-            } else if (self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens)) {
+            } else if (segment_full_attn_layer_major) {
                 // Effort-15 cycle 13: batched full-attn segment path. One
                 // submit per layer covering attn_norm + Q/K/V/(packed or
                 // separate) gate + per-head Q/K norms + RoPE + KV write +
