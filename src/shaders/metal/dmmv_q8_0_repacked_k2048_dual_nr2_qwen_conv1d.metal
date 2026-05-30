@@ -129,10 +129,19 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
+    // Cycle ~67: pack the two final-reduction `simd_sum` calls into one
+    // `simd_sum(float2)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 64-bit packed lanes per
+    // shuffle_xor instead of two independent 32-bit trees, cutting cross-lane
+    // shuffle traffic ~2× on the per-simdgroup tail of hot kernel #5
+    // (220 ms/req across 1044 calls, 15% of timed kernel time — the `prev_fused_attn_norm`
+    // SSM in-proj qkv+z dual matvec fused with conv1d postlude). The
+    // downstream lane<2 paired writeback consumes both sums as
+    // simdgroup-uniform scalars, so picking float2 components by lane is
+    // bit-equivalent. Same proven pattern as cycle ~62/63/64/65.
+    const float2 sums = simd_sum(float2(acc0, acc1));
     // Distribute the two row writes + conv1d postludes across lanes 0 and 1.
-    // After simd_sum both sum0/sum1 are present on every lane, and row/row+1
+    // After simd_sum both components are present on every lane, and row/row+1
     // are disjoint conv channels owned by this simdgroup, so the two lanes
     // touch non-overlapping output/state addresses. Lanes 0 and 1 reading
     // conv_state[row..row+1] (also c+row..c+row+1, 2c+row..2c+row+1) issue
@@ -141,7 +150,7 @@ kernel void main0(
     // layers per decode token that take the `prev_fused_attn_norm` path.
     if (lane < 2u) {
         const uint local_row = row + lane;
-        const float local_sum = (lane == 0u) ? sum0 : sum1;
+        const float local_sum = (lane == 0u) ? sums.x : sums.y;
         output[local_row] = local_sum;
 
         if (first) {
