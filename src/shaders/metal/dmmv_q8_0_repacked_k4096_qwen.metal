@@ -71,27 +71,19 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
-    // Parallelize the 4-row writeback across lanes 0..3 (cycle-39 sibling of
-    // cycle-38's K=2048 lane-parallel writeback). After simd_sum all four sums
-    // are present on every lane; base_row+0..+3 are four contiguous floats so
-    // lanes 0..3 of this simdgroup issue a single coalesced 16-byte store
-    // instead of four serial lane-0 stores. The dispatch route
-    // `.exact_qwen_k4096` gates on `M % 4 == 0` (forward_metal.zig:8043), and
-    // the `base_row >= p.M` early-return at the top means all four rows owned
-    // by this simdgroup are always valid (no per-row `has` check). Production
-    // hot user: SSM out projection (M=2048, K=4096, 30/token × 256 WGs ≈ 7.7K
-    // TGs/token, hot kernel #4 by total bytes streamed). Same lane-parallel
-    // pattern as cycle-32 (`dmmv_q8_0_dual_fused_norm_conv1d.metal`) and
-    // cycle-38 (`dmmv_q8_0_repacked_k2048_qwen.metal`).
+    // Pack the four per-row simdgroup reductions into a single `simd_sum(float4)`
+    // — Apple9's vector `simd_sum` lowers to one 5-level butterfly that
+    // transfers a 128-bit packed lane per `shuffle_xor`, cutting cross-lane
+    // shuffle traffic ~4× on the per-simdgroup tail vs. four scalar `simd_sum`
+    // calls. K=4096 sibling of cycle-73's K=2048 repacked-qwen pack and cycle-71's
+    // non-repacked K=4096 quad pack (`dmmv_q8_0_k4096_quad.metal`). Production
+    // hot user: SSM out projection (M=2048, K=4096, 1080 calls/req × 256 TGs ≈
+    // 276K simdgroup-tail reductions/req — hot kernel #4 by streamed bytes,
+    // 8.96 GiB/req across both SSM-out and full-attn-out which share this exact
+    // shape). The lane-parallel writeback below remains: lanes 0..3 each write
+    // one of the float4 components, issuing a coalesced 16-byte store.
+    const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
     if (lane < 4u) {
-        const float local_sum = (lane == 0u) ? sum0
-                              : (lane == 1u) ? sum1
-                              : (lane == 2u) ? sum2
-                              : sum3;
-        output[base_row + lane] = local_sum;
+        output[base_row + lane] = sums[lane];
     }
 }
