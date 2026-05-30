@@ -87,6 +87,22 @@ const BENCHMARK_COOLDOWN_MS = parsePositiveIntEnv("ZINC_BENCHMARK_COOLDOWN_MS", 
 // Default 0 = off (backward-compatible); set to e.g. 16 for decode runs so
 // throughput is measured over a sustained generation window.
 const MIN_DECODE_TOKENS = parsePositiveIntEnv("ZINC_MIN_DECODE_TOKENS", 0);
+// Cross-effort guard: when optimizing one metric (e.g., decode), periodically
+// measure the OTHER metric (e.g., prefill) so a cross-effort regression surfaces
+// EARLY instead of after the run completes. Effort 5 decode run cycles 4-26
+// touched SSM/Q8 shaders that are shared with prefill; the regression from
+// 101.9 → ~89 prefill tok/s wasn't visible until an out-of-band verification.
+//
+// Setup: ZINC_CROSS_EFFORT_PROMPT (different prompt for the guard),
+// ZINC_CROSS_EFFORT_METRIC ("prefill" or "decode" — opposite of main),
+// ZINC_CROSS_EFFORT_PROMPT_MODE ("chat" or "raw"),
+// ZINC_CROSS_EFFORT_MAX_TOKENS (e.g. 16 for prefill, 64 for decode),
+// ZINC_CROSS_EFFORT_EVERY (default 5 — measure every N cycles, plus cycle 1).
+const CROSS_EFFORT_PROMPT = process.env.ZINC_CROSS_EFFORT_PROMPT ?? "";
+const CROSS_EFFORT_METRIC: MetricMode = parseMetricModeEnv("ZINC_CROSS_EFFORT_METRIC", METRIC_MODE === "decode" ? "prefill" : "decode");
+const CROSS_EFFORT_PROMPT_MODE = (process.env.ZINC_CROSS_EFFORT_PROMPT_MODE ?? "chat").trim().toLowerCase();
+const CROSS_EFFORT_MAX_TOKENS = parsePositiveIntEnv("ZINC_CROSS_EFFORT_MAX_TOKENS", 16);
+const CROSS_EFFORT_EVERY = parsePositiveIntEnv("ZINC_CROSS_EFFORT_EVERY", 5);
 // Confirmation re-run: when a candidate lands in the noise zone around the
 // promotion boundary (or its samples were flagged bimodal/THERMAL), collect
 // this many EXTRA timed samples and re-aggregate over the combined set before
@@ -2089,6 +2105,15 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push(...diversityLines);
   }
 
+  // Cross-effort guard status. When a baseline exists, surface the latest
+  // measurement so the agent sees whether their changes are quietly regressing
+  // the other metric. Escalated wording when regression ≥ 5%.
+  const crossLines = buildCrossEffortStatus(state);
+  if (crossLines.length > 0) {
+    diagnosis.push("");
+    diagnosis.push(...crossLines);
+  }
+
   // Stall warning
   const recentProgress = recentAcceptedProgress(state);
   if (state.stalledCycles >= STALL_THRESHOLD && recentProgress.hasProgress) {
@@ -2426,6 +2451,14 @@ export type RunState = {
   /// validators / probes that the kept tree leaves default-off still fire and
   /// produce per-tensor/per-layer evidence for the next cycle.
   lastNearMissDiagnostic?: { cycle: number; envApplied: string[]; output: string } | null;
+  /// Cross-effort guard: first measurement of the OTHER metric in this run,
+  /// frozen as the regression baseline. Set on cycle 1 (or the first cross-
+  /// effort measurement); all subsequent cross-effort tok/s are compared to it.
+  crossEffortBaseline?: { metric: MetricMode; tokPerSec: number; cycle: number } | null;
+  /// Latest cross-effort measurement + delta vs baseline. Surfaced in the next
+  /// cycle's prompt so the agent can see whether their changes regressed the
+  /// other metric — and react before the loop ends.
+  lastCrossEffort?: { cycle: number; metric: MetricMode; tokPerSec: number; deltaPct: number } | null;
   reviewSummaries: string[];
   /// Optional multi-hour effort doc (raw markdown) spliced into every agent
   /// prompt. Loaded via `--effort N`, which finds `MULTI_HOUR_EFFORT_N_*.md`
@@ -2516,6 +2549,69 @@ async function runNearMissDiagnostic(
   const combined = (run.stderr + run.stdout).slice(-4000);
   console.log(clr("2", `    diagnostic captured (${combined.length} bytes)`));
   return combined;
+}
+
+/**
+ * Cross-effort guard: run one inference using the OTHER metric/prompt mode
+ * (e.g. prefill during a decode-focused run) and return the parsed tok/s for
+ * that metric. Used to surface cross-effort regression EARLY without affecting
+ * the main keep gate.
+ */
+async function runCrossEffortCheck(): Promise<number | null> {
+  if (!CROSS_EFFORT_PROMPT) return null;
+  console.log(clr("1;35", `  🔬 Cross-effort check: measuring ${CROSS_EFFORT_METRIC} with ${CROSS_EFFORT_PROMPT_MODE} prompt mode...`));
+  const args = [
+    ...zincModelArgs(),
+    "--prompt", CROSS_EFFORT_PROMPT,
+    ...(CROSS_EFFORT_PROMPT_MODE === "chat" ? ["--chat"] : []),
+    "-n", String(CROSS_EFFORT_MAX_TOKENS),
+  ];
+  const run = await runCommand("./zig-out/bin/zinc", args, { timeout: RUN_TIMEOUT_MS });
+  if (run.exitCode !== 0) {
+    console.log(clr("1;33", "    ⚠ Cross-effort check crashed; skipping"));
+    return null;
+  }
+  const combined = run.stderr + run.stdout;
+  const tps = parseTokPerSec(combined, CROSS_EFFORT_METRIC);
+  if (tps == null) {
+    console.log(clr("1;33", "    ⚠ Cross-effort check produced no parseable tok/s; skipping"));
+    return null;
+  }
+  console.log(clr("2", `    cross-effort ${CROSS_EFFORT_METRIC}: ${tps.toFixed(2)} tok/s`));
+  return tps;
+}
+
+/**
+ * Build the cross-effort status section spliced into every prompt while a
+ * cross-effort baseline is set. Highlights regression vs the baseline so the
+ * agent can react before the run ends with a silent cross-effort loss.
+ */
+export function buildCrossEffortStatus(state: Pick<RunState, "crossEffortBaseline" | "lastCrossEffort">): string[] {
+  const last = state.lastCrossEffort;
+  const base = state.crossEffortBaseline;
+  if (!last || !base) return [];
+  const lines: string[] = [];
+  const severe = last.deltaPct <= -5;
+  const moderate = last.deltaPct <= -2 && !severe;
+  const tag = severe
+    ? "## ⚠⚠ CROSS-EFFORT REGRESSION — your changes are HURTING the other metric"
+    : moderate
+      ? "## ⚠ CROSS-EFFORT DRIFT — the other metric is sliding"
+      : "## Cross-effort status";
+  lines.push(tag);
+  lines.push(
+    `Other metric: **${last.metric}** measured ${last.tokPerSec.toFixed(2)} tok/s at cycle ${last.cycle} (baseline ${base.tokPerSec.toFixed(2)} from cycle ${base.cycle}, Δ ${last.deltaPct >= 0 ? "+" : ""}${last.deltaPct.toFixed(1)}%).`,
+  );
+  if (severe) {
+    lines.push("");
+    lines.push(`A change earlier in this run regressed ${last.metric} by ${Math.abs(last.deltaPct).toFixed(1)}%. The Effort 5/16 docs explicitly prohibit cross-effort regressions >3%. Before another ${METRIC_MODE}-targeting change:`);
+    lines.push("- Read the Cycle History below and identify which KEPT cycle(s) likely touched shared kernels (SSM, Q8 dispatch, fused-norm, RoPE/KV).");
+    lines.push(`- If a single recent fusion is the suspect, GATE it behind an env flag rather than landing another optimization on top. That preserves the ${METRIC_MODE} win while restoring ${last.metric}.`);
+    lines.push("- Do not roll out another shader fusion this cycle if its hot path is also used by " + last.metric + " — instead, propose a default-off variant.");
+  } else if (moderate) {
+    lines.push("Watch for further drift. If the next cross-effort check goes below -5%, the harness will treat this as a hard regression.");
+  }
+  return lines;
 }
 
 const REVIEW_EVERY = 10;
@@ -2822,6 +2918,8 @@ async function main() {
     state.effortFile ??= null;
     state.bestIncorrect ??= null;
     state.lastNearMissDiagnostic ??= null;
+    state.crossEffortBaseline ??= null;
+    state.lastCrossEffort ??= null;
     normalizeStateBestTokPerSec(state);
     // Seed the near-miss target from history for runs predating bestIncorrect.
     if (backfillNearMiss(state) && state.bestIncorrect) {
@@ -2873,6 +2971,8 @@ async function main() {
       lastProfileOutput: null,
       lastProfileCycle: null,
       lastNearMissDiagnostic: null,
+      crossEffortBaseline: null,
+      lastCrossEffort: null,
       reviewSummaries: [],
       effortPlan: effortBundle?.plan ?? null,
       effortId: effort,
@@ -3164,6 +3264,33 @@ async function main() {
         await writeFile(join(cycleDir, "near_miss_diagnostic.log"), diagOutput);
       } catch {
         console.log(clr("1;33", "  ⚠ Near-miss diagnostic run failed, continuing"));
+      }
+    }
+
+    // Cross-effort guard. When ZINC_CROSS_EFFORT_PROMPT is set, measure the
+    // OTHER metric (e.g. prefill during a decode run) every CROSS_EFFORT_EVERY
+    // cycles (plus cycle 1 for the baseline). Surfaces regression early.
+    if (
+      CROSS_EFFORT_PROMPT &&
+      verify.buildExitCode === 0 &&
+      verify.testExitCode === 0 &&
+      (cycle === 1 || cycle % CROSS_EFFORT_EVERY === 0)
+    ) {
+      try {
+        const xtps = await runCrossEffortCheck();
+        if (xtps != null) {
+          if (!state.crossEffortBaseline) {
+            state.crossEffortBaseline = { metric: CROSS_EFFORT_METRIC, tokPerSec: xtps, cycle };
+            console.log(clr("1;36", `  ◎ Cross-effort baseline locked: ${CROSS_EFFORT_METRIC} = ${xtps.toFixed(2)} tok/s (cycle ${cycle})`));
+          }
+          const baseline = state.crossEffortBaseline.tokPerSec;
+          const deltaPct = ((xtps - baseline) / baseline) * 100;
+          state.lastCrossEffort = { cycle, metric: CROSS_EFFORT_METRIC, tokPerSec: xtps, deltaPct };
+          const flag = deltaPct <= -5 ? " ⚠⚠ REGRESSION" : deltaPct <= -2 ? " ⚠ drift" : "";
+          console.log(clr(deltaPct <= -5 ? "1;31" : deltaPct <= -2 ? "1;33" : "1;36", `  ◎ Cross-effort ${CROSS_EFFORT_METRIC}: ${xtps.toFixed(2)} tok/s (baseline ${baseline.toFixed(2)}, Δ ${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%)${flag}`));
+        }
+      } catch {
+        console.log(clr("1;33", "  ⚠ Cross-effort check failed, continuing"));
       }
     }
 

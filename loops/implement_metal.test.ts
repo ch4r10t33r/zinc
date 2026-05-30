@@ -3,6 +3,7 @@ import {
   aggregateTimedSamples,
   backfillNearMiss,
   bestKeptCorrectTokPerSec,
+  buildCrossEffortStatus,
   buildNearMissDirective,
   buildStepKindDiversityNudge,
   countNearMissFamilyReverts,
@@ -1423,5 +1424,52 @@ describe("buildStepKindDiversityNudge", () => {
     ];
     const lines = buildStepKindDiversityNudge({ cycles });
     expect(lines.length).toBeGreaterThan(0); // fires: 9 opt + 1 fix (not analysis)
+  });
+});
+
+// ── buildCrossEffortStatus ─────────────────────────────────────────
+
+describe("buildCrossEffortStatus", () => {
+  test("silent when no cross-effort baseline is set", () => {
+    expect(buildCrossEffortStatus({ crossEffortBaseline: null, lastCrossEffort: null })).toEqual([]);
+  });
+
+  test("silent when baseline exists but no measurement yet", () => {
+    expect(
+      buildCrossEffortStatus({
+        crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
+        lastCrossEffort: null,
+      }),
+    ).toEqual([]);
+  });
+
+  test("plain status when other metric is stable (Δ > -2%)", () => {
+    const lines = buildCrossEffortStatus({
+      crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 99.5, cycle: 5, deltaPct: -0.5 },
+    }).join("\n");
+    expect(lines).toContain("Cross-effort status");
+    expect(lines).not.toContain("REGRESSION");
+    expect(lines).not.toContain("DRIFT");
+  });
+
+  test("DRIFT warning at -2% to -5%", () => {
+    const lines = buildCrossEffortStatus({
+      crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 97, cycle: 10, deltaPct: -3 },
+    }).join("\n");
+    expect(lines).toContain("CROSS-EFFORT DRIFT");
+    expect(lines).toContain("Watch for further drift");
+  });
+
+  test("REGRESSION warning at <= -5% with concrete remediation guidance", () => {
+    const lines = buildCrossEffortStatus({
+      crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 90, cycle: 15, deltaPct: -10 },
+    }).join("\n");
+    expect(lines).toContain("CROSS-EFFORT REGRESSION");
+    expect(lines).toContain("HURTING the other metric");
+    expect(lines).toContain("GATE it behind an env flag");
+    expect(lines).toContain("10.0%");
   });
 });
