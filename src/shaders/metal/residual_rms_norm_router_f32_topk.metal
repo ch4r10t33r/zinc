@@ -113,10 +113,26 @@ kernel void main0(
     const float total_sq = simd_sum(partial);
     const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
 
+    // Cycle ~61: extend the cycle-60 inter-phase register-passing pattern to
+    // Phase 4 (shared-gate dot, lines 173-180). Hoist `nval` out of the active
+    // block into an outer-scope register so the shared-gate loop can consume
+    // the SAME float4 the thread wrote to x_cache4 without re-reading TG mem.
+    // Validation guards (lines 61-66) ensure k_vec4 = (p.K >> 2) ≤ MAX_K_VEC4
+    // = TG_SIZE = 1024, so the Phase 4 stride loop body executes AT MOST ONCE
+    // per thread (vi = local_id; next iter vi += TG_SIZE is always ≥ k_vec4).
+    // Therefore each Phase 4 read of x_cache4[local_id] is intra-thread (same
+    // thread that wrote it in Phase 2) and can route through the register
+    // instead of TG mem. The Phase 2 `x_cache4[vi] = nval` write + line-127
+    // barrier still preserve cross-thread x_cache4 visibility for Phase 3
+    // (router GEMM uses lane-strided reads across simdgroups). Same llama.cpp
+    // `kernel_mul_mv_q4_K_f32_impl` register-resident-Y pattern adapted to
+    // the SUBSEQUENT inter-phase boundary on hot kernel #1 (339 ms/req across
+    // 1436 calls). Eliminates one TG mem read per active thread in Phase 4.
+    float4 nval = float4(0.0f);
     if (active) {
         const uint idx = vi << 2;
         const float4 w = *(device const float4*)(norm_weight + idx);
-        const float4 nval = w * (updated * rms_inv);
+        nval = w * (updated * rms_inv);
         x_cache4[vi] = nval;
         *(device float4*)(norm_out + idx) = nval;
     }
@@ -171,8 +187,8 @@ kernel void main0(
 
     device const float* shared_row = W_shared_gate + (p.shared_gate_offset >> 2);
     float shared_acc = 0.0f;
-    for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
-        shared_acc += dot(*(device const float4*)(shared_row + (vi << 2)), x_cache4[vi]);
+    if (active) {
+        shared_acc = dot(*(device const float4*)(shared_row + (local_id << 2)), nval);
     }
     const float shared_sum = simd_sum(shared_acc);
     if (lane == 0u) {
