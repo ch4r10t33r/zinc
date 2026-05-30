@@ -179,6 +179,19 @@ pub const ResidualRmsNormPush = extern struct {
     scale_bits: u32,
 };
 
+/// Push constants for fused residual-add + RMS norm + Q8_1 activation quantize
+/// (src/shaders/residual_rms_norm_quant_q8_1.comp). Same residual/RMS math as
+/// ResidualRmsNormPush, but also emits packed int8 lanes + (scale, dsum) so
+/// the downstream Qwen3.6-27B dense FFN DP4a gate+up GEMM can skip its
+/// separate quantize_act_q8_1 dispatch.
+pub const ResidualRmsNormQuantQ8_1Push = extern struct {
+    n: u32,
+    eps_bits: u32,
+    scale_bits: u32,
+    blocks_per_token: u32,
+    stride_packed: u32,
+};
+
 /// Push constants for fused RMS norm + RoPE shader.
 pub const NormRopePush = extern struct {
     head_dim: u32,
@@ -294,6 +307,11 @@ pub const ElementwiseDispatch = struct {
     pipeline_kv_cache_write_batched: ?Pipeline,
     /// Fused residual-add + RMS norm for prefillBatched (4 bindings).
     pipeline_residual_rms_norm: ?Pipeline,
+    /// Fused residual-add + RMS norm + Q8_1 quantize for the Qwen3.6-27B
+    /// dense FFN prefill DP4a path (6 bindings: hidden(rw), residual,
+    /// norm_out, weights, packed_i8, scale_dsum). Saves one quantize_act_q8_1
+    /// dispatch + barrier per SSM-fed layer-major segment.
+    pipeline_residual_rms_norm_quant_q8_1: ?Pipeline,
     /// Fused RMS norm + residual-accumulate (hidden += weight * rmsnorm(src)),
     /// 3 bindings (hidden, src, weights). Used by Gemma's post_ffw_norm tail.
     pipeline_rms_norm_add: ?Pipeline,
@@ -573,6 +591,22 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        // residual_rms_norm_quant_q8_1: 6 bindings (hidden, residual, norm_out,
+        // weights, packed_i8, scale_dsum). Used by the Qwen3.6-27B dense FFN
+        // prefill DP4a path to fuse the quantize_act_q8_1 dispatch into the
+        // upstream SSM-out residual+RMS-norm. Workgroup size is 256 (not 64
+        // like residual_rms_norm) to align cleanly with 32-block subgroup
+        // clusters; the host enforces (hidden_dim % 256) == 0 before
+        // dispatching.
+        const resnorm_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/residual_rms_norm_quant_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_residual_rms_norm_quant_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, resnorm_q8_1_path, 6, @sizeOf(ResidualRmsNormQuantQ8_1Push), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("residual_rms_norm_quant_q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_residual_rms_norm_quant_q8_1 != null) {
+            log.info("residual_rms_norm_quant_q8_1 pipeline loaded (Qwen3.6-27B dense FFN DP4a input fusion)", .{});
+        }
+
         // norm_rope: fused RMS norm + RoPE, 3 bindings (data, weight, freq)
         const norm_rope_path = std.fmt.bufPrint(&path_buf, "{s}/norm_rope.spv", .{shader_dir}) catch unreachable;
         const pipeline_norm_rope = pipeline_mod.createFromSpirvWithOptions(instance, norm_rope_path, 3, @sizeOf(NormRopePush), &.{}, push_options, allocator) catch |err| blk: {
@@ -652,6 +686,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_kv_cache_write = pipeline_kv_cache_write,
             .pipeline_kv_cache_write_batched = pipeline_kv_cache_write_batched,
             .pipeline_residual_rms_norm = pipeline_residual_rms_norm,
+            .pipeline_residual_rms_norm_quant_q8_1 = pipeline_residual_rms_norm_quant_q8_1,
             .pipeline_rms_norm_add = pipeline_rms_norm_add,
             .pipeline_norm_rope = pipeline_norm_rope,
             .pipeline_rms_norm_dmmv_f32 = pipeline_rms_norm_dmmv_f32,
@@ -1070,6 +1105,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_kv_cache_write) |*p| p.deinit();
         if (self.pipeline_kv_cache_write_batched) |*p| p.deinit();
         if (self.pipeline_residual_rms_norm) |*p| p.deinit();
+        if (self.pipeline_residual_rms_norm_quant_q8_1) |*p| p.deinit();
         if (self.pipeline_rms_norm_add) |*p| p.deinit();
         if (self.pipeline_norm_rope) |*p| p.deinit();
         if (self.pipeline_rms_norm_dmmv_f32) |*p| p.deinit();

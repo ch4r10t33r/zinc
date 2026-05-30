@@ -52,6 +52,7 @@ const DeinterleavePush = elementwise_mod.DeinterleavePush;
 const KvCacheWritePush = elementwise_mod.KvCacheWritePush;
 const KvCacheWriteBatchedPush = elementwise_mod.KvCacheWriteBatchedPush;
 const ResidualRmsNormPush = elementwise_mod.ResidualRmsNormPush;
+const ResidualRmsNormQuantQ8_1Push = elementwise_mod.ResidualRmsNormQuantQ8_1Push;
 const RmsNormAddPush = elementwise_mod.RmsNormAddPush;
 const NormRopePush = elementwise_mod.NormRopePush;
 const QkNormRopeKvWritePush = elementwise_mod.QkNormRopeKvWritePush;
@@ -9343,6 +9344,109 @@ pub const InferenceEngine = struct {
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), n_tokens, 1, 1);
     }
 
+    /// Effort-15 cycle 16: fused residual+RMS norm + Q8_1 activation quantize
+    /// for the Qwen3.6-27B dense FFN prefill DP4a path. Equivalent to running
+    /// dispatchResidualRmsNorm + recordQuantizeActQ8_1 + computeBuffersBarrier
+    /// over the same (residual, scratch_norm) pair, but in a single dispatch
+    /// without the intermediate barrier or the f32 re-read of norm_out.
+    ///
+    /// The shader writes both f32 norm_out (still needed by ragged-token tail
+    /// in the gate+up f32 fallback) and (packed_i8, scale_dsum) (consumed by
+    /// the DP4a GEMM). hidden_dim must be a multiple of 256.
+    fn dispatchResidualRmsNormQuantQ8_1(
+        self: *InferenceEngine,
+        hidden: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        residual: vk.c.VkBuffer,
+        residual_size: vk.c.VkDeviceSize,
+        norm_out: vk.c.VkBuffer,
+        norm_out_size: vk.c.VkDeviceSize,
+        weights: vk.c.VkBuffer,
+        weights_size: vk.c.VkDeviceSize,
+        packed_i8: vk.c.VkBuffer,
+        packed_i8_size: vk.c.VkDeviceSize,
+        scale_dsum: vk.c.VkBuffer,
+        scale_dsum_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        n_tokens: u32,
+        eps: f32,
+        scale: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_residual_rms_norm_quant_q8_1 orelse return error.ShaderNotLoaded);
+        if ((hidden_dim & 255) != 0) return error.InvalidArgument;
+        const push = ResidualRmsNormQuantQ8_1Push{
+            .n = hidden_dim,
+            .eps_bits = @bitCast(eps),
+            .scale_bits = @bitCast(scale),
+            .blocks_per_token = hidden_dim / 32,
+            .stride_packed = hidden_dim / 4,
+        };
+        if (pip.uses_push_descriptors) {
+            self.pushDispatch6(
+                pip,
+                std.mem.asBytes(&push),
+                hidden,
+                hidden_size,
+                residual,
+                residual_size,
+                norm_out,
+                norm_out_size,
+                weights,
+                weights_size,
+                packed_i8,
+                packed_i8_size,
+                scale_dsum,
+                scale_dsum_size,
+                n_tokens,
+                1,
+                1,
+            );
+            return;
+        }
+        const ds = try self.allocDescSet(pip.descriptor_set_layout);
+        self.writeDescSet6(
+            ds,
+            hidden,
+            hidden_size,
+            residual,
+            residual_size,
+            norm_out,
+            norm_out_size,
+            weights,
+            weights_size,
+            packed_i8,
+            packed_i8_size,
+            scale_dsum,
+            scale_dsum_size,
+        );
+        self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), n_tokens, 1, 1);
+    }
+
+    /// Effort-15 cycle 16: env-gated wrapper around dispatchResidualRmsNormQuantQ8_1.
+    /// Returns true if the fused path ran, false to indicate the caller should
+    /// use the standard dispatchResidualRmsNorm + the downstream gate+up path
+    /// will run its own quantize_act_q8_1 dispatch.
+    fn qwen36DenseFuseRmsQuantEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.qwen36Dp4aDownEnabled()) return false;
+        if (self.elementwise.pipeline_residual_rms_norm_quant_q8_1 == null) return false;
+        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a == null) return false;
+        if (self.batched_scratch_hidden_i8 == null) return false;
+        if (self.batched_scratch_hidden_scale_dsum == null) return false;
+        const cfg = self.model.config;
+        if ((cfg.hidden_dim & 255) != 0) return false;
+        // Threshold matches the DP4a gate+up path so the fused shader's output
+        // is actually consumed (n_tokens < 128 falls back to the f32 path).
+        if (n_tokens < 128) return false;
+        if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
+            if (std.mem.eql(u8, v, "0")) return false;
+        }
+        return true;
+    }
+
     /// Batched KV-cache write — stores N tokens' K/V into the paged cache in
     /// one dispatch. Replaces the per-token vkCmdCopyBuffer loop that prefill-
     /// Batched emitted in its first cut, and with it the
@@ -12383,11 +12487,17 @@ pub const InferenceEngine = struct {
         self: *InferenceEngine,
         gate_t: *const LoadedTensor,
         up_t: *const LoadedTensor,
+        down_t: *const LoadedTensor,
         scratch_norm: Buffer,
         scratch_swiglu: Buffer,
         hidden_dim: u32,
         inter_dim: u32,
         n_tokens: u32,
+        // Effort-15 cycle 16: upstream produced hidden_i8 + hidden_sd via the
+        // fused residual_rms_norm_quant_q8_1 path; skip our own
+        // recordQuantizeActQ8_1 + barrier so this dispatch becomes
+        // GEMM-only.
+        input_pre_quantized: bool,
     ) !DenseGateUpDp4aResult {
         // Threshold 128 matches the Q6_K dense-down DP4a path: under ~128 tokens
         // the one-shot quantize pre-pass + extra dispatch/barrier outweigh the
@@ -12411,24 +12521,29 @@ pub const InferenceEngine = struct {
         const hidden_i8 = self.batched_scratch_hidden_i8.?;
         const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
         const push_fn = self.instance.push_descriptor_fn;
-        // One-shot quantize of the f32 RMS-normed hidden (full cols only).
-        try self.dmmv.recordQuantizeActQ8_1(
-            &self.decode_cmd,
-            push_fn,
-            scratch_norm.handle,
-            scratch_norm.size,
-            hidden_i8.handle,
-            hidden_i8.size,
-            hidden_sd.handle,
-            hidden_sd.size,
-            full_cols,
-            hidden_dim,
-        );
-        const i8_ranges = [_]CommandBuffer.BufferRange{
-            .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
-            .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
-        };
-        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        if (!input_pre_quantized) {
+            // One-shot quantize of the f32 RMS-normed hidden (full cols only).
+            // Skipped when the upstream SSM segment ran the fused
+            // residual_rms_norm_quant_q8_1 shader, which already produced
+            // packed_i8 + scale_dsum as part of the previous submit.
+            try self.dmmv.recordQuantizeActQ8_1(
+                &self.decode_cmd,
+                push_fn,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                full_cols,
+                hidden_dim,
+            );
+            const i8_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
+                .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
+            };
+            self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        }
         // Pick the fused Q8 output variant when the downstream dense-down DP4a
         // path will consume it AND it's not a validation/diagnostic run. This
         // is the structural lever: BM=32 in the producer maps 1:1 to the
@@ -12440,9 +12555,21 @@ pub const InferenceEngine = struct {
         // .q8_swiglu signal is safe — if the down path falls back to f32, the
         // scratch_swiglu buffer is undefined for the full-cols range and the
         // model output silently corrupts.
+        // Pre-existing bug fix (effort-15 cycle 16): fuse_q8 emits Q8 packed
+        // swiglu, but the downstream dense-down DP4a path requires
+        // down_t.info.type_ == .q6_k (it's a Q6_K DP4a kernel). The Q4_K_M
+        // Qwen3.6-27B quant has Q4_K down on ~2/3 of mid layers (8..54); on
+        // those layers the fuse_q8 path used to fire unconditionally and then
+        // dispatchQwen36DenseDown returned error.UnsupportedConfiguration,
+        // breaking every prompt ≥ 128 tokens. Now fuse_q8 only fires when
+        // down is actually Q6_K; Q4_K down layers fall back to the f32 swiglu
+        // emit + standard f32 Q4_K dispatchProjectionBatched (which is the
+        // correct path that worked at cycle 2 before c289c4a3 re-introduced
+        // the leaked fuse_q8 wiring).
         const fuse_q8 = !self.validation_diagnostics_enabled and
             !self.use_qwen36_dense_prefill_validate and
             !self.use_qwen36_ssm_prefill_validate and
+            down_t.info.type_ == .q6_k and
             (inter_dim & 255) == 0 and
             (hidden_dim & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null and
@@ -13143,20 +13270,47 @@ pub const InferenceEngine = struct {
             if (use_batched_q5k_ssm_out) {
                 try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 self.decode_cmd.computeBarrier();
-                try self.dispatchResidualRmsNorm(
-                    scratch_hidden.handle,
-                    scratch_hidden.size,
-                    scratch_down.handle,
-                    scratch_down.size,
-                    scratch_norm.handle,
-                    scratch_norm.size,
-                    ffn_norm_t.gpu_buffer.handle,
-                    ffn_norm_t.gpu_buffer.size,
-                    hidden_dim,
-                    n_tokens,
-                    self.model.config.rms_norm_eps,
-                    1.0,
-                );
+                // Effort-15 cycle 16: when the downstream layer-major dense
+                // FFN call will run its DP4a gate+up path, emit the packed
+                // Q8_1 activation here in the same dispatch so the dense FFN
+                // skips its quantize_act_q8_1 pre-pass.
+                if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+                    const h_i8 = self.batched_scratch_hidden_i8.?;
+                    const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+                    try self.dispatchResidualRmsNormQuantQ8_1(
+                        scratch_hidden.handle,
+                        scratch_hidden.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        ffn_norm_t.gpu_buffer.handle,
+                        ffn_norm_t.gpu_buffer.size,
+                        h_i8.handle,
+                        h_i8.size,
+                        h_sd.handle,
+                        h_sd.size,
+                        hidden_dim,
+                        n_tokens,
+                        self.model.config.rms_norm_eps,
+                        1.0,
+                    );
+                } else {
+                    try self.dispatchResidualRmsNorm(
+                        scratch_hidden.handle,
+                        scratch_hidden.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        ffn_norm_t.gpu_buffer.handle,
+                        ffn_norm_t.gpu_buffer.size,
+                        hidden_dim,
+                        n_tokens,
+                        self.model.config.rms_norm_eps,
+                        1.0,
+                    );
+                }
             } else {
                 tok_idx = 0;
                 while (tok_idx < n_tokens) : (tok_idx += 1) {
@@ -13382,20 +13536,47 @@ pub const InferenceEngine = struct {
             if (use_batched_q5k_ssm_out) {
                 try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 self.decode_cmd.computeBarrier();
-                try self.dispatchResidualRmsNorm(
-                    scratch_hidden.handle,
-                    scratch_hidden.size,
-                    scratch_down.handle,
-                    scratch_down.size,
-                    scratch_norm.handle,
-                    scratch_norm.size,
-                    ffn_norm_t.gpu_buffer.handle,
-                    ffn_norm_t.gpu_buffer.size,
-                    hidden_dim,
-                    n_tokens,
-                    self.model.config.rms_norm_eps,
-                    1.0,
-                );
+                // Effort-15 cycle 16: when the downstream layer-major dense
+                // FFN call will run its DP4a gate+up path, emit the packed
+                // Q8_1 activation here in the same dispatch so the dense FFN
+                // skips its quantize_act_q8_1 pre-pass.
+                if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+                    const h_i8 = self.batched_scratch_hidden_i8.?;
+                    const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+                    try self.dispatchResidualRmsNormQuantQ8_1(
+                        scratch_hidden.handle,
+                        scratch_hidden.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        ffn_norm_t.gpu_buffer.handle,
+                        ffn_norm_t.gpu_buffer.size,
+                        h_i8.handle,
+                        h_i8.size,
+                        h_sd.handle,
+                        h_sd.size,
+                        hidden_dim,
+                        n_tokens,
+                        self.model.config.rms_norm_eps,
+                        1.0,
+                    );
+                } else {
+                    try self.dispatchResidualRmsNorm(
+                        scratch_hidden.handle,
+                        scratch_hidden.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        ffn_norm_t.gpu_buffer.handle,
+                        ffn_norm_t.gpu_buffer.size,
+                        hidden_dim,
+                        n_tokens,
+                        self.model.config.rms_norm_eps,
+                        1.0,
+                    );
+                }
             } else {
                 tok_idx = 0;
                 while (tok_idx < n_tokens) : (tok_idx += 1) {
@@ -13591,6 +13772,12 @@ pub const InferenceEngine = struct {
         scratch_up: Buffer,
         scratch_swiglu: Buffer,
         scratch_down: Buffer,
+        // Effort-15 cycle 16: upstream SSM segment already produced packed
+        // int8 + scale_dsum via the fused residual_rms_norm_quant_q8_1 shader.
+        // When true, the gate+up DP4a path skips its standalone
+        // quantize_act_q8_1 dispatch and reads the pre-quantized buffers
+        // directly.
+        input_pre_quantized: bool,
     ) !void {
         const lt = self.layer_tensors[layer];
         const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
@@ -13626,7 +13813,7 @@ pub const InferenceEngine = struct {
         // .q8_swiglu means the SwiGLU activation was pre-quantized into
         // swiglu_i8 / swiglu_scale; dense-down then skips its own quantize step.
         const dp4a_result: DenseGateUpDp4aResult = if (use_fused_gateup)
-            try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens)
+            try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens, input_pre_quantized)
         else
             .not_handled;
         const dp4a_done = dp4a_result != .not_handled;
@@ -14015,7 +14202,14 @@ pub const InferenceEngine = struct {
                 }
             }
 
-            if (!is_full_attn and !use_ssm_preproj) {
+            // Effort-15 cycle 16: track whether the SSM segment ran the fused
+            // residual_rms_norm_quant_q8_1 shader. Only the
+            // prefillQwen36RunSsmLayerToFfnNorm path can fuse — the per-token
+            // decodeStep loop builds scratch_norm element-by-element so its
+            // RMS norm cannot inline a per-32-block activation quant.
+            const prefix_ran_ssm_segment = !is_full_attn and !use_ssm_preproj;
+            const prefix_pre_quantized = prefix_ran_ssm_segment and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
+            if (prefix_ran_ssm_segment) {
                 try self.prefillQwen36RunSsmLayerToFfnNorm(
                     state,
                     prompt_tokens,
@@ -14069,6 +14263,7 @@ pub const InferenceEngine = struct {
                 scratch_up,
                 scratch_swiglu,
                 scratch_down,
+                prefix_pre_quantized,
             );
         }
 
@@ -14101,6 +14296,10 @@ pub const InferenceEngine = struct {
                 );
             }
             const segment_is_full_attn = ((segment_layer + 1) % full_attn_interval) == 0;
+            // Effort-15 cycle 16: fused rms+quant runs only when the SSM
+            // segment path emits scratch_norm; full_attn segments build
+            // scratch_norm via per-token decodeStep and don't fuse.
+            const segment_pre_quantized = !segment_is_full_attn and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
             if (!segment_is_full_attn) {
                 try self.prefillQwen36RunSsmLayerToFfnNorm(
                     state,
@@ -14151,6 +14350,7 @@ pub const InferenceEngine = struct {
                 scratch_up,
                 scratch_swiglu,
                 scratch_down,
+                segment_pre_quantized,
             );
             tail_start_layer = segment_layer + 1;
         }

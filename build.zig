@@ -230,6 +230,11 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q4k_gate_up_swiglu_full_dp4a",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a_q8",
         "quantize_act_q8_1",
+        // Effort-15 cycle 16: fuses residual+RMS norm + Q8_1 activation
+        // quantize for the Qwen3.6-27B dense FFN prefill DP4a path. Drops the
+        // separate quantize_act_q8_1 dispatch + barrier inside dense_ffn_gateup
+        // per SSM-fed layer-major segment.
+        "residual_rms_norm_quant_q8_1",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;
