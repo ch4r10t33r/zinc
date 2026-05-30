@@ -160,26 +160,35 @@ kernel void main0(
                 }
             }
 
-            const float sum0 = simd_sum(acc0);
-            const float sum1 = simd_sum(acc1);
+            // Cycle ~65: pack the two router-GEMM final-reduction `simd_sum`
+            // calls into a single `simd_sum(float2)` — Apple's `simd_sum` on
+            // vector types issues one fused butterfly per lane width (5
+            // shuffle_xor pairs for SIMD32) instead of two sequential
+            // reductions, halving cross-lane shuffle traffic on the
+            // per-simdgroup row tail. Same pattern as cycle ~62/63 on
+            // `dmmv_q5k_moe_k512_quad`/`dmmv_q4k_moe_gate_up_swiglu_k2048` and
+            // cycle ~64 on `dmmv_q8_0_pair_swiglu`. Hot kernel #1 fires 4
+            // row_blocks × 32 simdgroups = 128 reduction tails per kernel
+            // call × 1436 calls/req — saving one `simd_sum` per tail amplifies
+            // into ~184K shuffle-pair savings per request. acc1 stays semantic
+            // even when `base_row + 1u >= p.n_experts` (always zero in that
+            // case, would have summed zeros either way); the `store_row <
+            // p.n_experts` predicate below still gates the write.
+            const float2 sums = simd_sum(float2(acc0, acc1));
             // Cycle-52: lane-parallel 2-row writeback of router GEMM partials
-            // into threadgroup `values[]`. After simd_sum, both `sum0` and
-            // `sum1` are present on every lane; lanes 0 and 1 each issue one
-            // store to consecutive `values[base_row..base_row+1]` slots in a
-            // single SIMD scatter instead of lane 0 doing two serial stores.
-            // This fires 4 row_blocks × 32 simdgroups = 128 writeback blocks
-            // per kernel invocation, on the hottest timed kernel (#1, 337.50
-            // ms/req across 1436 calls, 23% of timed kernel time, single-TG
-            // `{1,1,1}` × `{1024,1,1}` dispatch per
-            // `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`). The
-            // `store_row < p.n_experts` predicate preserves the
-            // generic-validation tail (n_experts < ROWS_PER_TG cases).
-            // Extends cycle-43/45/47/49/50 lane-parallel writeback discipline
-            // from global memory to threadgroup memory; the barrier at
-            // line 147 still serializes against the next-phase top-k reader.
+            // into threadgroup `values[]`. After `simd_sum`, both `sums.x`
+            // and `sums.y` are present on every lane; lanes 0 and 1 each
+            // issue one store to consecutive `values[base_row..base_row+1]`
+            // slots in a single SIMD scatter instead of lane 0 doing two
+            // serial stores. The `store_row < p.n_experts` predicate
+            // preserves the generic-validation tail (n_experts < ROWS_PER_TG
+            // cases). Extends cycle-43/45/47/49/50 lane-parallel writeback
+            // discipline from global memory to threadgroup memory; the
+            // barrier at line 147 still serializes against the next-phase
+            // top-k reader.
             const uint store_row = base_row + lane;
             if (lane < 2u && store_row < p.n_experts) {
-                const float val = (lane == 0u) ? sum0 : sum1;
+                const float val = (lane == 0u) ? sums.x : sums.y;
                 values[store_row] = val;
             }
         }
