@@ -87,10 +87,23 @@ kernel void main0(
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        output[base_row + 1u] = sum1;
-        output[base_row + 2u] = sum2;
-        output[base_row + 3u] = sum3;
+    // Parallelize the 4-row writeback across lanes 0..3 (cycle-40 sibling of
+    // cycle-39's standalone K=4096 lane-parallel writeback). After simd_sum
+    // all four sums are present on every lane; base_row+0..+3 are four
+    // contiguous floats so lanes 0..3 of this simdgroup issue a single
+    // coalesced 16-byte store instead of four serial lane-0 stores. The
+    // dispatch route `.exact_qwen_k4096_gated` gates on `M % 4 == 0` and
+    // the `base_row >= p.M` early-return at the top means all four rows
+    // owned by this simdgroup are always valid (no per-row `has` check).
+    // Production hot user: full-attn out projection with attn_gate
+    // (M=2048, K=4096, 10/token × 256 WGs ≈ 2.5K TGs/token). Same
+    // lane-parallel pattern as cycle-32/38/39 across the standalone
+    // Q8_0 exact-repacked kernel family.
+    if (lane < 4u) {
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : sum3;
+        output[base_row + lane] = local_sum;
     }
 }
