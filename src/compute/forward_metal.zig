@@ -6996,7 +6996,7 @@ fn canUseQwenSsmDualRepackedQ8K2048(
     if (M0 != 8192 or M1 != 4096 or K != 2048) return false;
     if (engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe.handle == null) return false;
     return engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe.thread_execution_width == 32 and
-        engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe.max_threads_per_threadgroup >= 256;
+        engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe.max_threads_per_threadgroup >= 128;
 }
 
 fn isGemmaSharedGateUpQ8Pair(
@@ -7462,15 +7462,17 @@ fn dispatchQwenSsmDualRepackedQ8K2048OnCmd(
         .y1_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ weight0_buf, weight1_buf, input_buf, output0_buf, output1_buf };
-    // Bump the threadgroup from llama.cpp's N_SG=4 (128 threads) up to 8 SGs
-    // (256 threads): the Qwen3.6 SSM qkv+z dual covers 12288 total rows, so the
-    // original 128-thread shape spawns 1536 workgroups against M4 Max's 40
-    // cores (~38 WG/core). Doubling block_size halves WG count to 768 (~19
-    // WG/core) — well-subscribed but with half the per-WG launch overhead.
-    // The shader now reads `simdgroups_per_threadgroup`, so the per-row math
-    // is unchanged. Stays below the dual nr=4 (cycle-5) over-shrink that
-    // dropped WGs to 192.
-    const block_size: u32 = 256;
+    // Decode is bandwidth-bound and benefits from more in-flight WGs to hide
+    // DRAM latency. Cycle-4 showed K=2048 single-tensor SSM projections at
+    // M=4096 prefer 6.4 WG/core over 3.2/core; apply the same direction to
+    // the dual. The earlier cycle-5 choice of block=256 (~19 WG/core, 768 WGs
+    // over 12288 total rows) was justified by "half the per-WG launch
+    // overhead" — true for PREFILL where dispatches are batched and compute-
+    // bound. For DECODE where the dual is a hot per-token matvec, drop to
+    // llama.cpp's original N_SG=4 / block=128 → 1536 WGs (~38 WG/core), the
+    // shape the upstream Metal backend uses by default. The shader reads
+    // `simdgroups_per_threadgroup`, so per-row math is unchanged.
+    const block_size: u32 = 128;
     const rows_per_wg: u32 = (block_size / 32) * 2;
     const total_rows = M0 + M1;
     const wgs = (total_rows + rows_per_wg - 1) / rows_per_wg;
