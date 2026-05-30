@@ -12712,7 +12712,14 @@ fn dispatchFullAttnPrepOnCmd(
         // Slow path: separate Q-rope, K-rope, and KV cache write dispatches.
         dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
         dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
-        profileFullAttnQkvBarrier(cmd, profile, true, true, false, false, engine); // rope outputs visible before KV cache write
+        // Adapt llama.cpp `ggml_mem_ranges_check_dst` (ggml-metal-common.cpp:165):
+        // the immediate next dispatch (KV cache write, including the Q8 variant on
+        // the Qwen3.6 hot path) only reads k_buf and v_buf — v_buf has no in-flight
+        // write since the initial QKV barrier, so scope this rope barrier to k_buf
+        // alone. Q rope's write to q_buf becomes visible at the later pre-flash
+        // attn barrier on q_buf+kv caches; dropping q_buf here lets the concurrent
+        // encoder run Q rope alongside the KV cache write instead of serializing.
+        profileFullAttnQkvBarrier(cmd, profile, false, true, false, false, engine);
 
         dispatchKvCacheWriteOnCmd(
             engine,
