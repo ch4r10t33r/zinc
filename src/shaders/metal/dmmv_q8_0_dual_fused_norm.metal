@@ -128,16 +128,39 @@ kernel void main0(
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output0[row0] = sum0;
-        if (has1) {
-            output1[row1] = sum1;
-        }
-        if (has2) {
-            output2[row2] = sum2;
-        }
-        if (has3) {
-            output3[row3] = sum3;
+    // Parallelize the 4-row writeback across lanes 0..3 (lane 0 serial 4
+    // stores → lanes 0..3 parallel stores). After simd_sum all four sums are
+    // broadcast to every lane, and per-row uniforms (row*/output*/has*) are
+    // already computed by all lanes uniformly above. The production alpha+beta
+    // tail (M0=dt_rank=32, M1=dt_rank=32, ~1080 calls/req across 30 SSM layers
+    // × every decode token, block=32 → 1 SG/TG with 4 rows/SG) writes 4
+    // contiguous floats per simdgroup into a single output buffer (Y0 or Y1,
+    // since M0=32 is 4-aligned ⇒ no per-WG cross-buffer split) — issues a
+    // coalesced 16-byte store instead of four serial lane-0 stores. The
+    // has1/has2/has3 predicates remain to handle the generic-validation tail
+    // (in-tree shader test uses M0=4, M1=3). Mirrors the sibling cycle-28
+    // pattern in `dmmv_q8_0_dual_fused_norm_conv1d.metal` and cycle-27/32/38/
+    // 39/40/41/43/45/46/47 lane-parallel writeback discipline across the Q8
+    // family, completing it on the non-conv1d fused-norm dual kernel.
+    if (lane < 4u) {
+        const bool has = (lane == 0u) ? true
+                       : (lane == 1u) ? has1
+                       : (lane == 2u) ? has2
+                       : has3;
+        const uint local_row = (lane == 0u) ? row0
+                             : (lane == 1u) ? row1
+                             : (lane == 2u) ? row2
+                             : row3;
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : sum3;
+        device float* local_output = (lane == 0u) ? output0
+                                   : (lane == 1u) ? output1
+                                   : (lane == 2u) ? output2
+                                   : output3;
+        if (has) {
+            local_output[local_row] = local_sum;
         }
     }
 }
