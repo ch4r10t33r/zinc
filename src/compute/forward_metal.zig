@@ -6166,12 +6166,29 @@ pub const InferenceEngine = struct {
                         preferApple9QwenSharedDownQ8QuadShape(self.config, tensor, M, K);
                     if (prefer_qwen_shared_down_q8_quad and
                         self.dmmv_q8_0_k512_quad_pipe.thread_execution_width == 32 and
-                        self.dmmv_q8_0_k512_quad_pipe.max_threads_per_threadgroup >= 512)
+                        self.dmmv_q8_0_k512_quad_pipe.max_threads_per_threadgroup >= 32)
                     {
                         // Exact Qwen3.6 shared-down shape: split each K=512 Q8
                         // block across two lanes and process eight adjacent
                         // rows per simdgroup, reusing each X half-block load.
-                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 128, .block_size = 512 };
+                        //
+                        // Cycle 17: the previous block=512 / 128-rows-per-WG
+                        // configuration produced only ceil(2048/128)=16 WGs on
+                        // the M4 Max's 40 cores — 0.4 WG/core, the worst
+                        // undersubscription cliff left in the hot Q8 fleet (and
+                        // ~30/token via the shared MoE down path, matching the
+                        // call frequency of the SSM out projection). The kernel
+                        // hard-codes 8 rows per simdgroup via N_R0 (see
+                        // `base_row = (tg_id * simdgroups_per_tg + sg_idx) * 8`),
+                        // so per-row arithmetic is independent of TG size —
+                        // halving four times to block=32 / 8-rows-per-WG yields
+                        // 256 WGs (6.4 WG/core), the same density cycle 11
+                        // KEPT for `exact_qwen_k4096` (M=2048 K=4096 SSM-out)
+                        // and cycle 4 KEPT for `exact_qwen_k2048` M=4096
+                        // (SSM-gate). Adapted from llama.cpp
+                        // `kernel_mul_mv_q8_0_f32_impl` (ggml-metal.metal)
+                        // N_SG=1 fallback for short K rows.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 32 };
                     }
                     if (prefer_qwen_shared_down_q8_quad and
                         self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
