@@ -23,7 +23,20 @@ struct Params {
     uint shared_gate_offset;
 };
 
-#define TG_SIZE 512
+// Cycle-42: bump TG_SIZE 512→1024 to match the Q8 router sibling
+// (ROUTER_TG_SIZE=1024 in residual_rms_norm_router_q8_0_topk_repacked_k2048).
+// The kernel runs as a SINGLE threadgroup dispatch — `.{ 1, 1, 1 }` grid in
+// dispatchQwenResidualRmsNormRouterF32TopkOnCmd — so adding simdgroups inside
+// the TG is the only way to widen parallelism short of splitting the kernel.
+// With TG_SIZE=1024, N_SIMDGROUPS=32 and ROWS_PER_TG=64, the 256-expert router
+// GEMM completes in 4 sequential row_blocks instead of 8: per-simdgroup work
+// halves on the hottest decode-token kernel (cycle-41 profile: hot #1 at
+// 234.98us avg × 1436 calls = 337.43ms total, 23% of timed kernel time).
+// Shared mem stays ~17.5 KB (16 KB x_cache4 + 1 KB values + small partials),
+// well under Apple9's 32 KB/TG limit. Distinct from cycle-34 (reverted), which
+// quadrupled ROWS_PER_SG and was likely register-bound; this change keeps
+// ROWS_PER_SG=2 unchanged and only widens the simdgroup count.
+#define TG_SIZE 1024
 #define SIMD_WIDTH 32
 #define N_SIMDGROUPS (TG_SIZE / SIMD_WIDTH)
 #define ROWS_PER_TG (N_SIMDGROUPS * 2)

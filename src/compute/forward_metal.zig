@@ -9757,7 +9757,8 @@ fn canUseQwenResidualRmsNormRouterF32Topk(
         gate.info.numElements() == hidden_dim and
         engine.residual_rms_norm_router_f32_topk_pipe.handle != null and
         engine.residual_rms_norm_router_f32_topk_pipe.thread_execution_width == 32 and
-        engine.residual_rms_norm_router_f32_topk_pipe.max_threads_per_threadgroup >= 512;
+        // Cycle-42: kernel now uses TG_SIZE=1024 (matches the Q8 router sibling).
+        engine.residual_rms_norm_router_f32_topk_pipe.max_threads_per_threadgroup >= 1024;
 }
 
 fn dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
@@ -9792,7 +9793,10 @@ fn dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
         .shared_gate_offset = tensorPageOffset(engine.model, shared_gate),
     };
     const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output, &shared_gate.gpu_buffer, shared_gate_output };
-    cmd.dispatchV2(&engine.residual_rms_norm_router_f32_topk_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
+    // Cycle-42: TG_SIZE 512→1024 to widen simdgroup count from 16 to 32 in the
+    // single-TG dispatch — the 256-expert router GEMM now runs 4 row_blocks
+    // instead of 8, halving per-simdgroup work on the hottest timed kernel.
+    cmd.dispatchV2(&engine.residual_rms_norm_router_f32_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
 }
 
 /// Triple-fused: residual_norm + residual_add + output_norm.
@@ -27660,7 +27664,10 @@ test "residual_rms_norm_router_f32_topk shader matches residual norm and CPU top
 
     var pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
     defer metal_pipeline.freePipeline(&pipe);
-    if (pipe.max_threads_per_threadgroup < 512) return error.SkipZigTest;
+    // Cycle-42: shader TG_SIZE is now 1024 — partial_sums[N_SIMDGROUPS]
+    // (N_SIMDGROUPS=32) is sized at compile time, so a 512-thread dispatch
+    // would leave half the partial slots uninitialized.
+    if (pipe.max_threads_per_threadgroup < 1024) return error.SkipZigTest;
 
     const K: usize = 64;
     const n_experts: usize = 96;
@@ -27767,7 +27774,7 @@ test "residual_rms_norm_router_f32_topk shader matches residual norm and CPU top
     const bufs = [_]*const MetalBuffer{ &hidden_buf, &residual_buf, &norm_buf, &norm_weight_buf, &weight_buf, &output_buf, &shared_gate_weight_buf, &shared_gate_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
     cmd.commitAndWait();
 
     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
