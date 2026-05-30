@@ -1413,6 +1413,10 @@ pub const InferenceEngine = struct {
     // and per-32-block f32 scales (see quantize_act_q8.comp / mul_mm_q6k_full_dp4a.comp).
     batched_scratch_swiglu_i8: ?Buffer = null,
     batched_scratch_swiglu_scale: ?Buffer = null,
+    // Q8_1-style per-32-block (scale, dsum) vec2 for the Q4_K-down DP4a path
+    // (mul_mm_q4k_full_dp4a). Packed int8 lanes reuse batched_scratch_swiglu_i8;
+    // only the per-block scale layout differs from the Q6_K-down (Q8_0) path.
+    batched_scratch_swiglu_scale_dsum: ?Buffer = null,
     // int8 DP4a dense gate+up+SwiGLU prefill: packed int8 hidden activations
     // (4 lanes/uint) and per-32-block (scale, dsum) vec2 used to subtract the
     // Q4_K bias term (see quantize_act_q8_1.comp /
@@ -3293,6 +3297,11 @@ pub const InferenceEngine = struct {
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
+            // Q8_1 (scale + dsum) variant of the swiglu scale buffer, used by the
+            // Q4_K-down DP4a prefill path (mul_mm_q4k_full_dp4a needs the dsum
+            // bias-correction term). vec2 per 32-block, so 2x the Q8_0 size.
+            const inter_scale_dsum_bytes = n * (inter_dim / 32) * 2 * f32_sz;
+            try growSlot(self.instance, &self.batched_scratch_swiglu_scale_dsum, inter_scale_dsum_bytes, storage_xfer);
             // Same path also drives the int8 DP4a dense gate/up prefill
             // (K=hidden_dim) AND the Q5_K SSM out prefill (K=d_inner). The
             // buffer is reused across both passes within one layer's submit;
@@ -12673,6 +12682,13 @@ pub const InferenceEngine = struct {
     /// ragged token tail (n_tokens not a multiple of 32) stays on the f32 checked
     /// kernel reading the untouched f32 scratch_swiglu, so output layout is
     /// identical regardless of which path runs.
+    ///
+    /// Effort-15 cycle-19: Q4_K-down layers (~47 of 64 in the Qwen3.6-27B Q4_K_M
+    /// quant) previously fell through to the f32 dispatchProjectionBatched. They
+    /// now use the existing generic mul_mm_q4k_full_dp4a kernel (added in
+    /// cycle 2 for the SSM z projection) with a one-shot Q8_1 quantize of
+    /// scratch_swiglu; only the per-block scale layout (vec2 scale+dsum) differs
+    /// from the Q6_K path. Packed int8 lanes reuse batched_scratch_swiglu_i8.
     fn dispatchQwen36DenseDown(
         self: *InferenceEngine,
         down_t: *const LoadedTensor,
@@ -12751,6 +12767,89 @@ pub const InferenceEngine = struct {
                 );
                 if (full_cols < n_tokens) {
                     try self.dmmv.recordMulMmQ6K(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        hidden_dim,
+                        n_tokens - full_cols,
+                        inter_dim,
+                        inter_dim,
+                        hidden_dim,
+                        0,
+                        full_cols * inter_dim,
+                        full_cols * hidden_dim,
+                    );
+                }
+                return;
+            }
+        }
+        // Q4_K-down DP4a (effort-15 cycle-19). fuse_q8 only fires when down is
+        // Q6_K (see dispatchQwen36DenseGateUpDp4a), so swiglu_already_q8 cannot
+        // be true here — scratch_swiglu always holds the f32 SwiGLU activation.
+        const dp4a_ok_q4k = !swiglu_already_q8 and
+            self.qwen36Dp4aDownEnabled() and
+            down_t.info.type_ == .q4_k and
+            n_tokens >= 128 and
+            (inter_dim & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q4k != null and
+            self.batched_scratch_swiglu_i8 != null and
+            self.batched_scratch_swiglu_scale_dsum != null;
+        if (dp4a_ok_q4k) {
+            const full_cols = n_tokens & ~@as(u32, 31);
+            if (full_cols > 0) {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+                const push_fn = self.instance.push_descriptor_fn;
+                // Q8_1 (scale + dsum) quantize of the f32 SwiGLU activation
+                // (full cols). Q4_K weights are factor*nibble - bias; the GEMM
+                // needs the dsum bias-correction term that Q8_0 (scale-only)
+                // doesn't carry.
+                try self.dmmv.recordQuantizeActQ8_1(
+                    &self.decode_cmd,
+                    push_fn,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_sd.handle,
+                    swiglu_sd.size,
+                    full_cols,
+                    inter_dim,
+                );
+                const i8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
+                    .{ .buffer = swiglu_sd.handle, .size = swiglu_sd.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                try self.dmmv.recordMulMmQ4KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_sd.handle,
+                    swiglu_sd.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    hidden_dim,
+                    full_cols,
+                    inter_dim,
+                    0,
+                    0,
+                );
+                if (full_cols < n_tokens) {
+                    // Ragged tail: f32 Q4_K row-parallel path on the untouched
+                    // scratch_swiglu.
+                    try self.dmmv.recordMulMmQ4K(
                         &self.decode_cmd,
                         push_fn,
                         down_t.gpu_buffer.handle,
@@ -16637,6 +16736,7 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_down) |*b| b.deinit();
         if (self.batched_scratch_swiglu_i8) |*b| b.deinit();
         if (self.batched_scratch_swiglu_scale) |*b| b.deinit();
+        if (self.batched_scratch_swiglu_scale_dsum) |*b| b.deinit();
         if (self.batched_scratch_hidden_i8) |*b| b.deinit();
         if (self.batched_scratch_hidden_scale_dsum) |*b| b.deinit();
         if (self.batched_scratch_norm_q8) |*b| b.deinit();
