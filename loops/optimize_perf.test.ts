@@ -12,6 +12,7 @@ import {
   codexExecArgs,
   detectAgentRateLimit,
   detectCorrectnessStreak,
+  extractOptimizePerfPidsFromPs,
   effortArtifactPaths,
   formatCodexStreamLine,
   formatCoherenceFailureList,
@@ -1887,6 +1888,38 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
+  });
+});
+
+describe("extractOptimizePerfPidsFromPs", () => {
+  const sample = [
+    " 47142 /Users/zolotukhin/.bun/bin/bun loops/optimize_perf.ts --effort 15 --model qwen3627b --agent claude --cycles 50",
+    " 47140 zsh -lc bun loops/optimize_perf.ts --effort 15 --model qwen3627b --agent claude --cycles 50 2>&1 | tee log",
+    " 47139 login -pflq zolotukhin /bin/zsh -lc bun loops/optimize_perf.ts",
+    " 47137 SCREEN -dmS zinc_effort15_50 zsh -lc bun loops/optimize_perf.ts --effort 15 --model qwen3627b",
+    "  1234 some other process",
+  ].join("\n");
+
+  test("returns just the bun-leader PID when other instance is running", () => {
+    expect(extractOptimizePerfPidsFromPs(sample, 99999)).toEqual([47142]);
+  });
+
+  test("excludes the current process by PID match", () => {
+    expect(extractOptimizePerfPidsFromPs(sample, 47142)).toEqual([]);
+  });
+
+  test("returns empty on empty input", () => {
+    expect(extractOptimizePerfPidsFromPs("", 1)).toEqual([]);
+  });
+
+  test("returns empty when no bun command is present", () => {
+    const out = " 1234 node something.js\n 5678 python foo.py\n";
+    expect(extractOptimizePerfPidsFromPs(out, 99999)).toEqual([]);
+  });
+
+  test("finds multiple bun instances if there really are several", () => {
+    const out = " 1111 /usr/local/bin/bun loops/optimize_perf.ts --effort 1\n 2222 bun loops/optimize_perf.ts --effort 2\n";
+    expect(extractOptimizePerfPidsFromPs(out, 99999)).toEqual([1111, 2222]);
   });
 });
 

@@ -21,7 +21,7 @@
  *   bun loops/optimize_perf.ts --effort 1 --cycles 10 --dry-run  # Baseline only
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -832,6 +832,50 @@ function boxLine(text: string): string {
 // -- Command runner with streaming -------------------------------------------
 
 type RunResult = { exitCode: number; signal: NodeJS.Signals | null; stdout: string; stderr: string };
+
+/**
+ * Detect other `bun loops/optimize_perf.ts` instances running on this host
+ * besides the current process. Returns their PIDs (empty when alone).
+ *
+ * Why this exists: on 2026-05-30 a `screen -X quit` killed only the screen
+ * wrapper while the bun child survived and kept rsyncing/building/committing
+ * to the same `main` branch concurrently with the freshly-launched second
+ * loop. The two runs interleaved cycle commits, corrupted state, and made
+ * per-cycle measurements that weren't reproducible because each loop was
+ * benchmarking a tree the other was mutating. main() aborts at startup
+ * when a sibling is detected — stop it explicitly before relaunching.
+ *
+ * `extractOptimizePerfPidsFromPs` is exported separately so the parsing
+ * logic is unit-testable without spawning a real `ps`.
+ */
+export function extractOptimizePerfPidsFromPs(psOutput: string, currentPid: number): number[] {
+  const pids: number[] = [];
+  for (const line of psOutput.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const m = trimmed.match(/^(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    if (!Number.isFinite(pid) || pid === currentPid) continue;
+    const cmd = m[2];
+    // Require both: a bun-like leader and the script path. The literal
+    // "loops/optimize_perf.ts" filters out the wrapping zsh/login/screen
+    // command lines so we don't false-positive on those.
+    if (/(^|\/)bun(\s|$)/.test(cmd) && /loops\/optimize_perf\.ts/.test(cmd)) {
+      pids.push(pid);
+    }
+  }
+  return pids;
+}
+
+export function detectExistingOptimizePerfRuns(currentPid: number = process.pid): number[] {
+  try {
+    const out = execSync("ps -axo pid=,command=", { encoding: "utf8", timeout: 5000 });
+    return extractOptimizePerfPidsFromPs(out, currentPid);
+  } catch {
+    return [];
+  }
+}
 
 async function runCommand(
   cmd: string,
@@ -3101,6 +3145,22 @@ async function revertAgentChanges(): Promise<void> {
 // -- Main loop ---------------------------------------------------------------
 
 async function main() {
+  // Race-prevention guard: refuse to start if another optimize_perf.ts
+  // is already running. Two concurrent loops rsyncing/building/committing
+  // to the same main branch corrupts state and makes per-cycle measurements
+  // unreproducible (the other run mutates the tree mid-benchmark). Opt out
+  // with ZINC_PERF_ALLOW_PARALLEL=1 only if you know what you're doing.
+  if (process.env.ZINC_PERF_ALLOW_PARALLEL !== "1") {
+    const existing = detectExistingOptimizePerfRuns();
+    if (existing.length > 0) {
+      console.error(
+        `ERROR: another optimize_perf.ts loop is already running (PID${existing.length > 1 ? "s" : ""}: ${existing.join(", ")}). ` +
+        `Stop it first (kill ${existing.join(" ")}) or set ZINC_PERF_ALLOW_PARALLEL=1 to override. ` +
+        `Two concurrent loops produced unreproducible measurements and corrupted state on 2026-05-30.`,
+      );
+      process.exit(2);
+    }
+  }
   const { effort, cycles, dryRun, model: requestedModel, modelExplicit, resume, agent, analyze } = parseArgs();
   const effortSpec = getEffortSpec(effort);
   if (!effortSpec) {
