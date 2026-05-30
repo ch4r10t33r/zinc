@@ -64,11 +64,24 @@ kernel void main0(
         }
     }
 
+    // Distribute the two row writes across lanes 0 and 1 so the pair of
+    // output stores at base_row..base_row+1 issues as one coalesced 8-byte
+    // transaction (mirrors cycle-43 dmmv_q8_0_pair_swiglu, cycle-47
+    // dmmv_q8_0_repacked_k4096_nr2_qwen, and cycle-49
+    // dmmv_q8_0_repacked_k2048_dual_nr2_qwen). Hoist simd_sum(acc1) out of the
+    // conditional — simd_sum needs uniform participation, and `has_next` is
+    // uniform within a simdgroup (depends only on base_row), so this is
+    // bit-equivalent. Lane 1's write is gated on has_next for the boundary
+    // simdgroup.
+    //
+    // Applies to the production Qwen3.6 SSM qkv path: M=8192 K=2048 (17.93
+    // GiB per request, 1080 calls — the single biggest Q8 traffic line, hit
+    // every decode token across all 30 SSM layers via the tg128 nr=2 path
+    // selected in cachedDmmvPipeline_q8 for preferLlamaQ8SmallThreadgroupForQwenSsm).
     const float sum0 = simd_sum(acc0);
-    if (lane == 0u) output[base_row] = sum0;
-
-    if (base_row + 1u < p.M) {
-        const float sum1 = simd_sum(acc1);
-        if (lane == 0u) output[base_row + 1u] = sum1;
+    const float sum1 = simd_sum(acc1);
+    const bool has_next = base_row + 1u < p.M;
+    if (lane < 2u && (lane == 0u || has_next)) {
+        output[base_row + lane] = (lane == 0u) ? sum0 : sum1;
     }
 }
