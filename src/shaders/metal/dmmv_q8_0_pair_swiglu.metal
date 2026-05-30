@@ -74,15 +74,17 @@ kernel void main0(
 
     const float gate_sum0 = simd_sum(gate0);
     const float up_sum0 = simd_sum(up0);
-    if (lane == 0u) {
-        output[base_row] = gate_sum0 * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum0)) * up_sum0;
-    }
-
-    if (has_next) {
-        const float gate_sum1 = simd_sum(gate1);
-        const float up_sum1 = simd_sum(up1);
-        if (lane == 0u) {
-            output[base_row + 1u] = gate_sum1 * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum1)) * up_sum1;
-        }
+    const float gate_sum1 = simd_sum(gate1);
+    const float up_sum1 = simd_sum(up1);
+    // Distribute the two row writes across lanes 0 and 1 so the pair of
+    // output stores at base_row..base_row+1 issues as one coalesced 8-byte
+    // transaction (mirrors the cycle-27 conv1d-fused sibling and the cycle-32
+    // 4-row pattern). Lane 1's write is gated on `has_next` for the boundary
+    // simdgroup. Both gate1/up1 simd_sums are uniform within the simdgroup
+    // (`has_next` is uniform), so hoisting them out is bit-equivalent.
+    if (lane < 2u && (lane == 0u || has_next)) {
+        const float gate_sum = (lane == 0u) ? gate_sum0 : gate_sum1;
+        const float up_sum = (lane == 0u) ? up_sum0 : up_sum1;
+        output[base_row + lane] = gate_sum * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum)) * up_sum;
     }
 }
