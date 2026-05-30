@@ -61,8 +61,14 @@ kernel void main0(
 
     const float sum0 = simd_sum(acc0);
     const float sum1 = simd_sum(acc1);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        output[base_row + 1u] = sum1;
+    // Distribute the two row writes across lanes 0 and 1 so the pair of
+    // output stores at base_row..base_row+1 issues as one coalesced 8-byte
+    // transaction (mirrors the cycle-32 conv1d sibling, cycle-43 pair-swiglu,
+    // and cycle-38/39 4-row writeback pattern). M is guaranteed to be a
+    // multiple of `rows_per_wg=8` by the dispatcher (see forward_metal.zig
+    // M % rows_per_wg == 0 guard before `tg128_k2048_qwen` selection), so
+    // base_row + 1 is always in range.
+    if (lane < 2u) {
+        output[base_row + lane] = (lane == 0u) ? sum0 : sum1;
     }
 }
