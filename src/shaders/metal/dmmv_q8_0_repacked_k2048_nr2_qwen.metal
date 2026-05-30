@@ -59,8 +59,21 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
+    // Pack the two per-row simdgroup reductions into a single
+    // `simd_sum(float2)` — Apple9's vector `simd_sum` lowers to one
+    // log2(32)=5-level butterfly that transfers a 64-bit packed lane per
+    // `shuffle_xor` instead of two independent 32-bit trees, cutting
+    // cross-lane shuffle traffic ~2× on the per-simdgroup tail of hot
+    // kernel #1 by streamed bytes (SSM `attn_qkv` M=8192 K=2048,
+    // 17.93 GiB/req across 1080 calls — every SSM layer per decode
+    // token, also the full-attn `attn_qkv` M=5120 K=2048 ×10/token).
+    // Same proven pattern as cycle ~63 (`dmmv_q4k_moe_gate_up_swiglu_k2048`),
+    // cycle ~65 (`residual_rms_norm_router_f32_topk` shared-gate),
+    // and cycle ~67 (`dmmv_q8_0_pair`/`conv1d_dual` siblings).
+    // Downstream lane<2 writeback consumes the sums as simdgroup-uniform
+    // scalars (component access on the simdgroup-uniform float2), so
+    // picking float2 components by lane is bit-equivalent.
+    const float2 sums = simd_sum(float2(acc0, acc1));
     // Distribute the two row writes across lanes 0 and 1 so the pair of
     // output stores at base_row..base_row+1 issues as one coalesced 8-byte
     // transaction (mirrors the cycle-32 conv1d sibling, cycle-43 pair-swiglu,
@@ -69,6 +82,6 @@ kernel void main0(
     // M % rows_per_wg == 0 guard before `tg128_k2048_qwen` selection), so
     // base_row + 1 is always in range.
     if (lane < 2u) {
-        output[base_row + lane] = (lane == 0u) ? sum0 : sum1;
+        output[base_row + lane] = (lane == 0u) ? sums.x : sums.y;
     }
 }
