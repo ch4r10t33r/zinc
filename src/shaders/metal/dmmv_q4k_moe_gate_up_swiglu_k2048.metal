@@ -44,7 +44,7 @@ inline float2 get_scale_min_k4(uint j, device const uchar* sc) {
 inline void accumulate_q4k_pair_direct(
     device const uchar* gate_block,
     device const uchar* up_block,
-    device const float* input,
+    threadgroup const float* input,
     uint bi,
     uint lane,
     thread float& gate_acc,
@@ -57,8 +57,8 @@ inline void accumulate_q4k_pair_direct(
     const uint col_lo = bi * 256u + j * 64u + local_off;
     const uint col_hi = col_lo + 32u;
 
-    const float4 x_lo = *(device const float4*)(input + col_lo);
-    const float4 x_hi = *(device const float4*)(input + col_hi);
+    const float4 x_lo = *(threadgroup const float4*)(input + col_lo);
+    const float4 x_hi = *(threadgroup const float4*)(input + col_hi);
 
     {
         const float d = float(as_type<half>(*(device const ushort*)(gate_block)));
@@ -144,13 +144,34 @@ kernel void main0(
     ushort simdgroup                              [[simdgroup_index_in_threadgroup]]
 ) {
     const uint expert_slot = tg_pos.y;
-    const uint expert_id = expert_ids[expert_slot];
     const uint row = tg_pos.x * ROWS_PER_TG + uint(simdgroup);
+
+    // Cycle ~56: cooperative X load into threadgroup memory. All 16 simdgroups
+    // in this TG handle the SAME expert_slot (`expert_slot = tg_pos.y`) and the
+    // dispatch site (forward_metal.zig:9157 `dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd`)
+    // passes `x_expert_stride=0`, so EVERY simdgroup reads identical 2048-float
+    // X. Previously each simdgroup re-issued ~256 device float4 loads against
+    // the same 8 KB X buffer (16 sg × 256 reads = 4096 redundant L1-cached reads
+    // per TG). Stage X into 8 KB of threadgroup memory once (TG_SIZE=512 threads
+    // each load 1 float4 from contiguous offsets — perfect DRAM coalescing),
+    // then read x_lo/x_hi from TG mem inside the matvec (1-2 cycle latency vs
+    // 10+ cycle L1 cache latency on Apple9). Same x_cache discipline as the
+    // hot kernel #1 sibling `residual_rms_norm_router_f32_topk` (uses
+    // `x_cache4`) and `residual_rms_norm_router_q8_0_topk_repacked_k2048`
+    // (uses `norm_cache`). 1024 TGs × ~217 µs/dispatch on the #2 hot
+    // decode-token kernel (304 ms/req across 1400 calls, 20% of timed kernel
+    // time). Also frees L1 capacity for the 36 KB of W reads per TG.
+    threadgroup float x_cache[2048];
+    device const float* input = X + (p.x_offset / 4u) + expert_slot * p.x_expert_stride;
+    const uint local_id = uint(simdgroup) * 32u + uint(lane);
+    *(threadgroup float4*)(&x_cache[local_id * 4u]) = *(device const float4*)(input + local_id * 4u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     if (row >= p.M) {
         return;
     }
 
-    device const float* input = X + (p.x_offset / 4u) + expert_slot * p.x_expert_stride;
+    const uint expert_id = expert_ids[expert_slot];
     constexpr uint blocks_per_row = 8u;
     constexpr ulong row_bytes = 1152ul;
     const ulong gate_expert_base = ulong(p.gate_a_offset) + ulong(expert_id) * ulong(p.gate_expert_stride);
@@ -167,7 +188,7 @@ kernel void main0(
         accumulate_q4k_pair_direct(
             gate_row + ulong(bi) * 144ul,
             up_row + ulong(bi) * 144ul,
-            input, bi, uint(lane), gate_acc, up_acc);
+            x_cache, bi, uint(lane), gate_acc, up_acc);
     }
 
     const float gate_sum = simd_sum(gate_acc);
