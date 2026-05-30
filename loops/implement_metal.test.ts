@@ -4,7 +4,9 @@ import {
   backfillNearMiss,
   bestKeptCorrectTokPerSec,
   buildNearMissDirective,
+  buildStepKindDiversityNudge,
   countNearMissFamilyReverts,
+  noiseAwareImproveBand,
   parseDiagnosticEnv,
   buildPrompt,
   buildQwen36PrefillPlateauAnalysis,
@@ -1359,5 +1361,67 @@ describe("buildNearMissDirective surfaces diagnostic output", () => {
     });
     const lines = buildNearMissDirective(state, 102, false).join("\n");
     expect(lines).not.toContain("Latest near-miss diagnostic");
+  });
+});
+
+// ── noiseAwareImproveBand ──────────────────────────────────────────
+
+describe("noiseAwareImproveBand", () => {
+  test("leaves the base band untouched when samples are tight", () => {
+    expect(noiseAwareImproveBand(1.0, [50.1, 50.2, 50.15])).toBe(1.0);
+  });
+
+  test("inflates the band to ~30% of the observed range when samples are noisy", () => {
+    // range = 11, 30 % = 3.3 → larger than 1.0 base, so wins
+    expect(noiseAwareImproveBand(1.0, [43.3, 51.0, 49.3, 47.6, 39.2])).toBeCloseTo(3.54, 1);
+  });
+
+  test("respects the base band when noise is small", () => {
+    expect(noiseAwareImproveBand(2.0, [50, 50.5, 51])).toBe(2.0); // 1*0.3 < 2
+  });
+
+  test("returns the base band on insufficient samples", () => {
+    expect(noiseAwareImproveBand(1.0, [50])).toBe(1.0);
+    expect(noiseAwareImproveBand(1.0, [50, 51])).toBe(1.0);
+  });
+
+  test("safe with empty / identical samples", () => {
+    expect(noiseAwareImproveBand(1.0, [])).toBe(1.0);
+    expect(noiseAwareImproveBand(1.0, [50, 50, 50])).toBe(1.0); // range=0
+  });
+});
+
+// ── buildStepKindDiversityNudge ────────────────────────────────────
+
+describe("buildStepKindDiversityNudge", () => {
+  const optCycle = (n: number) => makeCycle({ cycle: n, stepKind: "optimization", kept: false, containsReference: true });
+  const anlCycle = (n: number) => makeCycle({ cycle: n, stepKind: "analysis", kept: false, containsReference: true });
+
+  test("fires when recent window is all-optimization with no analysis/enablement", () => {
+    const cycles = Array.from({ length: 10 }, (_, i) => optCycle(i + 1));
+    const lines = buildStepKindDiversityNudge({ cycles });
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines[0]).toContain("STEP-KIND IMBALANCE");
+    expect(lines.join("\n")).toContain("microbench");
+  });
+
+  test("silent when at least one analysis or enablement cycle appears in the window", () => {
+    const cycles = [optCycle(1), optCycle(2), optCycle(3), optCycle(4), optCycle(5), optCycle(6), optCycle(7), optCycle(8), optCycle(9), anlCycle(10)];
+    expect(buildStepKindDiversityNudge({ cycles })).toEqual([]);
+  });
+
+  test("silent for short histories (lets fresh loops iterate)", () => {
+    const cycles = [optCycle(1), optCycle(2), optCycle(3)];
+    expect(buildStepKindDiversityNudge({ cycles })).toEqual([]);
+  });
+
+  test("allows one non-optimization step in the window before silencing", () => {
+    // 9 of 10 optimization; the one fix shouldn't qualify as analysis/enablement
+    const cycles = [
+      ...Array.from({ length: 9 }, (_, i) => optCycle(i + 1)),
+      makeCycle({ cycle: 10, stepKind: "fix", kept: false, containsReference: true }),
+    ];
+    const lines = buildStepKindDiversityNudge({ cycles });
+    expect(lines.length).toBeGreaterThan(0); // fires: 9 opt + 1 fix (not analysis)
   });
 });

@@ -71,6 +71,13 @@ const BENCHMARK_WARMUPS = parsePositiveIntEnv("ZINC_BENCHMARK_WARMUPS", 1);
 // middle anyway. Mitigates the cold/warm process-boundary noise pattern
 // without requiring zinc itself to support multi-prompt batched runs.
 const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
+// Sleep between consecutive timed samples. Decode benchmarks at 128 tokens/sample × 5 samples
+// sustain enough GPU load on M-series that samples bimodalize from thermal throttling
+// (range 7–11 tok/s observed on Effort 5 cycle 1). A short cool-down between samples
+// lets the GPU clocks settle and meaningfully tightens the sample range, which directly
+// improves the keep-gate's signal-to-noise ratio. Default 0 = off; set to 3000–5000 ms
+// for thermal-bound benches like 35B decode.
+const BENCHMARK_COOLDOWN_MS = parsePositiveIntEnv("ZINC_BENCHMARK_COOLDOWN_MS", 0);
 // Confirmation re-run: when a candidate lands in the noise zone around the
 // promotion boundary (or its samples were flagged bimodal/THERMAL), collect
 // this many EXTRA timed samples and re-aggregate over the combined set before
@@ -1123,6 +1130,8 @@ export function shouldConfirmCandidate(args: {
  * both the in-cycle benchmark and the optional confirmation re-run. Does not
  * build or test — the caller guarantees `./zig-out/bin/zinc` is current.
  */
+const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
 async function collectTimedSamples(
   maxTokens: number,
   runs: number,
@@ -1132,6 +1141,11 @@ async function collectTimedSamples(
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
   for (let sample = 0; sample < runs; sample++) {
+    if (sample > 0 && BENCHMARK_COOLDOWN_MS > 0) {
+      // Inter-sample cool-down: let GPU clocks settle before the next timed run
+      // so we measure sustained throughput, not the thermal slope.
+      await sleep(BENCHMARK_COOLDOWN_MS);
+    }
     const run = await runCommand(
       "./zig-out/bin/zinc",
       [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
@@ -1147,6 +1161,29 @@ async function collectTimedSamples(
     }
   }
   return { samples, lastRun, lastCombined };
+}
+
+/**
+ * Inflate the promotion band when measured sample noise dwarfs it.
+ *
+ * Without this, on thermally-noisy decode runs the band can be ~1 tok/s while
+ * sample spread is ~10 tok/s, so a "+1.0 tok/s improvement" verdict is mostly
+ * noise. The verdict ratchets the recorded best upward on luck rather than on
+ * real progress (Effort 16 cycles 1-24 saw 0.21→0.30 inflated this way before
+ * the original noise band was tightened).
+ *
+ * Heuristic: require the candidate to beat best by at least ~30% of the
+ * observed range. Pure ranges of 0-2 tok/s leave the base band untouched
+ * (clean signal); ranges of 7-11 tok/s lift the band to ~2-3 tok/s, which
+ * is the smallest improvement that survives ~95% of the observed jitter.
+ * Returns the larger of the original band and this noise-aware floor.
+ */
+export function noiseAwareImproveBand(baseBand: number, samples: number[]): number {
+  if (samples.length < 3) return baseBand;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const range = sorted[sorted.length - 1] - sorted[0];
+  if (range <= 0) return baseBand;
+  return Math.max(baseBand, range * 0.3);
 }
 
 async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
@@ -1796,6 +1833,46 @@ export function countNearMissFamilyReverts(state: RunState): number {
   return count;
 }
 
+/**
+ * If the recent N cycles are dominated by `optimization` step-kinds with no
+ * `analysis` / `enablement` foundation work, return a directive telling the
+ * agent to build evidence/tooling rather than try another kernel variant.
+ *
+ * Triggered late enough to let an obviously-fast-and-fresh loop iterate
+ * (don't nag in the first 8 cycles), and only when the agent has demonstrably
+ * NOT been building tools. Designed for the Effort 5 cycle-10-25 pattern:
+ * 16 consecutive optimization reverts targeting noise-bound infrastructure
+ * because no microbench was ever built for the hot Q4_K/Q8_0 SSM shapes.
+ */
+export function buildStepKindDiversityNudge(
+  state: Pick<RunState, "cycles">,
+  windowSize: number = 10,
+): string[] {
+  const recent = state.cycles.slice(-windowSize);
+  if (recent.length < 8) return [];
+  let optCount = 0, otherCount = 0;
+  for (const c of recent) {
+    if (c.stepKind === "optimization") optCount++;
+    else if (c.stepKind === "analysis" || c.stepKind === "enablement") otherCount++;
+  }
+  // Require ~all recent cycles to be optimization AND zero analysis/enablement.
+  if (optCount < recent.length - 1) return [];
+  if (otherCount > 0) return [];
+
+  const lines: string[] = [];
+  lines.push(`## ⚠ STEP-KIND IMBALANCE — ${optCount}/${recent.length} recent cycles were "optimization", 0 were "analysis"/"enablement"`);
+  lines.push("");
+  lines.push("Pattern: you keep proposing kernel/threadgroup/barrier retunes, almost all reverted by the noise-band. The harness has zero new exact-shape evidence to back the next attempt — every cycle is a blind shot in a regime where sample range exceeds the keep band.");
+  lines.push("");
+  lines.push("Before another optimization, do ONE of:");
+  lines.push("1. **Add an exact-shape microbench** for the actual hot tensors (e.g. extend `benchmarks/metal_q8_shapes.zig` with the LM head / SSM qkv / ssm_out / shared-gate shapes from the latest profile). Default-off, foundation keep allowed at 0 % impact.");
+  lines.push("2. **Add a per-kernel timing probe** behind an env flag that prints µs/dispatch for the top-5 hot kernels under `--profile`. Default-off.");
+  lines.push("3. **Read the latest profile output below** and write down the ONE smallest-named-bucket hypothesis that explains the gap to llama.cpp — name the kernel + shape + estimated savings, then either implement that fix (not a retune) OR add the microbench that would confirm/reject it.");
+  lines.push("");
+  lines.push("Do NOT propose another threadgroup sweep, barrier-scope change, or hazard-tracking flag this cycle. Those have measured neutral across the recent window — the issue is lack of evidence, not lack of kernel candidates.");
+  return lines;
+}
+
 export function buildNearMissDirective(
   state: RunState,
   acceptedBestTps: number,
@@ -1968,6 +2045,17 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       diagnosis.push("");
       diagnosis.push(...nearMissLines);
     }
+  }
+
+  // Step-kind diversity nudge. When recent cycles are all optimization shots
+  // and no analysis/enablement work was done, push back. Effort 5 cycles 10-25
+  // drifted into noise-bound barrier/encoder retunes (10+ reverts) because the
+  // agent never built an exact-shape microbench for the actual hot tensors;
+  // surface the imbalance so the next cycle considers foundation work.
+  const diversityLines = buildStepKindDiversityNudge(state);
+  if (diversityLines.length > 0) {
+    diagnosis.push("");
+    diagnosis.push(...diversityLines);
   }
 
   // Stall warning
@@ -2867,7 +2955,14 @@ async function main() {
     // The neutral band is intentionally tighter than the promotion band:
     // a correct foundation step can be kept when it is flat, but not when
     // it materially slows the current tree.
-    const improveBand = Math.max(0.3, bestTps * 0.02);
+    // Promotion band scales with best, then inflates when measured sample
+    // spread dwarfs it (decode benchmarks regularly bimodalize from M-series
+    // thermal throttling; a tiny 1-tok band against a 10-tok spread accepts
+    // mostly noise). See `noiseAwareImproveBand`.
+    const improveBand = noiseAwareImproveBand(
+      Math.max(0.3, bestTps * 0.02),
+      verify.tokPerSecSamples,
+    );
     const noiseBand = Math.max(0.25, acceptedTps * 0.01);
     const currentProgressBand = smallAcceptedProgressBand(acceptedTps);
 
