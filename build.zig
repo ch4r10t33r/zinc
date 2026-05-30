@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         "flash_attn",
         "flash_attn_split_merge",
         "deinterleave",
+        "deinterleave_batched",
         "vadd",
         "scale_accumulate",
         "bias_add",

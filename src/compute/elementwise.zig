@@ -266,6 +266,10 @@ pub const ElementwiseDispatch = struct {
     pipeline_rope_batched: ?Pipeline,
     /// DEINTERLEAVE pipeline, or null.
     pipeline_deinterleave: ?Pipeline,
+    /// Token-batched DEINTERLEAVE pipeline, or null. Used by Qwen3.6-27B
+    /// layer-major full-attn prefill to split packed Q+gate across n_tokens
+    /// in one dispatch.
+    pipeline_deinterleave_batched: ?Pipeline,
     /// SIGMOID MUL pipeline, or null.
     pipeline_sigmoid_mul: ?Pipeline,
     /// VADD pipeline, or null.
@@ -443,6 +447,14 @@ pub const ElementwiseDispatch = struct {
         const deinterleave_path = std.fmt.bufPrint(&path_buf, "{s}/deinterleave.spv", .{shader_dir}) catch unreachable;
         const pipeline_deinterleave = pipeline_mod.createFromSpirvWithOptions(instance, deinterleave_path, 3, @sizeOf(DeinterleavePush), &.{}, push_options, allocator) catch |err| blk: {
             log.warn("deinterleave shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // deinterleave_batched: 1 input + 2 outputs = 3 bindings (token-batched
+        // sibling of deinterleave, dispatched as (heads*head_dim/64, n_tokens, 1)).
+        const deinterleave_batched_path = std.fmt.bufPrint(&path_buf, "{s}/deinterleave_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_deinterleave_batched = pipeline_mod.createFromSpirvWithOptions(instance, deinterleave_batched_path, 3, @sizeOf(DeinterleavePush), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("deinterleave_batched shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -681,6 +693,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_rope = pipeline_rope,
             .pipeline_rope_batched = pipeline_rope_batched,
             .pipeline_deinterleave = pipeline_deinterleave,
+            .pipeline_deinterleave_batched = pipeline_deinterleave_batched,
             .pipeline_sigmoid_mul = pipeline_sigmoid_mul,
             .pipeline_vadd = pipeline_vadd,
             .pipeline_scale_acc = pipeline_scale_acc,
@@ -899,6 +912,24 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
+    /// Token-batched deinterleave: dispatches one Y row per token, splitting
+    /// each token's packed [Q(head_dim), gate(head_dim)] per-head blocks into
+    /// separate Q and gate output buffers.
+    pub fn recordDeinterleaveBatched(
+        self: *const ElementwiseDispatch,
+        cmd: *CommandBuffer,
+        descriptor_set: vk.c.VkDescriptorSet,
+        head_dim: u32,
+        n_heads: u32,
+        n_tokens: u32,
+    ) !void {
+        const pip = if (self.pipeline_deinterleave_batched) |*p| p else return error.ShaderNotLoaded;
+        const push = DeinterleavePush{ .head_dim = head_dim, .n_heads = n_heads };
+        const total = head_dim * n_heads;
+        const workgroups_x = (total + 63) / 64;
+        cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups_x, n_tokens, 1);
+    }
+
     /// Record a sigmoid multiply dispatch: out = input * sigmoid(gate).
     pub fn recordSigmoidMul(
         self: *const ElementwiseDispatch,
@@ -1101,6 +1132,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_rope) |*p| p.deinit();
         if (self.pipeline_rope_batched) |*p| p.deinit();
         if (self.pipeline_deinterleave) |*p| p.deinit();
+        if (self.pipeline_deinterleave_batched) |*p| p.deinit();
         if (self.pipeline_sigmoid_mul) |*p| p.deinit();
         if (self.pipeline_vadd) |*p| p.deinit();
         if (self.pipeline_scale_acc) |*p| p.deinit();

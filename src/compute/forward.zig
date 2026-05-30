@@ -14502,6 +14502,12 @@ pub const InferenceEngine = struct {
         scratch_k: Buffer,
         scratch_v: Buffer,
         scratch_attn_out: Buffer,
+        // For Qwen3Next-style packed Q+gate layouts the Q projection writes
+        // 2 × layer_q_dim per token into this temp before a batched
+        // deinterleave splits it into scratch_q and scratch_gate_attn.
+        // Caller must size it for n_tokens × 2 × layer_q_dim × f32 (scratch_up
+        // works on Qwen3.6-27B where inter_dim 17408 ≥ 2 × q_dim 12288).
+        scratch_packed_qgate: Buffer,
         scratch_gate_attn: Buffer,
         scratch_down: Buffer,
     ) !void {
@@ -14523,7 +14529,6 @@ pub const InferenceEngine = struct {
 
         const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
         const k_rows: u32 = @intCast(k_t.info.numElements() / hidden_dim);
-        const layer_q_dim: u32 = q_rows;
         const layer_kv_dim: u32 = k_rows;
         const layer_head_dim: u32 = if (q_norm_t_opt) |qn|
             @intCast(qn.info.numElements())
@@ -14531,38 +14536,36 @@ pub const InferenceEngine = struct {
             @intCast(kn.info.numElements())
         else
             cfg.head_dim;
-        if (layer_head_dim == 0 or (layer_q_dim % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+        if (layer_head_dim == 0) return error.UnsupportedPartialDecode;
         if ((layer_kv_dim % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+        const layer_q_dim_cfg: u32 = cfg.n_heads * layer_head_dim;
+        // Qwen3Next-style packed Q+gate: the Q projection emits
+        // 2 × q_dim per token, interleaved per-head as [Q(hd), gate(hd)].
+        // The per-token path splits via deinterleave; we mirror that here
+        // with a batched deinterleave once the packed projection has run.
+        const packed_q_gate = (q_rows == 2 * layer_q_dim_cfg);
+        if (!packed_q_gate and q_rows != layer_q_dim_cfg) return error.UnsupportedPartialDecode;
+        const layer_q_dim: u32 = layer_q_dim_cfg;
         const layer_n_kv_heads: u32 = layer_kv_dim / layer_head_dim;
         const layer_rope_dim: u32 = if (cfg.rope_dim > 0) @min(cfg.rope_dim, layer_head_dim) else layer_head_dim;
         const o_cols: u32 = @intCast(o_t.info.numElements() / hidden_dim);
 
-        // Required scratch fits per-call: Q/K/V/attn_out are pre-sized for
-        // q_dim/kv_dim, scratch_gate_attn must be at least layer_q_dim
-        // floats per token (caller passes scratch_up which is sized for
-        // inter_dim ≥ layer_q_dim on Qwen3.6-27B).
+        // Qwen3Next packs Q+gate at the Q tensor; separate attn_gate weights
+        // are mutually exclusive. Use packed gate when present, otherwise
+        // optionally take attn_gate_t (skip sigmoid_mul if neither exists).
+        const use_packed_gate = packed_q_gate;
+        const use_separate_gate = !packed_q_gate and attn_gate_t_opt != null;
+        const apply_attn_gate = use_packed_gate or use_separate_gate;
+
         const q_total_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, layer_q_dim) * @sizeOf(f32);
+        const packed_q_gate_total_bytes: vk.c.VkDeviceSize = q_total_bytes * 2;
         const kv_total_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, layer_kv_dim) * @sizeOf(f32);
-        if (q_total_bytes > scratch_q.size) {
-            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_q too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_q.size, n_tokens, layer_q_dim });
-            return error.BufferTooSmall;
-        }
-        if (kv_total_bytes > scratch_k.size) {
-            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_k too small {d} > {d} (n_tokens={d}, kv_dim={d})", .{ kv_total_bytes, scratch_k.size, n_tokens, layer_kv_dim });
-            return error.BufferTooSmall;
-        }
-        if (kv_total_bytes > scratch_v.size) {
-            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_v too small {d} > {d} (n_tokens={d}, kv_dim={d})", .{ kv_total_bytes, scratch_v.size, n_tokens, layer_kv_dim });
-            return error.BufferTooSmall;
-        }
-        if (q_total_bytes > scratch_attn_out.size) {
-            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_attn_out too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_attn_out.size, n_tokens, layer_q_dim });
-            return error.BufferTooSmall;
-        }
-        if (attn_gate_t_opt != null and q_total_bytes > scratch_gate_attn.size) {
-            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_gate_attn too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_gate_attn.size, n_tokens, layer_q_dim });
-            return error.BufferTooSmall;
-        }
+        if (q_total_bytes > scratch_q.size) return error.BufferTooSmall;
+        if (kv_total_bytes > scratch_k.size) return error.BufferTooSmall;
+        if (kv_total_bytes > scratch_v.size) return error.BufferTooSmall;
+        if (q_total_bytes > scratch_attn_out.size) return error.BufferTooSmall;
+        if (apply_attn_gate and q_total_bytes > scratch_gate_attn.size) return error.BufferTooSmall;
+        if (use_packed_gate and packed_q_gate_total_bytes > scratch_packed_qgate.size) return error.BufferTooSmall;
 
         const freq_buf_handle = self.rope_freq_buf.handle;
         const freq_buf_size = self.rope_freq_buf.size;
@@ -14595,14 +14598,55 @@ pub const InferenceEngine = struct {
         );
         self.decode_cmd.computeBarrier();
 
-        // Batched Q/K/V/(attn_gate) projections (weights read once per chunk).
-        try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+        // Batched Q (or packed Q+gate) / K / V / (separate attn_gate)
+        // projections — each weight tensor is read once per chunk.
+        if (use_packed_gate) {
+            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens);
+        } else {
+            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+        }
         try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
         try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
-        if (attn_gate_t_opt) |attn_gate_t| {
-            try self.dispatchProjectionBatched(attn_gate_t, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens);
+        if (use_separate_gate) {
+            try self.dispatchProjectionBatched(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens);
         }
         self.decode_cmd.computeBarrier();
+
+        // Packed Q+gate split: scratch_packed_qgate → scratch_q + scratch_gate_attn
+        if (use_packed_gate) {
+            const pip = &(self.elementwise.pipeline_deinterleave_batched orelse return error.ShaderNotLoaded);
+            const total: u32 = layer_head_dim * cfg.n_heads;
+            const workgroups_x: u32 = (total + 63) / 64;
+            const push = DeinterleavePush{ .head_dim = layer_head_dim, .n_heads = cfg.n_heads };
+            if (pip.uses_push_descriptors) {
+                self.pushDispatch3(
+                    pip,
+                    std.mem.asBytes(&push),
+                    scratch_packed_qgate.handle,
+                    scratch_packed_qgate.size,
+                    scratch_q.handle,
+                    scratch_q.size,
+                    scratch_gate_attn.handle,
+                    scratch_gate_attn.size,
+                    workgroups_x,
+                    n_tokens,
+                    1,
+                );
+            } else {
+                const ds = try self.allocDescSet(pip.descriptor_set_layout);
+                self.writeDescSet3(
+                    ds,
+                    scratch_packed_qgate.handle,
+                    scratch_packed_qgate.size,
+                    scratch_q.handle,
+                    scratch_q.size,
+                    scratch_gate_attn.handle,
+                    scratch_gate_attn.size,
+                );
+                try self.elementwise.recordDeinterleaveBatched(&self.decode_cmd, ds, layer_head_dim, cfg.n_heads, n_tokens);
+            }
+            self.decode_cmd.computeBarrier();
+        }
 
         // Per-head Q / K norms — one RMS row per (token, head).
         if (q_norm_t_opt) |q_norm_t| {
@@ -14715,9 +14759,9 @@ pub const InferenceEngine = struct {
 
         // attn_out *= sigmoid(attn_gate). Linear element count covers all
         // n_tokens × layer_q_dim floats in one dispatch. Skip when the layer
-        // has no attn_gate tensor (matches the per-token apply_attn_gate
-        // guard so other Qwen-class checkpoints keep working).
-        if (attn_gate_t_opt != null) {
+        // has no gate (neither packed nor separate) — matches the per-token
+        // apply_attn_gate guard so other Qwen-class checkpoints keep working.
+        if (apply_attn_gate) {
             try self.dispatchSigmoidMul(
                 scratch_attn_out.handle,
                 scratch_attn_out.size,
@@ -14779,6 +14823,7 @@ pub const InferenceEngine = struct {
         if (self.elementwise.pipeline_kv_cache_write_batched == null) return false;
         if (self.elementwise.pipeline_sigmoid_mul == null) return false;
         if (self.elementwise.pipeline_residual_rms_norm == null) return false;
+        if (self.elementwise.pipeline_deinterleave_batched == null) return false;
         if (std.posix.getenv("ZINC_QWEN36_27B_FULL_ATTN_BATCHED")) |mode| {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
@@ -15359,13 +15404,14 @@ pub const InferenceEngine = struct {
                 );
             } else if (self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens)) {
                 // Effort-15 cycle 13: batched full-attn segment path. One
-                // submit per layer covering attn_norm + Q/K/V/gate + per-head
-                // Q/K norms + RoPE + KV write + flash attn + sigmoid_mul +
-                // O proj + residual+ffn_norm. Replaces ~n_tokens per-token
-                // submits and amortizes Q/K/V/gate/O weight reads. Use
-                // scratch_up as attn_gate scratch — sized for inter_dim
-                // which is strictly larger than layer_q_dim on Qwen3.6-27B
-                // (17408 vs 5120).
+                // submit per layer covering attn_norm + Q/K/V/(packed or
+                // separate) gate + per-head Q/K norms + RoPE + KV write +
+                // flash attn + sigmoid_mul + O proj + residual+ffn_norm.
+                // Replaces ~n_tokens per-token submits and amortizes
+                // Q/K/V/gate/O weight reads. scratch_up is the packed
+                // Q+gate temp (Qwen3.6-27B: 2×q_dim=12288 ≤ inter_dim=17408)
+                // and scratch_swiglu holds the deinterleaved gate so the
+                // dense FFN call after can reuse scratch_up for FFN up.
                 try self.prefillQwen36RunFullAttnLayerToFfnNorm(
                     state,
                     base_token,
@@ -15379,6 +15425,7 @@ pub const InferenceEngine = struct {
                     self.batched_scratch_v.?,
                     self.batched_scratch_attn_out.?,
                     scratch_up,
+                    scratch_swiglu,
                     scratch_down,
                 );
             } else {
