@@ -191,9 +191,17 @@ kernel void main0(
             x_cache, bi, uint(lane), gate_acc, up_acc);
     }
 
-    const float gate_sum = simd_sum(gate_acc);
-    const float up_sum = simd_sum(up_acc);
+    // Cycle ~63: pack the two final-reduction simd_sum calls into a single
+    // simd_sum(float2) — Apple's `simd_sum` on float2/float4 issues one fused
+    // butterfly per lane width (5 shuffle_xor pairs total for SIMD32) instead
+    // of N sequential reductions, halving cross-lane shuffle traffic on the
+    // per-simdgroup row tail. Same pattern as cycle ~62 on hot kernel #3
+    // (`dmmv_q5k_moe_k512_quad`'s float4 pack). Hot kernel #2 (303 ms/req
+    // across 1400 calls), so the per-row tail is amplified by ROWS_PER_TG=16.
+    const float2 sums = simd_sum(float2(gate_acc, up_acc));
     if (lane == 0u) {
+        const float gate_sum = sums.x;
+        const float up_sum = sums.y;
         swigluY[p.gate_y_offset / 4u + expert_slot * p.M + row] =
             gate_sum * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum)) * up_sum;
     }
