@@ -8,6 +8,24 @@ const std = @import("std");
 const shim = @import("c.zig").shim;
 const MetalBuffer = @import("buffer.zig").MetalBuffer;
 const MetalPipeline = @import("pipeline.zig").MetalPipeline;
+const kernel_timing = @import("kernel_timing.zig");
+
+inline fn timingStart() i128 {
+    return if (kernel_timing.enabled) std.time.nanoTimestamp() else 0;
+}
+
+inline fn timingFinish(cmd: *MetalCommand, pipe: *const MetalPipeline, t_start: i128) void {
+    // Branch-predicted false on the hot path (probe is default-off).
+    if (!kernel_timing.enabled) return;
+    if (cmd.handle == null) return;
+    shim.mtl_commit_wait_restart(cmd.handle);
+    // Restart implies an implicit GPU sync; reflect it in barrier accounting so
+    // the next `barrier()` call no-ops as expected.
+    cmd.last_barrier_dispatch_count = cmd.dispatch_count;
+    const elapsed_i = std.time.nanoTimestamp() - t_start;
+    const elapsed_ns: u64 = if (elapsed_i < 0) 0 else @intCast(elapsed_i);
+    kernel_timing.record(@ptrCast(pipe.handle), pipe.name, elapsed_ns);
+}
 
 /// Encoder policy used when opening a Metal compute command buffer.
 pub const CommandEncoderMode = enum(u8) {
@@ -44,6 +62,7 @@ pub const MetalCommand = struct {
             c_bufs[i] = b.handle;
         }
 
+        const t_start = timingStart();
         shim.mtl_dispatch(
             self.handle,
             pipe.handle,
@@ -54,6 +73,7 @@ pub const MetalCommand = struct {
             push_data,
             push_size,
         );
+        timingFinish(self, pipe, t_start);
     }
 
     /// Dispatch with explicit push constant buffer index.
@@ -79,6 +99,7 @@ pub const MetalCommand = struct {
             c_bufs[i] = b.handle;
         }
 
+        const t_start = timingStart();
         shim.mtl_dispatch_v2(
             self.handle,
             pipe.handle,
@@ -90,6 +111,7 @@ pub const MetalCommand = struct {
             push_size,
             push_idx,
         );
+        timingFinish(self, pipe, t_start);
     }
 
     /// Dispatch with explicit threadgroup memory allocation.
@@ -113,6 +135,7 @@ pub const MetalCommand = struct {
             c_bufs[i] = b.handle;
         }
 
+        const t_start = timingStart();
         shim.mtl_dispatch_v2_tgmem(
             self.handle,
             pipe.handle,
@@ -125,6 +148,7 @@ pub const MetalCommand = struct {
             push_idx,
             tg_mem_size,
         );
+        timingFinish(self, pipe, t_start);
     }
 
     /// Insert a memory barrier ensuring all prior dispatches complete before subsequent ones.

@@ -17,6 +17,7 @@ const metal_command = @import("../metal/command.zig");
 const MetalCommand = metal_command.MetalCommand;
 /// Command-encoder mode re-export used by runtime init options.
 pub const CommandEncoderMode = metal_command.CommandEncoderMode;
+const kernel_timing = @import("../metal/kernel_timing.zig");
 const shim = @import("../metal/c.zig").shim;
 
 const log = std.log.scoped(.forward);
@@ -3347,6 +3348,12 @@ pub const InferenceEngine = struct {
         self.qwen_final_tail_kv_fused_norm_enabled = readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true;
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
+        // Per-kernel timing probe — default off, distorts decode tok/s when on (each
+        // dispatch becomes a commit+wait sync). Use only with `--profile` runs to
+        // surface µs/dispatch evidence for the next optimization cycle.
+        if (readBoolEnv("ZINC_METAL_KERNEL_TIMING") orelse false) {
+            kernel_timing.enable();
+        }
         self.request_profile = .{};
         self.prefill_profile = .{};
         self.qwen_ssm_proj_validate_captured_tokens = 0;
@@ -5802,6 +5809,9 @@ pub const InferenceEngine = struct {
         self.profile_enabled = true;
         self.request_profile.reset();
         self.prefill_profile.reset();
+        // Reset per-kernel timing too so the probe reports only this request's
+        // dispatches; cheap no-op when the env flag is unset.
+        if (kernel_timing.enabled) kernel_timing.reset();
     }
 
     /// Log the collected Metal profiling summary for the current request.
@@ -6020,6 +6030,24 @@ pub const InferenceEngine = struct {
         }
         if (profile.debug_validation_ns > 0) {
             log.info("  debug-validation {d:.2} ms", .{nsToMs(profile.debug_validation_ns)});
+        }
+        if (kernel_timing.enabled) {
+            var top_buf: [5]kernel_timing.Entry = undefined;
+            const top = kernel_timing.topByTotalNs(&top_buf);
+            if (top.len == 0) {
+                log.info("  kernel timing: probe enabled but no dispatches recorded", .{});
+            } else {
+                log.info("  kernel timing (ZINC_METAL_KERNEL_TIMING — distorts decode; CPU-side per-dispatch sync):", .{});
+                for (top, 0..) |entry, rank| {
+                    const avg_us = @as(f64, @floatFromInt(entry.avg_ns)) / 1_000.0;
+                    const max_us = @as(f64, @floatFromInt(entry.max_ns)) / 1_000.0;
+                    const total_ms = @as(f64, @floatFromInt(entry.total_ns)) / 1_000_000.0;
+                    log.info(
+                        "    #{d}: {s} calls={d} avg={d:.2}us max={d:.2}us total={d:.2}ms",
+                        .{ rank + 1, entry.name, entry.calls, avg_us, max_us, total_ms },
+                    );
+                }
+            }
         }
     }
 
@@ -6340,7 +6368,10 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     source_buf[bytes_read] = 0;
     var fn_buf: [128]u8 = undefined;
     const fn_name = std.fmt.bufPrintZ(&fn_buf, "main0", .{}) catch return error.NameTooLong;
-    return metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
+    var pipe = try metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
+    // All current callers pass string literals — safe to store the slice by reference.
+    pipe.name = name;
+    return pipe;
 }
 
 // ---------------------------------------------------------------------------

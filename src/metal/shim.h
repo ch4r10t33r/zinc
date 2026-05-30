@@ -71,6 +71,13 @@ void mtl_commit_and_wait(MetalCmd* cmd);
 void mtl_commit_async(MetalCmd* cmd);
 void mtl_wait(MetalCmd* cmd);
 
+// Commit current command buffer, wait for GPU completion, then start a fresh
+// command buffer + encoder on the same MetalCmd handle and reset all binding
+// caches. Used by per-dispatch timing under `ZINC_METAL_KERNEL_TIMING`.
+// The MetalCmd struct stays valid; the caller must continue to re-bind any
+// state it relies on after this returns (matches a fresh `mtl_begin_command`).
+void mtl_commit_wait_restart(MetalCmd* cmd);
+
 // Residency set management (macOS 15+). Wires GPU buffers down so they don't
 // page-fault on cold access. Adapted from llama.cpp ggml-metal-device.m
 // `ggml_metal_buffer_rset_init`. Returns NULL on systems where the API is

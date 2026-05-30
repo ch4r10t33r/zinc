@@ -35,6 +35,7 @@ struct MetalPipe {
 };
 
 struct MetalCmd {
+    id<MTLCommandQueue> queue; // retained for mtl_commit_wait_restart
     id<MTLCommandBuffer> cmd_buf;
     id<MTLComputeCommandEncoder> encoder;
     id<MTLComputePipelineState> current_pipeline;
@@ -367,6 +368,7 @@ MetalCmd* mtl_begin_command_mode(MetalCtx* ctx, uint8_t serial) {
 
     MetalCmd* cmd = (MetalCmd*)calloc(1, sizeof(MetalCmd));
     if (!cmd) return NULL;
+    cmd->queue = ctx->queue;
     cmd->cmd_buf = cmd_buf;
     cmd->encoder = encoder;
     cmd->current_pipeline = nil;
@@ -558,6 +560,7 @@ void mtl_commit_and_wait(MetalCmd* cmd) {
     cmd->encoder = nil;
     cmd->current_pipeline = nil;
     cmd->cmd_buf = nil;
+    cmd->queue = nil;
     free(cmd);
 }
 
@@ -579,7 +582,51 @@ void mtl_wait(MetalCmd* cmd) {
     }
 
     cmd->cmd_buf = nil;
+    cmd->queue = nil;
     free(cmd);
+}
+
+void mtl_commit_wait_restart(MetalCmd* cmd) {
+    if (!cmd || !cmd->cmd_buf || !cmd->queue) return;
+
+    [cmd->encoder endEncoding];
+    [cmd->cmd_buf commit];
+    [cmd->cmd_buf waitUntilCompleted];
+
+    if ([cmd->cmd_buf status] == MTLCommandBufferStatusError) {
+        fprintf(stderr, "Error: Metal command buffer failed during restart: %s\n",
+                [[cmd->cmd_buf.error localizedDescription] UTF8String]);
+    }
+
+    id<MTLCommandBuffer> new_buf = [cmd->queue commandBufferWithUnretainedReferences];
+    if (!new_buf) {
+        fprintf(stderr, "Error: mtl_commit_wait_restart could not create a new command buffer.\n");
+        cmd->encoder = nil;
+        cmd->cmd_buf = nil;
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> new_encoder = cmd->is_concurrent
+        ? [new_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+        : [new_buf computeCommandEncoder];
+    if (!new_encoder) {
+        fprintf(stderr, "Error: mtl_commit_wait_restart could not create a new compute encoder.\n");
+        cmd->encoder = nil;
+        cmd->cmd_buf = new_buf;
+        return;
+    }
+
+    [new_buf enqueue];
+
+    cmd->cmd_buf = new_buf;
+    cmd->encoder = new_encoder;
+
+    // Encoder state cache is invalid after restart — all bindings must be re-issued.
+    cmd->current_pipeline = nil;
+    memset(cmd->current_buffers, 0, sizeof(cmd->current_buffers));
+    memset(cmd->current_bytes_valid, 0, sizeof(cmd->current_bytes_valid));
+    memset(cmd->current_bytes_size, 0, sizeof(cmd->current_bytes_size));
+    memset(cmd->current_tgmem_lengths, 0, sizeof(cmd->current_tgmem_lengths));
 }
 
 // --- Residency sets (macOS 15+) ---

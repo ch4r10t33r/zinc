@@ -17,6 +17,9 @@ pub const MetalPipeline = struct {
     thread_execution_width: u32,
     /// Bytes of threadgroup memory statically allocated by the kernel.
     static_threadgroup_memory_length: u32,
+    /// Optional debug label, set by the caller (typically the shader name).
+    /// Used by the `ZINC_METAL_KERNEL_TIMING` probe to attribute dispatches.
+    name: ?[]const u8 = null,
 };
 
 /// Compile an MSL source string into a compute pipeline for the given function name.
@@ -63,7 +66,11 @@ pub fn freePipeline(pipe: *MetalPipeline) void {
 }
 
 test "MetalPipeline struct size" {
-    try std.testing.expect(@sizeOf(MetalPipeline) <= 24);
+    // Bumped from 24 to 64 after adding the optional `name` slice (kernel timing
+    // probe label). MetalPipeline is held by value on the InferenceEngine and
+    // passed by const pointer to dispatch — the extra bytes don't reach the
+    // hot dispatch path.
+    try std.testing.expect(@sizeOf(MetalPipeline) <= 64);
 }
 
 test "createPipeline compiles simple MSL kernel" {
