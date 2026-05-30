@@ -173,11 +173,13 @@ pub const MetalCommand = struct {
                 if (bufs[0].handle != null) {
                     self.barrier_count += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
-                    // Match llama.cpp's `ggml_metal_encoder_memory_barrier`:
-                    // hot Qwen prefill has thousands of single-buffer barriers,
-                    // and the scope barrier avoids per-resource ObjC setup while
-                    // preserving stronger-than-requested ordering.
-                    shim.mtl_barrier(h);
+                    // Mirror llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // (ggml-metal-common.cpp `ggml_mem_ranges_check`): when only
+                    // one buffer is the join, use a true resource-scoped barrier
+                    // so independent dispatches that touch OTHER buffers stay
+                    // concurrent across this edge. ObjC cost for one resource
+                    // (single pointer + count=1) equals the scope-only call.
+                    shim.mtl_barrier_buffer(h, bufs[0].handle);
                 }
                 return;
             }
