@@ -12785,11 +12785,22 @@ fn dispatchFullAttnPrepOnCmd(
     // across the 64-thread TG's two simdgroups in 32-element Q8_0 blocks. The
     // pre-flash-attention barrier (which already covers kv_k_cache/kv_v_cache)
     // serves as the visibility fence; no per-layer write barrier is needed.
+    //
+    // Cycle-25 register-only variant: the K branch now keeps rope outputs in
+    // thread-private registers and quantizes them in an alternating-block
+    // layout where each thread reads only registers it itself wrote — dropping
+    // the in-kernel mem_device threadgroup_barrier and the round-trip through
+    // k_inout. The {tid, tid+64, ...} write↔read invariant holds when
+    // `rope_dim % 128 == 0` (so half_rot is a multiple of 64) and head_dim <=
+    // 512 (the on-stack `k_out[8]` register budget). Otherwise fall back to
+    // cycle-22's `rope_qk_norm_inplace` + standalone `kv_cache_write_q8`.
     const fuse_qk_norm_into_rope_kv_q8 =
         fuse_qk_norm_into_rope_inplace and
         engine.kv_cache_q8 and
         (attn.head_dim % 64) == 0 and
-        attn.head_dim >= 64 and
+        attn.head_dim >= 128 and
+        attn.head_dim <= 512 and
+        (attn.rope_dim % 128) == 0 and
         engine.rope_qk_norm_kv_q8_pipe.handle != null;
     // Q/K norms are independent — concurrent dispatch overlaps them when
     // not fused into the rope+kv-write kernel.

@@ -6,27 +6,31 @@ using namespace metal;
 // decode path. Extends cycle-22's `rope_qk_norm_inplace.metal` by folding the
 // follow-up `kv_cache_write_q8` dispatch (and its barrier) into this kernel:
 //   - Q-heads (head < n_q_heads): Q-norm + Q-rope, in place in q_inout.
-//   - K-heads (head < n_q_heads + n_kv_heads): K-norm + K-rope in place in
-//     k_inout, then Q8-quantize this head's rotated K row directly into
-//     kv_k_cache at `dst_offset_bytes` (current token slot).
-//   - V-heads (head < n_q_heads + 2*n_kv_heads): Q8-quantize the corresponding
-//     v_inout row directly into kv_v_cache at `dst_offset_bytes`.
+//   - K-heads (head < n_q_heads + n_kv_heads): K-norm + K-rope kept entirely in
+//     thread-private registers, then Q8-quantized directly into kv_k_cache at
+//     `dst_offset_bytes` (current token slot) via an alternating-block layout
+//     where each simdgroup owns blocks {simd_id, simd_id+2, ...} and each
+//     thread quantizes only registers it itself produced — eliminating both
+//     the cycle-23 mem_device threadgroup_barrier and the round-trip device
+//     writes/reads through k_inout.
+//   - V-heads (head < n_q_heads + 2*n_kv_heads): Q8-quantize v_inout directly
+//     into kv_v_cache at `dst_offset_bytes`.
 //
 // Adapts llama.cpp `ggml_metal_op_concurrency_check/reset` single-consumer
 // fusion (ggml-metal-ops.cpp:159, 175) to the QK-norm → rope → kv-write chain
-// that the Q8 KV decode path of Qwen3.6 walks every dense full-attn layer:
-// since the only consumer of the rotated K (and the v_buf row) is the KV cache
-// write that immediately follows, the rope→write barrier becomes redundant
-// once both ops live in the same dispatch. Saves one dispatch + one barrier
-// per dense full-attn layer (≈10/decode token on Qwen3.6-35B), extending the
-// cycle-21/22 single-consumer fusion discipline to the KV-materialization edge.
+// that the Q8 KV decode path of Qwen3.6 walks every dense full-attn layer.
+// The rotated K in k_inout has no remaining consumer (flash_attn_q8 reads
+// kv_k_cache, not k_buf), so the K writes are skipped entirely on the Q8 path.
 //
-// Requires head_dim % 64 == 0 so each K/V head splits evenly into 32-element
-// Q8_0 blocks across both simdgroups of the 64-thread TG (blocks_per_head =
-// head_dim / 32, blocks_per_simd = blocks_per_head / 2). Falls back to the
-// cycle-22 unfused path otherwise. The pre-flash-attention barrier (which
-// already includes kv_k_cache and kv_v_cache) makes the cache writes visible
-// before flash_attn_q8 reads them.
+// Layout invariant for the no-barrier K branch: thread `tid` owns indices
+// {tid, tid+64, tid+128, ..., tid + 64*(blocks_per_simd-1)} in the head's
+// rotated K row. With `simd_id ∈ {0,1}` and `simd_lane ∈ [0,32)`, this matches
+// the alternating quantize block assignment exactly (block bi for simdgroup
+// `simd_id` = block_in_head `simd_id + 2*bi`, elem_offset = tid + 64*bi). The
+// rope loop (pair (i, i+half_rot)) and post-rope loop (rope_dim + j*64 + tid)
+// preserve the {tid, tid+64, ...} layout when both `half_rot` and `rope_dim`
+// are multiples of 64 — i.e. `rope_dim % 128 == 0`. The dispatch site gates
+// on that condition; otherwise the cycle-22 unfused path runs instead.
 
 struct RopeQkNormKvQ8Push {
     uint stride;            // head_dim
@@ -56,6 +60,7 @@ kernel void main0(
     const uint stride = p.stride;
     const uint half_rot = p.rope_dim / 2;
     const uint blocks_per_head = stride / 32u;
+    const uint blocks_per_simd = blocks_per_head / 2u;
 
     if (head < p.n_q_heads) {
         // Q branch — identical to rope_qk_norm_inplace.metal Q path.
@@ -85,7 +90,13 @@ kernel void main0(
     }
 
     if (head < p.n_q_heads + p.n_kv_heads) {
-        // K branch — norm + rope (in place to k_inout) + Q8 quantize+write.
+        // K branch — registers + alternating quantize, no barrier, no device
+        // writes to k_inout. Each thread holds its blocks_per_simd K rope/post-
+        // rope outputs in `k_out[]` and feeds them straight into the alternating
+        // quantize loop, where the per-thread→per-block mapping `block_in_head
+        // = simd_id + 2*bi`, `elem_offset = tid + 64*bi` matches the rope+post-
+        // rope write layout exactly. Drops the cycle-23 threadgroup_barrier
+        // (mem_device) and the round-trip through k_inout.
         const uint kv_head = head - p.n_q_heads;
         const uint base = kv_head * stride;
 
@@ -97,36 +108,38 @@ kernel void main0(
         sum_sq = simd_sum(sum_sq);
         const float k_rms_inv = fast::rsqrt(fast::divide(sum_sq, float(stride)) + p.eps);
 
-        for (uint i = tid; i < half_rot; i += 64) {
+        // Up to head_dim=512 (blocks_per_simd=8). Apple9 register file (24 KiB
+        // per simdgroup at peak occupancy) easily covers this 8 × float per
+        // lane allocation.
+        float k_out[8];
+        const uint half_rot_blocks = half_rot >> 6;   // # of 64-stride steps fitting in half_rot
+        const uint rope_dim_blocks = p.rope_dim >> 6; // # of 64-stride steps fitting in rope_dim
+
+        // Rope writes: pair (i, i+half_rot) with i = tid + j*64, j ∈ [0, half_rot/64).
+        // Output index `i` lands in k_out[j]; output index `i+half_rot` lands in
+        // k_out[j + half_rot/64] (since half_rot % 64 == 0 under our gate).
+        for (uint j = 0u, i = tid; i < half_rot; ++j, i += 64u) {
             const float theta = float(p.position) * freqs[i];
             const float cos_t = fast::cos(theta);
             const float sin_t = fast::sin(theta);
             const float x0 = k_inout[base + i] * k_rms_inv * k_norm_w[i];
             const float x1 = k_inout[base + i + half_rot] * k_rms_inv * k_norm_w[i + half_rot];
-            k_inout[base + i] = x0 * cos_t - x1 * sin_t;
-            k_inout[base + i + half_rot] = x0 * sin_t + x1 * cos_t;
+            k_out[j] = x0 * cos_t - x1 * sin_t;
+            k_out[j + half_rot_blocks] = x0 * sin_t + x1 * cos_t;
         }
-        for (uint i = p.rope_dim + tid; i < stride; i += 64) {
-            k_inout[base + i] = k_inout[base + i] * k_rms_inv * k_norm_w[i];
+        // Post-rope writes: index rope_dim + j*64 + tid lands in
+        // k_out[rope_dim/64 + j] (rope_dim % 64 == 0 under our gate).
+        for (uint j = 0u, i = p.rope_dim + tid; i < stride; ++j, i += 64u) {
+            k_out[rope_dim_blocks + j] = k_inout[base + i] * k_rms_inv * k_norm_w[i];
         }
 
-        // All K writes from both simdgroups in this TG must be visible before
-        // re-reading for Q8 quantization (simdgroup 0 wrote indices 0..31 and
-        // 64..95, simdgroup 1 wrote 32..63 and 96..127 plus the +half_rot
-        // pairs — and the quantize block assignment crosses the simdgroup
-        // boundary). The threadgroup_barrier is TG-local and far cheaper than
-        // the encoder-scope barrier that the standalone kv_cache_write_q8
-        // dispatch would otherwise need.
-        threadgroup_barrier(mem_flags::mem_device);
-
-        // Quantize this K head's rotated values into the layer's KV cache:
-        // each simdgroup of the 64-thread TG owns half the head's blocks.
-        const uint blocks_per_simd = blocks_per_head / 2u;
+        // Quantize: alternating blocks per simdgroup. SG simd_id owns blocks
+        // {simd_id, simd_id+2, simd_id+4, ...}; thread (simd_id, simd_lane)
+        // quantizes register k_out[bi] into block_in_head = simd_id + 2*bi.
         const uint kv_block_base = kv_head * blocks_per_head;
-        for (uint bi = 0; bi < blocks_per_simd; bi++) {
-            const uint block_in_head = simd_id * blocks_per_simd + bi;
-            const uint elem_offset = block_in_head * 32u + simd_lane;
-            const float k_val = k_inout[base + elem_offset];
+        for (uint bi = 0u; bi < blocks_per_simd; ++bi) {
+            const uint block_in_head = simd_id + 2u * bi;
+            const float k_val = k_out[bi];
             const float k_abs_max = simd_max(fast::abs(k_val));
             const float k_scale = k_abs_max > 0.0f ? k_abs_max * (1.0f / 127.0f) : 0.0f;
             const float k_inv_scale = k_scale > 0.0f ? 1.0f / k_scale : 0.0f;
@@ -142,13 +155,15 @@ kernel void main0(
     }
 
     // V branch — Q8 quantize+write only (V needs neither rope nor norm on the
-    // Qwen3.6 Q8 KV path). Runs concurrently with the Q/K work above when the
-    // hardware has enough TG slack.
+    // Qwen3.6 Q8 KV path). V has no in-kernel intermediate so the original
+    // sequential per-simdgroup block layout is kept: SG 0 writes blocks
+    // 0..blocks_per_simd-1 and SG 1 writes the remaining blocks contiguously,
+    // which keeps the kv_v_cache writes from interleaving cache lines across
+    // simdgroups.
     const uint v_head = head - p.n_q_heads - p.n_kv_heads;
     const uint base = v_head * stride;
-    const uint blocks_per_simd = blocks_per_head / 2u;
     const uint kv_block_base = v_head * blocks_per_head;
-    for (uint bi = 0; bi < blocks_per_simd; bi++) {
+    for (uint bi = 0u; bi < blocks_per_simd; ++bi) {
         const uint block_in_head = simd_id * blocks_per_simd + bi;
         const uint elem_offset = block_in_head * 32u + simd_lane;
         const float v_val = v_inout[base + elem_offset];
