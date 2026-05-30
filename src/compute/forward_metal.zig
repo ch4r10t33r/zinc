@@ -1121,6 +1121,17 @@ const DmmvPush = extern struct {
     y_offset: u32,
 };
 
+/// Push for `dmmv_q8_0_repacked_k4096_qwen_gated.metal` — the K=4096 attn
+/// output projection fused with the attn_gate sigmoid-multiply on the X load.
+const GatedDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    g_offset: u32,
+};
+
 /// Push for `dmmv_q4k_lmhead_norm.metal` — Q4_K matvec with fused
 /// per-simdgroup RMS reduction over the unnormalized hidden vector
 /// and an inline `norm_weight * rms_inv` scaling on each X load.
@@ -2922,6 +2933,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_repacked_k4096_quad_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_qwen_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_qwen_gated_pipe: MetalPipeline,
     dmmv_f16_pipe: MetalPipeline,
     dmmv_f32_pipe: MetalPipeline,
     dmmv_f32_dual_small_pipe: MetalPipeline,
@@ -3549,6 +3561,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
         self.dmmv_q8_0_repacked_k2048_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_qwen");
         self.dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
+        self.dmmv_q8_0_repacked_k4096_qwen_gated_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen_gated");
         self.dmmv_f16_pipe = try loadShaderPipeline(ctx, "dmmv_f16");
         self.dmmv_f32_pipe = try loadShaderPipeline(ctx, "dmmv_f32");
         self.dmmv_f32_dual_small_pipe = try loadShaderPipeline(ctx, "dmmv_f32_dual_small");
@@ -4481,6 +4494,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_qwen_gated_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f16_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_dual_small_pipe);
@@ -10109,6 +10123,71 @@ fn dispatchSigmoidMulOnCmd(
     const push = SigmoidMulPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ gate, data, data };
     cmd.dispatchV2(&engine.sigmoid_mul_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SigmoidMulPush), 0);
+}
+
+/// Qwen3.6 full-attn output (M=2048, K=4096) DMMV fused with the attn_gate
+/// sigmoid-multiply on the input. Drops the standalone `dispatchSigmoidMulOnCmd`
+/// + its preceding `attn_out_buf` barrier on the apply_attn_gate path — gate_buf
+/// is already visible from the QKV-stage barrier, and the gated kernel reuses
+/// the same X load that the base DMMV already needed. Mirrors llama.cpp's
+/// `ggml_metal_op_concurrency_check/reset` discipline of fusing single-consumer
+/// pre-projection ops into the projection itself.
+fn dispatchQwenGatedAttnOutQ8DmmvOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    o_tensor: *const metal_loader.LoadedTensor,
+    o_weight_buf: *const MetalBuffer,
+    o_weight_offset: u32,
+    input_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, o_tensor, M, K);
+    recordQ8RepackedKernelProfile(engine, o_tensor, M, K, .exact_qwen);
+
+    const push = GatedDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = o_weight_offset,
+        .x_offset = 0,
+        .y_offset = 0,
+        .g_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ o_weight_buf, input_buf, gate_buf, output_buf };
+    // Match cycle-11's exact_qwen_k4096 block_size choice: block=64 for
+    // M=2048 (6.4 WG/core on M4 Max's 40 cores), block=256 otherwise.
+    const block_size: u32 = if (M >= 2048 and
+        engine.dmmv_q8_0_repacked_k4096_qwen_gated_pipe.max_threads_per_threadgroup >= 64)
+        64
+    else
+        256;
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+    cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_qwen_gated_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(GatedDmmvPush), 0);
+}
+
+fn canUseQwenGatedAttnOutDmmv(
+    engine: *const InferenceEngine,
+    o_tensor: *const metal_loader.LoadedTensor,
+    o_weight_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .qwen2_moe) return false;
+    if (cfg.hidden_dim != 2048) return false;
+    if (cfg.ssm_d_inner != 4096) return false;
+    if (o_tensor.info.type_ != .q8_0) return false;
+    if (M != 2048 or K != 4096) return false;
+    if (M % 4 != 0) return false;
+    // The gated kernel uses the repacked Q8_0 layout (same group_bytes /
+    // row_bytes as `dmmv_q8_0_repacked_k4096_qwen.metal`).
+    if (!o_weight_buf.is_repacked_q8) return false;
+    return engine.dmmv_q8_0_repacked_k4096_qwen_gated_pipe.handle != null and
+        engine.dmmv_q8_0_repacked_k4096_qwen_gated_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_repacked_k4096_qwen_gated_pipe.max_threads_per_threadgroup >= 64;
 }
 
 fn dispatchFfnActivationOnCmd(
@@ -17197,18 +17276,31 @@ fn runDecodeStep(
                 attn.kv_cache_bytes_per_token,
             );
             if (profile) |p| p.full_attn_flash_calls += 1;
-            if (apply_attn_gate) {
-                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before sigmoid_mul
-                dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
-            }
-            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
             const o_tensor = lt.attn_output orelse return error.MissingTensor;
             const o_weight_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
                 (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &o_tensor.gpu_buffer)
             else
                 &o_tensor.gpu_buffer;
             const o_weight_offset: u32 = if (o_weight_buf == &o_tensor.gpu_buffer) tensorPageOffset(engine.model, o_tensor) else 0;
-            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
+            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` single-consumer
+            // fusion to the Qwen3.6 full-attn gate edge: when apply_attn_gate is
+            // true and the output projection is the Qwen-shape repacked Q8_0
+            // (M=2048, K=4096), fold the standalone sigmoid_mul into the output
+            // DMMV's X load — gate_buf is already stable from the QKV-stage
+            // barrier, so the merged path drops one dispatch + one barrier per
+            // full-attn layer (≈10/token on Qwen3.6-35B).
+            const use_gated_attn_out = apply_attn_gate and
+                canUseQwenGatedAttnOutDmmv(engine, o_tensor, o_weight_buf, hidden_dim, attn.q_dim);
+            if (apply_attn_gate and !use_gated_attn_out) {
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before sigmoid_mul
+                dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
+            }
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
+            if (use_gated_attn_out) {
+                dispatchQwenGatedAttnOutQ8DmmvOnCmd(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.gate_buf, &engine.down_buf, hidden_dim, attn.q_dim);
+            } else {
+                dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
+            }
             profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
