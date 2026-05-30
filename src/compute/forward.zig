@@ -14469,6 +14469,322 @@ pub const InferenceEngine = struct {
         self.recordProfilingSample();
     }
 
+    /// Effort-15 cycle 13: layer-major batched attention for Qwen3.6-27B
+    /// full-attention segments. Replaces the per-token
+    /// prefillQwen36RunPartialTokenLoop call (n_tokens decodeStep submits,
+    /// each re-reading Q/K/V/gate/O weights) with a single batched command
+    /// buffer that runs attn_norm + Q/K/V/gate projections + per-head Q/K
+    /// norms + RoPE + KV cache write + flash attention + sigmoid_mul +
+    /// O projection + residual+ffn_norm — each projection reads its weights
+    /// once per chunk instead of once per token.
+    ///
+    /// Caller invariants:
+    ///   - scratch_hidden[i] holds the input hidden for prompt token base_token+i
+    ///   - page_table_buf is populated for [base_token..base_token+n_tokens)
+    ///   - layer is a full-attention layer (segment_is_full_attn == true)
+    ///   - Qwen3.6-27B specific tensor layout (separate attn_gate, q/k_norm,
+    ///     n_heads*head_dim == q_dim, no packed_q_gate, non-Gemma RoPE).
+    ///
+    /// Postconditions (matches prefillQwen36RunSsmLayerToFfnNorm contract):
+    ///   - scratch_hidden[i] += attn_out (post-sigmoid-gate, O-projected)
+    ///   - scratch_norm[i]   = rms_norm(scratch_hidden[i]) * ffn_norm_weight
+    ///   - state.position    = base_token + n_tokens - 1
+    fn prefillQwen36RunFullAttnLayerToFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        scratch_v: Buffer,
+        scratch_attn_out: Buffer,
+        scratch_gate_attn: Buffer,
+        scratch_down: Buffer,
+    ) !void {
+        const cfg = self.model.config;
+        const lt = self.layer_tensors[layer];
+        const eps = cfg.rms_norm_eps;
+        const layer_idx: usize = @intCast(layer);
+
+        const attn_norm_t = lt.attn_norm orelse return error.TensorNotFound;
+        const q_t = lt.attn_q orelse return error.TensorNotFound;
+        const k_t = lt.attn_k orelse return error.TensorNotFound;
+        const v_t = lt.attn_v orelse return error.TensorNotFound;
+        const o_t = lt.attn_output orelse return error.TensorNotFound;
+        const attn_gate_t_opt = lt.attn_gate;
+        const ffn_norm_t = lt.ffn_norm orelse
+            lt.post_attention_norm orelse return error.TensorNotFound;
+        const q_norm_t_opt = lt.attn_q_norm;
+        const k_norm_t_opt = lt.attn_k_norm;
+
+        const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+        const k_rows: u32 = @intCast(k_t.info.numElements() / hidden_dim);
+        const layer_q_dim: u32 = q_rows;
+        const layer_kv_dim: u32 = k_rows;
+        const layer_head_dim: u32 = if (q_norm_t_opt) |qn|
+            @intCast(qn.info.numElements())
+        else if (k_norm_t_opt) |kn|
+            @intCast(kn.info.numElements())
+        else
+            cfg.head_dim;
+        if (layer_head_dim == 0 or (layer_q_dim % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+        if ((layer_kv_dim % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+        const layer_n_kv_heads: u32 = layer_kv_dim / layer_head_dim;
+        const layer_rope_dim: u32 = if (cfg.rope_dim > 0) @min(cfg.rope_dim, layer_head_dim) else layer_head_dim;
+        const o_cols: u32 = @intCast(o_t.info.numElements() / hidden_dim);
+
+        // Required scratch fits per-call: Q/K/V/attn_out are pre-sized for
+        // q_dim/kv_dim, scratch_gate_attn must be at least layer_q_dim
+        // floats per token (caller passes scratch_up which is sized for
+        // inter_dim ≥ layer_q_dim on Qwen3.6-27B).
+        const q_total_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, layer_q_dim) * @sizeOf(f32);
+        const kv_total_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, layer_kv_dim) * @sizeOf(f32);
+        if (q_total_bytes > scratch_q.size) {
+            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_q too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_q.size, n_tokens, layer_q_dim });
+            return error.BufferTooSmall;
+        }
+        if (kv_total_bytes > scratch_k.size) {
+            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_k too small {d} > {d} (n_tokens={d}, kv_dim={d})", .{ kv_total_bytes, scratch_k.size, n_tokens, layer_kv_dim });
+            return error.BufferTooSmall;
+        }
+        if (kv_total_bytes > scratch_v.size) {
+            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_v too small {d} > {d} (n_tokens={d}, kv_dim={d})", .{ kv_total_bytes, scratch_v.size, n_tokens, layer_kv_dim });
+            return error.BufferTooSmall;
+        }
+        if (q_total_bytes > scratch_attn_out.size) {
+            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_attn_out too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_attn_out.size, n_tokens, layer_q_dim });
+            return error.BufferTooSmall;
+        }
+        if (attn_gate_t_opt != null and q_total_bytes > scratch_gate_attn.size) {
+            log.warn("prefillQwen36RunFullAttnLayerToFfnNorm: scratch_gate_attn too small {d} > {d} (n_tokens={d}, q_dim={d})", .{ q_total_bytes, scratch_gate_attn.size, n_tokens, layer_q_dim });
+            return error.BufferTooSmall;
+        }
+
+        const freq_buf_handle = self.rope_freq_buf.handle;
+        const freq_buf_size = self.rope_freq_buf.size;
+        const use_imrope = cfg.rope_sections[0] > 0 or cfg.rope_sections[1] > 0;
+        const use_yarn = hasYarnScaling(&cfg);
+        const use_precomputed_freq = use_imrope or use_yarn;
+        const rope_freq: f32 = if (use_precomputed_freq) 0.0 else cfg.rope_freq_base;
+        const rope_attn_scale: f32 = if (use_yarn) effectiveRopeAttnScale(&cfg) else 1.0;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.transferToComputeBarrier();
+
+        const attention_phase = self.beginProfilePhase();
+
+        // attn RMS norm: scratch_hidden → scratch_norm
+        try self.dispatchRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            attn_norm_t.gpu_buffer.handle,
+            attn_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_dim,
+            n_tokens,
+            eps,
+        );
+        self.decode_cmd.computeBarrier();
+
+        // Batched Q/K/V/(attn_gate) projections (weights read once per chunk).
+        try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+        try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
+        try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        if (attn_gate_t_opt) |attn_gate_t| {
+            try self.dispatchProjectionBatched(attn_gate_t, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens);
+        }
+        self.decode_cmd.computeBarrier();
+
+        // Per-head Q / K norms — one RMS row per (token, head).
+        if (q_norm_t_opt) |q_norm_t| {
+            try self.dispatchRmsNorm(
+                scratch_q.handle,
+                scratch_q.size,
+                q_norm_t.gpu_buffer.handle,
+                q_norm_t.gpu_buffer.size,
+                scratch_q.handle,
+                scratch_q.size,
+                layer_head_dim,
+                cfg.n_heads * n_tokens,
+                eps,
+            );
+        }
+        if (k_norm_t_opt) |k_norm_t| {
+            try self.dispatchRmsNorm(
+                scratch_k.handle,
+                scratch_k.size,
+                k_norm_t.gpu_buffer.handle,
+                k_norm_t.gpu_buffer.size,
+                scratch_k.handle,
+                scratch_k.size,
+                layer_head_dim,
+                layer_n_kv_heads * n_tokens,
+                eps,
+            );
+        }
+        if (q_norm_t_opt != null or k_norm_t_opt != null) self.decode_cmd.computeBarrier();
+
+        // Batched RoPE for Q and K.
+        try self.dispatchRopeBatched(
+            scratch_q.handle,
+            scratch_q.size,
+            scratch_q.handle,
+            scratch_q.size,
+            freq_buf_handle,
+            freq_buf_size,
+            layer_head_dim,
+            layer_rope_dim,
+            cfg.n_heads,
+            base_token,
+            n_tokens,
+            rope_freq,
+            rope_attn_scale,
+        );
+        try self.dispatchRopeBatched(
+            scratch_k.handle,
+            scratch_k.size,
+            scratch_k.handle,
+            scratch_k.size,
+            freq_buf_handle,
+            freq_buf_size,
+            layer_head_dim,
+            layer_rope_dim,
+            layer_n_kv_heads,
+            base_token,
+            n_tokens,
+            rope_freq,
+            rope_attn_scale,
+        );
+        self.decode_cmd.computeBarrier();
+
+        // Batched KV cache write — one dispatch writes all n_tokens K/V into
+        // paged slots [base_token, base_token + n_tokens).
+        try self.dispatchKvCacheWriteBatched(
+            scratch_k.handle,
+            scratch_k.size,
+            self.kv_k_cache[layer_idx].handle,
+            self.kv_k_cache[layer_idx].size,
+            scratch_v.handle,
+            scratch_v.size,
+            self.kv_v_cache[layer_idx].handle,
+            self.kv_v_cache[layer_idx].size,
+            self.page_table_buf.handle,
+            self.page_table_buf.size,
+            layer_kv_dim,
+            n_tokens,
+            kv_page_size_tokens,
+            base_token,
+        );
+        self.decode_cmd.computeBarrier();
+
+        // Batched causal flash attention: n_tokens queries over prefix KV +
+        // own freshly-written K/V slots.
+        const sink_offset = layer * cfg.n_heads;
+        try self.dispatchFlashAttnBatched(
+            scratch_q.handle,
+            scratch_q.size,
+            self.kv_k_cache[layer_idx].handle,
+            self.kv_k_cache[layer_idx].size,
+            self.kv_v_cache[layer_idx].handle,
+            self.kv_v_cache[layer_idx].size,
+            self.page_table_buf.handle,
+            self.page_table_buf.size,
+            scratch_attn_out.handle,
+            scratch_attn_out.size,
+            self.attn_sinks_buf.handle,
+            self.attn_sinks_buf.size,
+            layer_head_dim,
+            cfg.n_heads,
+            layer_n_kv_heads,
+            base_token,
+            n_tokens,
+            kv_page_size_tokens,
+            cfg.attn_scale,
+            sink_offset,
+        );
+        self.decode_cmd.computeBarrier();
+
+        // attn_out *= sigmoid(attn_gate). Linear element count covers all
+        // n_tokens × layer_q_dim floats in one dispatch. Skip when the layer
+        // has no attn_gate tensor (matches the per-token apply_attn_gate
+        // guard so other Qwen-class checkpoints keep working).
+        if (attn_gate_t_opt != null) {
+            try self.dispatchSigmoidMul(
+                scratch_attn_out.handle,
+                scratch_attn_out.size,
+                scratch_gate_attn.handle,
+                scratch_gate_attn.size,
+                scratch_attn_out.handle,
+                scratch_attn_out.size,
+                n_tokens * layer_q_dim,
+            );
+            self.decode_cmd.computeBarrier();
+        }
+
+        // O projection batched: scratch_attn_out → scratch_down (residual src).
+        try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens);
+        self.decode_cmd.computeBarrier();
+
+        self.endProfilePhase(.attention, attention_phase);
+
+        // Fused residual+rms_norm for FFN entry:
+        //   scratch_hidden[i] += scratch_down[i]
+        //   scratch_norm[i]    = rms_norm(scratch_hidden[i]) * ffn_norm
+        try self.dispatchResidualRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            scratch_down.handle,
+            scratch_down.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            ffn_norm_t.gpu_buffer.handle,
+            ffn_norm_t.gpu_buffer.size,
+            hidden_dim,
+            n_tokens,
+            eps,
+            1.0,
+        );
+
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+
+        state.position = base_token + n_tokens - 1;
+    }
+
+    /// Effort-15 cycle 13 gate: when true, the segment loop replaces the
+    /// per-token full-attn partial loop with prefillQwen36RunFullAttnLayerToFfnNorm.
+    /// Default-on for Qwen3.6-27B on RDNA with required pipelines present;
+    /// disable via ZINC_QWEN36_27B_FULL_ATTN_BATCHED=0.
+    fn qwen36DensePrefillFullAttnBatchedEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (n_tokens < 16) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.attention.pipeline_batched == null) return false;
+        if (self.elementwise.pipeline_rope_batched == null) return false;
+        if (self.elementwise.pipeline_kv_cache_write_batched == null) return false;
+        if (self.elementwise.pipeline_sigmoid_mul == null) return false;
+        if (self.elementwise.pipeline_residual_rms_norm == null) return false;
+        if (std.posix.getenv("ZINC_QWEN36_27B_FULL_ATTN_BATCHED")) |mode| {
+            return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+        }
+        return true;
+    }
+
     fn prefillQwen36RunBatchedDenseFfnLayer(
         self: *InferenceEngine,
         layer: u32,
@@ -15040,6 +15356,30 @@ pub const InferenceEngine = struct {
                     scratch_norm,
                     scratch_down,
                     pipeline_tail,
+                );
+            } else if (self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens)) {
+                // Effort-15 cycle 13: batched full-attn segment path. One
+                // submit per layer covering attn_norm + Q/K/V/gate + per-head
+                // Q/K norms + RoPE + KV write + flash attn + sigmoid_mul +
+                // O proj + residual+ffn_norm. Replaces ~n_tokens per-token
+                // submits and amortizes Q/K/V/gate/O weight reads. Use
+                // scratch_up as attn_gate scratch — sized for inter_dim
+                // which is strictly larger than layer_q_dim on Qwen3.6-27B
+                // (17408 vs 5120).
+                try self.prefillQwen36RunFullAttnLayerToFfnNorm(
+                    state,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    segment_layer,
+                    scratch_hidden,
+                    scratch_norm,
+                    self.batched_scratch_q.?,
+                    self.batched_scratch_k.?,
+                    self.batched_scratch_v.?,
+                    self.batched_scratch_attn_out.?,
+                    scratch_up,
+                    scratch_down,
                 );
             } else {
                 try self.prefillQwen36RunPartialTokenLoop(
