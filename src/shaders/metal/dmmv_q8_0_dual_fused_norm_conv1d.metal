@@ -157,66 +157,53 @@ kernel void main0(
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output0[row0] = sum0;
-        if (has1) {
-            output1[row1] = sum1;
-        }
-        if (has2) {
-            output2[row2] = sum2;
-        }
-        if (has3) {
-            output3[row3] = sum3;
-        }
+    // Parallelize the 4-row writeback + conv1d postlude across lanes 0..3.
+    // After simd_sum all four sums are present on every lane, and row0..row3
+    // are disjoint conv channels owned by this simdgroup, so the lanes touch
+    // non-overlapping output*/conv_state/conv_out addresses (offsets r+0..r+3).
+    // Lanes 0..3 reading conv_state[r..r+3] (also c+r..c+r+3 and 2c+r..2c+r+3)
+    // issue each quad as a coalesced transaction instead of the previous four
+    // serial lane-0 loads — mirrors cycle-27's lane 0/1 parallelization in the
+    // sibling `dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal` and
+    // completes the symmetric postlude pattern across both Qwen SSM
+    // qkv+conv1d-fused decode paths.
+    if (lane < 4u) {
+        const bool has = (lane == 0u) ? true
+                       : (lane == 1u) ? has1
+                       : (lane == 2u) ? has2
+                       : has3;
+        const bool first = (lane == 0u) ? first0
+                         : (lane == 1u) ? first1
+                         : (lane == 2u) ? first2
+                         : first3;
+        const uint local_row = (lane == 0u) ? row0
+                             : (lane == 1u) ? row1
+                             : (lane == 2u) ? row2
+                             : row3;
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : sum3;
+        device float* local_output = (lane == 0u) ? output0
+                                   : (lane == 1u) ? output1
+                                   : (lane == 2u) ? output2
+                                   : output3;
 
-        // Conv1d postlude: identical math to ssm_conv1d_qwen_d4.metal, run
-        // by the same lane that just produced the conv1d input for this row.
-        // Each conv channel is owned by exactly one simdgroup (row0..row3 are
-        // unique across the dispatch), so state[] writes do not race.
-        const uint c = p.conv_channels;
-        if (first0) {
-            const float x0 = conv_state[row0];
-            const float x1 = conv_state[c + row0];
-            const float x2 = conv_state[2u * c + row0];
-            const float4 w = *(device const float4*)(conv_kernel + row0 * 4u);
-            const float s = dot(w, float4(x0, x1, x2, sum0));
-            conv_out[row0] = s * fast::divide(1.0f, 1.0f + fast::exp(-s));
-            conv_state[row0] = x1;
-            conv_state[c + row0] = x2;
-            conv_state[2u * c + row0] = sum0;
-        }
-        if (has1 && first1) {
-            const float x0 = conv_state[row1];
-            const float x1 = conv_state[c + row1];
-            const float x2 = conv_state[2u * c + row1];
-            const float4 w = *(device const float4*)(conv_kernel + row1 * 4u);
-            const float s = dot(w, float4(x0, x1, x2, sum1));
-            conv_out[row1] = s * fast::divide(1.0f, 1.0f + fast::exp(-s));
-            conv_state[row1] = x1;
-            conv_state[c + row1] = x2;
-            conv_state[2u * c + row1] = sum1;
-        }
-        if (has2 && first2) {
-            const float x0 = conv_state[row2];
-            const float x1 = conv_state[c + row2];
-            const float x2 = conv_state[2u * c + row2];
-            const float4 w = *(device const float4*)(conv_kernel + row2 * 4u);
-            const float s = dot(w, float4(x0, x1, x2, sum2));
-            conv_out[row2] = s * fast::divide(1.0f, 1.0f + fast::exp(-s));
-            conv_state[row2] = x1;
-            conv_state[c + row2] = x2;
-            conv_state[2u * c + row2] = sum2;
-        }
-        if (has3 && first3) {
-            const float x0 = conv_state[row3];
-            const float x1 = conv_state[c + row3];
-            const float x2 = conv_state[2u * c + row3];
-            const float4 w = *(device const float4*)(conv_kernel + row3 * 4u);
-            const float s = dot(w, float4(x0, x1, x2, sum3));
-            conv_out[row3] = s * fast::divide(1.0f, 1.0f + fast::exp(-s));
-            conv_state[row3] = x1;
-            conv_state[c + row3] = x2;
-            conv_state[2u * c + row3] = sum3;
+        if (has) {
+            local_output[local_row] = local_sum;
+
+            if (first) {
+                const uint c = p.conv_channels;
+                const float x0 = conv_state[local_row];
+                const float x1 = conv_state[c + local_row];
+                const float x2 = conv_state[2u * c + local_row];
+                const float4 w = *(device const float4*)(conv_kernel + local_row * 4u);
+                const float s = dot(w, float4(x0, x1, x2, local_sum));
+                conv_out[local_row] = s * fast::divide(1.0f, 1.0f + fast::exp(-s));
+                conv_state[local_row] = x1;
+                conv_state[c + local_row] = x2;
+                conv_state[2u * c + local_row] = local_sum;
+            }
         }
     }
 }
