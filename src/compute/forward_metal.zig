@@ -2966,6 +2966,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_repacked_k2048_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_nr2_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_nr2_qwen_pipe: MetalPipeline,
     dmmv_q8_0_repacked_quad_pipe: MetalPipeline,
@@ -3155,6 +3156,12 @@ pub const InferenceEngine = struct {
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
+    // Set true while `prefillBatch` (and queued-prefill variants) walk the
+    // prompt-token decode-path so dispatch sites that have cross-effort-
+    // sensitive kernel choices (e.g. cycle-75 `simd_sum(float2)` pack in
+    // dmmv_q8_0_repacked_k2048_nr2_qwen) can swap to a sibling that doesn't
+    // erode the prefill metric. Decode keeps its packed kernel by default.
+    in_prefill_phase: bool,
     qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
     fused_ssm_delta_gated_norm_enabled: bool,
@@ -3347,6 +3354,7 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.in_prefill_phase = false;
         self.qwen_ssm_prefill_proj_enabled =
             readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse
             readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse
@@ -3606,6 +3614,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
         self.dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
         self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
+        self.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked");
         self.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_dual_nr2_qwen");
         self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
         self.dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
@@ -4543,6 +4552,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_quad_pipe);
@@ -5023,6 +5033,9 @@ pub const InferenceEngine = struct {
     /// Run prompt prefill by replaying the decode path for each prompt token.
     pub fn prefillBatch(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
+        // Cross-effort gate: see `dispatchQ8RepackedDmmvOnCmd`.
+        self.in_prefill_phase = true;
+        defer self.in_prefill_phase = false;
 
         const prompt_token_count: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
         const target_context_tokens = if (state.requested_context_tokens > 0)
@@ -8130,7 +8143,18 @@ fn dispatchQ8RepackedDmmvOnCmd(
             const rows_per_wg: u32 = (block_size / 32) * 2;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
-            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            // Cross-effort gate: the cycle-75 `simd_sum(float2)` pack in the
+            // packed sibling banks a kept decode-tok/s win on the per-token
+            // attn_qkv hot path but contributed to the prefill metric drift
+            // (see cycle-78's rejected straight revert — decode regressed).
+            // During prefill, swap to the pre-pack two-scalar sibling so the
+            // cross-effort prefill measurement recovers without losing the
+            // decode bank.
+            const pipe = if (engine.in_prefill_phase and engine.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe.handle != null)
+                &engine.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe
+            else
+                &engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe;
+            cmd.dispatchV2(pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         },
         .tg128_k4096_qwen => {
             const block_size: u32 = 128;
@@ -8317,7 +8341,14 @@ fn dispatchDmmvOnCmdWithWeightBuf(
                 // Production Qwen3.6 SSM rows fill whole TG128 row groups, so
                 // the shader can omit the generic base-row tail guard.
                 recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
-                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                // Cross-effort gate: see the sibling note in
+                // dispatchQ8RepackedDmmvOnCmd — prefill paths take the
+                // unpacked variant; decode stays on the packed kernel.
+                const pipe = if (engine.in_prefill_phase and engine.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe.handle != null)
+                    &engine.dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe
+                else
+                    &engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe;
+                cmd.dispatchV2(pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
                 return;
             }
             if (K == 4096 and
@@ -25281,6 +25312,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_pipe);
     var dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+    var dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe);
     var dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_dual_nr2_qwen");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe);
     var dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
@@ -25436,6 +25469,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_repacked_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_quad_pipe.handle != null);
