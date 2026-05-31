@@ -9798,6 +9798,39 @@ fn dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
     // Cycle-42: TG_SIZE 512→1024 to widen simdgroup count from 16 to 32 in the
     // single-TG dispatch — the 256-expert router GEMM now runs 4 row_blocks
     // instead of 8, halving per-simdgroup work on the hottest timed kernel.
+    //
+    // Cycle 77 (analysis-only, NO production change): cycles 62-76 have plateaued
+    // on simd_sum packing variants of this and sibling kernels (decode tok/s
+    // 80.4–80.8, all within the noise band, kept for completeness). Smallest-
+    // named-bucket hypothesis from profile timing (1436 calls × ~37 us true =
+    // 53 ms/request true ≈ 17% of true decode time, after stripping the ~6.4×
+    // ZINC_METAL_KERNEL_TIMING distortion): this dispatch is single-core-bound
+    // on a 40-core GPU. Grid `.{1,1,1}` × block `.{1024,1,1}` = 32 simdgroups,
+    // which fully saturates ONE Apple9 core's simdgroup capacity but leaves
+    // the other 39 cores idle for the kernel's ~37 us. Cycle 42 already pushed
+    // simdgroups per TG to the per-core maximum, so further TG_SIZE/SIMD-pack
+    // retunes cannot escape the single-core ceiling. The remaining decode
+    // headroom on this kernel requires CROSS-CORE parallelism, not intra-TG
+    // tuning. Concrete next-cycle moves (each non-retune):
+    //   A. Split the router GEMM into N>1 TGs (e.g. 4 TGs × 64 experts each)
+    //      with a second `topk_reduce_shared_gate` dispatch that reads partial
+    //      expert scores from a small global buffer and produces the topk +
+    //      shared-gate scalar. Trades one dispatch+barrier per layer for 4×
+    //      cross-core parallelism on the router GEMM phase (~3-4 ms/req decode).
+    //   B. Keep the fusion but use `.{4,1,1}` grid where row 0 owns Phase 1+2
+    //      (residual+RMSNorm) and rows 1-3 own disjoint slices of Phase 3
+    //      (router GEMM). Requires inter-TG barrier (Metal `simdgroup_event`
+    //      or fence) which Apple9 supports but adds complexity.
+    //   C. Unfuse the router GEMM entirely, run as `dispatchGemmF32SmallOnCmd`
+    //      (forward_metal.zig:2686) which is already a multi-TG kernel, then
+    //      run a small `residual_rms_norm_topk_shared_gate.metal` fusion that
+    //      consumes precomputed router scores. Simplest impl, biggest dispatch
+    //      cost (+1 dispatch per layer × 40 layers = ~40 us overhead/token vs
+    //      a potential ~4 ms saving per token from 4× core utilization).
+    // Each requires writing/testing a new kernel; the per-call true time is
+    // 37 us (≈1500 us decode if naively 4× faster on this kernel ⇒ ~12% upside
+    // if all overhead absorbed). Recorded here so the next cycle can pick a
+    // path instead of repeating the simd_sum-pack plateau.
     cmd.dispatchV2(&engine.residual_rms_norm_router_f32_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
 }
 
