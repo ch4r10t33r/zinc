@@ -14860,6 +14860,186 @@ pub const InferenceEngine = struct {
         state.position = base_token + n_tokens - 1;
     }
 
+    /// Final full-attention layer shortcut for Qwen3.6-27B prefill.
+    ///
+    /// For the terminal transformer layer, non-last prompt tokens only need
+    /// their K/V cache entries preserved for future decode. Their Q/flash/O
+    /// output and dense FFN result feed no later layer and no logits. This
+    /// helper writes K/V for all prompt tokens; the caller then runs the
+    /// existing single-token final layer for only the last prompt token.
+    fn prefillQwen36RunFinalFullAttnKvOnly(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_k: Buffer,
+        scratch_v: Buffer,
+    ) !void {
+        if (n_tokens == 0) return;
+
+        const cfg = self.model.config;
+        const lt = self.layer_tensors[layer];
+        const eps = cfg.rms_norm_eps;
+        const layer_idx: usize = @intCast(layer);
+
+        const attn_norm_t = lt.attn_norm orelse return error.TensorNotFound;
+        const k_t = lt.attn_k orelse return error.TensorNotFound;
+        const v_t = lt.attn_v orelse return error.TensorNotFound;
+        const k_norm_t_opt = lt.attn_k_norm;
+
+        const k_rows: u32 = @intCast(k_t.info.numElements() / hidden_dim);
+        const v_rows: u32 = @intCast(v_t.info.numElements() / hidden_dim);
+        if (v_rows != k_rows) return error.UnsupportedPartialDecode;
+
+        const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+            @intCast(qn.info.numElements())
+        else if (k_norm_t_opt) |kn|
+            @intCast(kn.info.numElements())
+        else
+            cfg.head_dim;
+        if (layer_head_dim == 0) return error.UnsupportedPartialDecode;
+        if ((k_rows % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+
+        const layer_kv_dim: u32 = k_rows;
+        const layer_n_kv_heads: u32 = layer_kv_dim / layer_head_dim;
+        const layer_rope_dim: u32 = if (cfg.rope_dim > 0) @min(cfg.rope_dim, layer_head_dim) else layer_head_dim;
+        const kv_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, layer_kv_dim) *
+            @sizeOf(f32);
+        if (kv_total_bytes > scratch_k.size) return error.BufferTooSmall;
+        if (kv_total_bytes > scratch_v.size) return error.BufferTooSmall;
+
+        const use_imrope = cfg.rope_sections[0] > 0 or cfg.rope_sections[1] > 0;
+        const use_yarn = hasYarnScaling(&cfg);
+        const use_precomputed_freq = use_imrope or use_yarn;
+        const rope_freq: f32 = if (use_precomputed_freq) 0.0 else cfg.rope_freq_base;
+        const rope_attn_scale: f32 = if (use_yarn) effectiveRopeAttnScale(&cfg) else 1.0;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.transferToComputeBarrier();
+
+        const attention_phase = self.beginProfilePhase();
+
+        try self.dispatchRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            attn_norm_t.gpu_buffer.handle,
+            attn_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_dim,
+            n_tokens,
+            eps,
+        );
+        self.decode_cmd.computeBarrier();
+
+        try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
+        try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        self.decode_cmd.computeBarrier();
+
+        if (k_norm_t_opt) |k_norm_t| {
+            try self.dispatchRmsNorm(
+                scratch_k.handle,
+                scratch_k.size,
+                k_norm_t.gpu_buffer.handle,
+                k_norm_t.gpu_buffer.size,
+                scratch_k.handle,
+                scratch_k.size,
+                layer_head_dim,
+                layer_n_kv_heads * n_tokens,
+                eps,
+            );
+            self.decode_cmd.computeBarrier();
+        }
+
+        try self.dispatchRopeBatched(
+            scratch_k.handle,
+            scratch_k.size,
+            scratch_k.handle,
+            scratch_k.size,
+            self.rope_freq_buf.handle,
+            self.rope_freq_buf.size,
+            layer_head_dim,
+            layer_rope_dim,
+            layer_n_kv_heads,
+            base_token,
+            n_tokens,
+            rope_freq,
+            rope_attn_scale,
+        );
+        self.decode_cmd.computeBarrier();
+
+        try self.dispatchKvCacheWriteBatched(
+            scratch_k.handle,
+            scratch_k.size,
+            self.kv_k_cache[layer_idx].handle,
+            self.kv_k_cache[layer_idx].size,
+            scratch_v.handle,
+            scratch_v.size,
+            self.kv_v_cache[layer_idx].handle,
+            self.kv_v_cache[layer_idx].size,
+            self.page_table_buf.handle,
+            self.page_table_buf.size,
+            layer_kv_dim,
+            n_tokens,
+            kv_page_size_tokens,
+            base_token,
+        );
+
+        self.endProfilePhase(.attention, attention_phase);
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+
+        state.position = base_token + n_tokens - 1;
+    }
+
+    fn prefillQwen36RunFinalLayerLastToken(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        prompt_tokens: []const u32,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        layer: u32,
+        scratch_hidden: Buffer,
+    ) !void {
+        if (n_tokens == 0) return;
+
+        const last_idx = n_tokens - 1;
+        const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, last_idx) * hidden_size;
+        self.prefill_current_token_idx = last_idx;
+        state.position = base_token + last_idx;
+        self.partial_decode_start_layer = layer;
+        self.partial_decode_end_layer = layer + 1;
+        self.partial_decode_hidden_in = scratch_hidden.handle;
+        self.partial_decode_hidden_in_offset = hidden_offset;
+        self.partial_decode_hidden_out = scratch_hidden.handle;
+        self.partial_decode_hidden_out_offset = hidden_offset;
+        self.partial_decode_advance_position = false;
+        self.partial_decode_allow_final_tail = false;
+        self.partial_decode_stop_after_ffn_norm = false;
+        self.partial_decode_ffn_norm_out = null;
+        self.partial_decode_ffn_norm_out_offset = 0;
+
+        const saved_pipeline_mode = self.prefill_pipeline_mode;
+        self.prefill_pipeline_mode = true;
+        defer self.prefill_pipeline_mode = saved_pipeline_mode;
+        try self.decodeStep(state, prompt_tokens[last_idx], true);
+        try self.decode_cmd.waitForCompletion();
+    }
+
     /// Effort-15 cycle 13 gate: when true, the segment loop replaces the
     /// per-token full-attn partial loop with prefillQwen36RunFullAttnLayerToFfnNorm.
     /// Default-on for Qwen3.6-27B on RDNA with required pipelines present;
@@ -15442,6 +15622,31 @@ pub const InferenceEngine = struct {
                 self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens);
             const segment_layer_major = !segment_is_full_attn or segment_full_attn_layer_major;
             const segment_pre_quantized = segment_layer_major and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
+            const segment_is_final_layer = segment_layer + 1 == cfg.n_layers;
+            if (segment_is_final_layer and segment_full_attn_layer_major) {
+                try self.prefillQwen36RunFinalFullAttnKvOnly(
+                    state,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    segment_layer,
+                    scratch_hidden,
+                    scratch_norm,
+                    self.batched_scratch_k.?,
+                    self.batched_scratch_v.?,
+                );
+                try self.prefillQwen36RunFinalLayerLastToken(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    segment_layer,
+                    scratch_hidden,
+                );
+                tail_start_layer = segment_layer + 1;
+                continue;
+            }
             if (!segment_is_full_attn) {
                 try self.prefillQwen36RunSsmLayerToFfnNorm(
                     state,
