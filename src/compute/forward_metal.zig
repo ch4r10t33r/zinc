@@ -2954,6 +2954,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_k4096_quad_pipe: MetalPipeline,
     dmmv_q8_0_k2048_quad_pipe: MetalPipeline,
     dmmv_q8_0_k512_quad_pipe: MetalPipeline,
+    dmmv_q8_0_k512_quad_unpacked_pipe: MetalPipeline,
     dmmv_q8_0_quad_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
     dmmv_q8_0_pair_pipe: MetalPipeline,
@@ -3602,6 +3603,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096_quad");
         self.dmmv_q8_0_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_quad");
         self.dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+        self.dmmv_q8_0_k512_quad_unpacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad_unpacked");
         self.dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
         self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
@@ -4540,6 +4542,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k4096_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k512_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k512_quad_unpacked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
@@ -6273,7 +6276,29 @@ pub const InferenceEngine = struct {
                         // (SSM-gate). Adapted from llama.cpp
                         // `kernel_mul_mv_q8_0_f32_impl` (ggml-metal.metal)
                         // N_SG=1 fallback for short K rows.
-                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 32 };
+                        //
+                        // Cycle-80 cross-effort phase gate: cycle-70's eight-row
+                        // `simd_sum(float4)` pack reorders the per-simdgroup
+                        // reduction tree on this shared-down hot kernel (1436
+                        // calls/req in decode). The float4 butterfly halves
+                        // cross-lane shuffle traffic but changes the order of
+                        // floating-point additions vs the pre-pack eight scalar
+                        // `simd_sum` calls. Following cycle-79's resolution
+                        // recipe for `dmmv_q8_0_repacked_k2048_nr2_qwen` (which
+                        // recovered prefill via an `_unpacked` sibling), keep
+                        // the packed kernel for production decode and swap to
+                        // the pre-pack eight-scalar sibling during prefill so
+                        // the shared-down rounding tree matches the cycle-30
+                        // baseline. Decode benchmark is unchanged because
+                        // `engine.in_prefill_phase` is false during decode.
+                        const shared_down_pipe = if (self.in_prefill_phase and
+                            self.dmmv_q8_0_k512_quad_unpacked_pipe.handle != null and
+                            self.dmmv_q8_0_k512_quad_unpacked_pipe.thread_execution_width == 32 and
+                            self.dmmv_q8_0_k512_quad_unpacked_pipe.max_threads_per_threadgroup >= 32)
+                            &self.dmmv_q8_0_k512_quad_unpacked_pipe
+                        else
+                            &self.dmmv_q8_0_k512_quad_pipe;
+                        break :blk .{ .pipe = shared_down_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 32 };
                     }
                     if (prefer_qwen_shared_down_q8_quad and
                         self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
@@ -25304,6 +25329,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_k4096_quad_pipe);
     var dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_k512_quad_pipe);
+    var dmmv_q8_0_k512_quad_unpacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad_unpacked");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k512_quad_unpacked_pipe);
     var dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_quad_pipe);
     var dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
@@ -25465,6 +25492,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_k4096_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_k4096_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_k512_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k512_quad_unpacked_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_pipe.handle != null);
