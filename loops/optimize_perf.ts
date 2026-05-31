@@ -250,6 +250,27 @@ type EffortSpec = {
   // work from the plan document and the in-tree code. The agent is free to
   // ignore these; they are presented as options, not obligations.
   referenceImplementations?: Array<{ path: string; focus: string }>;
+  // llama.cpp baselines per scenario, used to render a "beat llama.cpp"
+  // delta block in the agent prompt. The loop's per-cycle benchmark only
+  // measures ONE scenario (the controller's primaryMetric), but the actual
+  // success goal is to beat llama.cpp on all four scenarios. Showing the
+  // gap explicitly stops the loop from optimizing in a single-metric
+  // vacuum and surfaces secondary scenarios the agent isn't measuring
+  // directly. The primary-metric scenario also gets a "to beat llama.cpp,
+  // you need X more tok/s (+Y%)" target that the agent can reason against.
+  llamaCppBaselines?: LlamaCppBaseline[];
+};
+
+export type LlamaCppBaseline = {
+  scenario: string;
+  prefillTokPerSec: number;
+  decodeTokPerSec: number;
+  // Which baseline corresponds to the loop's primaryMetric. Matched
+  // case-insensitively against primaryMetricLabel (e.g. a label of
+  // "Qwen3.6-27B prefill tok/s" matches isPrimary when metricMode is
+  // "prefill" and scenario contains "context-medium" — the controller's
+  // benchmark prompt is the site-aligned context-medium prefill).
+  isPrimary?: boolean;
 };
 
 const EFFORT_SPECS: Record<number, EffortSpec> = {
@@ -573,6 +594,16 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
         path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
         focus: "Historical RDNA Qwen prefill attempts, especially dormant tiled-GEMM lessons and SSM capture/validation failures.",
       },
+    ],
+    // llama.cpp baselines from the effort-doc measurement contract (R9700,
+    // RADV gfx1201, RADV_PERFTEST=coop_matrix). Stable per llama.cpp version;
+    // the project-success criterion is to beat these on at least 3 of 4
+    // scenarios across {prefill, decode}.
+    llamaCppBaselines: [
+      { scenario: "core",              prefillTokPerSec: 61.12,  decodeTokPerSec: 34.43 },
+      { scenario: "context-medium",    prefillTokPerSec: 195.01, decodeTokPerSec: 34.40, isPrimary: true },
+      { scenario: "context-long",      prefillTokPerSec: 69.89,  decodeTokPerSec: 44.33 },
+      { scenario: "decode-extended",   prefillTokPerSec: 97.29,  decodeTokPerSec: 31.29 },
     ],
   },
 };
@@ -1715,6 +1746,58 @@ export function detectCorrectnessStreak(cycles: CycleRecord[]): CorrectnessStrea
   };
 }
 
+/**
+ * Render the "beat llama.cpp" delta block: shows the controller's current
+ * best on its primary metric vs llama.cpp's number on the same metric,
+ * the absolute and relative gap to close, plus llama numbers on the other
+ * scenarios that the controller is NOT measuring directly. The point is
+ * to remind the agent that "best ZINC tok/s" is a means, not the end:
+ * the success criterion is beating llama.cpp on each scenario.
+ *
+ * When `bestTokPerSec` is null/0 (no measurement yet), the gap is shown
+ * as "—" rather than guessed.
+ */
+export function formatLlamaCppComparison(
+  baselines: LlamaCppBaseline[],
+  primaryMetricLabel: string,
+  metricMode: MetricMode,
+  bestTokPerSec: number | null,
+): string {
+  const primary = baselines.find((b) => b.isPrimary) ?? baselines[0];
+  if (!primary) return "";
+  const llamaPrimary = metricMode === "decode" ? primary.decodeTokPerSec : primary.prefillTokPerSec;
+  const ratioStr = bestTokPerSec != null && bestTokPerSec > 0
+    ? `${((bestTokPerSec / llamaPrimary) * 100).toFixed(1)}%`
+    : "—";
+  const gapAbs = bestTokPerSec != null && bestTokPerSec > 0
+    ? (llamaPrimary - bestTokPerSec).toFixed(2)
+    : "—";
+  const gapPct = bestTokPerSec != null && bestTokPerSec > 0
+    ? `${(((llamaPrimary - bestTokPerSec) / bestTokPerSec) * 100).toFixed(1)}%`
+    : "—";
+  const tier =
+    bestTokPerSec != null && bestTokPerSec >= llamaPrimary ? "BEATING llama.cpp ✓" :
+    bestTokPerSec != null && bestTokPerSec / llamaPrimary >= 0.9 ? "within striking distance (≥90%)" :
+    bestTokPerSec != null && bestTokPerSec / llamaPrimary >= 0.7 ? "closing the gap (70-90%)" :
+    "structural gap remains (<70%)";
+  const otherLines = baselines
+    .filter((b) => b !== primary)
+    .map((b) => `  - ${b.scenario.padEnd(18)} prefill: ${b.prefillTokPerSec.toFixed(2)} tok/s   decode: ${b.decodeTokPerSec.toFixed(2)} tok/s`)
+    .join("\n");
+  return [
+    `Primary metric (${primaryMetricLabel}):`,
+    `  ZINC best:       ${bestTokPerSec != null ? bestTokPerSec.toFixed(2) : "—"} tok/s`,
+    `  llama.cpp:       ${llamaPrimary.toFixed(2)} tok/s`,
+    `  ratio:           ${ratioStr}   (${tier})`,
+    `  gap to beat:     +${gapAbs} tok/s   (+${gapPct} on current best)`,
+    "",
+    `Other scenarios the loop is NOT measuring per-cycle (also count toward "beat llama.cpp on all 4"):`,
+    otherLines,
+    "",
+    `Project success rule (from MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md): beat llama.cpp on at least 3 of 4 decode scenarios AND keep prefill ≤ 20% behind on every context scenario. A change that improves the controller's prompt but regresses an other scenario does not count. If you are within ~10% of llama.cpp on the primary, prefer the structural lever (validated layer-major batched SSM+dense prefill, Tracks 1-3 in the effort doc) over more micro-fusion — micro-fusion compounds slower than structural batching at this scale.`,
+  ].join("\n");
+}
+
 export function formatCorrectnessStreakWarning(w: CorrectnessStreakWarning): string {
   const filesHint = w.sharedFiles.length
     ? ` Files touched by multiple failed cycles (most likely buggy path): ${w.sharedFiles.slice(0, 5).join(", ")}.`
@@ -1786,6 +1869,8 @@ export function buildAgentPrompt(
     knownFlatCategories?: string[];
     structuralSwingIdeas?: string[];
     referenceImplementations?: Array<{ path: string; focus: string }>;
+    llamaCppBaselines?: LlamaCppBaseline[];
+    metricMode?: MetricMode;
     mode?: "normal" | "pivot";
   } = {},
 ): string {
@@ -1833,6 +1918,15 @@ export function buildAgentPrompt(
   const correctnessStreak = context ? detectCorrectnessStreak(context.cycles) : null;
   const correctnessStreakBlock = correctnessStreak
     ? formatCorrectnessStreakWarning(correctnessStreak)
+    : null;
+
+  const llamaCppBlock = options.llamaCppBaselines && options.llamaCppBaselines.length > 0
+    ? formatLlamaCppComparison(
+        options.llamaCppBaselines,
+        options.primaryMetricLabel ?? "primary metric",
+        options.metricMode ?? "prefill",
+        bestPerf.tokPerSec,
+      )
     : null;
 
   const knownFlatBlock = options.knownFlatCategories?.length
@@ -1893,7 +1987,7 @@ ${currentVsBestNote}
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}
@@ -1997,6 +2091,8 @@ export function buildPivotPrompt(
     knownFlatCategories?: string[];
     structuralSwingIdeas?: string[];
     referenceImplementations?: Array<{ path: string; focus: string }>;
+    llamaCppBaselines?: LlamaCppBaseline[];
+    metricMode?: MetricMode;
   },
 ): string {
   const modelTarget = MODELS[model] ?? MODELS.qwen36b;
@@ -2035,6 +2131,14 @@ export function buildPivotPrompt(
         .map((r, i) => `${i + 1}. ${r.path} — ${r.focus}`)
         .join("\n")
     : null;
+  const llamaCppBlock = options.llamaCppBaselines && options.llamaCppBaselines.length > 0
+    ? formatLlamaCppComparison(
+        options.llamaCppBaselines,
+        primaryMetricLabel,
+        options.metricMode ?? "prefill",
+        currentBest.tokPerSec,
+      )
+    : null;
 
   return `You are in a PIVOT cycle for the ZINC Vulkan inference engine. The loop has been stalled — recent cycles are not moving the primary metric. Before another speculative change, stop and review.
 
@@ -2049,7 +2153,7 @@ ${plan}
 - ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
+${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
 ## Committed Foundations From Recent Cycles
 ${committedFoundations}
 
@@ -2737,6 +2841,8 @@ async function spawnAgent(
     knownFlatCategories: effortSpec?.knownFlatCategories,
     structuralSwingIdeas: effortSpec?.structuralSwingIdeas,
     referenceImplementations: effortSpec?.referenceImplementations,
+    llamaCppBaselines: effortSpec?.llamaCppBaselines,
+    metricMode: effortSpec?.metricMode,
     mode: isPivot ? "pivot" : "normal",
   });
   if (isPivot) {

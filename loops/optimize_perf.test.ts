@@ -17,6 +17,7 @@ import {
   formatCodexStreamLine,
   formatCoherenceFailureList,
   formatCorrectnessStreakWarning,
+  formatLlamaCppComparison,
   formatPhaseBudget,
   formatToolInput,
   formatClaudeStreamLine,
@@ -1888,6 +1889,55 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
+  });
+});
+
+describe("formatLlamaCppComparison", () => {
+  const baselines = [
+    { scenario: "core",            prefillTokPerSec: 61.12,  decodeTokPerSec: 34.43 },
+    { scenario: "context-medium",  prefillTokPerSec: 195.01, decodeTokPerSec: 34.40, isPrimary: true },
+    { scenario: "context-long",    prefillTokPerSec: 69.89,  decodeTokPerSec: 44.33 },
+    { scenario: "decode-extended", prefillTokPerSec: 97.29,  decodeTokPerSec: 31.29 },
+  ];
+
+  test("shows primary ratio, gap-to-beat, and the other-scenario block", () => {
+    const out = formatLlamaCppComparison(baselines, "Qwen3.6-27B prefill tok/s", "prefill", 150.95);
+    expect(out).toContain("150.95");
+    expect(out).toContain("195.01");
+    expect(out).toContain("77.4%"); // 150.95/195.01
+    expect(out).toContain("+44.06"); // 195.01-150.95
+    expect(out).toContain("+29.2%"); // (195.01-150.95)/150.95 = 29.2%
+    expect(out).toContain("core");
+    expect(out).toContain("context-long");
+    expect(out).toContain("decode-extended");
+  });
+
+  test("classifies tier as 'closing the gap (70-90%)' at 77%", () => {
+    const out = formatLlamaCppComparison(baselines, "x", "prefill", 150.95);
+    expect(out).toContain("closing the gap");
+  });
+
+  test("classifies tier as 'BEATING llama.cpp ✓' when ahead", () => {
+    const out = formatLlamaCppComparison(baselines, "x", "prefill", 200.0);
+    expect(out).toContain("BEATING llama.cpp");
+  });
+
+  test("classifies tier as 'within striking distance' at >=90%", () => {
+    const out = formatLlamaCppComparison(baselines, "x", "prefill", 180.0);
+    expect(out).toContain("within striking distance");
+  });
+
+  test("handles null/zero bestTokPerSec without crashing or fabricating numbers", () => {
+    const out = formatLlamaCppComparison(baselines, "x", "prefill", null);
+    expect(out).toContain("—");
+    expect(out).not.toContain("NaN");
+    expect(out).not.toContain("Infinity");
+  });
+
+  test("uses decode baseline when metricMode is decode", () => {
+    const out = formatLlamaCppComparison(baselines, "decode tok/s", "decode", 28.0);
+    expect(out).toContain("34.40"); // primary decode baseline
+    expect(out).not.toContain("195.01"); // not the prefill row
   });
 });
 
