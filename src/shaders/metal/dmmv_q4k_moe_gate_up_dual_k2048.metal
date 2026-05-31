@@ -119,10 +119,24 @@ kernel void main0(
         accumulate_q4k_direct(up_row + ulong(bi) * 144ul, input, bi, uint(lane), up_acc);
     }
 
-    const float gate_sum = simd_sum(gate_acc);
-    const float up_sum = simd_sum(up_acc);
+    // Pack the two per-row simdgroup reductions into one `simd_sum(float2)`
+    // — Apple9's vector `simd_sum` lowers to a single log2(32)=5-level
+    // butterfly that transfers a 64-bit packed lane per `shuffle_xor`
+    // instead of two independent 32-bit trees, cutting cross-lane shuffle
+    // traffic ~2× on the per-simdgroup tail. Same proven pattern as
+    // cycle ~63 (`dmmv_q4k_moe_gate_up_swiglu_k2048.metal` — the SwiGLU-
+    // fused sibling that production decode takes via the Qwen3.6 MoE
+    // gate-up path) applied here to the non-fused validation/fallback
+    // dual variant (qwen_prefill_validation / debug / gemma_moe_validation
+    // paths and the M=17 partial-WG test). The downstream lane-0
+    // writeback consumes both sums as simdgroup-uniform scalars
+    // (component access on the simdgroup-uniform float2), so picking
+    // float2 components is bit-equivalent to the prior two scalar
+    // `simd_sum` calls. Writebacks stay lane-0 serial since gateY and
+    // upY are disjoint buffers (no coalesce opportunity between them).
+    const float2 sums = simd_sum(float2(gate_acc, up_acc));
     if (lane == 0u) {
-        gateY[p.gate_y_offset / 4u + expert_slot * p.M + row] = gate_sum;
-        upY[p.up_y_offset / 4u + expert_slot * p.M + row] = up_sum;
+        gateY[p.gate_y_offset / 4u + expert_slot * p.M + row] = sums.x;
+        upY[p.up_y_offset / 4u + expert_slot * p.M + row] = sums.y;
     }
 }
