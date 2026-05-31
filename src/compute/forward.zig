@@ -13101,6 +13101,7 @@ pub const InferenceEngine = struct {
         // its standalone Q8_0 quantize + barrier and routes the Q6_K GEMM
         // through the Q8_1-input shader variant (`.x` of vec2 scale_dsum).
         input_pre_quantized_q8_1: bool,
+        pre_quantized_cols: u32,
     ) !bool {
         // Threshold 128 matches the dense-down/gate-up DP4a path: under ~128
         // tokens the one-shot quantize pre-pass + extra dispatch/barrier outweighs
@@ -13128,7 +13129,39 @@ pub const InferenceEngine = struct {
             self.batched_scratch_norm_q8 != null and
             self.batched_scratch_norm_q8_scale != null;
         if (!dp4a_ok_shared and !dp4a_ok_standalone) return false;
-        const full_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = n_tokens & ~@as(u32, 31);
+        if (input_pre_quantized_q8_1 and pre_quantized_cols > full_cols) {
+            full_cols = pre_quantized_cols;
+        } else if (!input_pre_quantized_q8_1) {
+            const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+            if (padded_cols > full_cols) {
+                const norm_i8 = self.batched_scratch_norm_q8.?;
+                const norm_scale = self.batched_scratch_norm_q8_scale.?;
+                const need_input: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim) *
+                    @sizeOf(f32);
+                const need_i8: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                    @sizeOf(u32);
+                const need_scale: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                    @sizeOf(f32);
+                const need_output: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, conv_channels) *
+                    @sizeOf(f32);
+                if (scratch_norm.size >= need_input and
+                    norm_i8.size >= need_i8 and
+                    norm_scale.size >= need_scale and
+                    scratch_qkv.size >= need_output)
+                {
+                    full_cols = padded_cols;
+                }
+            }
+        }
         if (full_cols == 0) return false;
         const push_fn = self.instance.push_descriptor_fn;
         if (dp4a_ok_shared) {
@@ -13246,6 +13279,7 @@ pub const InferenceEngine = struct {
         // consumed by the Q6_K wqkv DP4a path). Skip the standalone Q8_1
         // quantize + barrier; the GEMM stays the same.
         input_pre_quantized_q8_1: bool,
+        pre_quantized_cols: u32,
     ) !bool {
         // Threshold 128 matches the dense-down/gate-up/wqkv DP4a paths: under
         // ~128 tokens the one-shot quantize pre-pass + extra dispatch/barrier
@@ -13262,7 +13296,40 @@ pub const InferenceEngine = struct {
             self.batched_scratch_hidden_i8 != null and
             self.batched_scratch_hidden_scale_dsum != null;
         if (!dp4a_ok) return false;
-        const full_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = n_tokens & ~@as(u32, 31);
+        if (input_pre_quantized_q8_1 and pre_quantized_cols > full_cols) {
+            full_cols = pre_quantized_cols;
+        } else if (!input_pre_quantized_q8_1) {
+            const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+            if (padded_cols > full_cols) {
+                const norm_i8 = self.batched_scratch_hidden_i8.?;
+                const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
+                const need_input: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim) *
+                    @sizeOf(f32);
+                const need_i8: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                    @sizeOf(u32);
+                const need_sd: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                    2 *
+                    @sizeOf(f32);
+                const need_output: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, d_inner) *
+                    @sizeOf(f32);
+                if (scratch_norm.size >= need_input and
+                    norm_i8.size >= need_i8 and
+                    norm_sd.size >= need_sd and
+                    scratch_z.size >= need_output)
+                {
+                    full_cols = padded_cols;
+                }
+            }
+        }
         if (full_cols == 0) return false;
         const norm_i8 = self.batched_scratch_hidden_i8.?;
         const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
@@ -13374,7 +13441,7 @@ pub const InferenceEngine = struct {
             self.batched_scratch_hidden_i8 != null and
             self.batched_scratch_hidden_scale_dsum != null;
         if (!dp4a_ok) return false;
-        const full_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols == 0) return false;
         // Make sure the borrowed buffers cover this layer's K=d_inner stride.
         // hidden_i8 is sized for n*hidden_dim/4 u32; we need n*d_inner/4.
@@ -13383,6 +13450,33 @@ pub const InferenceEngine = struct {
         // but the runtime check guards against future shape drift.
         const act_i8 = self.batched_scratch_hidden_i8.?;
         const act_sd = self.batched_scratch_hidden_scale_dsum.?;
+        const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > full_cols) {
+            const need_input: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, d_inner) *
+                @sizeOf(f32);
+            const need_i8: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, d_inner / 4) *
+                @sizeOf(u32);
+            const need_sd: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, d_inner / 32) *
+                2 *
+                @sizeOf(f32);
+            const need_output: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, hidden_dim) *
+                @sizeOf(f32);
+            if (scratch_swiglu.size >= need_input and
+                act_i8.size >= need_i8 and
+                act_sd.size >= need_sd and
+                scratch_down.size >= need_output)
+            {
+                full_cols = padded_cols;
+            }
+        }
         const need_i8_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, full_cols) * @as(vk.c.VkDeviceSize, d_inner / 4) * @sizeOf(u32);
         const need_sd_bytes: vk.c.VkDeviceSize =
@@ -13854,12 +13948,13 @@ pub const InferenceEngine = struct {
             // (no per-block bias term), so the Q8_1 buffer is a valid input
             // for both kernels. Saves one quantize_act dispatch + one barrier
             // per SSM layer (~32 SSM layers in Qwen3.6-27B).
-            const shared_q8_1_full_cols = n_tokens & ~@as(u32, 31);
+            const shared_q8_1_floor_cols = n_tokens & ~@as(u32, 31);
+            var shared_q8_1_cols = shared_q8_1_floor_cols;
             const shared_q8_1_ok = self.qwen36Dp4aDownEnabled() and
                 wqkv_t.info.type_ == .q6_k and
                 z_t.info.type_ == .q4_k and
                 n_tokens >= 128 and
-                shared_q8_1_full_cols > 0 and
+                shared_q8_1_floor_cols > 0 and
                 (hidden_dim & 255) == 0 and
                 (conv_channels & 31) == 0 and
                 (d_inner & 31) == 0 and
@@ -13873,6 +13968,38 @@ pub const InferenceEngine = struct {
             if (shared_q8_1_ok) {
                 const norm_i8 = self.batched_scratch_hidden_i8.?;
                 const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
+                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+                if (padded_cols > shared_q8_1_floor_cols) {
+                    const need_input: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim) *
+                        @sizeOf(f32);
+                    const need_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                        @sizeOf(u32);
+                    const need_sd: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                        2 *
+                        @sizeOf(f32);
+                    const need_qkv: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, conv_channels) *
+                        @sizeOf(f32);
+                    const need_z: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, d_inner) *
+                        @sizeOf(f32);
+                    if (scratch_norm.size >= need_input and
+                        norm_i8.size >= need_i8 and
+                        norm_sd.size >= need_sd and
+                        scratch_gate.size >= need_qkv and
+                        scratch_up.size >= need_z)
+                    {
+                        shared_q8_1_cols = padded_cols;
+                    }
+                }
                 try self.dmmv.recordQuantizeActQ8_1(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
@@ -13882,7 +14009,7 @@ pub const InferenceEngine = struct {
                     norm_i8.size,
                     norm_sd.handle,
                     norm_sd.size,
-                    shared_q8_1_full_cols,
+                    shared_q8_1_cols,
                     hidden_dim,
                 );
                 const i8_ranges = [_]CommandBuffer.BufferRange{
@@ -13893,14 +14020,14 @@ pub const InferenceEngine = struct {
             }
 
             const ssm_proj_qkv_phase = self.beginProfilePhase();
-            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens, shared_q8_1_ok);
+            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
             if (!wqkv_dp4a) {
                 try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
             }
             self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
 
             const ssm_proj_z_phase = self.beginProfilePhase();
-            const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens, shared_q8_1_ok);
+            const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
             if (!z_dp4a) {
                 try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
             }
