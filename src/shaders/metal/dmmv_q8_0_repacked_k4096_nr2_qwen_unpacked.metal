@@ -9,11 +9,16 @@ struct DmmvPush {
     uint y_offset;
 };
 
-// Exact even-row Qwen3.6 SSM Q8_0 repacked DMMV for K=4096.
+// Pre-pack variant of dmmv_q8_0_repacked_k4096_nr2_qwen.metal.
 //
-// Keeps the accepted llama.cpp-style TG128/two-row geometry for ssm_out while
-// removing the generic tail-row branch. Production Qwen3.6 ssm_out rows are
-// even, so the guarded dispatch below keeps tail cases on the older shader.
+// Identical kernel except the per-row simdgroup reduction tail uses two
+// scalar `simd_sum(float)` calls instead of the packed `simd_sum(float2)`
+// pattern. Kept reachable so the prefill path (selected when
+// `engine.in_prefill_phase == true`) can sidestep any cross-effort prefill
+// drift the float2 pack might contribute without giving up the per-decode-
+// token win it banks on the hot SSM `ssm_out` path. Mirrors the gating
+// pattern of `dmmv_q8_0_repacked_k2048_nr2_qwen_unpacked.metal` introduced
+// in cycle ~79. See the dispatch routing in `dispatchQ8RepackedDmmvOnCmd`.
 kernel void main0(
     constant DmmvPush& p [[buffer(0)]],
     device const uchar* W [[buffer(1)]],
@@ -58,28 +63,9 @@ kernel void main0(
         }
     }
 
-    // Pack the two per-row simdgroup reductions into a single
-    // `simd_sum(float2)` — Apple9's vector `simd_sum` lowers to one
-    // log2(32)=5-level butterfly that transfers a 64-bit packed lane per
-    // `shuffle_xor` instead of two independent 32-bit trees, cutting cross-
-    // lane shuffle traffic ~2× on the per-simdgroup tail of hot kernel #4
-    // by streamed bytes (SSM `ssm_out` M=2048 K=4096, 8.96 GiB/req across
-    // 1080 calls — every SSM layer per decode token). K=4096 sibling of the
-    // cycle ~75 K=2048 nr2 qwen pack. Same proven pattern as cycle ~82
-    // (`dmmv_q8_0_repacked_k2048_dual_nr2_qwen`) and cycle ~83
-    // (`dmmv_q8_0_pair`). Downstream lane<2 writeback consumes the sums
-    // as simdgroup-uniform scalars (component access on the simdgroup-
-    // uniform float2), so picking float2 components by lane is bit-
-    // equivalent.
-    const float2 sums = simd_sum(float2(acc0, acc1));
-    // Distribute the two row writes across lanes 0 and 1 so the pair of
-    // output stores at base_row..base_row+1 issues as one coalesced 8-byte
-    // transaction (sibling of cycle-45 k2048_nr2_qwen, cycle-43 pair-swiglu,
-    // cycle-32 conv1d, cycle-38/39 4-row writeback pattern). M is guaranteed
-    // to be a multiple of `rows_per_wg=8` by the dispatcher (see
-    // forward_metal.zig M % rows_per_wg == 0 guard before `tg128_k4096_qwen`
-    // selection), so base_row + 1 is always in range.
+    const float sum0 = simd_sum(acc0);
+    const float sum1 = simd_sum(acc1);
     if (lane < 2u) {
-        output[base_row + lane] = (lane == 0u) ? sums.x : sums.y;
+        output[base_row + lane] = (lane == 0u) ? sum0 : sum1;
     }
 }
