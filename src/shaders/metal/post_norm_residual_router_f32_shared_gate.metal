@@ -123,13 +123,30 @@ kernel void main0(
                 }
             }
 
-            const float sum0 = simd_sum(acc0);
-            const float sum1 = simd_sum(acc1);
-            if (lane == 0u) {
-                values[base_row] = sum0;
-                if (base_row + 1u < p.n_experts) {
-                    values[base_row + 1u] = sum1;
-                }
+            // Pack the two router-GEMM final-reduction `simd_sum` calls into
+            // a single `simd_sum(float2)` + lane-parallel 2-row writeback —
+            // Apple9's vector `simd_sum` lowers to one log2(32)=5-level
+            // butterfly that transfers 64-bit packed lanes per `shuffle_xor`
+            // instead of two independent 32-bit trees, cutting cross-lane
+            // shuffle traffic ~2× on the per-simdgroup tail. Same proven
+            // pattern as cycle ~65 on the SSM-boundary sibling
+            // `residual_rms_norm_router_f32_topk.metal` (lines 177-193) and
+            // cycles 75/82/83/86/87/88 across the Q8 dual/quad family. This
+            // kernel fires on every Qwen3.6 full-attention decode-token
+            // boundary (10 attn layers × per-step ≈ 360 calls/req); with
+            // TG_SIZE=512/SG_PER_TG=16 and 256 experts → 8 row_blocks × 16
+            // simdgroups ≈ 128 reduction tails per call ≈ 46K per request.
+            // acc1 stays semantic even when `base_row + 1u >= p.n_experts`
+            // (always zero — the inner accumulate predicate gated the dot
+            // product); the `store_row < p.n_experts` predicate below still
+            // gates the write. Lane-parallel writeback issues two coalesced
+            // stores at consecutive TG-mem slots in a single SIMD scatter
+            // instead of lane 0 doing two serial stores.
+            const float2 sums = simd_sum(float2(acc0, acc1));
+            const uint store_row = base_row + lane;
+            if (lane < 2u && store_row < p.n_experts) {
+                const float val = (lane == 0u) ? sums.x : sums.y;
+                values[store_row] = val;
             }
         }
     }
