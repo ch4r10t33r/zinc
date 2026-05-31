@@ -10070,7 +10070,7 @@ fn canUseQwenPostNormResidualRouterF32SharedGate(
         gate.info.numElements() == hidden_dim and
         engine.post_norm_residual_router_f32_shared_gate_pipe.handle != null and
         engine.post_norm_residual_router_f32_shared_gate_pipe.thread_execution_width == 32 and
-        engine.post_norm_residual_router_f32_shared_gate_pipe.max_threads_per_threadgroup >= 512;
+        engine.post_norm_residual_router_f32_shared_gate_pipe.max_threads_per_threadgroup >= 1024;
 }
 
 fn dispatchQwenPostNormResidualRouterF32SharedGateOnCmd(
@@ -10113,7 +10113,7 @@ fn dispatchQwenPostNormResidualRouterF32SharedGateOnCmd(
         &shared_gate.gpu_buffer,
         shared_gate_output,
     };
-    cmd.dispatchV2(&engine.post_norm_residual_router_f32_shared_gate_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRouterF32SharedGatePush), 1);
+    cmd.dispatchV2(&engine.post_norm_residual_router_f32_shared_gate_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRouterF32SharedGatePush), 1);
 }
 
 /// Dispatch a Q4_K × f32 batched matmul.

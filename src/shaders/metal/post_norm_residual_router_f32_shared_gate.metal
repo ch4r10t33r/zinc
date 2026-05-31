@@ -24,7 +24,20 @@ struct Params {
     uint output_stride;
 };
 
-#define TG_SIZE 512
+// Cycle ~92: bump TG_SIZE 512→1024 to match the SSM-boundary sibling
+// `residual_rms_norm_router_f32_topk.metal` (cycle-42, TG_SIZE=1024).
+// Dispatch is single-TG (`.{1,1,1}` × `.{TG_SIZE,1,1}` in
+// `dispatchQwenPostNormResidualRouterF32SharedGateOnCmd`) so bumping does NOT
+// reduce in-flight TG count — it only adds simdgroups within the same TG.
+// With SG_PER_TG=32 and ROWS_PER_TG = SG_PER_TG * 2 = 64, the 256-expert
+// router GEMM completes in 4 sequential row_blocks instead of 8: per-simdgroup
+// work halves on the full-attn-boundary decode-token kernel (~360 calls/req
+// across 10 attn layers). Shared mem stays well under Apple9's 32 KB/TG limit
+// (~17 KB: x_cache4 16 KB + values 1 KB + small partials). Distinct from the
+// failed cycle-42 attempt on `dmmv_q4k_moe_gate_up_swiglu_k2048` which was a
+// many-TG DMMV shader where bumping reduced TG-level parallelism; here the
+// single-TG geometry means strictly more parallelism with no tradeoff.
+#define TG_SIZE 1024
 #define SG_PER_TG (TG_SIZE / 32)
 #define MAX_EXPERTS 256
 #define MAX_K_USED 16
@@ -171,8 +184,10 @@ kernel void main0(
     // and (b) parallelizes the shared_total store with sg 0's ~400-cycle top-k
     // loop — the two are data-independent (top-k reads `values[]`, this reads
     // `shared_partials[]` and writes `shared_gate_out[0]`, distinct buffers).
-    // Lane mask `(lane < SG_PER_TG)` is needed because SG_PER_TG=16 here (vs
-    // 32 in the TG_SIZE=1024 sibling); sg 1 always exists with TG_SIZE=512.
+    // Post-cycle-92 TG bump: SG_PER_TG=32 now matches the SSM-boundary sibling
+    // exactly, so the `(lane < SG_PER_TG)` mask becomes `(lane < 32)` which is
+    // identically true across the 32-lane simdgroup; compiler will fold it.
+    // sg 1 always exists (N_SIMDGROUPS=32).
     // Hot user: every Qwen3.6 full-attention decode-token boundary (10 attn
     // layers × per-step ≈ 360 calls/req).
     if (sg_idx == 1u) {
