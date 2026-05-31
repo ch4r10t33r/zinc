@@ -1328,6 +1328,7 @@ pub const InferenceEngine = struct {
     dense_prefill_validate_layer: u32 = 0,
     dense_prefill_validate_max_tokens: u32 = 0,
     dense_prefill_validate_captured_tokens: u32 = 0,
+    dense_prefill_validate_production: bool = false,
     dense_prefill_validate_norm_ref: ?Buffer = null,
     dense_prefill_validate_pre_hidden_ref: ?Buffer = null,
     dense_prefill_validate_post_hidden_ref: ?Buffer = null,
@@ -2772,8 +2773,14 @@ pub const InferenceEngine = struct {
 
         const dense_prefill_validate_env = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE");
         const dense_prefill_validate_requested = dense_prefill_validate_env != null and
-            std.mem.eql(u8, dense_prefill_validate_env.?, "1");
+            (std.mem.eql(u8, dense_prefill_validate_env.?, "1") or
+                std.mem.eql(u8, dense_prefill_validate_env.?, "prod") or
+                std.mem.eql(u8, dense_prefill_validate_env.?, "production"));
+        const dense_prefill_validate_production_requested = dense_prefill_validate_env != null and
+            (std.mem.eql(u8, dense_prefill_validate_env.?, "prod") or
+                std.mem.eql(u8, dense_prefill_validate_env.?, "production"));
         var dense_prefill_validate_enabled = false;
+        var dense_prefill_validate_production = false;
         var dense_prefill_validate_layer: u32 = 0;
         var dense_prefill_validate_max_tokens: u32 = 0;
         var dense_prefill_validate_norm_ref: ?Buffer = null;
@@ -2792,8 +2799,10 @@ pub const InferenceEngine = struct {
             inter_val > 0)
         {
             const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
-            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch 16 else 16;
-            dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), @as(u32, 16));
+            const default_tokens: u32 = if (dense_prefill_validate_production_requested) 128 else 16;
+            const max_tokens_cap: u32 = if (dense_prefill_validate_production_requested) 192 else 16;
+            const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch default_tokens else default_tokens;
+            dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), max_tokens_cap);
             const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
             const parsed_layer = if (raw_layer) |raw| std.fmt.parseInt(u32, raw, 10) catch 0 else 0;
             dense_prefill_validate_layer = @min(parsed_layer, config.n_layers - 1);
@@ -2815,16 +2824,21 @@ pub const InferenceEngine = struct {
             errdefer if (dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
             dense_prefill_validate_post_hidden_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
             errdefer if (dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
-            dense_prefill_validate_gate_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
-            errdefer if (dense_prefill_validate_gate_ref) |*b| b.deinit();
-            dense_prefill_validate_up_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
-            errdefer if (dense_prefill_validate_up_ref) |*b| b.deinit();
-            dense_prefill_validate_swiglu_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
-            errdefer if (dense_prefill_validate_swiglu_ref) |*b| b.deinit();
-            dense_prefill_validate_down_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
-            errdefer if (dense_prefill_validate_down_ref) |*b| b.deinit();
+            if (!dense_prefill_validate_production_requested) {
+                dense_prefill_validate_gate_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+                errdefer if (dense_prefill_validate_gate_ref) |*b| b.deinit();
+                dense_prefill_validate_up_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+                errdefer if (dense_prefill_validate_up_ref) |*b| b.deinit();
+                dense_prefill_validate_swiglu_ref = try Buffer.initDeviceLocal(instance, inter_capture_bytes, usage_ref);
+                errdefer if (dense_prefill_validate_swiglu_ref) |*b| b.deinit();
+                dense_prefill_validate_down_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+                errdefer if (dense_prefill_validate_down_ref) |*b| b.deinit();
+            }
 
-            const staging_bytes = hidden_capture_bytes * 4 + inter_capture_bytes * 6;
+            const staging_bytes = if (dense_prefill_validate_production_requested)
+                hidden_capture_bytes * 2
+            else
+                hidden_capture_bytes * 4 + inter_capture_bytes * 6;
             dense_prefill_validate_staging = try Buffer.init(
                 instance,
                 staging_bytes,
@@ -2841,15 +2855,18 @@ pub const InferenceEngine = struct {
                 }
             }
             dense_prefill_validate_enabled = true;
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B (replays chunks 4/8/16 when captured)", .{
+            dense_prefill_validate_production = dense_prefill_validate_production_requested;
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE={s}: dense FFN validator layer={d} tokens={d} hidden={d} inter={d} staging={d} B ({s})", .{
+                if (dense_prefill_validate_production_requested) @as([]const u8, "prod") else @as([]const u8, "1"),
                 dense_prefill_validate_layer,
                 dense_prefill_validate_max_tokens,
                 config.hidden_dim,
                 inter_val,
                 staging_bytes,
+                if (dense_prefill_validate_production_requested) @as([]const u8, "production DP4a replay") else @as([]const u8, "f32 intermediate replay chunks 4/8/16"),
             });
         } else if (dense_prefill_validate_requested) {
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1 requested but prerequisites missing (requires dense SSM model with nonzero hidden/intermediate dims); skipping", .{});
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE requested but prerequisites missing (requires dense SSM model with nonzero hidden/intermediate dims); skipping", .{});
         }
 
         var ssm_prefill_validate_enabled = false;
@@ -2866,7 +2883,7 @@ pub const InferenceEngine = struct {
         var ssm_prefill_validate_post_hidden_ref: ?Buffer = null;
         var ssm_prefill_validate_state_backup: ?Buffer = null;
         var ssm_prefill_validate_staging: ?Buffer = null;
-        if (dense_prefill_validate_enabled and config.ssm_d_inner > 0 and config.ssm_dt_rank > 0) {
+        if (dense_prefill_validate_enabled and !dense_prefill_validate_production and config.ssm_d_inner > 0 and config.ssm_dt_rank > 0) {
             const full_attn_interval_v: u32 = if (config.full_attn_interval > 0) config.full_attn_interval else 1;
             const validate_layer_is_ssm = ((dense_prefill_validate_layer + 1) % full_attn_interval_v) != 0;
             const lt_validate = layer_tensors[dense_prefill_validate_layer];
@@ -3036,6 +3053,7 @@ pub const InferenceEngine = struct {
             .use_qwen36_dense_prefill_validate = dense_prefill_validate_enabled,
             .dense_prefill_validate_layer = dense_prefill_validate_layer,
             .dense_prefill_validate_max_tokens = dense_prefill_validate_max_tokens,
+            .dense_prefill_validate_production = dense_prefill_validate_production,
             .dense_prefill_validate_norm_ref = dense_prefill_validate_norm_ref,
             .dense_prefill_validate_pre_hidden_ref = dense_prefill_validate_pre_hidden_ref,
             .dense_prefill_validate_post_hidden_ref = dense_prefill_validate_post_hidden_ref,
@@ -8612,10 +8630,11 @@ pub const InferenceEngine = struct {
                     self.dense_prefill_validate_norm_ref != null and
                     self.dense_prefill_validate_pre_hidden_ref != null and
                     self.dense_prefill_validate_post_hidden_ref != null and
-                    self.dense_prefill_validate_gate_ref != null and
-                    self.dense_prefill_validate_up_ref != null and
-                    self.dense_prefill_validate_swiglu_ref != null and
-                    self.dense_prefill_validate_down_ref != null;
+                    (self.dense_prefill_validate_production or
+                        (self.dense_prefill_validate_gate_ref != null and
+                            self.dense_prefill_validate_up_ref != null and
+                            self.dense_prefill_validate_swiglu_ref != null and
+                            self.dense_prefill_validate_down_ref != null));
                 if (dense_prefill_validate_capture) {
                     const tok_idx = self.prefill_current_token_idx;
                     const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
@@ -8637,7 +8656,7 @@ pub const InferenceEngine = struct {
                     self.dmmv.pipeline_q4k_fused_gate_up_swiglu != null and
                     config.architecture != .gemma and
                     config.architecture != .gpt_oss and
-                    !dense_prefill_validate_capture and
+                    (!dense_prefill_validate_capture or self.dense_prefill_validate_production) and
                     gate_tensor.info.type_ == .q4_k and
                     up_tensor.info.type_ == .q4_k and
                     (inter_dim <= 12288 or qwen36_row1_dense_eligible) and
@@ -8661,7 +8680,7 @@ pub const InferenceEngine = struct {
                     };
                     self.decode_cmd.computeBuffersBarrier(&dense_gateup_ranges);
 
-                    if (dense_prefill_validate_capture) {
+                    if (dense_prefill_validate_capture and !self.dense_prefill_validate_production) {
                         const tok_idx = self.prefill_current_token_idx;
                         const inter_size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
                         const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * inter_size;
@@ -8683,7 +8702,7 @@ pub const InferenceEngine = struct {
                         inter_dim,
                     );
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
-                    if (dense_prefill_validate_capture) {
+                    if (dense_prefill_validate_capture and !self.dense_prefill_validate_production) {
                         const tok_idx = self.prefill_current_token_idx;
                         const inter_size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
                         const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * inter_size;
@@ -8703,7 +8722,7 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_rms_norm_add != null and
                     !self.validation_diagnostics_enabled;
                 const dense_ffn_down_phase = self.beginProfilePhase();
-                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled and !dense_prefill_validate_capture) {
+                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled and (!dense_prefill_validate_capture or self.dense_prefill_validate_production)) {
                     // Fused: down DMMV accumulates directly into hidden_buf,
                     // eliminating separate scale_acc dispatch + barrier
                     try self.dispatchDmmvAcc(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.hidden_buf, hidden_dim, inter_dim);
@@ -8743,7 +8762,7 @@ pub const InferenceEngine = struct {
                         self.decode_cmd.computeBarrier();
                     }
 
-                    if (dense_prefill_validate_capture) {
+                    if (dense_prefill_validate_capture and !self.dense_prefill_validate_production) {
                         const tok_idx = self.prefill_current_token_idx;
                         const dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
                         self.decode_cmd.computeAndTransferBarrier();
@@ -10086,6 +10105,113 @@ pub const InferenceEngine = struct {
             1,
             1,
         );
+    }
+
+    fn validateDensePrefillProductionChunk(self: *InferenceEngine, n_tokens: u32) !void {
+        if (!self.use_qwen36_dense_prefill_validate or !self.dense_prefill_validate_production or n_tokens == 0) return;
+        if (n_tokens < 128) {
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=prod: production dense replay skipped, captured tokens={d} < DP4a threshold 128", .{n_tokens});
+            return;
+        }
+
+        const cfg = self.model.config;
+        if (self.dense_prefill_validate_layer >= cfg.n_layers) return;
+
+        const norm_ref = self.dense_prefill_validate_norm_ref orelse return;
+        const pre_hidden_ref = self.dense_prefill_validate_pre_hidden_ref orelse return;
+        const post_hidden_ref = self.dense_prefill_validate_post_hidden_ref orelse return;
+        const staging = self.dense_prefill_validate_staging orelse return;
+        const hidden_dim = cfg.hidden_dim;
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const hidden_capture_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const hidden_elems: usize = @intCast(@as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim));
+        if (hidden_capture_bytes * 2 > staging.size) return error.BufferTooSmall;
+
+        try self.ensureBatchedScratchCapacity(self.qwen36DensePrefillPaddedTokenCount(n_tokens));
+        const scratch_hidden = self.batched_scratch_hidden.?;
+        const scratch_norm = self.batched_scratch_norm.?;
+        const scratch_gate = self.batched_scratch_gate.?;
+        const scratch_up = self.batched_scratch_up.?;
+        const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const scratch_down = self.batched_scratch_down.?;
+        if (hidden_capture_bytes > scratch_hidden.size or hidden_capture_bytes > scratch_norm.size) return error.BufferTooSmall;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, pre_hidden_ref.handle, scratch_hidden.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = hidden_capture_bytes,
+        });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, norm_ref.handle, scratch_norm.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = hidden_capture_bytes,
+        });
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        try self.prefillQwen36RunBatchedDenseFfnLayer(
+            self.dense_prefill_validate_layer,
+            n_tokens,
+            hidden_dim,
+            inter_dim,
+            scratch_hidden,
+            scratch_norm,
+            scratch_gate,
+            scratch_up,
+            scratch_swiglu,
+            scratch_down,
+            false,
+        );
+
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.decode_cmd.computeToTransferBarrier();
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, post_hidden_ref.handle, staging.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = hidden_capture_bytes,
+        });
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_hidden.handle, staging.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = hidden_capture_bytes,
+            .size = hidden_capture_bytes,
+        });
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        const base: [*]const f32 = @ptrCast(@alignCast(staging.mapped.?));
+        const ref_post = base[0..hidden_elems];
+        const prod_post = base[@intCast(hidden_capture_bytes / @sizeOf(f32))..][0..hidden_elems];
+        var max_abs: f32 = 0;
+        var max_idx: usize = 0;
+        for (ref_post, prod_post, 0..) |r, p, i| {
+            const diff = @abs(r - p);
+            if (diff > max_abs) {
+                max_abs = diff;
+                max_idx = i;
+            }
+        }
+        const token_idx = max_idx / hidden_dim;
+        const elem_idx = max_idx % hidden_dim;
+        const tol: f32 = 1.0;
+        const verdict: []const u8 = if (max_abs <= tol) "PASS" else "CHECK";
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=prod: dense_ffn production replay layer={d} tokens={d} verdict={s} post_hidden={e:.6}@tok{d}/elem{d} ref={d:.6} prod={d:.6} tol={e:.3}", .{
+            self.dense_prefill_validate_layer,
+            n_tokens,
+            verdict,
+            max_abs,
+            token_idx,
+            elem_idx,
+            ref_post[max_idx],
+            prod_post[max_idx],
+            tol,
+        });
     }
 
     fn validateDensePrefillFfnChunk(self: *InferenceEngine, n_tokens: u32) !void {
@@ -12869,7 +12995,7 @@ pub const InferenceEngine = struct {
         // correct path that worked at cycle 2 before c289c4a3 re-introduced
         // the leaked fuse_q8 wiring).
         const fuse_q8 = !self.validation_diagnostics_enabled and
-            !self.use_qwen36_dense_prefill_validate and
+            (!self.use_qwen36_dense_prefill_validate or self.dense_prefill_validate_production) and
             !self.use_qwen36_ssm_prefill_validate and
             down_t.info.type_ == .q6_k and
             (inter_dim & 255) == 0 and
@@ -12890,7 +13016,7 @@ pub const InferenceEngine = struct {
         // checks as the downstream Q4_K-down DP4a path (n_tokens, inter_dim,
         // hidden_dim alignment) so the producer's contract holds.
         const fuse_q8_1 = !self.validation_diagnostics_enabled and
-            !self.use_qwen36_dense_prefill_validate and
+            (!self.use_qwen36_dense_prefill_validate or self.dense_prefill_validate_production) and
             !self.use_qwen36_ssm_prefill_validate and
             down_t.info.type_ == .q4_k and
             (inter_dim & 255) == 0 and
@@ -17098,19 +17224,25 @@ pub const InferenceEngine = struct {
 
         if (self.use_qwen36_dense_prefill_validate and self.dense_prefill_validate_captured_tokens > 0) {
             const n_validate = @min(self.dense_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
-            const validate_chunks = [_]u32{ 4, 8, 16 };
-            var ran_exact_chunk = false;
-            for (validate_chunks) |chunk| {
-                if (chunk > n_validate) continue;
-                if (chunk == n_validate) ran_exact_chunk = true;
-                self.validateDensePrefillFfnChunk(chunk) catch |err| {
-                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+            if (self.dense_prefill_validate_production) {
+                self.validateDensePrefillProductionChunk(n_validate) catch |err| {
+                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE=prod: dense FFN production replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
                 };
-            }
-            if (!ran_exact_chunk) {
-                self.validateDensePrefillFfnChunk(n_validate) catch |err| {
-                    log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
-                };
+            } else {
+                const validate_chunks = [_]u32{ 4, 8, 16 };
+                var ran_exact_chunk = false;
+                for (validate_chunks) |chunk| {
+                    if (chunk > n_validate) continue;
+                    if (chunk == n_validate) ran_exact_chunk = true;
+                    self.validateDensePrefillFfnChunk(chunk) catch |err| {
+                        log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ chunk, @errorName(err) });
+                    };
+                }
+                if (!ran_exact_chunk) {
+                    self.validateDensePrefillFfnChunk(n_validate) catch |err| {
+                        log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay chunk={d} skipped: {s}", .{ n_validate, @errorName(err) });
+                    };
+                }
             }
         }
         if (self.use_qwen36_ssm_prefill_validate and self.ssm_prefill_validate_captured_tokens > 0) {
