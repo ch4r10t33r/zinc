@@ -457,6 +457,10 @@ fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
+fn defaultGemmaQ8MoeFallbackDownEnabled(cfg: ModelConfig) bool {
+    return isGemma26A4BMoeShape(cfg);
+}
+
 fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
     return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
         readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
@@ -3385,6 +3389,7 @@ pub const InferenceEngine = struct {
     qwen_layer0_shared_down_prefill_enabled: bool,
     qwen_layer0_shared_gate_prefill_enabled: bool,
     gemma_q8_moe_decode_enabled: bool,
+    gemma_q8_moe_fallback_down_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -3599,6 +3604,7 @@ pub const InferenceEngine = struct {
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
         self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
+        self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -16877,10 +16883,14 @@ fn runGemmaExplicitMoeFallback(
     profileBarrier(&cmd, profile, .fallback_moe);
 
     const down_supported = engine.dmmvPipelineForType(down_exps, hidden_dim, inter_dim) != null;
+    const use_batched_q8_down =
+        engine.gemma_q8_moe_fallback_down_enabled and
+        down_exps.info.type_ == .q8_0 and
+        engine.dmmv_q8_0_moe_pipe.handle != null;
     const use_batched_down =
         use_batched_moe_dispatch and
         down_supported and
-        down_exps.info.type_ == .q5_1 and
+        (down_exps.info.type_ == .q5_1 or use_batched_q8_down) and
         cfg.n_experts_used == 8 and
         lt.ffn_down_exps_bias == null;
     if (down_supported) {
@@ -25319,15 +25329,19 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
         .shared_expert_intermediate_dim = 0,
     };
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.hidden_dim = 4096;
     try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(!isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.n_experts = 0;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     gemma_cfg.architecture = .qwen35;
     gemma_cfg.n_experts = 128;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
 
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, true, false));
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
