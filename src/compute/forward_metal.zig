@@ -3299,6 +3299,7 @@ pub const InferenceEngine = struct {
     qwen_final_tail_kv_fused_norm_enabled: bool,
     qwen_layer0_shared_down_prefill_enabled: bool,
     qwen_layer0_shared_gate_prefill_enabled: bool,
+    gemma_q8_moe_decode_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -3512,6 +3513,7 @@ pub const InferenceEngine = struct {
         self.qwen_final_tail_kv_fused_norm_enabled = readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true;
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
+        self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse false;
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -14440,11 +14442,20 @@ fn canUseGpuRoutedMoeDown(engine: *const InferenceEngine, down_quant: GGMLType) 
     return switch (down_quant) {
         .q4_k => true,
         .q5_1 => engine.dmmv_q5_1_moe_pipe.handle != null,
-        .q8_0 => engine.dmmv_q8_0_moe_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_pipe.handle != null and gemmaQ8RoutedMoeAllowed(
+            engine.config.architecture,
+            engine.in_prefill_phase,
+            engine.gemma_q8_moe_decode_enabled,
+        ),
         .q5_k => engine.dmmv_q5k_moe_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_pipe.handle != null,
         else => false,
     };
+}
+
+fn gemmaQ8RoutedMoeAllowed(arch: config_mod.Architecture, in_prefill_phase: bool, decode_enabled: bool) bool {
+    if (arch != .gemma) return true;
+    return in_prefill_phase or decode_enabled;
 }
 
 fn isF32Tensor(tensor: ?*const metal_loader.LoadedTensor) bool {
@@ -25196,6 +25207,13 @@ test "q8 lm head stays on GPU" {
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q4_k));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
+}
+
+test "gemma q8 routed moe is prefill-only by default" {
+    try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, true, false));
+    try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
+    try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, false, true));
+    try std.testing.expect(gemmaQ8RoutedMoeAllowed(.qwen35, false, false));
 }
 
 test "defaultKvCacheQ8Enabled disables Gemma ISWA q8 KV cache" {
