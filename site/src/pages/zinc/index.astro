@@ -103,7 +103,7 @@ function buildBoard(target: any, ids: string[]) {
 
 const rdnaBoard = buildBoard(rdnaTarget, [
   'qwen36-35b-a3b-q4k-xl',
-  'qwen3-8b-q4k-m',
+  'qwen35-9b-q4k-m',
   'qwen36-27b-q4k-m',
   'gemma4-26b-a4b-q4k-m',
   'gemma4-31b-q4k-m',
@@ -283,7 +283,7 @@ const jsonLd = {
       <article class="perf-stat">
         <strong>{benchmarkedModelCount}</strong>
         <span>models benchmarked</span>
-        <small>Qwen 3 / 3.6 + Gemma 4</small>
+        <small>Qwen 3 / 3.5 / 3.6 + Gemma 4</small>
       </article>
     </div>
 
@@ -314,7 +314,7 @@ const jsonLd = {
         </article>
       ))}
     </div>
-    <p class="perf-caption">Median across the RDNA suite with <code>RADV_PERFTEST=coop_matrix</code>. ZINC leads on the flagship Qwen3.6-35B-A3B MoE; dense models stay close on decode but trail llama.cpp on prefill, which is the active optimization target.</p>
+    <p class="perf-caption">Median across the RDNA suite with <code>RADV_PERFTEST=coop_matrix</code>. ZINC leads on the flagship Qwen3.6-35B-A3B MoE and Qwen 3.5 9B decode; prefill remains the active optimization target across the dense and hybrid rows.</p>
 
     <h3 class="perf-heading">Apple Silicon — Mac Studio (M4 Max) <span class="perf-sub">40-core GPU · 64 GB unified · {formatRefreshDate(metalTarget?.generated_at)}</span></h3>
     <div class="perf-board" role="img" aria-label="ZINC vs llama.cpp decode throughput on Apple M4 Max">
@@ -351,7 +351,7 @@ const jsonLd = {
 
     <p>The API is OpenAI-compatible: <code>POST /v1/chat/completions</code> with SSE streaming, plus a built-in chat UI with thinking mode support. Point your existing client at ZINC and it works. <a href="/zinc/docs/api">API reference</a>.</p>
 
-    <p>Models load from GGUF files via direct memory-map — DMA to GPU VRAM on Vulkan, zero-copy <code>newBufferWithBytesNoCopy</code> on Metal. Supports Q4_K, Q5_K, Q6_K, Q8_0, and F16 quantization. Architectures: Qwen 3 / 3.6 (dense and A3B MoE), Gemma 4, and SSM-hybrid paths.</p>
+    <p>Models load from GGUF files via direct memory-map — DMA to GPU VRAM on Vulkan, zero-copy <code>newBufferWithBytesNoCopy</code> on Metal. Supports Q4_K, Q5_K, Q6_K, Q8_0, and F16 quantization. Architectures: Qwen 3 / 3.5 / 3.6 (dense and A3B MoE), Gemma 4, and SSM-hybrid paths.</p>
 
     <p>The whole thing is written in Zig (with a thin Objective-C shim for Metal). No hidden allocations, direct GPU API calls, comptime dispatch tables, single binary.</p>
 
