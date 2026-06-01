@@ -6,6 +6,8 @@ How to reproduce ZINC's published numbers, run an ad-hoc llama.cpp baseline, and
 
 The site at [zolotukhin.ai/zinc/performance](https://zolotukhin.ai/zinc/performance) is generated from `tools/performance_suite.mjs`. Every published run pairs ZINC against llama.cpp on the same hardware, same model file, and the same four-scenario matrix (`core`, `context-medium`, `context-long`, `decode-extended`). Those scenarios are real workload prompts: quick chat, coding review, incident-context QA, and longer coding-plan generation. The full run is what gets pushed to `site/src/data/zinc-performance.json` and Cloudflare Pages picks it up on every push to `main`.
 
+Remote machine details are intentionally supplied by `.env` or CLI flags. Do not commit public hostnames, public IP addresses, private SSH ports, or one-off benchmark node aliases into this document or into published site data.
+
 ```bash
 # Metal target (Apple Silicon, runs locally)
 bun tools/performance_suite.mjs --target metal
@@ -23,6 +25,8 @@ bun tools/performance_suite.mjs --target all --rdna-sync --rdna-build --rdna-sta
 Defaults are 1 warmup + 3 measured runs per scenario; pass `--runs N --warmup M` to override. Pass `--no-site-write` to leave `site/src/data/zinc-performance.json` alone (the run still emits a `/tmp` artifact via `--output`). The suite stamps `provenance.zinc.version` from `git describe --dirty`, so commit (or stash) before publishing — a `-dirty` tag means reviewers cannot reproduce the exact tree.
 
 `bun tools/performance_suite.mjs --help` lists every flag (target subset, model filtering, baseline binary overrides, remote workdir / libc / model-root overrides, etc.).
+
+Current RDNA publish runs cover the two Gemma 4 rows, Qwen 3.5 9B Q4_K_M, Qwen 3.6 27B Q4_K_M, and Qwen 3.6 35B-A3B UD Q4_K_XL. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
 
 ## Ad-hoc llama.cpp baseline on the RDNA4 node
 
@@ -45,9 +49,10 @@ cat /sys/module/amdgpu/parameters/ras_enable  # should show 0
 # 3. RADV_PERFTEST=coop_matrix set in llama-server.service
 #    Without this, cooperative matrix is disabled → scalar fallback
 
-# 4. llama.cpp build 3306dba, built with:
-#    cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release \
-#      -DCMAKE_CXX_FLAGS='-O3 -march=znver4' -DCMAKE_C_FLAGS='-O3 -march=znver4'
+# 4. llama.cpp must be recorded from the benchmark binary:
+#    /root/llama.cpp/build/bin/llama-server --version
+#    The published artifact records the exact version and commit under
+#    provenance.llama_cpp. Rebuild and republish when changing it.
 
 # 5. Server flags (in /etc/systemd/system/llama-server.service):
 #    -ngl 99 --device Vulkan0 --parallel 4 -c 32768
@@ -77,7 +82,8 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
     printf "Run %d: gen %s tok/s | prompt %s tok/s\n" "$i" "$gen" "$prompt"
   done
 '
-# Expected: ~107 tok/s generation, ~220 tok/s prompt (runs 2-3, after warmup)
+# Treat this as a one-off sanity check. The canonical values are the
+# medians in site/src/data/zinc-performance.json and on /zinc/performance.
 ```
 
 ## Measure ZINC (CLI)
