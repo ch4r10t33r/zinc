@@ -8,24 +8,20 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
 
 const topicLinks = [
   {
-    label: 'Qwen3.6 architecture',
+    label: 'Qwen3.6',
     href: '/topics/qwen3-6-local-inference/',
-    detail: 'Architecture, GGUF, MoE, MTP',
   },
   {
-    label: 'Gemma 4 local inference',
+    label: 'Gemma 4',
     href: '/topics/gemma-local-inference/',
-    detail: 'SWA, GQA, Vulkan, Metal',
   },
   {
-    label: 'RDNA4 performance',
+    label: 'AMD RDNA4',
     href: '/topics/amd-rdna4-llm-inference/',
-    detail: 'R9700, RX 9070 XT, Vulkan',
   },
   {
-    label: 'KV cache and quantization',
+    label: 'KV cache',
     href: '/topics/kv-cache-quantization/',
-    detail: 'Long context, INT8, TurboQuant',
   },
 ];
 ---
@@ -38,13 +34,13 @@ const topicLinks = [
   <h1>Local LLM Inference Blog</h1>
   <p class="intro">Technical notes on building ZINC, GPU programming, and making local AI work on hardware people actually own.</p>
 
-  <nav class="topic-router" aria-label="Topic guides">
-    <span class="topic-router-label">Guides</span>
-    {topicLinks.map(topic => (
-      <a href={topic.href}>
-        <strong>{topic.label}</strong>
-        <span>{topic.detail}</span>
-      </a>
+  <nav class="guide-links" aria-label="Related topic guides">
+    <span class="guide-links-label">Related guides</span>
+    {topicLinks.map((topic, index) => (
+      <>
+        <a href={topic.href}>{topic.label}</a>
+        {index < topicLinks.length - 1 && <span class="guide-separator" aria-hidden="true">/</span>}
+      </>
     ))}
   </nav>
 
@@ -64,67 +60,42 @@ const topicLinks = [
 <style>
   .intro {
     color: var(--color-text-muted);
-    padding-bottom: var(--space-lg);
+    margin-bottom: var(--space-sm);
   }
 
-  .topic-router {
+  .guide-links {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.45rem;
-    padding: var(--space-sm) 0 var(--space-lg);
-    border-top: 1px solid var(--color-border);
+    gap: 0.35rem 0.55rem;
+    padding-bottom: var(--space-lg);
     border-bottom: 1px solid var(--color-border);
-  }
-
-  .topic-router-label {
-    margin-right: 0.25rem;
     color: var(--color-text-muted);
-    font-size: 0.75rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    font-size: 0.86rem;
   }
 
-  .topic-router a {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 0.4rem;
-    min-height: 2.25rem;
-    padding: 0.28rem 0.6rem;
-    border: 1px solid var(--color-border);
-    border-radius: 999px;
+  .guide-links-label {
+    color: var(--color-text-muted);
+    font-weight: 700;
+  }
+
+  .guide-links a {
     color: var(--color-text);
+    font-weight: 700;
     text-decoration: none;
   }
 
-  .topic-router a:hover {
-    border-color: var(--color-accent);
+  .guide-links a:hover {
+    color: var(--color-accent);
   }
 
-  .topic-router strong {
-    font-size: 0.82rem;
-    line-height: 1.2;
-  }
-
-  .topic-router span {
-    color: var(--color-text-muted);
-    font-size: 0.72rem;
-    line-height: 1.2;
+  .guide-separator {
+    color: var(--color-border);
   }
 
   @media (max-width: 600px) {
-    .topic-router {
-      align-items: stretch;
-    }
-
-    .topic-router-label {
+    .guide-links-label {
       width: 100%;
-    }
-
-    .topic-router a {
-      width: 100%;
-      justify-content: space-between;
     }
   }
 </style>
