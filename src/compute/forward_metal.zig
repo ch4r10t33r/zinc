@@ -7940,6 +7940,27 @@ fn canUseQwen36FinalTailKvFusedNorm(
     return canUseFusedNormDualQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim);
 }
 
+fn canUseGemma26FinalTailKvFusedNorm(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    attn: LayerAttentionParams,
+    hidden_dim: u32,
+) bool {
+    if (!engine.qwen_final_tail_kv_fused_norm_enabled) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (!engine.in_prefill_phase or !isGemma26A4BMoeShape(engine.config)) return false;
+    if (attn.use_k_as_v or attn.kv_dim == 0 or hidden_dim == 0) return false;
+    if (hidden_dim != engine.config.hidden_dim or hidden_dim > 4096 or hidden_dim % 32 != 0) return false;
+
+    const k_tensor = lt.attn_k orelse return false;
+    const v_tensor = lt.attn_v orelse return false;
+    const block_size = engine.q8_dual_tg_override orelse @as(u32, 128);
+    return k_tensor.info.type_ == .q8_0 and
+        v_tensor.info.type_ == .q8_0 and
+        engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_dual_fused_norm_pipe.max_threads_per_threadgroup >= block_size;
+}
+
 fn canUseDenseQ4KGateUpDual(
     engine: *const InferenceEngine,
     gate: *const metal_loader.LoadedTensor,
@@ -14334,9 +14355,9 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
 
     if (fuse_attn_norm) {
-        // The caller already checked `canUseQwen36FinalTailKvFusedNorm`.
-        // Reuse that decision here so the non-terminal prompt tail does not
-        // repeat paired-KV and env-gated selector work for every prompt token.
+        // The caller already checked the final-tail fused-norm guard. Reuse
+        // that decision here so the non-terminal prompt tail does not repeat
+        // paired-KV and env-gated selector work for every prompt token.
         dispatchFusedNormDualQ8DmmvOnCmd(
             engine,
             cmd,
@@ -18926,7 +18947,8 @@ fn runDecodeStep(
             const fuse_final_tail_attn_norm =
                 skip_final_prompt_tail and
                 !prev_fused_attn_norm and
-                canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim);
+                (canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim) or
+                    canUseGemma26FinalTailKvFusedNorm(engine, lt, attn, hidden_dim));
             if (prev_fused_attn_norm) {
                 // Previous layer's residual_rms_norm already wrote norm_buf using
                 // attn_norm_bufs[layer_idx]; its trailing barrier (or the implicit
@@ -31017,10 +31039,11 @@ test "dmmv_q8_0_k2048_fused_norm shader matches CPU reference" {
     for (0..K) |i| sq_sum += @as(f64, hidden_ptr[i]) * @as(f64, hidden_ptr[i]);
     const rms_inv: f32 = @floatCast(1.0 / @sqrt(sq_sum / @as(f64, K) + 1e-6));
 
-    var normed_input: [2048]f32 = undefined;
+    const allocator = std.testing.allocator;
+    const normed_input = try allocator.alloc(f32, K);
+    defer allocator.free(normed_input);
     for (0..K) |i| normed_input[i] = norm_ptr[i] * (hidden_ptr[i] * rms_inv);
 
-    const allocator = std.testing.allocator;
     const ref_row = try allocator.alloc(f32, K);
     defer allocator.free(ref_row);
 
@@ -31059,7 +31082,7 @@ test "dmmv_q8_0_dual_fused_norm shader matches CPU reference" {
 
     const M0: u32 = 4;
     const M1: u32 = 3;
-    const K: u32 = 2048;
+    const K: u32 = 2816;
     const blocks_per_row: usize = K / 32;
     const row_bytes: usize = blocks_per_row * 34;
 
@@ -31123,10 +31146,11 @@ test "dmmv_q8_0_dual_fused_norm shader matches CPU reference" {
     for (0..K) |i| sq_sum += @as(f64, hidden_ptr[i]) * @as(f64, hidden_ptr[i]);
     const rms_inv: f32 = @floatCast(1.0 / @sqrt(sq_sum / @as(f64, K) + 1e-6));
 
-    var normed_input: [2048]f32 = undefined;
+    const allocator = std.testing.allocator;
+    const normed_input = try allocator.alloc(f32, K);
+    defer allocator.free(normed_input);
     for (0..K) |i| normed_input[i] = norm_ptr[i] * (hidden_ptr[i] * rms_inv);
 
-    const allocator = std.testing.allocator;
     const ref_row = try allocator.alloc(f32, K);
     defer allocator.free(ref_row);
 
