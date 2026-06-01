@@ -427,19 +427,15 @@ fn preferGemma26PrefillSharedQ8Tg128(cfg: ModelConfig, tensor_name: []const u8, 
     const shexp_inter_dim = cfg.shared_expert_intermediate_dim;
     if (shexp_inter_dim == 0) return false;
 
-    const is_shared_gate_up =
-        (std.mem.endsWith(u8, tensor_name, "ffn_gate_shexp.weight") or
-            std.mem.endsWith(u8, tensor_name, "ffn_up_shexp.weight") or
-            std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
-            std.mem.endsWith(u8, tensor_name, "ffn_up.weight")) and
+    // Cycle 69's 128-thread selector helped the hot shared gate/up bucket
+    // (M=2112,K=2816). Keep shared-down on the older 256-thread shape so the
+    // less-hot M=2816,K=2112 projection does not inherit that occupancy trade.
+    return (std.mem.endsWith(u8, tensor_name, "ffn_gate_shexp.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_up_shexp.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_up.weight")) and
         M == shexp_inter_dim and
         K == cfg.hidden_dim;
-    const is_shared_down =
-        (std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight") or
-            std.mem.endsWith(u8, tensor_name, "ffn_down.weight")) and
-        M == cfg.hidden_dim and
-        K == shexp_inter_dim;
-    return is_shared_gate_up or is_shared_down;
 }
 
 fn dmmvPipelineChoiceDependsOnPrefillPhase(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
@@ -26186,7 +26182,7 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
+test "gemma26 prefill shared q8 tg128 only matches shared gate-up shapes" {
     const gemma_cfg = ModelConfig{
         .architecture = .gemma,
         .n_layers = 30,
@@ -26213,8 +26209,8 @@ test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
 
     try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_gate.weight", 2112, 2816));
     try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_up_shexp.weight", 2112, 2816));
-    try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_down.weight", 2816, 2112));
-    try std.testing.expect(dmmvPipelineChoiceDependsOnPrefillPhase(gemma_cfg, "blk.0.ffn_down_shexp.weight", 2816, 2112));
+    try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_down.weight", 2816, 2112));
+    try std.testing.expect(!dmmvPipelineChoiceDependsOnPrefillPhase(gemma_cfg, "blk.0.ffn_down_shexp.weight", 2816, 2112));
 
     try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.attn_output.weight", 2816, 4096));
     try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_gate.weight", 2112, 2048));
