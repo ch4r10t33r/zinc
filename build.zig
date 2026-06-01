@@ -332,6 +332,38 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    if (selected_backend == .zinc_rt and is_linux) {
+        const compat_build_options = b.addOptions();
+        compat_build_options.addOption([]const u8, "version", build_version);
+        compat_build_options.addOption([]const u8, "commit", build_commit);
+        compat_build_options.addOption(
+            []const u8,
+            "target",
+            b.fmt("{s}-{s}-{s}", .{
+                @tagName(target.result.cpu.arch),
+                @tagName(target.result.os.tag),
+                @tagName(target.result.abi),
+            }),
+        );
+        compat_build_options.addOption([]const u8, "optimize", @tagName(optimize));
+        compat_build_options.addOption([]const u8, "backend", "vulkan");
+
+        const compat_mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        compat_mod.addOptions("build_options", compat_build_options);
+        configureVulkanModule(b, target, compat_mod);
+
+        const compat_exe = b.addExecutable(.{
+            .name = "zinc-vulkan",
+            .root_module = compat_mod,
+        });
+        b.installArtifact(compat_exe);
+    }
+
     const hot_bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_hot_decode.zig"),
         .target = target,

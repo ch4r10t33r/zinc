@@ -38,4 +38,14 @@ describe("detectZincRtExecutionMode", () => {
 
     expect(detectZincRtExecutionMode(output)).toBe("direct");
   });
+
+  test("detects the Vulkan compatibility tier explicitly", () => {
+    const output = [
+      "info(zinc_rt): ZINC_RT vulkan_compat delegating full model inference to ./zig-out/bin/zinc-vulkan",
+      "info(forward): Generated 96 tokens in 1070.8 ms — 89.65 tok/s",
+      "info(zinc_rt): ZINC_RT M1 model_execution=vulkan_compat execution_tier=vulkan_compat delegated_backend=vulkan real_model_slice=1",
+    ].join("\n");
+
+    expect(detectZincRtExecutionMode(output)).toBe("vulkan_compat");
+  });
 });

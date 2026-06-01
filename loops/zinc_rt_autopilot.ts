@@ -1017,6 +1017,7 @@ export type ZincRtExecutionMode =
   | "cpu"
   | "cpu_after_admission"
   | "host_assisted"
+  | "vulkan_compat"
   | "direct"
   | "unknown";
 
@@ -1089,6 +1090,10 @@ export function detectZincRtExecutionMode(resultOrOutput: Pick<BenchmarkResult, 
   const out = typeof resultOrOutput === "string" ? resultOrOutput : resultOrOutput.runOutput;
   if (!out.trim()) return "missing";
 
+  if (/\bmodel_execution\s*=\s*vulkan_compat\b/i.test(out)) {
+    return "vulkan_compat";
+  }
+
   // This is the critical state in current ZINC_RT: queue admission and PM4
   // smokes pass, but model tokens still come from forward_zinc_rt's CPU path.
   if (/execution_tier\s*=\s*t_cpu_after_admission\b/i.test(out)) {
@@ -1125,6 +1130,8 @@ function zincRtExecutionModeLabel(mode: ZincRtExecutionMode): string {
       return "CPU fallback";
     case "host_assisted":
       return "host-assisted CPU decode with direct probes";
+    case "vulkan_compat":
+      return "Vulkan compatibility tier";
     case "direct":
       return "direct runtime tier";
     case "missing":

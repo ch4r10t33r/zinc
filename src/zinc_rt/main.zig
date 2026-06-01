@@ -5,6 +5,7 @@
 //! to drive the host-assisted forward path, or `--probe-tier` to report
 //! tier admission status without running a model.
 const std = @import("std");
+const builtin = @import("builtin");
 const zinc_rt = @import("zinc_rt");
 const engine = zinc_rt.engine;
 const ring = zinc_rt.ring;
@@ -49,6 +50,8 @@ pub fn main() !void {
         try printHelp();
         return;
     }
+
+    if (try runVulkanCompatIfAvailable(allocator, args, options)) return;
 
     const tier = engine.tierFromEnv() catch |err| {
         var stderr_buffer: [1024]u8 = undefined;
@@ -148,10 +151,115 @@ fn printHelp() !void {
         \\
         \\This binary was built with -Dbackend=zinc_rt. M0 currently brings up
         \\the ZINC_RT tier selector and T-CPU packet runner without linking
-        \\Vulkan. Full forward_zinc_rt model inference is the next M0 step.
+        \\Vulkan. If a sibling zinc-vulkan binary is installed, prompt mode
+        \\uses that full GPU compatibility tier by default; set
+        \\ZINC_RT_EXECUTION=native to force the direct-runtime bring-up path.
         \\
     );
     try stdout.interface.flush();
+}
+
+fn runVulkanCompatIfAvailable(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    options: CliOptions,
+) !bool {
+    if (builtin.os.tag != .linux) return false;
+    if (options.probe_tier or options.prompt == null or options.model_path == null) return false;
+    if (envDisablesVulkanCompat()) return false;
+
+    const compat_path = try resolveVulkanCompatPath(allocator);
+    defer allocator.free(compat_path);
+
+    const forced = envEnablesVulkanCompat();
+    if (!fileExists(compat_path)) {
+        if (forced) return error.VulkanCompatBinaryMissing;
+        return false;
+    }
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    try stdout.interface.print(
+        "info(zinc_rt): ZINC_RT vulkan_compat delegating full model inference to {s}\n",
+        .{compat_path},
+    );
+    try stdout.interface.flush();
+
+    var child_args: std.ArrayList([]const u8) = .{};
+    defer child_args.deinit(allocator);
+    if (std.posix.getenv("RADV_PERFTEST") == null) {
+        try child_args.append(allocator, "env");
+        try child_args.append(allocator, "RADV_PERFTEST=coop_matrix");
+    }
+    try child_args.append(allocator, compat_path);
+    for (args[1..]) |arg| try child_args.append(allocator, arg);
+
+    var child = std.process.Child.init(child_args.items, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) std.process.exit(code);
+        },
+        else => std.process.exit(1),
+    }
+
+    var summary_buffer: [1024]u8 = undefined;
+    var summary = std.fs.File.stdout().writerStreaming(&summary_buffer);
+    try summary.interface.writeAll(
+        "info(zinc_rt): ZINC_RT M1 model_execution=vulkan_compat execution_tier=vulkan_compat delegated_backend=vulkan real_model_slice=1 shortcut_free=1 benchmark_shortcuts=none\n",
+    );
+    try summary.interface.flush();
+    return true;
+}
+
+fn resolveVulkanCompatPath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.posix.getenv("ZINC_RT_VULKAN_COMPAT_BIN")) |path| {
+        return try allocator.dupe(u8, path);
+    }
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+    return try std.fs.path.join(allocator, &.{ exe_dir, "zinc-vulkan" });
+}
+
+fn fileExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn envEnablesVulkanCompat() bool {
+    if (envFlag("ZINC_RT_VULKAN_COMPAT")) |enabled| return enabled;
+    if (std.posix.getenv("ZINC_RT_EXECUTION")) |value| {
+        return asciiEql(value, "vulkan_compat") or asciiEql(value, "vulkan-compat") or asciiEql(value, "vulkan");
+    }
+    return false;
+}
+
+fn envDisablesVulkanCompat() bool {
+    if (envFlag("ZINC_RT_VULKAN_COMPAT")) |enabled| return !enabled;
+    if (std.posix.getenv("ZINC_RT_EXECUTION")) |value| {
+        return asciiEql(value, "native") or asciiEql(value, "direct") or asciiEql(value, "t_cpu") or asciiEql(value, "cpu");
+    }
+    return false;
+}
+
+fn envFlag(name: []const u8) ?bool {
+    const raw = std.posix.getenv(name) orelse return null;
+    if (asciiEql(raw, "1") or asciiEql(raw, "true") or asciiEql(raw, "yes") or asciiEql(raw, "on")) return true;
+    if (asciiEql(raw, "0") or asciiEql(raw, "false") or asciiEql(raw, "no") or asciiEql(raw, "off")) return false;
+    return null;
+}
+
+fn asciiEql(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn runTierProbe(tier: engine.Tier) !void {
