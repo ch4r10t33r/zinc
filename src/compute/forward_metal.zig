@@ -5366,14 +5366,38 @@ pub const InferenceEngine = struct {
             pending_count += 1;
         }
 
-        for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
-            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-            const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
-                &self.qwen_ssm_prefill_branch_buf
-            else
-                &self.prefill_embed_buf;
-            try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, 0);
-            pending_count += 1;
+        const async_chunk_tokens = queuedTokenMajorAsyncChunkTokens(self.config, prompt_tokens.len);
+        if (async_chunk_tokens <= 1) {
+            for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
+                const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+                const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                    &self.qwen_ssm_prefill_branch_buf
+                else
+                    &self.prefill_embed_buf;
+                try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, 0);
+                pending_count += 1;
+            }
+        } else {
+            const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
+            var token_idx: usize = 0;
+            while (token_idx < pending_token_count) {
+                const chunk_end = @min(pending_token_count, token_idx + async_chunk_tokens);
+                var chunk_cmd = try beginProfiledCommand(self, profile);
+                errdefer if (chunk_cmd.handle != null) chunk_cmd.wait();
+                for (prompt_tokens[token_idx..chunk_end], token_idx..) |_, i| {
+                    const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+                    const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                        &self.qwen_ssm_prefill_branch_buf
+                    else
+                        &self.prefill_embed_buf;
+                    try runDecodeStep(self, false, embed_src, embed_offset, null, &chunk_cmd, 0);
+                }
+                commitAsyncProfiled(&chunk_cmd, profile);
+                pending[pending_count] = chunk_cmd;
+                pending_count += 1;
+                chunk_cmd.handle = null;
+                token_idx = chunk_end;
+            }
         }
 
         const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
@@ -5469,6 +5493,19 @@ pub const InferenceEngine = struct {
         // the stable default back at 8 tokens; keep the env override available
         // for same-cycle A/B runs.
         return @min(prompt_len / 2, @as(usize, 8));
+    }
+
+    fn defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
+        if (!isGemma26A4BMoeShape(cfg)) return 1;
+        if (prompt_len < 4) return 1;
+        return 4;
+    }
+
+    fn queuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
+        const default_chunk = defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg, prompt_len);
+        const requested = readU32Env("ZINC_METAL_GEMMA_PREFILL_CHUNK_TOKENS") orelse return default_chunk;
+        if (requested <= 1 or prompt_len <= 2) return 1;
+        return @min(@as(usize, @intCast(requested)), @min(prompt_len - 1, @as(usize, 16)));
     }
 
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
