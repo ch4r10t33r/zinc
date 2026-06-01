@@ -234,11 +234,14 @@ function displayModelLabel(): string {
 }
 
 function isGemmaRun(state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">): boolean {
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  if (effortText.trim().length > 0) return effortText.includes("gemma");
   const model = displayModelLabel().toLowerCase();
   return model.includes("gemma") ||
-    state?.effortId === 11 ||
-    (state?.effortFile?.toLowerCase().includes("gemma") ?? false) ||
-    (state?.effortPlan?.toLowerCase().includes("gemma") ?? false);
+    state?.effortId === 11;
 }
 
 function isQwen36PrefillRun(

@@ -535,6 +535,12 @@ pub fn build(b: *std.Build) void {
     run_bun_tests.setCwd(b.path("."));
     addBunDirToPath(b, run_bun_tests, bun_exe);
     run_bun_tests.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
+    // Keep implement_metal.ts prompt tests deterministic under the outer
+    // optimization harness. Those tests construct Qwen/Gemma states directly,
+    // so parent-process model and metric env must not decide their branch.
+    run_bun_tests.setEnvironmentVariable("ZINC_MODEL_ID", "qwen36-35b-a3b-q4k-xl");
+    run_bun_tests.setEnvironmentVariable("ZINC_MODEL", "");
+    run_bun_tests.setEnvironmentVariable("ZINC_METRIC_MODE", "decode");
     // Pin ZINC_TARGET_TOK_PER_SEC to the implement_metal.ts default (50)
     // so the harness's parent-process value (e.g. 26) does not leak into
     // the buildPrompt unit tests in loops/implement_metal.test.ts, which
