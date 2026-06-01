@@ -7170,9 +7170,11 @@ fn classifyDmmvDetailUncached(path: DmmvPathClass, name: []const u8) DmmvDetailC
             .ssm_tail
         else
             .none,
-        .shared_expert => if (isSharedDownTensor(name))
+        .shared_expert => if (isSharedDownTensor(name) or std.mem.endsWith(u8, name, "ffn_down.weight"))
             .shared_down
-        else if (isSharedGateUpTensor(name))
+        else if (isSharedGateUpTensor(name) or
+            std.mem.endsWith(u8, name, "ffn_gate.weight") or
+            std.mem.endsWith(u8, name, "ffn_up.weight"))
             .shared_gate_up
         else
             .none,
@@ -25957,6 +25959,14 @@ test "gemma shared down q8 tensors stay GPU eligible" {
     try std.testing.expect(!shouldCpuQ8Fallback(.gemma, "blk.0.ffn_down_shexp.weight"));
     try std.testing.expect(!shouldCpuQ8Fallback(.gemma, "blk.0.ffn_up.weight"));
     try std.testing.expect(!shouldCpuQ8Fallback(.qwen35, "blk.0.ffn_down.weight"));
+}
+
+test "gemma dense-named shared experts populate detailed profile buckets" {
+    try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_gate.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_up.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.shared_down, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_down.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_gate_shexp.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate.weight"));
 }
 
 test "q8 lm head stays on GPU" {
