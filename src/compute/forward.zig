@@ -12762,6 +12762,22 @@ pub const InferenceEngine = struct {
         return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
     }
 
+    fn qwenDenseSsmOutDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+
+        if (self.isQwen35DenseHybrid9B()) {
+            // The 9B SSM-out projection is Q5_K with K=d_inner=4096, and the
+            // public long-draft prompt is exactly 64 tokens. Use the same
+            // measured 9B crossover already accepted for dense FFN DP4a rather
+            // than inheriting the 27B-only 128-token floor.
+            return n_tokens >= 64;
+        }
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+    }
+
     fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
         if (!self.qwen36Dp4aDownEnabled()) return false;
         if (n_tokens < 128) return false;
@@ -13865,14 +13881,12 @@ pub const InferenceEngine = struct {
         d_inner: u32,
         n_tokens: u32,
     ) !bool {
-        // Threshold 128 matches the dense-down/gate-up/wqkv/z DP4a paths: under
-        // ~128 tokens the one-shot quantize pre-pass + extra dispatch/barrier
-        // outweighs the savings from a single 32-col GEMM block. context-medium
-        // prompts on the controller workload land at ~277 tokens, so the path
-        // engages.
-        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+        // The 27B path keeps its measured 128-token floor. Qwen3.5 9B has a
+        // smaller 4096x4096 Q5_K SSM-out shape and reaches the public
+        // long-draft prompt at 64 tokens, so qwenDenseSsmOutDp4aEnabled lowers
+        // only that exact-shape crossover.
+        const dp4a_ok = self.qwenDenseSsmOutDp4aEnabled(n_tokens) and
             ssm_out_t.info.type_ == .q5_k and
-            n_tokens >= 128 and
             (d_inner & 255) == 0 and
             (hidden_dim & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q5k_full_dp4a != null and
