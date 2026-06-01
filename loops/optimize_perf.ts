@@ -104,6 +104,14 @@ const MODELS: Record<string, ModelTarget> = {
     coherencePromptMode: "chat",
     envVar: "ZINC_RDNA_QWEN36_27B_MODEL",
   },
+  qwen359b: {
+    key: "qwen359b",
+    name: "Qwen3.5-9B",
+    path: envOrDefault("ZINC_RDNA_QWEN35_9B_MODEL", "/root/models/Qwen3.5-9B-Q4_K_M.gguf"),
+    promptMode: "raw",
+    coherencePromptMode: "chat",
+    envVar: "ZINC_RDNA_QWEN35_9B_MODEL",
+  },
   qwen8b: {
     key: "qwen8b",
     name: "Qwen3-8B",
@@ -214,6 +222,9 @@ const LONG_CONTEXT_DECODE_PROMPT = [
 const GEMMA_LONG_DECODE_PROMPT =
   "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.";
 
+const QWEN35_9B_LONG_DRAFT_PREFILL_PROMPT =
+  "Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.\n\nPlan:\n1.";
+
 type MetricMode = "decode" | "prefill";
 
 type EffortSpec = {
@@ -259,6 +270,7 @@ type EffortSpec = {
   // directly. The primary-metric scenario also gets a "to beat llama.cpp,
   // you need X more tok/s (+Y%)" target that the agent can reason against.
   llamaCppBaselines?: LlamaCppBaseline[];
+  llamaCppSuccessRule?: string;
 };
 
 export type LlamaCppBaseline = {
@@ -605,6 +617,53 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       { scenario: "context-long",      prefillTokPerSec: 69.89,  decodeTokPerSec: 44.33 },
       { scenario: "decode-extended",   prefillTokPerSec: 97.29,  decodeTokPerSec: 31.29 },
     ],
+  },
+  17: {
+    doc: "MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md",
+    summary: "RDNA4 Qwen 3.5 9B prefill gap recovery (site long-draft/core)",
+    metricMode: "prefill",
+    primaryMetricLabel: "Qwen3.5-9B long-draft prefill tok/s",
+    defaultModel: "qwen359b",
+    benchmarkPrompt: QWEN35_9B_LONG_DRAFT_PREFILL_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "site-aligned decode-extended Long Coding Plan prefill benchmark on RDNA for Qwen3.5-9B Q4_K_M; run with --model qwen359b",
+    minHealthyTokPerSec: 50,
+    knownFlatCategories: [
+      "Do not chase decode first. Qwen3.5-9B decode is already ahead of llama.cpp on all four published RDNA scenarios (~95-97 tok/s ZINC vs ~85 tok/s llama). The gap is prompt prefill.",
+      "Do not optimize a synthetic Paris prompt. The biggest published RDNA gap is the site long-draft raw prompt: 105.91 tok/s ZINC vs 855.82 tok/s llama.cpp. Core prefill is also poor (100.79 vs 548.94).",
+      "Do not blindly flip canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0. Qwen3.5 is an SSM+attention hybrid, and earlier SSM batched-prefill attempts on the Qwen3.6 dense hybrid produced GPU resets or hidden-state dependency bugs when validation was skipped.",
+      "Do not reuse the Qwen3.6-27B predicate as-is. isQwen36DenseHybrid27B is shape-locked to hidden_dim=5120/intermediate_dim=17408, so every accepted 27B layer-major prefill path is currently disabled on Qwen3.5-9B.",
+      "Do not add another single-token DMMV micro-fusion before proving the prefill path is layer-major on this model. A 5-8x prefill gap is a batching/dataflow problem, not a 1% shader clean-up problem.",
+    ],
+    structuralSwingIdeas: [
+      "First cycle should prove the active path. Run the baseline with ZINC_PREFILL_PROFILE=1 and inspect whether Qwen3.5-9B falls through to token-major prefillBatch because canUseBatchedPrefillRdna rejects cfg.ssm_d_inner > 0. If profile phase data is missing, add only the missing labels before changing kernels.",
+      "Generalize the Qwen3.6 dense-hybrid prefill enablement to a shape-safe Qwen dense SSM hybrid helper. Replace the hard hidden_dim=5120/intermediate_dim=17408 predicate with a helper that admits qwen35 architecture, n_experts=0, ssm_d_inner>0, full_attn_interval=4, required tensors present, and known supported Q4_K/Q5_K/Q6_K projection types. Keep the old 27B env names working, but add Qwen3.5-neutral or QWEN35_9B-specific flags for risky changes.",
+      "Port the validated layer-major prefix/segment plan to the smaller Qwen3.5 shape. Start with a validation/foundation cycle that reuses the existing dense FFN and SSM projection validators on one layer and a 16/32/64-token chunk. Do not make it production-default until final logits or captured tensors match the token-major reference.",
+      "Once validation passes, enable the minimum production layer-major path that can move the long-draft prefill metric: batched dense FFN for prefix SSM layers plus batched full-attention segment layers. Qwen3.5-9B has smaller hidden/inter dims than 27B, so setup overhead may dominate at short prompts; test chunk thresholds instead of assuming the 27B thresholds transfer.",
+      "Use the phase budget to choose the bucket after the first validated keep. Expected candidates are SSM projection/conv/delta and dense FFN gate/up/down. If dense FFN dominates, reuse the Qwen3.6 DP4a dense gate/up/down machinery only after checking tensor types and n_tokens thresholds. If SSM dominates, prefer layer-major projection batching before delta-scan rewrites.",
+      "After any keep above 150 tok/s, run or at least prepare the full four-scenario matrix before declaring success. Core and long-draft prefill expose different shapes: core has 36 prompt tokens, long-draft has 64, context-medium has 174, and context-long has 322. A threshold that helps 64 tokens but regresses 174/322 is not a public win.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Read canUseBatchedPrefillRdna, isQwen36DenseHybrid27B, qwen36DensePrefillPrefixLayers, qwen36DensePrefillSegmentLayers, prefillQwen36DenseFfnPrefix, prefillQwen36RunBatchedDenseFfnLayer, prefillQwen36RunFullAttnLayerToFfnNorm, and dispatchProjectionBatched before editing.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+        focus: "Use the staged validator-first approach and failed-attempt list. The mechanism is relevant to Qwen3.5, but the 27B-specific shape constants and thresholds are not.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/tools/performance_suite.mjs",
+        focus: "Source of the public prompt matrix. contextualizePrompt(..., decode-extended) defines the Long Coding Plan prompt used as this effort's primary metric.",
+      },
+    ],
+    llamaCppBaselines: [
+      { scenario: "core",              prefillTokPerSec: 548.94, decodeTokPerSec: 85.51 },
+      { scenario: "context-medium",    prefillTokPerSec: 202.32, decodeTokPerSec: 85.10 },
+      { scenario: "context-long",      prefillTokPerSec: 205.64, decodeTokPerSec: 85.15 },
+      { scenario: "decode-extended",   prefillTokPerSec: 855.82, decodeTokPerSec: 84.96, isPrimary: true },
+    ],
+    llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md): close the Qwen3.5-9B RDNA prefill gap without giving back ZINC's decode lead. Primary target is decode-extended prefill, where llama.cpp is 855.82 tok/s and ZINC is 105.91 tok/s in the published artifact. A keep must preserve coherent output and should be checked against core/context-medium/context-long before being treated as public progress.",
   },
 };
 
@@ -1762,6 +1821,7 @@ export function formatLlamaCppComparison(
   primaryMetricLabel: string,
   metricMode: MetricMode,
   bestTokPerSec: number | null,
+  successRule?: string,
 ): string {
   const primary = baselines.find((b) => b.isPrimary) ?? baselines[0];
   if (!primary) return "";
@@ -1794,7 +1854,7 @@ export function formatLlamaCppComparison(
     `Other scenarios the loop is NOT measuring per-cycle (also count toward "beat llama.cpp on all 4"):`,
     otherLines,
     "",
-    `Project success rule (from MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md): beat llama.cpp on at least 3 of 4 decode scenarios AND keep prefill ≤ 20% behind on every context scenario. A change that improves the controller's prompt but regresses an other scenario does not count. If you are within ~10% of llama.cpp on the primary, prefer the structural lever (validated layer-major batched SSM+dense prefill, Tracks 1-3 in the effort doc) over more micro-fusion — micro-fusion compounds slower than structural batching at this scale.`,
+    successRule ?? `Project success rule (from MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md): beat llama.cpp on at least 3 of 4 decode scenarios AND keep prefill ≤ 20% behind on every context scenario. A change that improves the controller's prompt but regresses an other scenario does not count. If you are within ~10% of llama.cpp on the primary, prefer the structural lever (validated layer-major batched SSM+dense prefill, Tracks 1-3 in the effort doc) over more micro-fusion — micro-fusion compounds slower than structural batching at this scale.`,
   ].join("\n");
 }
 
@@ -1870,6 +1930,7 @@ export function buildAgentPrompt(
     structuralSwingIdeas?: string[];
     referenceImplementations?: Array<{ path: string; focus: string }>;
     llamaCppBaselines?: LlamaCppBaseline[];
+    llamaCppSuccessRule?: string;
     metricMode?: MetricMode;
     mode?: "normal" | "pivot";
   } = {},
@@ -1926,6 +1987,7 @@ export function buildAgentPrompt(
         options.primaryMetricLabel ?? "primary metric",
         options.metricMode ?? "prefill",
         bestPerf.tokPerSec,
+        options.llamaCppSuccessRule,
       )
     : null;
 
@@ -2092,6 +2154,7 @@ export function buildPivotPrompt(
     structuralSwingIdeas?: string[];
     referenceImplementations?: Array<{ path: string; focus: string }>;
     llamaCppBaselines?: LlamaCppBaseline[];
+    llamaCppSuccessRule?: string;
     metricMode?: MetricMode;
   },
 ): string {
@@ -2137,6 +2200,7 @@ export function buildPivotPrompt(
         primaryMetricLabel,
         options.metricMode ?? "prefill",
         currentBest.tokPerSec,
+        options.llamaCppSuccessRule,
       )
     : null;
 
@@ -2842,6 +2906,7 @@ async function spawnAgent(
     structuralSwingIdeas: effortSpec?.structuralSwingIdeas,
     referenceImplementations: effortSpec?.referenceImplementations,
     llamaCppBaselines: effortSpec?.llamaCppBaselines,
+    llamaCppSuccessRule: effortSpec?.llamaCppSuccessRule,
     metricMode: effortSpec?.metricMode,
     mode: isPivot ? "pivot" : "normal",
   });

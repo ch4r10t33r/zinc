@@ -517,6 +517,20 @@ describe("controller helpers", () => {
     expect(spec?.structuralSwingIdeas?.join("\n")).toContain("shaderstats");
   });
 
+  test("RDNA Qwen35 9B effort targets the largest published prefill gap", () => {
+    const spec = getEffortSpec(17);
+    expect(spec).not.toBeNull();
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md");
+    expect(spec?.primaryMetricLabel).toBe("Qwen3.5-9B long-draft prefill tok/s");
+    expect(spec?.defaultModel).toBe("qwen359b");
+    expect(spec?.benchmarkMethod).toContain("decode-extended Long Coding Plan");
+    expect(spec?.benchmarkPrompt).toContain("stable benchmark preset");
+    expect(spec?.benchmarkPrompt).toContain("Plan:\n1.");
+    expect(spec?.llamaCppBaselines?.find((b) => b.isPrimary)?.prefillTokPerSec).toBe(855.82);
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("decode first");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("Qwen3.5-9B");
+  });
+
   test("resume compatibility rejects state from older benchmark regimes", () => {
     const spec = getEffortSpec(3);
     expect(spec).not.toBeNull();
@@ -1938,6 +1952,12 @@ describe("formatLlamaCppComparison", () => {
     const out = formatLlamaCppComparison(baselines, "decode tok/s", "decode", 28.0);
     expect(out).toContain("34.40"); // primary decode baseline
     expect(out).not.toContain("195.01"); // not the prefill row
+  });
+
+  test("renders an effort-specific success rule when provided", () => {
+    const out = formatLlamaCppComparison(baselines, "x", "prefill", 150.95, "Project success rule: custom effort rule.");
+    expect(out).toContain("Project success rule: custom effort rule.");
+    expect(out).not.toContain("MULTI_HOUR_EFFORT_15");
   });
 });
 
