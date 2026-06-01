@@ -868,6 +868,9 @@ pub const RuntimeProfile = struct {
     queued_prefill_final_barrier_calls: u32 = 0,
     queued_prefill_async_record_ns: u64 = 0,
     queued_prefill_final_record_ns: u64 = 0,
+    queued_prefill_async_submit_count: u32 = 0,
+    queued_prefill_async_to_final_wait_ns: u64 = 0,
+    queued_prefill_final_wait_ns: u64 = 0,
     shared_expert_bytes: u64 = 0,
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
@@ -1346,6 +1349,13 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             profile.queued_prefill_final_dispatch_calls,
             profile.queued_prefill_final_barrier_calls,
             nsToMs(profile.queued_prefill_final_record_ns),
+        });
+        log.info("  {s} queued prefill queue: async_submits {d} first_async_to_final_wait {d:.2} ms final_wait {d:.2} ms ({d:.1}% of prefill waits)", .{
+            label,
+            profile.queued_prefill_async_submit_count,
+            nsToMs(profile.queued_prefill_async_to_final_wait_ns),
+            nsToMs(profile.queued_prefill_final_wait_ns),
+            pctOf(profile.gpu_completion_wait_ns, profile.queued_prefill_final_wait_ns),
         });
     }
 }
@@ -2513,6 +2523,9 @@ fn recordQueuedPrefillStart(
     p.queued_prefill_final_barrier_calls = 0;
     p.queued_prefill_async_record_ns = 0;
     p.queued_prefill_final_record_ns = 0;
+    p.queued_prefill_async_submit_count = 0;
+    p.queued_prefill_async_to_final_wait_ns = 0;
+    p.queued_prefill_final_wait_ns = 0;
 }
 
 fn recordQueuedPrefillChunk(profile: ?*RuntimeProfile, chunk_tokens: usize, is_final: bool) void {
@@ -2552,6 +2565,20 @@ fn recordQueuedPrefillChunkWork(
         p.queued_prefill_async_barrier_calls += cmd.barrier_count;
         p.queued_prefill_async_record_ns += record_ns;
     }
+}
+
+fn recordQueuedPrefillAsyncSubmit(profile: ?*RuntimeProfile, first_async_submit_ns: *i128) void {
+    const p = profile orelse return;
+    p.queued_prefill_async_submit_count += 1;
+    if (first_async_submit_ns.* < 0) {
+        first_async_submit_ns.* = std.time.nanoTimestamp();
+    }
+}
+
+fn recordQueuedPrefillFinalWait(profile: ?*RuntimeProfile, async_to_final_wait_ns: u64, final_wait_ns: u64) void {
+    const p = profile orelse return;
+    p.queued_prefill_async_to_final_wait_ns += async_to_final_wait_ns;
+    p.queued_prefill_final_wait_ns += final_wait_ns;
 }
 
 fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
@@ -5485,6 +5512,7 @@ pub const InferenceEngine = struct {
         const async_chunk_tokens = queuedTokenMajorAsyncChunkTokensFromRequest(self.config, prompt_tokens.len, async_chunk_request);
         const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
         recordQueuedPrefillStart(profile, prompt_tokens.len, async_chunk_request, async_chunk_tokens);
+        var first_async_submit_ns: i128 = -1;
         if (async_chunk_tokens <= 1) {
             for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
                 const record_start = profileStart(profile != null);
@@ -5496,6 +5524,7 @@ pub const InferenceEngine = struct {
                 try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, 0);
                 recordQueuedPrefillChunkWork(profile, &pending[pending_count], profileElapsedNs(record_start), false);
                 recordQueuedPrefillChunk(profile, 1, false);
+                recordQueuedPrefillAsyncSubmit(profile, &first_async_submit_ns);
                 pending_count += 1;
             }
         } else {
@@ -5518,12 +5547,19 @@ pub const InferenceEngine = struct {
                 }
                 recordQueuedPrefillChunkWork(profile, &chunk_cmd, profileElapsedNs(record_start), is_final_chunk);
                 if (is_final_chunk) {
+                    const final_wait_start = profileStart(profile != null);
+                    const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
+                        @intCast(final_wait_start - first_async_submit_ns)
+                    else
+                        0;
                     commitAndWaitProfiled(&chunk_cmd, profile);
+                    recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
                     pending_completed_by_final_wait = true;
                     state.position = self.position;
                     return;
                 }
                 commitAsyncProfiled(&chunk_cmd, profile);
+                recordQueuedPrefillAsyncSubmit(profile, &first_async_submit_ns);
                 pending[pending_count] = chunk_cmd;
                 pending_count += 1;
                 chunk_cmd.handle = null;
@@ -5537,7 +5573,13 @@ pub const InferenceEngine = struct {
         else
             &self.prefill_embed_buf;
         recordQueuedPrefillChunk(profile, 1, true);
+        const final_wait_start = profileStart(profile != null);
+        const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
+            @intCast(final_wait_start - first_async_submit_ns)
+        else
+            0;
         try runDecodeStep(self, true, final_src, final_offset, null, null, 0);
+        recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
         pending_completed_by_final_wait = true;
         state.position = self.position;
     }
