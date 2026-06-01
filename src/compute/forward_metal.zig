@@ -5293,7 +5293,10 @@ pub const InferenceEngine = struct {
 
     fn canUseQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
         if (prompt_len <= 1 or prompt_len > queued_prefill_embed_tokens) return false;
-        if (!self.private_decode_buffers) return false;
+        const can_queue_shared_embedding =
+            self.config.architecture == .gemma and
+            self.copy_f32_pipe.handle != null;
+        if (!self.private_decode_buffers and !can_queue_shared_embedding) return false;
         if (self.debug_validation_enabled or self.gemma_moe_validation_enabled or self.qwen_prefill_validation_enabled) return false;
         if (self.config.n_experts == 0) return false;
 
@@ -18082,7 +18085,7 @@ fn runDecodeStep(
             .byte_offset = @intCast(@as(u64, embed_src_offset) * @as(u64, @sizeOf(f32))),
         };
     };
-    if (engine.private_decode_buffers) {
+    if (engine.private_decode_buffers or embed_src_override != null) {
         const cmd = shared_cmd orelse return error.PrivateDecodeFastPathRequiresSharedCommand;
         if (qwen_branch_hidden_seed == null) {
             const embed_src = embed_src_override orelse &engine.embed_staging;
