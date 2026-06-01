@@ -24,7 +24,7 @@
 // keep using the f32 mul_mm_q4k_gate_up_swiglu fallback and the standalone
 // quantize_act_q8_1 dispatch.
 
-#extension GL_EXT_integer_dot_product : require
+#include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require

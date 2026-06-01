@@ -23,7 +23,7 @@
 // LDS is tiny (int8 packed): ~2.7KB vs the f16 path's 6.3KB, so occupancy is no
 // longer the bottleneck. Host may only dispatch when M,N are multiples of 32.
 
-#extension GL_EXT_integer_dot_product : require
+#include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
