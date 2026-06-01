@@ -1713,6 +1713,17 @@ export function defaultRdnaCases(modelRoot) {
       max_tokens: defaultMaxTokensForModelId("qwen36-27b-q4k-m"),
       notes: ["RDNA4 dense Qwen 3.6 comparison against llama.cpp server"],
     },
+    {
+      id: "qwen35-9b-q4k-m",
+      label: "Qwen 3.5 9B Q4_K_M",
+      family: "Qwen 3.5",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "Qwen3.5-9B-Q4_K_M.gguf"),
+      prompt_mode: "raw",
+      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
+      notes: ["RDNA4 small Qwen comparison against llama.cpp server"],
+    },
   ];
 }
 
