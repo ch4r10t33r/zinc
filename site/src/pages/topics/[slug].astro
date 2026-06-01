@@ -1,0 +1,264 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import { buildBreadcrumbList } from '../../lib/structured-data';
+import { getTopicHub, topicHubs, type TopicHub } from '../../data/topic-hubs';
+
+export function getStaticPaths() {
+  return topicHubs.map((hub) => ({
+    params: { slug: hub.slug },
+    props: { hub },
+  }));
+}
+
+const { hub } = Astro.props as { hub: TopicHub };
+const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
+const breadcrumbItems = [
+  { name: 'Home', href: '/' },
+  { name: 'Topics', href: '/topics/' },
+  { name: hub.shortTitle },
+];
+const relatedHubs = hub.related
+  .map((slug) => getTopicHub(slug))
+  .filter(Boolean) as TopicHub[];
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'TechArticle',
+      headline: hub.title,
+      description: hub.description,
+      url: `${siteUrl}/topics/${hub.slug}/`,
+      author: {
+        '@type': 'Person',
+        name: 'Stepan Zolotukhin',
+        url: `${siteUrl}/about`,
+      },
+      publisher: {
+        '@type': 'Organization',
+        name: 'ZINC Project',
+        url: siteUrl,
+      },
+      keywords: hub.keywords.split(',').map((keyword) => keyword.trim()),
+      mainEntityOfPage: `${siteUrl}/topics/${hub.slug}/`,
+    },
+    {
+      '@type': 'FAQPage',
+      mainEntity: hub.faqs.map((faq) => ({
+        '@type': 'Question',
+        name: faq.question,
+        acceptedAnswer: {
+          '@type': 'Answer',
+          text: faq.answer,
+        },
+      })),
+    },
+    buildBreadcrumbList(siteUrl, breadcrumbItems),
+  ],
+};
+---
+
+<BaseLayout
+  title={hub.title}
+  description={hub.description}
+  keywords={hub.keywords}
+  jsonLd={jsonLd}
+>
+  <Breadcrumbs items={breadcrumbItems} />
+
+  <article class="topic-hub">
+    <header class="topic-header">
+      <p class="eyebrow">Topic Guide</p>
+      <h1>{hub.title}</h1>
+      <p class="lede">{hub.summary}</p>
+    </header>
+
+    <section class="answer-band" aria-labelledby="practical-answer">
+      <h2 id="practical-answer">Practical Answer</h2>
+      <p>{hub.practicalAnswer}</p>
+    </section>
+
+    <section aria-labelledby="what-matters">
+      <h2 id="what-matters">What Matters</h2>
+      <ul class="clean-list">
+        {hub.whatMatters.map((item) => <li>{item}</li>)}
+      </ul>
+    </section>
+
+    <section aria-labelledby="read-next">
+      <h2 id="read-next">Deep Reads</h2>
+      <div class="link-grid">
+        {hub.readNext.map((link) => (
+          <a href={link.href} class="link-card">
+            <strong>{link.title}</strong>
+            <span>{link.description}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+
+    <section aria-labelledby="docs">
+      <h2 id="docs">Run It</h2>
+      <div class="link-grid compact">
+        {hub.docs.map((link) => (
+          <a href={link.href} class="link-card">
+            <strong>{link.title}</strong>
+            <span>{link.description}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+
+    <section aria-labelledby="questions">
+      <h2 id="questions">Common Questions</h2>
+      <div class="faq-list">
+        {hub.faqs.map((faq) => (
+          <section class="faq-item">
+            <h3>{faq.question}</h3>
+            <p>{faq.answer}</p>
+          </section>
+        ))}
+      </div>
+    </section>
+
+    <nav class="related-topics" aria-labelledby="related-topics">
+      <h2 id="related-topics">Related Topics</h2>
+      <div>
+        {relatedHubs.map((related) => (
+          <a href={`/topics/${related.slug}/`}>{related.title}</a>
+        ))}
+      </div>
+    </nav>
+  </article>
+</BaseLayout>
+
+<style>
+  .topic-hub {
+    display: grid;
+    gap: var(--space-xl);
+  }
+
+  .topic-header {
+    padding-bottom: var(--space-lg);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .eyebrow {
+    margin-bottom: var(--space-xs);
+    color: var(--color-accent);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .lede {
+    color: var(--color-text-muted);
+    font-size: 1.05rem;
+  }
+
+  .answer-band {
+    padding: var(--space-lg) 0;
+    border-top: 1px solid var(--color-border);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .answer-band h2 {
+    margin-top: 0;
+  }
+
+  .answer-band p {
+    margin-bottom: 0;
+    font-size: 1.04rem;
+  }
+
+  .clean-list {
+    display: grid;
+    gap: var(--space-sm);
+    padding-left: 1.2rem;
+  }
+
+  .link-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-sm);
+  }
+
+  .link-grid.compact {
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  }
+
+  .link-card {
+    display: grid;
+    gap: 0.3rem;
+    min-height: 6.5rem;
+    padding: 0.8rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    color: var(--color-text);
+    text-decoration: none;
+  }
+
+  .link-card:hover {
+    border-color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .link-card strong {
+    line-height: 1.3;
+  }
+
+  .link-card span {
+    color: var(--color-text-muted);
+    font-size: 0.82rem;
+    line-height: 1.42;
+  }
+
+  .faq-list {
+    display: grid;
+    gap: var(--space-md);
+  }
+
+  .faq-item {
+    padding-bottom: var(--space-md);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .faq-item:last-child {
+    border-bottom: none;
+  }
+
+  .faq-item h3 {
+    margin-top: 0;
+  }
+
+  .related-topics {
+    padding-top: var(--space-lg);
+    border-top: 1px solid var(--color-border);
+  }
+
+  .related-topics div {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+  }
+
+  .related-topics a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.25rem;
+    padding: 0.3rem 0.7rem;
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    color: var(--color-text);
+    font-size: 0.88rem;
+    font-weight: 700;
+    text-decoration: none;
+  }
+
+  .related-topics a:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+</style>

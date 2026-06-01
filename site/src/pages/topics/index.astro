@@ -1,0 +1,123 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import { buildBreadcrumbList } from '../../lib/structured-data';
+import { topicHubs } from '../../data/topic-hubs';
+
+const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
+const breadcrumbItems = [
+  { name: 'Home', href: '/' },
+  { name: 'Topics' },
+];
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'CollectionPage',
+      name: 'Local LLM Inference Topics',
+      description: 'Evergreen guides for ZINC, Qwen3.6, Gemma 4, AMD RDNA4, and KV cache quantization.',
+      url: `${siteUrl}/topics/`,
+      mainEntity: {
+        '@type': 'ItemList',
+        itemListElement: topicHubs.map((hub, index) => ({
+          '@type': 'ListItem',
+          position: index + 1,
+          name: hub.title,
+          url: `${siteUrl}/topics/${hub.slug}/`,
+        })),
+      },
+    },
+    buildBreadcrumbList(siteUrl, breadcrumbItems),
+  ],
+};
+---
+
+<BaseLayout
+  title="Local LLM Inference Topics"
+  description="Evergreen guides for ZINC topics: Qwen3.6 local inference, Gemma 4, AMD RDNA4 GPUs, and KV cache quantization."
+  keywords="local LLM inference topics, Qwen3.6 local inference, Gemma 4 local inference, AMD RDNA4 LLM inference, KV cache quantization, ZINC guides"
+  jsonLd={jsonLd}
+>
+  <Breadcrumbs items={breadcrumbItems} />
+
+  <section class="topics-head">
+    <p class="eyebrow">Evergreen Guides</p>
+    <h1>Local LLM Inference Topics</h1>
+    <p class="lede">These pages are the stable entry points for the technical clusters behind ZINC. Start here when you want the practical answer, then follow the links into the deeper engineering posts.</p>
+  </section>
+
+  <section class="topic-grid" aria-label="Topic guides">
+    {topicHubs.map((hub) => (
+      <a href={`/topics/${hub.slug}/`} class="topic-card">
+        <span>{hub.shortTitle}</span>
+        <strong>{hub.title}</strong>
+        <p>{hub.summary}</p>
+      </a>
+    ))}
+  </section>
+</BaseLayout>
+
+<style>
+  .topics-head {
+    padding-bottom: var(--space-lg);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .eyebrow {
+    margin-bottom: var(--space-xs);
+    color: var(--color-accent);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .lede {
+    max-width: 42rem;
+    color: var(--color-text-muted);
+    font-size: 1.02rem;
+  }
+
+  .topic-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-md);
+    margin-top: var(--space-xl);
+  }
+
+  .topic-card {
+    display: grid;
+    gap: 0.45rem;
+    min-height: 10rem;
+    padding: 0.85rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    color: var(--color-text);
+    text-decoration: none;
+  }
+
+  .topic-card:hover {
+    border-color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .topic-card span {
+    color: var(--color-accent);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .topic-card strong {
+    font-size: 1.18rem;
+    line-height: 1.25;
+  }
+
+  .topic-card p {
+    color: var(--color-text-muted);
+    font-size: 0.86rem;
+    line-height: 1.45;
+  }
+</style>

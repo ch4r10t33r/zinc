@@ -5,6 +5,8 @@ https://www.zolotukhin.ai/*  https://zolotukhin.ai/:splat             301
 /about                       /about/                                  301
 /blog                        /blog/                                   301
 /blog/:slug                  /blog/:slug/                             301
+/topics                      /topics/                                 301
+/topics/:slug                /topics/:slug/                           301
 /zinc                        /zinc/                                   301
 /zinc/benchmarks             /zinc/benchmarks/                        301
 /zinc/performance            /zinc/benchmarks/                        301
