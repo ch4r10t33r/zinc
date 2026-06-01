@@ -444,7 +444,16 @@ fn readU32Env(env_name: [:0]const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
 }
 
+fn isGemma26A4BMoeShape(cfg: ModelConfig) bool {
+    return cfg.architecture == .gemma and
+        cfg.n_layers == 30 and
+        cfg.hidden_dim == 2816 and
+        cfg.n_experts == 128 and
+        cfg.n_experts_used == 8;
+}
+
 fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
+    if (isGemma26A4BMoeShape(cfg)) return false;
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
@@ -25213,7 +25222,7 @@ test "q8 lm head stays on GPU" {
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
 
-test "gemma q8 routed moe decode default is opt-out" {
+test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     var gemma_cfg = ModelConfig{
         .architecture = .gemma,
         .n_layers = 30,
@@ -25237,7 +25246,11 @@ test "gemma q8 routed moe decode default is opt-out" {
         .full_attn_interval = 0,
         .shared_expert_intermediate_dim = 0,
     };
+    try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
+    gemma_cfg.hidden_dim = 4096;
     try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.n_experts = 0;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     gemma_cfg.architecture = .qwen35;
