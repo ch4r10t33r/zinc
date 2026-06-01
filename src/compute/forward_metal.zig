@@ -444,6 +444,10 @@ fn readU32Env(env_name: [:0]const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
 }
 
+fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .gemma and cfg.n_experts > 0;
+}
+
 fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
     return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
         readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
@@ -3513,7 +3517,7 @@ pub const InferenceEngine = struct {
         self.qwen_final_tail_kv_fused_norm_enabled = readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true;
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
-        self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse false;
+        self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -25209,7 +25213,37 @@ test "q8 lm head stays on GPU" {
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
 
-test "gemma q8 routed moe is prefill-only by default" {
+test "gemma q8 routed moe decode default is opt-out" {
+    var gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 0,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 0,
+        .shared_expert_intermediate_dim = 0,
+    };
+    try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    gemma_cfg.n_experts = 0;
+    try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    gemma_cfg.architecture = .qwen35;
+    gemma_cfg.n_experts = 128;
+    try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, true, false));
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, false, true));
