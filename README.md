@@ -40,6 +40,24 @@
 | **Linux** | Intel Arc Xe2 / Battlemage | Vulkan | Experimental bring-up |
 | **macOS** | Apple Silicon (M1, M2, M3, M4, M5) | Metal | Supported — native MSL shaders |
 
+ZINC focuses on current local-inference models people are actively running:
+Qwen 3.5/3.6 and Gemma 4 today, with a managed catalog that stays narrow on
+purpose. Older Llama/Mistral/Gemma generations may work eventually, but broad
+legacy-model coverage is not the main optimization target.
+
+## Status vs llama.cpp
+
+Latest checked-in benchmark artifact, same machine, same weights, same prompt:
+
+| Platform | Compared models | Decode vs llama.cpp | Prefill vs llama.cpp | Read this as |
+|----------|----------------:|--------------------:|---------------------:|--------------|
+| AMD RDNA4 / Vulkan | 5 | 99% avg, 2 model wins | 24% avg | Decode is close; prefill is the active gap |
+| Apple Silicon / Metal | 5 | 62% avg, 1 model win | 58% avg, 2 model wins | Mixed by model; tuning is still uneven |
+| Intel Arc / Vulkan | 1 | 84% | 152% | Experimental, not full-catalog coverage yet |
+
+Full per-model numbers are in [Benchmarks](#benchmarks) and on the public
+dashboard: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks).
+
 ## Start Here
 
 Works the same on Linux (AMD GPU) and macOS (Apple Silicon):
@@ -72,14 +90,18 @@ The server exposes the built-in chat UI at `/` and an OpenAI-compatible API at `
 
 ## What Works Today
 
-- Single-stream CLI inference on the validated models listed below
-- OpenAI-compatible `/v1` API with streaming
-- Built-in browser chat UI with thinking mode support
-- Managed model workflow: `list`, `pull`, `use`, `active`, `rm`
-- `zinc chat` — start server and open browser in one command
-- **AMD path**: RDNA4-tuned Vulkan shaders (wave64, cooperative matrix, fused ops)
-- **Apple Silicon path**: native Metal shaders (MSL, zero-copy mmap, simdgroup ops)
-- Auto-detection: ZINC picks the right backend (Vulkan or Metal) at build time
+ZINC is usable today as a local, single-user inference engine for the
+validated models listed below.
+
+| Area | What you can do today |
+|------|------------------------|
+| Run models | Use the CLI for single-stream inference on supported GGUF models |
+| Chat | Start the built-in browser UI with `zinc chat`, including streaming and thinking-mode display |
+| API | Serve OpenAI-compatible `/v1` endpoints with streaming responses |
+| Models | Manage catalog models with `list`, `pull`, `use`, `active`, and `rm` |
+| AMD GPUs | Run the Vulkan backend with RDNA-tuned wave64, cooperative-matrix, and fused-op shaders |
+| Apple Silicon | Run the native Metal backend with MSL shaders, zero-copy mmap, and simdgroup ops |
+| Setup | Let ZINC select the available backend at build time: Vulkan on Linux, Metal on macOS |
 
 ## Still Rough
 
@@ -235,7 +257,7 @@ See also: [CONTRIBUTING.md](./CONTRIBUTING.md) · [Code of Conduct](./CODE_OF_CO
 
 ## Benchmarks
 
-The tables below are pulled directly from the latest published artifact at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refresh: 2026-06-01 UTC for RDNA4 and 2026-05-19 UTC for Metal. Numbers are median tok/s across the suite's runs on a fresh boot, ZINC and llama.cpp on the same hardware, weights, and prompt.
+The tables below are pulled directly from the latest published artifact at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refresh: 2026-06-01 UTC. Numbers are median tok/s across the suite's runs on a fresh boot, ZINC and llama.cpp on the same hardware, weights, and prompt.
 
 ### AMD RDNA4 — Radeon AI PRO R9700 (Vulkan)
 
@@ -251,18 +273,18 @@ The tables below are pulled directly from the latest published artifact at [zolo
 
 | Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen 3 8B Q4_K_M | **381.60** | 79.87 | **478%** | 73.93 | 83.06 | 89% |
-| Gemma 4 31B Q4_K_M | **131.40** | 103.16 | **127%** | 21.90 | 23.50 | 93% |
-| Gemma 4 26B-A4B MoE Q4_K_M | 53.20 | 410.72 | 13% | 48.18 | 83.50 | 58% |
-| Qwen 3.6 35B A3B UD Q4_K_XL | 34.80 | 320.33 | 11% | 33.86 | 66.31 | 51% |
-| Qwen 3.6 27B Dense Q4_K_M | 8.50 | 104.28 | 8% | 8.87 | 22.08 | 40% |
+| Gemma 4 31B Q4_K_M | **132.60** | 84.47 | **157%** | 21.86 | 23.30 | 94% |
+| Qwen 3.6 35B A3B UD Q4_K_XL | 97.40 | 151.50 | 64% | **81.07** | 73.09 | **111%** |
+| Qwen 3.6 27B Dense Q4_K_M | 9.60 | 27.87 | 34% | 8.93 | 23.32 | 38% |
+| Qwen 3.5 9B Q4_K_M | 23.20 | 90.65 | 26% | 23.21 | 66.52 | 35% |
+| Gemma 4 26B-A4B MoE Q4_K_M | 34.00 | 365.45 | 9% | 30.01 | 88.44 | 34% |
 
 ### Where we stand vs llama.cpp
 
-- **Ahead of llama.cpp**: RDNA4 decode for Qwen 3.6 35B-A3B (1.18x) and Qwen 3.5 9B (1.12x); Metal prefill for Qwen 3 8B (4.78x) and Gemma 4 31B (1.27x).
-- **Within striking distance (>=90% of llama.cpp)**: RDNA4 decode for Qwen 3.6 27B dense (93%); Metal decode for Gemma 4 31B (93%) and Qwen 3 8B (89%, just below the cutoff).
-- **Active gap**: RDNA4 prefill is still the primary gap on the larger models. Qwen 3.6 35B-A3B now reaches 154.27 tok/s, but llama.cpp is 398.82 tok/s on the same box, so the structural batched-prefill work remains the main unlock.
-- **In flight**: Metal prefill is no longer uniformly slow, but coverage is uneven. Qwen 3 8B and Gemma 4 31B are ahead of llama.cpp on prefill, while Qwen 3.6 27B/35B and Gemma 4 26B still need the batched path generalized across the catalog.
+- **Ahead of llama.cpp**: RDNA4 decode for Qwen 3.6 35B-A3B (1.18x) and Qwen 3.5 9B (1.12x); Metal decode for Qwen 3.6 35B-A3B (1.11x); Metal prefill for Gemma 4 31B (1.57x).
+- **Within striking distance (>=90% of llama.cpp)**: RDNA4 decode for Qwen 3.6 27B dense (93%); Metal decode for Gemma 4 31B (94%).
+- **Active gap**: RDNA4 prefill is still the primary gap. Qwen 3.6 35B-A3B reaches 154.27 tok/s, but llama.cpp is 398.82 tok/s on the same box, so structural batched-prefill work remains the main unlock.
+- **In flight**: Metal is mixed by model. Gemma 4 31B prefill and Qwen 3.6 35B decode are ahead of llama.cpp, while Qwen 3.5/3.6 dense and Gemma 4 26B still need backend-specific tuning.
 
 For local benchmark commands, harnesses, and methodology, see:
 
