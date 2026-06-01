@@ -320,7 +320,12 @@ If you want to rebuild and restart the shared RDNA4 test server from your curren
 ./scripts/deploy_rdna4_server.sh
 ```
 
-That script uses `.env` for `ZINC_HOST`, `ZINC_USER`, and `ZINC_PORT`, syncs the repo to `/root/zinc`, rebuilds it, restarts port `9090`, and finishes with a remote `/health` check.
+That script uses `.env` for the active RDNA target, syncs the repo to `/root/zinc`,
+rebuilds it, restarts port `9090`, and finishes with a remote `/health` check.
+For multi-node setups, set `ZINC_RDNA_NODE=rdna1` or `ZINC_RDNA_NODE=rdna2`
+and define matching `ZINC_RDNA1_HOST/PORT/USER` or
+`ZINC_RDNA2_HOST/PORT/USER` keys. If no selector is set, the script falls back
+to `ZINC_RDNA_HOST/PORT/USER` and then `ZINC_HOST/PORT/USER`.
 
 Useful flags:
 

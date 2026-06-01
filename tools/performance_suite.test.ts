@@ -25,6 +25,8 @@ import {
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
   prefersChatPrompt,
+  rdnaEnvValue,
+  rdnaNodeEnvKey,
   intelZincCommand,
   rdnaZincCommand,
   resolveLocalLlamaServer,
@@ -278,6 +280,24 @@ test("parseDotEnv handles export lines and quotes", () => {
   expect(env.ZINC_HOST).toBe("bench.local");
   expect(env.ZINC_USER).toBe("root");
   expect(env.ZINC_PORT).toBe("2222");
+});
+
+test("RDNA node selection prefers node-specific environment keys", () => {
+  const env = parseDotEnv(`
+    ZINC_RDNA_NODE=rdna2
+    ZINC_RDNA_HOST=rdna-default.local
+    ZINC_RDNA_USER=root
+    ZINC_RDNA_PORT=22
+    ZINC_RDNA2_HOST=rdna-two.local
+    ZINC_RDNA2_USER=bench
+    ZINC_RDNA2_PORT=2222
+  `);
+
+  expect(rdnaNodeEnvKey("rdna-2", "HOST")).toBe("ZINC_RDNA_2_HOST");
+  expect(rdnaEnvValue(env, { envMap: {} }, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST")).toBe("rdna-two.local");
+  expect(rdnaEnvValue(env, { envMap: {}, rdnaNode: "rdna1" }, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST")).toBe("rdna-default.local");
+  expect(rdnaEnvValue(env, { envMap: {} }, "USER", "ZINC_RDNA_USER", "ZINC_USER")).toBe("bench");
+  expect(rdnaEnvValue(env, { envMap: {} }, "PORT", "ZINC_RDNA_PORT", "ZINC_PORT")).toBe("2222");
 });
 
 test("parseZincCliOutput extracts prompt, prefill, decode, and output preview", () => {

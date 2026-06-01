@@ -231,13 +231,26 @@ For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning),
 
 ## RDNA4 Test Node
 
-For AMD GPU testing, the project uses a remote RDNA4 node. Environment setup:
+For AMD GPU testing, the project uses remote RDNA4 nodes. Environment setup:
 
 ```bash
 # .env file in repo root
-ZINC_HOST=<ip>
-ZINC_PORT=<ssh-port>
-ZINC_USER=root
+# Optional selector for machines with more than one RDNA node.
+# The selector maps rdna1 -> ZINC_RDNA1_* and rdna2 -> ZINC_RDNA2_*.
+ZINC_RDNA_NODE=rdna1
+
+ZINC_RDNA1_HOST=<ip-or-hostname>
+ZINC_RDNA1_PORT=<ssh-port>
+ZINC_RDNA1_USER=root
+
+ZINC_RDNA2_HOST=<ip-or-hostname>
+ZINC_RDNA2_PORT=<ssh-port>
+ZINC_RDNA2_USER=root
+
+# Compatibility fallback for older scripts and ad-hoc shell commands.
+ZINC_HOST=<active-rdna-ip-or-hostname>
+ZINC_PORT=<active-rdna-ssh-port>
+ZINC_USER=<active-rdna-ssh-user>
 
 # Optional overrides consumed by scripts/deploy_rdna4_server.sh
 ZINC_REMOTE_DIR=/root/zinc                 # remote checkout path
@@ -245,6 +258,10 @@ ZINC_REMOTE_MODEL=/root/models/<file>.gguf # model file the deployed server load
 ZINC_SERVER_PORT=9090                      # remote server port
 ZINC_REMOTE_LOG=/tmp/zinc_<port>.log       # remote log file
 ```
+
+Node-specific deploy overrides can use the same prefix, for example
+`ZINC_RDNA2_REMOTE_MODEL`, `ZINC_RDNA2_SERVER_PORT`, and
+`ZINC_RDNA2_REMOTE_LOG`.
 
 Intel Arc benchmark nodes use separate keys so they do not override the RDNA defaults:
 

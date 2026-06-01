@@ -56,7 +56,7 @@ function loadEnv(): Record<string, string> {
   if (existsSync(envPath)) {
     const content = require("fs").readFileSync(envPath, "utf8") as string;
     for (const line of content.split("\n")) {
-      const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+?)\s*$/);
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.+?)\s*$/);
       if (m) vars[m[1]] = m[2];
     }
   }
@@ -64,9 +64,33 @@ function loadEnv(): Record<string, string> {
 }
 
 const ENV = loadEnv();
-const ZINC_HOST = process.env.ZINC_HOST ?? ENV.ZINC_HOST ?? "127.0.0.1";
-const ZINC_PORT = Number(process.env.ZINC_PORT ?? ENV.ZINC_PORT ?? "22");
-const ZINC_USER = process.env.ZINC_USER ?? ENV.ZINC_USER ?? "root";
+
+function envValue(...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = process.env[key] ?? ENV[key];
+    if (value != null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function rdnaNodeEnvKey(node: string | undefined, suffix: string): string | null {
+  const normalized = (node ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized ? `ZINC_${normalized}_${suffix}` : null;
+}
+
+function rdnaEnvValue(suffix: string, ...fallbackKeys: string[]): string | undefined {
+  const node = envValue("ZINC_RDNA_NODE", "ZINC_NODE");
+  const nodeKey = rdnaNodeEnvKey(node, suffix);
+  return envValue(...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
+}
+
+const ZINC_HOST = rdnaEnvValue("HOST", "ZINC_RDNA_HOST", "ZINC_HOST") ?? "127.0.0.1";
+const ZINC_PORT = Number(rdnaEnvValue("PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22");
+const ZINC_USER = rdnaEnvValue("USER", "ZINC_RDNA_USER", "ZINC_USER") ?? "root";
 const REMOTE_DIR = "/root/zinc";
 
 type PromptMode = "raw" | "chat";

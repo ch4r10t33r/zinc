@@ -95,6 +95,7 @@ export function parseArgs(argv) {
     rdnaSync: false,
     rdnaBuild: false,
     rdnaStartLlama: false,
+    rdnaNode: process.env.ZINC_RDNA_NODE ?? process.env.ZINC_NODE ?? null,
     rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
       ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
       : 0,
@@ -179,6 +180,9 @@ export function parseArgs(argv) {
       case "--rdna-start-llama":
         args.rdnaStartLlama = true;
         break;
+      case "--rdna-node":
+        args.rdnaNode = argv[++i] ?? args.rdnaNode;
+        break;
       case "--intel-sync":
         args.intelSync = true;
         break;
@@ -255,6 +259,7 @@ function usage() {
   --rdna-sync                 Rsync current repo to the RDNA node before running
   --rdna-build                Build ReleaseFast on the RDNA node before running
   --rdna-start-llama          Start llama-server on the RDNA node before baseline runs
+  --rdna-node <name>          Select node-specific env keys, e.g. rdna2 -> ZINC_RDNA2_HOST/PORT/USER
   --intel-sync                Rsync current repo to the Intel node before running
   --intel-build               Build ReleaseFast on the Intel node before running
   --intel-start-llama         Stop stale llama-server processes on the Intel node before baseline runs
@@ -2122,12 +2127,33 @@ async function runMetalTarget(args) {
   };
 }
 
-function envValue(dotEnv, ...keys) {
+function envValueFrom(envMap, dotEnv, ...keys) {
   for (const key of keys) {
-    const value = process.env[key] ?? dotEnv[key];
+    const value = envMap[key] ?? dotEnv[key];
     if (value != null && value !== "") return value;
   }
   return null;
+}
+
+function envValue(dotEnv, ...keys) {
+  return envValueFrom(process.env, dotEnv, ...keys);
+}
+
+export function rdnaNodeEnvKey(node, suffix) {
+  const normalized = String(node ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!normalized) return null;
+  return `ZINC_${normalized}_${suffix}`;
+}
+
+export function rdnaEnvValue(dotEnv, args, suffix, ...fallbackKeys) {
+  const envMap = args?.envMap ?? process.env;
+  const node = args?.rdnaNode ?? envValueFrom(envMap, dotEnv, "ZINC_RDNA_NODE", "ZINC_NODE");
+  const nodeKey = node ? rdnaNodeEnvKey(node, suffix) : null;
+  return envValueFrom(envMap, dotEnv, ...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
 }
 
 function remoteHomeForUser(user) {
@@ -2136,11 +2162,11 @@ function remoteHomeForUser(user) {
 
 async function buildRdnaCreds(args) {
   const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
-  const host = envValue(dotEnv, "ZINC_RDNA_HOST", "ZINC_HOST");
-  const user = envValue(dotEnv, "ZINC_RDNA_USER", "ZINC_USER");
-  const port = envValue(dotEnv, "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22";
+  const host = rdnaEnvValue(dotEnv, args, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST");
+  const user = rdnaEnvValue(dotEnv, args, "USER", "ZINC_RDNA_USER", "ZINC_USER");
+  const port = rdnaEnvValue(dotEnv, args, "PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22";
   if (!host || !user) {
-    throw new Error("RDNA benchmarking needs ZINC_HOST and ZINC_USER in the environment or .env");
+    throw new Error("RDNA benchmarking needs node-specific ZINC_<NODE>_HOST/ZINC_<NODE>_USER, ZINC_RDNA_HOST/ZINC_RDNA_USER, or ZINC_HOST/ZINC_USER in the environment or .env");
   }
   return {
     host,

@@ -11,10 +11,49 @@ fi
 
 source .env
 
-REMOTE_DIR="${ZINC_REMOTE_DIR:-/root/zinc}"
-MODEL_PATH="${ZINC_REMOTE_MODEL:-/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf}"
-PORT="${ZINC_SERVER_PORT:-9090}"
-LOG_PATH="${ZINC_REMOTE_LOG:-/tmp/zinc_${PORT}.log}"
+rdna_node_var() {
+  local suffix="$1"
+  local fallback="${2:-}"
+  local node="${ZINC_RDNA_NODE:-${ZINC_NODE:-}}"
+
+  if [[ -n "$node" ]]; then
+    local normalized
+    normalized="$(printf '%s' "$node" | tr '[:lower:]-' '[:upper:]_')"
+    normalized="${normalized//-/_}"
+    local key="ZINC_${normalized}_${suffix}"
+    if [[ -n "${!key:-}" ]]; then
+      printf '%s' "${!key}"
+      return
+    fi
+  fi
+
+  local rdna_key="ZINC_RDNA_${suffix}"
+  if [[ -n "${!rdna_key:-}" ]]; then
+    printf '%s' "${!rdna_key}"
+    return
+  fi
+
+  local generic_key="ZINC_${suffix}"
+  if [[ -n "${!generic_key:-}" ]]; then
+    printf '%s' "${!generic_key}"
+    return
+  fi
+
+  printf '%s' "$fallback"
+}
+
+ZINC_HOST="$(rdna_node_var HOST)"
+ZINC_PORT="$(rdna_node_var PORT 22)"
+ZINC_USER="$(rdna_node_var USER root)"
+REMOTE_DIR="$(rdna_node_var REMOTE_DIR /root/zinc)"
+MODEL_PATH="$(rdna_node_var REMOTE_MODEL /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf)"
+PORT="$(rdna_node_var SERVER_PORT 9090)"
+LOG_PATH="$(rdna_node_var REMOTE_LOG /tmp/zinc_${PORT}.log)"
+
+if [[ -z "$ZINC_HOST" ]]; then
+  echo "Missing RDNA host. Set ZINC_RDNA_NODE=rdna1|rdna2 with ZINC_RDNA1_HOST/ZINC_RDNA2_HOST, or set ZINC_RDNA_HOST/ZINC_HOST." >&2
+  exit 1
+fi
 
 do_sync=1
 do_build=1
@@ -33,6 +72,7 @@ Options:
   --help            Show this help
 
 Environment overrides:
+  ZINC_RDNA_NODE    Optional selected node alias (for example rdna1 or rdna2)
   ZINC_REMOTE_DIR    Remote checkout path (default: $REMOTE_DIR)
   ZINC_REMOTE_MODEL  Remote model path (default: $MODEL_PATH)
   ZINC_SERVER_PORT   Remote server port (default: $PORT)

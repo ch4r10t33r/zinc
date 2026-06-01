@@ -15,6 +15,9 @@ bun tools/performance_suite.mjs --target metal
 # RDNA4 target (remote node from .env)
 bun tools/performance_suite.mjs --target rdna --rdna-sync --rdna-build --rdna-start-llama
 
+# Pick a specific RDNA node when .env defines ZINC_RDNA1_* and ZINC_RDNA2_*.
+bun tools/performance_suite.mjs --target rdna --rdna-node rdna2 --rdna-sync --rdna-build
+
 # Intel Arc target (separate remote node from .env)
 bun tools/performance_suite.mjs --target intel --intel-sync --intel-build --intel-start-llama
 
