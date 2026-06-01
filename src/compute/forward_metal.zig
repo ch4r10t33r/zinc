@@ -1921,6 +1921,12 @@ const RmsNormOffsetPush = extern struct {
     weight_offset: u32,
 };
 
+const CopyRmsNormOffsetPush = extern struct {
+    n: u32,
+    src_offset: u32,
+    eps: f32,
+};
+
 /// Push constants for fused residual-add + RMS norm (matches residual_rms_norm.metal: buffer(0)).
 /// Eliminates one barrier per layer vs separate scale_acc + rms_norm.
 const ResidualRmsNormPush = extern struct {
@@ -3427,6 +3433,7 @@ pub const InferenceEngine = struct {
     add_bias_pipe: MetalPipeline,
     rms_norm_pipe: MetalPipeline,
     rms_norm_offset_pipe: MetalPipeline,
+    copy_rms_norm_offset_pipe: MetalPipeline,
     gemma_moe_post_norm_residual_pipe: MetalPipeline,
     gemma_moe_weighted_post_norm_residual_pipe: MetalPipeline,
     moe_acc_pipe: MetalPipeline,
@@ -4087,6 +4094,7 @@ pub const InferenceEngine = struct {
         self.add_bias_pipe = try loadShaderPipeline(ctx, "add_bias");
         self.rms_norm_pipe = try loadShaderPipeline(ctx, "rms_norm_mul");
         self.rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
+        self.copy_rms_norm_offset_pipe = try loadShaderPipeline(ctx, "copy_rms_norm_offset");
         self.gemma_moe_post_norm_residual_pipe = try loadShaderPipeline(ctx, "gemma_moe_post_norm_residual");
         self.gemma_moe_weighted_post_norm_residual_pipe = try loadShaderPipeline(ctx, "gemma_moe_weighted_post_norm_residual");
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
@@ -5029,6 +5037,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.add_bias_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_offset_pipe);
+        metal_pipeline.freePipeline(&self.copy_rms_norm_offset_pipe);
         metal_pipeline.freePipeline(&self.gemma_moe_post_norm_residual_pipe);
         metal_pipeline.freePipeline(&self.gemma_moe_weighted_post_norm_residual_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
@@ -10299,6 +10308,29 @@ fn dispatchRmsNormOnCmdWithTensorWeights(
 ) void {
     const weight_offset: u32 = @intCast(tensorPageOffset(engine.model, weights) / @sizeOf(f32));
     dispatchRmsNormOnCmdWithWeightOffset(engine, cmd, input, output, &weights.gpu_buffer, weight_offset, n, n_groups);
+}
+
+fn dispatchCopyRmsNormOffsetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    src: *const MetalBuffer,
+    hidden: *const MetalBuffer,
+    norm: *const MetalBuffer,
+    weights: *const MetalBuffer,
+    n: u32,
+    src_offset: u32,
+) void {
+    const push = CopyRmsNormOffsetPush{
+        .n = n,
+        .src_offset = src_offset,
+        .eps = engine.config.rms_norm_eps,
+    };
+    const bufs = [_]*const MetalBuffer{ src, hidden, norm, weights };
+    const tg_size: u32 = @min(
+        @max(engine.copy_rms_norm_offset_pipe.max_threads_per_threadgroup, 32),
+        if (n >= 1024) @as(u32, 1024) else if (n >= 256) @as(u32, 256) else @as(u32, 32),
+    );
+    cmd.dispatchV2(&engine.copy_rms_norm_offset_pipe, .{ 1, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(CopyRmsNormOffsetPush), 0);
 }
 
 fn dispatchGemmaMoePostNormResidualOnCmd(
@@ -18879,18 +18911,44 @@ fn runDecodeStep(
             .byte_offset = @intCast(@as(u64, embed_src_offset) * @as(u64, @sizeOf(f32))),
         };
     };
+    var initial_attn_norm_ready = false;
     if (engine.private_decode_buffers or embed_src_override != null) {
         const cmd = shared_cmd orelse return error.PrivateDecodeFastPathRequiresSharedCommand;
         if (qwen_branch_hidden_seed == null) {
             const embed_src = embed_src_override orelse &engine.embed_staging;
-            dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
-            // (ggml-metal-common.cpp `ggml_mem_ranges_check_dst`): the only
-            // downstream consumer in this command buffer is layer 0's
-            // attn/ssm RMSNorm reading `hidden_buf`. Scope the barrier to
-            // that resource instead of fencing every prior buffer write
-            // (LM head/argmax tails from the SHARED command buffer).
-            profileBarrierBuffers(cmd, profile, .embed, &.{&engine.hidden_buf});
+            const can_fuse_embed_norm =
+                start_layer == 0 and
+                embed_src_override != null and
+                engine.in_prefill_phase and
+                isGemma26A4BMoeShape(cfg) and
+                engine.copy_rms_norm_offset_pipe.handle != null;
+            if (can_fuse_embed_norm) {
+                // Adapt llama.cpp's graph-edge materialization discipline
+                // (`ggml_metal_graph_compute`): the layer-0 attention norm has
+                // exactly the copied embedding as input, so materialize both
+                // consumers in one kernel before the Q/K/V projection barrier.
+                dispatchCopyRmsNormOffsetOnCmd(
+                    engine,
+                    cmd,
+                    embed_src,
+                    &engine.hidden_buf,
+                    &engine.norm_buf,
+                    &engine.attn_norm_bufs[0],
+                    hidden_dim,
+                    embed_src_offset,
+                );
+                profileBarrierBuffers(cmd, profile, .embed, &.{ &engine.hidden_buf, &engine.norm_buf });
+                initial_attn_norm_ready = true;
+            } else {
+                dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                // (ggml-metal-common.cpp `ggml_mem_ranges_check_dst`): the only
+                // downstream consumer in this command buffer is layer 0's
+                // attn/ssm RMSNorm reading `hidden_buf`. Scope the barrier to
+                // that resource instead of fencing every prior buffer write
+                // (LM head/argmax tails from the SHARED command buffer).
+                profileBarrierBuffers(cmd, profile, .embed, &.{&engine.hidden_buf});
+            }
         }
     }
 
@@ -18955,6 +19013,8 @@ fn runDecodeStep(
                 // cross-command-buffer ordering at chunk boundaries) makes it
                 // visible before the QKV dispatches read norm_buf.
                 prev_fused_attn_norm = false;
+            } else if (initial_attn_norm_ready and layer_idx == 0) {
+                initial_attn_norm_ready = false;
             } else if (!fuse_final_tail_attn_norm) {
                 dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
                 // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
@@ -27145,6 +27205,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&swiglu_pipe);
     var rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
     defer metal_pipeline.freePipeline(&rms_norm_offset_pipe);
+    var copy_rms_norm_offset_pipe = try loadShaderPipeline(ctx, "copy_rms_norm_offset");
+    defer metal_pipeline.freePipeline(&copy_rms_norm_offset_pipe);
 
     var acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
     defer metal_pipeline.freePipeline(&acc_pipe);
@@ -27277,6 +27339,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_moe_pipe_k2048_1024.handle != null);
     try std.testing.expect(swiglu_pipe.handle != null);
     try std.testing.expect(rms_norm_offset_pipe.handle != null);
+    try std.testing.expect(copy_rms_norm_offset_pipe.handle != null);
     try std.testing.expect(acc_pipe.handle != null);
     try std.testing.expect(lmhead_pipe.handle != null);
     try std.testing.expect(lmhead_pipe_1024.handle != null);
@@ -27414,6 +27477,60 @@ test "rms_norm shader normalizes each token slice with shared weights" {
 
     for (0..total) |i| {
         try std.testing.expectApproxEqAbs(expected[i], output_ptr[i], 0.001);
+    }
+}
+
+test "copy_rms_norm_offset shader copies selected row and normalizes it" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "copy_rms_norm_offset");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n: u32 = 8;
+    const eps: f32 = 1e-6;
+
+    var src_buf = try metal_buffer.createBuffer(ctx, n * 2 * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var weight_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+
+    @memcpy(src_ptr[0 .. n * 2], &[_]f32{
+        99.0, 98.0, 97.0, 96.0, 95.0, 94.0, 93.0, 92.0,
+        1.0,  -2.0, 3.0,  -4.0, 5.0,  -6.0, 7.0,  -8.0,
+    });
+    @memcpy(weight_ptr[0..n], &[_]f32{ 1.0, 0.5, 1.5, 0.25, 1.0, 0.5, 1.5, 0.25 });
+    @memset(hidden_buf.cpu_ptr.?[0..hidden_buf.size], 0);
+    @memset(norm_buf.cpu_ptr.?[0..norm_buf.size], 0);
+
+    const push = CopyRmsNormOffsetPush{ .n = n, .src_offset = n, .eps = eps };
+    const bufs = [_]*const MetalBuffer{ &src_buf, &hidden_buf, &norm_buf, &weight_buf };
+    const simd_width = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else @as(u32, 32);
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ simd_width, 1, 1 }, &bufs, &push, @sizeOf(CopyRmsNormOffsetPush), 0);
+    cmd.commitAndWait();
+
+    var sum_sq: f32 = 0.0;
+    for (0..n) |i| {
+        const v = src_ptr[n + i];
+        sum_sq += v * v;
+        try std.testing.expectApproxEqAbs(v, hidden_ptr[i], 0.001);
+    }
+    const rms_inv = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(n)) + eps);
+    for (0..n) |i| {
+        const expected = weight_ptr[i] * (src_ptr[n + i] * rms_inv);
+        try std.testing.expectApproxEqAbs(expected, norm_ptr[i], 0.001);
     }
 }
 
