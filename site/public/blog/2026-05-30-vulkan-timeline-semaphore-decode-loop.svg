@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171036"/>
+      <stop offset="1" stop-color="#0f0a26"/>
+    </linearGradient>
+    <linearGradient id="gpuGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5ee3ff"/>
+      <stop offset="1" stop-color="#3aa9ff"/>
+    </linearGradient>
+    <linearGradient id="stairGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#ffb84d"/>
+    </linearGradient>
+    <pattern id="waitHatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="#ff5ea0" fill-opacity="0.35"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#ff5ea0" stroke-width="2"/>
+    </pattern>
+  </defs>
+
+  <rect width="1100" height="720" fill="url(#bg)"/>
+
+  <!-- Title -->
+  <text x="40" y="48" fill="#f4f1ff" font-size="22" font-weight="700">One fence per token versus one timeline counter for the whole decode burst</text>
+  <text x="40" y="74" fill="#b8b0d8" font-size="14">A 100 tok/s decode budget on the Radeon AI PRO R9700 leaves 10 ms per step; the host roundtrip is no longer beneath the noise.</text>
+
+  <!-- Shared time axis label -->
+  <text x="40" y="120" fill="#9a92c8" font-size="12">time →</text>
+
+  <!-- =================== TOP BAND =================== -->
+  <g transform="translate(0,140)">
+    <text x="40" y="0" fill="#f4f1ff" font-size="16" font-weight="700">Binary VkFence, one wait per decode step</text>
+    <text x="40" y="22" fill="#b8b0d8" font-size="12">CPU records, submits, then blocks in vkWaitForFences until the GPU drains; the next submission cannot start until the wait returns.</text>
+
+    <!-- Track baseline -->
+    <line x1="40" y1="80" x2="1060" y2="80" stroke="#3a3268" stroke-width="1"/>
+
+    <!-- Lane labels -->
+    <text x="40" y="58" fill="#9a92c8" font-size="11">CPU</text>
+    <text x="40" y="108" fill="#9a92c8" font-size="11">GPU</text>
+
+    <!-- Step 1 -->
+    <!-- CPU record+submit -->
+    <rect x="80" y="44" width="60" height="22" rx="3" fill="url(#stairGrad)"/>
+    <text x="110" y="60" text-anchor="middle" fill="#1b1340" font-size="10" font-weight="700">rec+submit</text>
+    <!-- GPU forward -->
+    <rect x="140" y="92" width="180" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="230" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: forward + sample</text>
+    <!-- CPU wait while GPU runs (post-submit) -->
+    <rect x="140" y="44" width="180" height="22" rx="3" fill="url(#waitHatch)" stroke="#ff5ea0" stroke-width="1.2"/>
+    <text x="230" y="60" text-anchor="middle" fill="#ffe5f1" font-size="11" font-weight="700">CPU: vkWaitForFences</text>
+
+    <!-- Step 2 -->
+    <rect x="340" y="44" width="60" height="22" rx="3" fill="url(#stairGrad)"/>
+    <text x="370" y="60" text-anchor="middle" fill="#1b1340" font-size="10" font-weight="700">rec+submit</text>
+    <rect x="400" y="92" width="180" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="490" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: forward + sample</text>
+    <rect x="400" y="44" width="180" height="22" rx="3" fill="url(#waitHatch)" stroke="#ff5ea0" stroke-width="1.2"/>
+    <text x="490" y="60" text-anchor="middle" fill="#ffe5f1" font-size="11" font-weight="700">CPU: vkWaitForFences</text>
+
+    <!-- Step 3 -->
+    <rect x="600" y="44" width="60" height="22" rx="3" fill="url(#stairGrad)"/>
+    <text x="630" y="60" text-anchor="middle" fill="#1b1340" font-size="10" font-weight="700">rec+submit</text>
+    <rect x="660" y="92" width="180" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="750" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: forward + sample</text>
+    <rect x="660" y="44" width="180" height="22" rx="3" fill="url(#waitHatch)" stroke="#ff5ea0" stroke-width="1.2"/>
+    <text x="750" y="60" text-anchor="middle" fill="#ffe5f1" font-size="11" font-weight="700">CPU: vkWaitForFences</text>
+
+    <!-- Step 4 partial -->
+    <rect x="860" y="44" width="60" height="22" rx="3" fill="url(#stairGrad)"/>
+    <text x="890" y="60" text-anchor="middle" fill="#1b1340" font-size="10" font-weight="700">rec+submit</text>
+    <rect x="920" y="92" width="140" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="990" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: forward</text>
+
+    <!-- Gap markers on GPU lane between bursts -->
+    <g stroke="#ff5ea0" stroke-width="1" stroke-dasharray="3 3" fill="none">
+      <line x1="320" y1="92" x2="320" y2="114"/>
+      <line x1="400" y1="92" x2="400" y2="114"/>
+    </g>
+    <text x="360" y="138" text-anchor="middle" fill="#ff9bbf" font-size="10">idle, GPU drained, next submit not yet visible</text>
+
+    <!-- Per-step bracket -->
+    <g stroke="#9a92c8" stroke-width="1" fill="none">
+      <line x1="80" y1="160" x2="400" y2="160"/>
+      <line x1="80" y1="156" x2="80" y2="164"/>
+      <line x1="400" y1="156" x2="400" y2="164"/>
+    </g>
+    <text x="240" y="178" text-anchor="middle" fill="#d6cff0" font-size="11">one token: record · submit · wait · read · repeat</text>
+  </g>
+
+  <!-- =================== BOTTOM BAND =================== -->
+  <g transform="translate(0,400)">
+    <text x="40" y="0" fill="#f4f1ff" font-size="16" font-weight="700">VK_KHR_timeline_semaphore, one counter for N decode steps</text>
+    <text x="40" y="22" fill="#b8b0d8" font-size="12">CPU queues N submissions in one burst, each signaling a monotonically increasing 64-bit counter; the host waits only on counter ≥ N.</text>
+
+    <!-- Track baseline -->
+    <line x1="40" y1="80" x2="1060" y2="80" stroke="#3a3268" stroke-width="1"/>
+
+    <!-- Lane labels -->
+    <text x="40" y="58" fill="#9a92c8" font-size="11">CPU</text>
+    <text x="40" y="108" fill="#9a92c8" font-size="11">GPU</text>
+
+    <!-- CPU queues all N submissions in one burst -->
+    <rect x="80" y="44" width="140" height="22" rx="3" fill="url(#stairGrad)"/>
+    <text x="150" y="60" text-anchor="middle" fill="#1b1340" font-size="11" font-weight="700">queue 4 submits, signal vals 1..4</text>
+
+    <!-- GPU back-to-back submissions -->
+    <rect x="160" y="92" width="200" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="260" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: step 1 → signal 1</text>
+    <rect x="360" y="92" width="200" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="460" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: step 2 → signal 2</text>
+    <rect x="560" y="92" width="200" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="660" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: step 3 → signal 3</text>
+    <rect x="760" y="92" width="200" height="22" rx="3" fill="url(#gpuGrad)"/>
+    <text x="860" y="108" text-anchor="middle" fill="#0d1b3a" font-size="11" font-weight="700">GPU: step 4 → signal 4</text>
+
+    <!-- Host wait at end -->
+    <rect x="960" y="44" width="100" height="22" rx="3" fill="url(#waitHatch)" stroke="#ff5ea0" stroke-width="1.2"/>
+    <text x="1010" y="60" text-anchor="middle" fill="#ffe5f1" font-size="11" font-weight="700">wait ≥ 4</text>
+
+    <!-- Counter line (staircase) -->
+    <g stroke="#ffd166" stroke-width="2" fill="none" stroke-linejoin="miter">
+      <polyline points="80,168 360,168 360,154 560,154 560,140 760,140 760,126 960,126 960,112"/>
+    </g>
+    <text x="80" y="180" fill="#ffd166" font-size="11">counter = 0</text>
+    <text x="370" y="166" fill="#ffd166" font-size="11">1</text>
+    <text x="570" y="152" fill="#ffd166" font-size="11">2</text>
+    <text x="770" y="138" fill="#ffd166" font-size="11">3</text>
+    <text x="970" y="124" fill="#ffd166" font-size="11">4</text>
+
+    <!-- No-gap markers -->
+    <text x="660" y="138" text-anchor="middle" fill="#9be3a8" font-size="10">no host roundtrip between steps</text>
+  </g>
+
+  <!-- Footer caption -->
+  <rect x="40" y="640" width="1020" height="60" rx="6" fill="#1d1645" stroke="#3a3268"/>
+  <text x="56" y="662" fill="#d6cff0" font-size="11">Schematic. Lane widths are proportional to per-step CPU and GPU work; absolute durations vary by device and graph size.</text>
+  <text x="56" y="680" fill="#b8b0d8" font-size="11">Mechanism follows Khronos&apos; introduction of VK_KHR_timeline_semaphore (core in Vulkan 1.2) and the Vulkan-Samples timeline_semaphore walkthrough.</text>
+  <text x="56" y="696" fill="#9a92c8" font-size="11">A binary VkFence forces a host-side wait between submissions; a timeline counter lets the next submission be visible to the GPU before the previous one ends.</text>
+</svg>
