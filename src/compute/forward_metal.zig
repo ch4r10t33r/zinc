@@ -1084,6 +1084,64 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
+fn q8ShapeStatMinusPrefix(total_slot: Q8ShapeStat, prefix: RuntimeProfile) Q8ShapeStat {
+    if (total_slot.calls == 0) return .{};
+
+    var prefix_bytes: u64 = 0;
+    var prefix_calls: u32 = 0;
+    for (prefix.q8_shape_stats) |slot| {
+        if (slot.calls != 0 and
+            slot.path == total_slot.path and
+            slot.rows == total_slot.rows and
+            slot.cols == total_slot.cols)
+        {
+            prefix_bytes = slot.bytes;
+            prefix_calls = slot.calls;
+            break;
+        }
+    }
+
+    const bytes = total_slot.bytes -| prefix_bytes;
+    const calls = total_slot.calls -| prefix_calls;
+    if (bytes == 0 or calls == 0) return .{};
+    return .{
+        .path = total_slot.path,
+        .rows = total_slot.rows,
+        .cols = total_slot.cols,
+        .bytes = bytes,
+        .calls = calls,
+    };
+}
+
+fn q8RepackedDispatchStatMinusPrefix(total_slot: Q8RepackedDispatchStat, prefix: RuntimeProfile) Q8RepackedDispatchStat {
+    if (total_slot.calls == 0) return .{};
+
+    var prefix_bytes: u64 = 0;
+    var prefix_calls: u32 = 0;
+    for (prefix.q8_repacked_dispatch_stats) |slot| {
+        if (slot.calls != 0 and
+            slot.kind == total_slot.kind and
+            slot.rows == total_slot.rows and
+            slot.cols == total_slot.cols)
+        {
+            prefix_bytes = slot.bytes;
+            prefix_calls = slot.calls;
+            break;
+        }
+    }
+
+    const bytes = total_slot.bytes -| prefix_bytes;
+    const calls = total_slot.calls -| prefix_calls;
+    if (bytes == 0 or calls == 0) return .{};
+    return .{
+        .kind = total_slot.kind,
+        .rows = total_slot.rows,
+        .cols = total_slot.cols,
+        .bytes = bytes,
+        .calls = calls,
+    };
+}
+
 fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimeProfile {
     var delta: RuntimeProfile = .{};
     delta.decode_steps = total.decode_steps -| prefix.decode_steps;
@@ -1160,6 +1218,20 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.gpu_moe_finalizer_f32_calls = total.gpu_moe_finalizer_f32_calls -| prefix.gpu_moe_finalizer_f32_calls;
     delta.gpu_moe_finalizer_shared_calls = total.gpu_moe_finalizer_shared_calls -| prefix.gpu_moe_finalizer_shared_calls;
     delta.gpu_moe_finalizer_routed_only_calls = total.gpu_moe_finalizer_routed_only_calls -| prefix.gpu_moe_finalizer_routed_only_calls;
+    delta.q8_repacked_tg128_bytes = total.q8_repacked_tg128_bytes -| prefix.q8_repacked_tg128_bytes;
+    delta.q8_repacked_exact_qwen_bytes = total.q8_repacked_exact_qwen_bytes -| prefix.q8_repacked_exact_qwen_bytes;
+    delta.q8_repacked_quad_bytes = total.q8_repacked_quad_bytes -| prefix.q8_repacked_quad_bytes;
+    delta.q8_repacked_generic_bytes = total.q8_repacked_generic_bytes -| prefix.q8_repacked_generic_bytes;
+    delta.q8_repacked_tg128_calls = total.q8_repacked_tg128_calls -| prefix.q8_repacked_tg128_calls;
+    delta.q8_repacked_exact_qwen_calls = total.q8_repacked_exact_qwen_calls -| prefix.q8_repacked_exact_qwen_calls;
+    delta.q8_repacked_quad_calls = total.q8_repacked_quad_calls -| prefix.q8_repacked_quad_calls;
+    delta.q8_repacked_generic_calls = total.q8_repacked_generic_calls -| prefix.q8_repacked_generic_calls;
+    for (total.q8_shape_stats, 0..) |slot, idx| {
+        delta.q8_shape_stats[idx] = q8ShapeStatMinusPrefix(slot, prefix);
+    }
+    for (total.q8_repacked_dispatch_stats, 0..) |slot, idx| {
+        delta.q8_repacked_dispatch_stats[idx] = q8RepackedDispatchStatMinusPrefix(slot, prefix);
+    }
     return delta;
 }
 
