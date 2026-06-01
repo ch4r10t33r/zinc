@@ -12796,9 +12796,21 @@ pub const InferenceEngine = struct {
         return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
     }
 
+    fn qwenDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+
+        if (self.isQwen35DenseHybrid9B()) {
+            return n_tokens >= 64;
+        }
+
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+    }
+
     fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
-        if (!self.qwen36Dp4aDownEnabled()) return false;
-        if (n_tokens < 128) return false;
+        if (!self.qwenDenseProjectionDp4aEnabled(n_tokens)) return false;
         if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
         if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
         if (self.batched_scratch_hidden_i8 == null) return false;
@@ -12811,8 +12823,8 @@ pub const InferenceEngine = struct {
     }
 
     fn qwen36PrepareProjectionQ8_1(self: *InferenceEngine, src: Buffer, K: u32, n_tokens: u32) !u32 {
-        if (!self.qwen36Dp4aDownEnabled()) return 0;
-        if (n_tokens < 128 or K == 0 or (K & 255) != 0) return 0;
+        if (!self.qwenDenseProjectionDp4aEnabled(n_tokens)) return 0;
+        if (K == 0 or (K & 255) != 0) return 0;
         if (self.dmmv.pipeline_quantize_act_q8_1 == null) return 0;
         const packed_i8 = self.batched_scratch_hidden_i8 orelse return 0;
         const scale_dsum = self.batched_scratch_hidden_scale_dsum orelse return 0;
@@ -15827,8 +15839,27 @@ pub const InferenceEngine = struct {
         );
         self.decode_cmd.computeBarrier();
 
-        try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
-        try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        const kv_dp4a_wanted =
+            self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
+            self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens);
+        const kv_dp4a_cols: u32 = if (kv_dp4a_wanted)
+            try self.qwen36PrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
+        var k_done = false;
+        if (kv_dp4a_cols > 0) {
+            k_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, kv_dp4a_cols);
+        }
+        if (!k_done) {
+            try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
+        }
+        var v_done = false;
+        if (kv_dp4a_cols > 0) {
+            v_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, kv_dp4a_cols);
+        }
+        if (!v_done) {
+            try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        }
         self.decode_cmd.computeBarrier();
 
         if (k_norm_t_opt) |k_norm_t| {
