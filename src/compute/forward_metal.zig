@@ -3086,6 +3086,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_moe_cols_pipe: MetalPipeline,
     dmmv_q5_1_moe_pipe: MetalPipeline,
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
+    dmmv_q8_0_moe_pipe: MetalPipeline,
     dmmv_q5k_moe_pipe: MetalPipeline,
     dmmv_q5k_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_k512_pipe: MetalPipeline,
@@ -3736,6 +3737,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
+        self.dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
         self.dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
         self.dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
         self.dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
@@ -4676,6 +4678,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_pipe);
@@ -7072,6 +7075,9 @@ fn recordMoeDmmvProfile(
     recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
     recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, .moe_expert), bytes);
+    if (tensor.info.type_ == .q8_0) {
+        recordQ8ShapeProfile(profile, .moe_expert, rows, cols, bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9163,6 +9169,38 @@ fn dispatchDmmvMoeQ5_1OnCmd(
     cmd.dispatchV2(&engine.dmmv_q5_1_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
 }
 
+fn dispatchDmmvMoeQ8_0OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) !void {
+    if (tensor.info.type_ != .q8_0) return error.UnsupportedQuantType;
+    if (engine.dmmv_q8_0_moe_pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_byte_offset,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const rows_per_wg: u32 = 4;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+    cmd.dispatchV2(&engine.dmmv_q8_0_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+}
+
 fn canUseDenseGemmaDecodeGemm(
     engine: *const InferenceEngine,
     tensor: *const metal_loader.LoadedTensor,
@@ -9347,6 +9385,7 @@ fn dispatchDmmvMoeOnCmdWithInputOffset(
     switch (tensor.info.type_) {
         .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q8_0 => try dispatchDmmvMoeQ8_0OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         .mxfp4 => try dispatchDmmvMoeMxfp4OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
@@ -14401,6 +14440,7 @@ fn canUseGpuRoutedMoeDown(engine: *const InferenceEngine, down_quant: GGMLType) 
     return switch (down_quant) {
         .q4_k => true,
         .q5_1 => engine.dmmv_q5_1_moe_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_pipe.handle != null,
         else => false,
@@ -25611,6 +25651,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_pipe);
     var dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_cols_pipe);
+    var dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_moe_pipe);
     var dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_pipe);
     var dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
@@ -25758,6 +25800,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_k512_pipe.handle != null);
