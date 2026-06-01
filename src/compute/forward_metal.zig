@@ -45,7 +45,7 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 // an arbitrary layer cap.
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
-const moe_cols_dense_dispatch_cols: u32 = 4;
+const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -9610,7 +9610,7 @@ fn dispatchDmmvMoeColsOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf, packed_ids_buf, counts_buf };
     const rows_per_wg: u32 = 8;
-    const cols_per_wg: u32 = 4;
+    const cols_per_wg: u32 = moe_route_block_cols;
     cmd.dispatchV2(
         pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, n_experts, (route_blocks + cols_per_wg - 1) / cols_per_wg },
