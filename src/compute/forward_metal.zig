@@ -461,6 +461,11 @@ fn defaultGemmaQ8MoeFallbackDownEnabled(cfg: ModelConfig) bool {
     return isGemma26A4BMoeShape(cfg);
 }
 
+fn defaultGemmaMoePostNormResidualDecodeEnabled(cfg: ModelConfig) bool {
+    if (isGemma26A4BMoeShape(cfg)) return false;
+    return cfg.architecture == .gemma and cfg.n_experts > 0;
+}
+
 fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
     return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
         readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
@@ -3390,6 +3395,7 @@ pub const InferenceEngine = struct {
     qwen_layer0_shared_gate_prefill_enabled: bool,
     gemma_q8_moe_decode_enabled: bool,
     gemma_q8_moe_fallback_down_enabled: bool,
+    gemma_moe_post_norm_residual_decode_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -3605,6 +3611,7 @@ pub const InferenceEngine = struct {
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
         self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
         self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
+        self.gemma_moe_post_norm_residual_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_MOE_POST_NORM_DECODE") orelse defaultGemmaMoePostNormResidualDecodeEnabled(cfg);
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -17337,6 +17344,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
 
     const use_fused_post_norm_residual =
         !validate_moe and
+        (engine.in_prefill_phase or engine.gemma_moe_post_norm_residual_decode_enabled) and
         hidden_dim <= 16 * 1024 and
         engine.gemma_moe_post_norm_residual_pipe.handle != null;
     if (use_fused_post_norm_residual) {
@@ -25335,18 +25343,22 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     };
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
     try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.hidden_dim = 4096;
     try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
+    try std.testing.expect(defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
     try std.testing.expect(!isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.n_experts = 0;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
     gemma_cfg.architecture = .qwen35;
     gemma_cfg.n_experts = 128;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
 
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, true, false));
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
