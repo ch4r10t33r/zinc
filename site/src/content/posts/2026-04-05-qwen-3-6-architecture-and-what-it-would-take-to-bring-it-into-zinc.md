@@ -1,5 +1,6 @@
 ---
 title: "Qwen 3.6 architecture and local inference in ZINC"
+seoTitle: "Qwen3.6 Architecture Details"
 date: "2026-04-05"
 tags:
   - zinc
@@ -33,7 +34,17 @@ faqs:
   - question: "What is the hardest part of adding Qwen 3.6 to ZINC?"
     answer: "The hardest part is not the model catalog entry. It is implementing the real hybrid recurrent block, long-context memory behavior, and exact expert topology on both Vulkan and Metal while keeping correctness across GGUF metadata, graph planning, kernels, and chat-runtime behavior."
 excerpt: "Qwen3.6-Plus is exactly the kind of model that matters for local LLM inference: hybrid attention, sparse MoE routing, agentic coding, and a 1M context window. This deep technical post breaks down Qwen 3.6 architecture signals, how they compare with Qwen3 and Qwen3-Next, and what ZINC would need to run a local Qwen 3.6 release on Vulkan and Metal."
+seoDescription: "Qwen3.6 architecture details for local inference: hybrid attention, sparse MoE, GGUF status, speculative decoding, Vulkan, and Metal."
 ---
+
+Quick answer: Qwen3.6 is best understood as a Qwen3-Next-class architecture signal for local inference work: hybrid attention or Gated DeltaNet-style layers, sparse MoE routing, long-context pressure, and a local GGUF path that depends on compatible open weights. For ZINC, the hard parts are not the catalog entry; they are recurrent state, MoE routing, cache policy, and correct Vulkan and Metal kernels.
+
+| Question | Short answer |
+| --- | --- |
+| Is Qwen3.6 local today? | Qwen3.6-Plus itself is hosted, but compatible Qwen3.6-family GGUFs are the local path ZINC is preparing for. |
+| What architecture matters most? | Hybrid recurrent or linear-attention layers plus sparse MoE, not a plain dense transformer. |
+| What should engine authors implement first? | Exact metadata parsing, recurrent state handling, MoE top-k routing, long-context cache policy, and speculative decoding hooks. |
+| Related reading | [MoE inference in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc), [Qwen3.6 GGUF support](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc), and [Getting Started](/zinc/docs/getting-started). |
 
 The most important fact about Qwen3.6-Plus is not that it landed with good benchmark energy. It is that, as of April 2, 2026, it looks like exactly the kind of model that exposes whether an inference engine is real or cosmetic: very long context, strong agentic coding, multimodal inputs, and what appears to be a hybrid sparse architecture built for efficiency instead of brute force.
 

@@ -1,5 +1,6 @@
 ---
 title: "How AMD Qwen decode passed llama.cpp in six weeks on the Radeon AI PRO R9700"
+seoTitle: "AMD Qwen Inference vs llama.cpp"
 date: "2026-05-09"
 tags:
   - zinc
@@ -48,7 +49,10 @@ faqs:
   - question: "What was the biggest lesson from the failed attempts?"
     answer: "Porting a kernel is not the same as making it hot. Several llama.cpp-inspired pieces produced correct shaders but no throughput because they were wired only into cold call sites or because the buffer layout around them was still serial. The winning work changed where repeated work happened."
 excerpt: "The first serious zinc trace on AMD RDNA4 looked almost good, which was exactly the problem: it was English-shaped nonsense from a model whose LM head computed only three percent of the vocabulary rows. Six weeks later, on the same Radeon AI PRO R9700, the latest published suite shows zinc decoding Qwen3.6-35B-A3B UD Q4_K_XL at 117.07 tok/s against llama.cpp's 104.47. Prefill is not won yet: zinc is at 88.08 tok/s against llama.cpp's 181.95. The interesting part is not one magic shader. It is six weeks of correctness fixes, deleted dead ends, and Vulkan work that turned a 32 GB AMD card from a curiosity into a serious local Qwen 3.6 decode target."
+seoDescription: "AMD Qwen inference on Radeon AI PRO R9700: how ZINC decode crossed llama.cpp on Qwen3.6 and where prefill still lags."
 ---
+
+Quick answer: ZINC crossed llama.cpp on the scoped Qwen3.6 decode benchmark by fixing correctness first, then removing dead paths and moving repeated work into the hot Vulkan decode path. The remaining gap is prefill, not whether AMD RDNA4 can be a serious local Qwen inference target.
 
 The first serious RDNA4 trace looked almost good, which is worse than looking broken. zinc was emitting English-shaped text at four tokens per second on the Radeon AI PRO R9700. Then the LM-head dump showed the truth: on Qwen3.5-35B-A3B-UD Q4_K_XL, 240,560 of the 248,320 vocabulary rows were still zero. The model was sampling from the three percent of logits our dispatcher happened to compute.
 

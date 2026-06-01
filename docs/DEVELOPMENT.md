@@ -211,7 +211,7 @@ batching should raise aggregate throughput materially without linear p95 growth.
 ### Public performance output
 
 ```bash
-# Generate the benchmark artifact that powers /zinc/performance.
+# Generate the benchmark artifact that powers /zinc/benchmarks.
 # Legacy "both" runs RDNA + Metal; use "all" to include the Intel Arc node.
 bun tools/performance_suite.mjs --target both --output /tmp/zinc-performance.json
 bun tools/performance_suite.mjs --target intel --output /tmp/zinc-intel-performance.json

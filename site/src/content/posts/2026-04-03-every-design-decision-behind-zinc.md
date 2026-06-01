@@ -1,5 +1,6 @@
 ---
 title: "Every design decision behind ZINC, and why we'd make them again"
+seoTitle: "LLM Inference Engine Architecture"
 date: "2026-04-03"
 tags:
   - zinc
@@ -35,7 +36,10 @@ keywords:
   - OpenAI compatible server architecture
   - zero dependency inference engine
 excerpt: "ZINC is a from-scratch LLM inference engine in Zig targeting Vulkan and Metal. This post walks through every major design decision — from 'why not fork llama.cpp' to static compute graphs, hand-tuned shaders, paged KV cache, and a zero-dependency architecture — and explains what we learned, what surprised us, and what we would do again."
+seoDescription: "Architecture decisions behind a local LLM inference engine: Zig, Vulkan, Metal, GGUF parsing, static graphs, GPU shaders, and KV cache design."
 ---
+
+Quick answer: ZINC is a from-scratch local LLM inference engine because the design center is not generic model coverage; it is predictable GPU execution on AMD RDNA, Apple Silicon, and eventually other consumer hardware. The core bets are Zig, GGUF-native loading, static decode graphs, hand-tuned Vulkan/Metal kernels, explicit memory ownership, and an OpenAI-compatible serving layer.
 
 There is a meme format where step one is "draw two circles" and step two is "draw the rest of the owl." Building an inference engine from scratch follows the same pattern, except step one is "parse a GGUF file" and step two is "implement the entire forward pass of a 35-billion-parameter model on two different GPU architectures."
 

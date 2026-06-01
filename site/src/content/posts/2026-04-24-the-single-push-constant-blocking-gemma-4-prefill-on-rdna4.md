@@ -27,7 +27,11 @@ keywords:
   - ZINC Gemma port
   - prefill bandwidth ceiling consumer AMD
 excerpt: "Qwen3-8B prefill on ZINC's RDNA4 batched path runs at 187 tok/s. The same engine on Gemma 4 31B runs at 4.97 tok/s, because Gemma's batched-prefill gate is closed. Five of the six things blocking it open with small, mechanical fixes. The sixth is a single head_dim push constant on flash_attn_batched that quietly assumes Q and KV use the same dimension. Gemma 4's full-attention layers do not. Here is why one push constant became the bottleneck on a 31B model and what the right shape of the fix looks like."
+seoTitle: "Gemma 4 Prefill on RDNA4"
+seoDescription: "Why Gemma 4 31B prefill on AMD RDNA4 needs split Q/KV head dimensions, sliding-window attention, and Vulkan kernel fixes."
 ---
+
+If you are trying to run Gemma 4 31B locally on AMD RDNA4, the important constraint is not only model size. Gemma 4 mixes sliding-window attention with asymmetric grouped-query attention, so a Vulkan prefill path that assumes one shared head dimension for Q, K, and V will silently do the wrong indexing. ZINC's Gemma prefill work has to split Q and KV head dimensions, preserve Gemma's norm and RoPE rules, and then reopen batched prefill behind validation.
 
 The same `R9700` that runs Qwen3-8B prefill at **187 tok/s** through ZINC's batched path runs Gemma 4 31B at **4.97 tok/s** through the per-token path. That is not a model-size story. The bandwidth ceiling for a 31B model on a 576 GB/s card sits well above 30 tok/s. The reason Gemma is on the per-token path is that the batched-prefill gate is closed against `cfg.architecture == .gemma`, and the reason the gate is closed is that opening it produces structurally wrong output until six different things are fixed.
 

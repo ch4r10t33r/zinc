@@ -1,6 +1,8 @@
 # Apple Silicon Architecture Reference
 
-Comprehensive reference for Apple Silicon generations from M1 through M5, the public compute surfaces we can actually ship against, and the current state of opcode-level / ISA-level material. This is intended to be the "single source of truth" doc for ZINC work on Apple platforms.
+This is ZINC's Apple Silicon local LLM inference reference: M1 through M5 hardware families, Metal GPU families, unified-memory constraints, public compute APIs, and the current state of opcode-level / ISA-level material. It is intended to be the "single source of truth" doc for ZINC work on Apple platforms.
+
+Quick answer: shipping local LLM inference on Apple Silicon should target Metal and MSL first, use MLX as a reference layer rather than the runtime contract, and treat AMX/AGX opcode material as research input rather than a stable product API.
 
 Last updated: 2026-03-31
 

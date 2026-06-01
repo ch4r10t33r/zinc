@@ -2,13 +2,29 @@
 
 > **Experimental software**: ZINC is under active development. The CLI path is the best-supported way to start. Server mode, model coverage, and performance tuning are still moving quickly.
 
-ZINC is a local LLM inference engine for consumer GPUs and Apple Silicon. The fastest way to check if it works on your machine:
+ZINC runs local LLMs on AMD GPUs without ROCm by using Vulkan, and it runs the same managed GGUF model flow on Apple Silicon through Metal. The fastest way to check if it works on your machine is:
 
 1. Install Zig.
 2. Build the binary.
 3. Run one prompt from the terminal.
 
 If that works, move on to the [hardware requirements](/zinc/docs/hardware-requirements), [running ZINC](/zinc/docs/running-zinc), and the lower-level tuning docs.
+
+## Fast path
+
+```bash
+git clone https://github.com/zolotukhin/zinc.git
+cd zinc
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
+```
+
+On RDNA4 Linux, set the cooperative matrix fast path before the check or first prompt:
+
+```bash
+export RADV_PERFTEST=coop_matrix
+```
 
 ## Before you start
 

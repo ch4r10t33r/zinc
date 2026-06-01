@@ -1,5 +1,6 @@
 ---
 title: "How Mixture of Experts models work in ZINC"
+seoTitle: "MoE Inference on GPUs: Routing Costs"
 date: "2026-04-04"
 tags:
   - zinc
@@ -29,7 +30,18 @@ keywords:
   - vLLM MoE routing
   - ZINC Mixture of Experts
 excerpt: "Mixture of Experts (MoE) models only run a small set of experts per token, but the routing details decide whether inference is elegant or slow. This post explains how MoE models work, which Qwen and Gemma MoE models ZINC supports today, and how ZINC executes router top-k, batched expert kernels, and shared-expert paths on GPU."
+seoDescription: "How MoE inference works on GPUs: top-k routing, shared experts, Qwen and Gemma sparse models, Vulkan kernels, and Metal execution."
 ---
+
+Quick answer: Mixture of Experts inference is not just "run fewer weights." A GPU runtime has to project router logits, select top-k experts, batch or dispatch the selected expert paths, apply the activation, run the down projections, and fold in shared experts without turning routing into a CPU bottleneck.
+
+| MoE step | Runtime risk |
+| --- | --- |
+| Router projection | Small matvecs can become dispatch-bound. |
+| Top-k selection | CPU readbacks destroy decode latency if routing leaves the GPU. |
+| Expert execution | Sparse choices reduce compute but fragment memory access. |
+| Shared expert | Adds a dense side path that every token still pays. |
+| Related ZINC path | [Qwen3.6 architecture](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc), [RDNA4 debugging](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4), and [Getting Started](/zinc/docs/getting-started). |
 
 Mixture of Experts (MoE) models are the current answer to a very practical LLM question: how do you make the model bigger without paying dense-model cost on every token? The short answer is sparse routing. Instead of running one giant feed-forward network everywhere, an MoE model asks a router which experts should handle the current token, runs only the top-k experts, and combines their outputs. The long answer is that MoE inference lives or dies on the routing implementation, which is exactly why [ZINC](/zinc) treats MoE as a first-class runtime problem instead of "just another model family."
 

@@ -1,5 +1,6 @@
 ---
 title: "What broke first in local LLM inference on AMD RDNA4"
+seoTitle: "AMD RDNA4 LLM Inference Debugging"
 date: "2026-03-27"
 tags:
   - zinc
@@ -25,7 +26,10 @@ keywords:
   - vLLM paged attention
   - llama.cpp alternative AMD
 excerpt: "Early ZINC failures in local LLM inference on AMD RDNA4: flash attention, KV cache, RoPE, MoE, SSM, tokenizer correctness, and benchmark drift."
+seoDescription: "Debugging local LLM inference on AMD RDNA4: tokenizer bugs, flash attention, KV cache, RoPE, MoE routing, SSM state, and logits."
 ---
+
+Quick answer: the first AMD RDNA4 local LLM failures were correctness failures, not performance failures. ZINC had to fix architecture detection, tokenizer behavior, RoPE, KV cache writes, flash attention, MoE routing, SSM state updates, and LM-head dispatch before throughput numbers meant anything.
 
 The first version of ZINC, our local LLM inference engine for AMD RDNA4 GPUs, did not fail in one impressive way. It failed in ten smaller, more humiliating ways. The forward pass skipped all 40 transformer layers. The tokenizer turned spaces into the wrong token. Flash attention read the K cache as a page table and hung the GPU. One dispatch bug quietly zeroed 97% of the vocabulary logits.
 

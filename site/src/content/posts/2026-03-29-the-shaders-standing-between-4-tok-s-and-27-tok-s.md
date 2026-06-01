@@ -1,5 +1,6 @@
 ---
 title: "The broken Vulkan shaders keeping our AMD RDNA4 inference engine stuck at 4 tok/s"
+seoTitle: "Vulkan Shader Debugging for LLMs"
 date: "2026-03-29"
 tags:
   - zinc
@@ -31,7 +32,10 @@ keywords:
   - Qwen3.5-35B-A3B GGUF
   - llama.cpp alternative Vulkan
 excerpt: "ZINC could already run Qwen3.5-35B-A3B on AMD RDNA4, but local LLM inference was stuck at 4 tok/s because the Vulkan compute shaders behind SSM and MoE routing were still wrong. This is how we debugged RADV crashes, recurrent state drift, and CPU-GPU round trips to move decode back onto the GPU."
+seoDescription: "Vulkan shader debugging for local LLM inference on AMD RDNA4: SSM kernels, MoE routing, RADV crashes, and CPU-GPU sync."
 ---
+
+Quick answer: the RDNA4 decode path was stuck because SSM and MoE routing still forced too many CPU round trips. Moving conv1d, delta-net updates, gated norm, and router top-k toward GPU-resident Vulkan shaders was the first real throughput unlock.
 
 ZINC already knew how to talk. That was not the problem anymore.
 

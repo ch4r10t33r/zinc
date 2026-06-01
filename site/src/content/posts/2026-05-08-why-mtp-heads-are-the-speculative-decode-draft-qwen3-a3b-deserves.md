@@ -1,5 +1,6 @@
 ---
 title: "Why MTP heads are the speculative decode draft Qwen3 A3B always needed on RDNA4"
+seoTitle: "MTP Speculative Decoding for Qwen3"
 date: "2026-05-08"
 tags:
   - zinc
@@ -25,7 +26,10 @@ keywords:
   - Qwen3.6 27B mtp 2.5x decode
   - SSM rewind tax speculative decode
 excerpt: "The April 28 argument that draft-model speculative decoding does not net out on Qwen 35B-A3B was the right read at the time. Two pieces moved in the next ten days. PR 22400 made gated DeltaNet rollback partial instead of full, eliminating the SSM rewind tax. PR 22673 wired MTP heads into llama.cpp as a built-in draft, and the measured speedup on Qwen3.6 27B is 2.5x at γ=3 with a 0.72 acceptance rate. The cost ratio that ruined the 0.8B draft drops by an order of magnitude when the draft is one transformer layer attached to the verifier's last hidden state, and on a 32 GB RDNA4 card the only thing standing between local Qwen3 and that 2.5x is a Vulkan kernel that has not landed yet."
+seoDescription: "Why MTP heads are the right speculative decoding draft for Qwen3: hidden-state alignment, low cost ratio, and partial Gated DeltaNet rollback."
 ---
+
+Quick answer: MTP heads are a better speculative decoding draft for Qwen3-style models because they are trained against the verifier's hidden state and cost roughly one extra layer, not a separate dense draft model. That fixes the cost-ratio problem that makes a vocab-matched 0.8B draft unattractive on hybrid MoE/SSM verifiers.
 
 The [argument we made on April 28](/blog/2026-04-28-why-speculative-decoding-does-not-net-out-on-qwen-35b-a3b) was that a vocab-matched 0.8B draft model could not pay for itself on Qwen 35B-A3B. The Leviathan speedup formula said so directly: at acceptance rate `α = 0.55`, lookahead `γ = 4`, and cost ratio `c = 0.20`, the expected speedup was `1.17×`, and the gated DeltaNet rewind tax pushed `c` to `0.30`, dropping the formula to `0.96×`. The public benchmark on a 3090 measured exactly that: zero speedup across nineteen configurations.
 

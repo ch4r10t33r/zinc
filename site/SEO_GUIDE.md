@@ -4,6 +4,65 @@
 
 Every page should naturally cover terms from its relevant cluster. Don't stuff â€” write content that answers the query someone would type.
 
+## Local Analytics Workflow
+
+The detailed GA4 and Search Console analysis is generated locally under `site/.seo/`, which is gitignored. Do not commit raw analytics exports or generated private reports.
+
+Use:
+
+```bash
+npm run seo:analyze -- --ga4 <ga4-export.csv> --gsc-dir <search-console-export-dir>
+```
+
+The public repo should keep only durable SEO policy, tooling, and content strategy. Page-level traffic, query counts, CTRs, bounce rates, and raw export filenames belong in local ignored reports.
+
+### Review Checklist
+
+Use the local report to decide which pages to edit first:
+
+- Pages with high impressions, low CTR, and average position 10 or better need better `seoTitle`, `seoDescription`, and first-screen answers.
+- Pages with search clicks but poor engagement need a stronger opening, clearer internal next steps, and tighter intent matching.
+- Pages with both trailing-slash and non-trailing-slash variants need canonical redirect work.
+- 404 traffic needs Cloudflare or GA4 page-path investigation before content changes.
+- Query clusters with growing impressions should become hubs, not isolated posts.
+
+### Durable Blog Topics
+
+Future posts should deepen proven clusters instead of broadening randomly:
+
+1. **Qwen3.6 architecture/local inference**
+   - `Qwen3.6 Architecture Details: Hybrid Attention, Sparse MoE, and Local Inference`
+   - `Qwen3.6 GGUF and Local Inference: What Needs To Exist Before It Runs Locally`
+2. **Speculative decoding and MTP**
+   - `Why Speculative Decoding Fails on Qwen3.6-Style MoE/SSM Models`
+   - `MTP vs Draft Models for Local Qwen Inference`
+3. **MoE inference**
+   - `MoE Inference on GPUs: Router Top-K, Shared Experts, and Why It Bottlenecks`
+   - `Qwen and Gemma MoE Inference: What Sparse Routing Costs on Consumer GPUs`
+4. **Gemma local inference**
+   - `Gemma 4 Local Inference: Sliding-Window Attention, Asymmetric GQA, and GPU Memory`
+   - `Gemma 4 on AMD RDNA4: Prefill, Vulkan Command Buffers, and Kernel Assumptions`
+   - `Gemma 4 vs Qwen3.6 for Local Inference: MoE, SSM, SWA, and Memory Tradeoffs`
+5. **RDNA4 / Radeon inference**
+   - `AMD RDNA4 LLM Inference Guide: R9700, RX 9070 XT, Vulkan, and llama.cpp`
+   - `Radeon AI PRO R9700 vs RX 9070 XT for Local LLM Inference`
+6. **Quantization and precision**
+   - `FP4 vs FP8 for Local LLM Inference on RDNA4`
+   - `KV Cache Quantization for 128K Context on 32GB GPUs`
+7. **Apple Silicon local inference**
+   - `Apple Silicon Local LLM Inference: Metal, Unified Memory, and M-Series Limits`
+
+### Metadata policy update
+
+Blog posts now support dedicated search metadata:
+
+```yaml
+seoTitle: "Qwen3.6 Architecture Details for Local Inference"
+seoDescription: "A concise technical guide to Qwen3.6 architecture signals, GGUF status, MoE routing, and what local inference engines need."
+```
+
+Use `title` for the article headline. Use `seoTitle` and `seoDescription` for Google results. High-potential pages should receive these fields first.
+
 ### Primary clusters
 
 | Cluster | Target queries | Pages |
@@ -11,6 +70,7 @@ Every page should naturally cover terms from its relevant cluster. Don't stuff â
 | **AMD GPU inference** | "LLM inference AMD GPU", "AMD consumer GPU AI", "RDNA4 LLM", "RDNA3 inference", "RX 9070 XT LLM", "Radeon AI PRO R9700 inference" | /zinc, /blog posts |
 | **ROCm alternatives** | "ROCm alternative consumer GPU", "vLLM without ROCm", "llama.cpp alternative AMD", "Vulkan LLM inference" | /zinc |
 | **TurboQuant** | "TurboQuant KV cache compression", "KV cache quantization LLM", "Lloyd-Max quantization GPU", "QJL residual correction" | /zinc/docs/turboquant-spec |
+| **Gemma local inference** | "Gemma 4 local inference", "Gemma 4 AMD GPU", "Gemma 4 RDNA4", "Gemma flash attention", "Gemma MoE inference" | /blog posts, /zinc |
 | **RDNA4 tuning** | "RDNA4 tuning LLM", "RADV cooperative matrix", "AMD GPU ECC disable", "SPIR-V RADV performance" | /zinc/docs/rdna4-tuning |
 | **Local AI serving** | "local LLM server", "OpenAI compatible local inference", "self-hosted LLM API", "continuous batching consumer GPU" | /zinc, /blog posts |
 | **Zig + Vulkan** | "Zig inference engine", "Vulkan compute shaders LLM", "GLSL compute shader inference" | /zinc/docs/spec |
@@ -88,7 +148,9 @@ Already implemented. Ensure `keywords` array covers target terms.
 
 For every new post:
 - [ ] Title includes a primary keyword
-- [ ] Excerpt (meta description) includes 2-3 target terms
+- [ ] `seoTitle` is 45-60 characters after the brand suffix is included
+- [ ] `seoDescription` is 120-155 characters and includes 2-3 target terms
+- [ ] Excerpt is reader-facing card copy, not necessarily the meta description
 - [ ] Tags map to target clusters
 - [ ] First paragraph mentions the primary topic
 - [ ] At least one internal link to /zinc or a doc page

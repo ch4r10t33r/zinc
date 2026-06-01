@@ -1,5 +1,6 @@
 ---
 title: "Qwen3.6-35B-A3B GGUF on AMD and Metal"
+seoTitle: "Qwen3.6 GGUF Local Inference"
 date: "2026-04-17"
 tags:
   - zinc
@@ -38,7 +39,10 @@ faqs:
   - question: "Does Qwen 3.6 run on Apple Silicon Metal in ZINC?"
     answer: "Yes. The same managed Qwen 3.6 entry is also marked as tested on `apple-silicon`, which maps to ZINC's Metal backend."
 excerpt: "Qwen3.6-35B-A3B-UD-Q4_K_XL is now a supported ZINC managed model for AMD RDNA4 Vulkan and Apple Silicon Metal local inference, with one-command pull and chat-ready defaults."
+seoDescription: "Run Qwen3.6-35B-A3B GGUF locally with ZINC on AMD RDNA4 Vulkan or Apple Silicon Metal using the managed model cache."
 ---
+
+Quick answer: ZINC exposes Qwen3.6-35B-A3B GGUF as a managed local model for AMD RDNA4 Vulkan and Apple Silicon Metal. Use the managed model id, not an ad hoc GGUF path, when you want the supported local inference path.
 
 If you want the blunt version, here it is: **`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` now runs in ZINC on the two local targets we care about most, AMD RDNA4 through Vulkan and Apple Silicon through Metal.**
 

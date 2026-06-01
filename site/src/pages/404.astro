@@ -6,7 +6,12 @@ import BaseLayout from '../layouts/BaseLayout.astro';
   <div class="not-found">
     <h1>404</h1>
     <p>Page not found.</p>
-    <a href="/">&larr; Back to blog</a>
+    <nav aria-label="Useful links">
+      <a href="/">Home</a>
+      <a href="/zinc">ZINC</a>
+      <a href="/zinc/docs">Docs</a>
+      <a href="/zinc/benchmarks">Benchmarks</a>
+    </nav>
   </div>
 </BaseLayout>
 
@@ -19,5 +24,30 @@ import BaseLayout from '../layouts/BaseLayout.astro';
   .not-found h1 {
     font-size: 4rem;
     color: var(--color-text-muted);
+  }
+
+  .not-found nav {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    margin-top: var(--space-lg);
+  }
+
+  .not-found a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.25rem;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    color: var(--color-text);
+    text-decoration: none;
+    font-weight: 700;
+  }
+
+  .not-found a:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
   }
 </style>

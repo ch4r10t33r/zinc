@@ -38,6 +38,10 @@ bun.lockb
 .env
 .env.*
 
+# Local analytics exports/reports
+.seo/
+site/.seo/
+
 # Claude Code — track commands, ignore user-specific files
 .claude/settings.json
 .claude/settings.local.json

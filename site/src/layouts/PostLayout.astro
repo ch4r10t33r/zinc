@@ -16,8 +16,10 @@ interface FAQItem {
 
 interface Props {
   title: string;
+  seoTitle?: string;
   date: Date;
   excerpt: string;
+  seoDescription?: string;
   tags?: string[];
   keywords?: string[];
   faqs?: FAQItem[];
@@ -25,7 +27,7 @@ interface Props {
   nextPost?: PostLink | null;
 }
 
-const { title, date, excerpt, tags, keywords, faqs, prevPost, nextPost } = Astro.props;
+const { title, seoTitle, date, excerpt, seoDescription, tags, keywords, faqs, prevPost, nextPost } = Astro.props;
 
 const isoDate = date.toISOString().split('T')[0];
 const formattedDate = new Intl.DateTimeFormat('en-US', {
@@ -35,6 +37,8 @@ const formattedDate = new Intl.DateTimeFormat('en-US', {
   timeZone: 'UTC',
 }).format(date);
 const keywordList = keywords && keywords.length > 0 ? keywords : tags ?? [];
+const metaTitle = seoTitle ?? title;
+const metaDescription = seoDescription ?? excerpt;
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
 const canonicalUrl = Astro.url.href;
@@ -70,7 +74,7 @@ const jsonLd = {
         name: 'ZINC Project',
         url: siteUrl,
       },
-      description: excerpt,
+      description: metaDescription,
       url: Astro.url.href,
       keywords: keywordList,
       mainEntityOfPage: Astro.url.href,
@@ -92,8 +96,8 @@ const jsonLd = {
 ---
 
 <BaseLayout
-  title={title}
-  description={excerpt}
+  title={metaTitle}
+  description={metaDescription}
   keywords={keywordList.length > 0 ? keywordList.join(', ') : undefined}
   ogType="article"
   publishedDate={isoDate}

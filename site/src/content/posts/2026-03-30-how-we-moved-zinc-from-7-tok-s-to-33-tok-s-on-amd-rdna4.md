@@ -1,5 +1,6 @@
 ---
 title: "How we made AMD LLM inference 4x faster on a single GPU"
+seoTitle: "AMD RDNA4 LLM Inference Speedup"
 date: "2026-03-30"
 tags:
   - zinc
@@ -26,7 +27,10 @@ keywords:
   - GPU resident inference
   - Vulkan command batching
 excerpt: "ZINC used to look stuck at about 7 tok/s on AMD RDNA4. The clean ReleaseFast baseline now measures 33.58 tok/s on Qwen3.5-35B-A3B-UD Q4_K_XL on a Radeon AI PRO R9700. This is what changed, which old numbers were misleading, and what still separates us from llama.cpp."
+seoDescription: "How ZINC sped up AMD RDNA4 LLM inference on Radeon AI PRO R9700 by moving decode work onto Vulkan and reducing CPU round trips."
 ---
+
+Quick answer: the AMD RDNA4 speedup came from moving more of Qwen decode onto the GPU, reducing CPU-GPU synchronization, cleaning up benchmark paths, and separating raw decode throughput from chat/server overhead. The lesson for local LLM inference is that correctness, dispatch shape, and measurement hygiene matter before exotic kernels do.
 
 For a while, ZINC had an annoying kind of progress problem.
 

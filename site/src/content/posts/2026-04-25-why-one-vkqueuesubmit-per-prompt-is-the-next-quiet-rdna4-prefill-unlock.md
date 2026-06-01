@@ -12,6 +12,8 @@ tags:
   - llm-inference
   - linux
   - performance
+  - gemma
+  - gemma4
 keywords:
   - vkQueueSubmit overhead RDNA4
   - Vulkan command buffer batching
@@ -23,8 +25,13 @@ keywords:
   - llama.cpp Vulkan prefill submit
   - prefill CPU stall RDNA4
   - 60-layer Gemma 4 submit budget
+  - Gemma 4 prefill command buffers
 excerpt: "ZINC currently records one Vulkan command buffer per transformer layer and calls vkQueueSubmit once for each. On a 60-layer Gemma 4 prefill that is 60 round trips through the amdgpu ioctl path, and the gap between submits is wide enough to land on every flame graph the engine produces. Collapsing those 60 submits into one is a small change at the recording layer with a measurable upside, and it is the right shape of fix to land before AMD's user-mode queues make the per-submit cost smaller but not zero."
+seoTitle: "Gemma 4 Prefill and vkQueueSubmit"
+seoDescription: "Why Gemma 4 prefill on AMD RDNA4 should use one Vulkan command buffer per prompt instead of per-layer vkQueueSubmit calls."
 ---
+
+Gemma 4 is a useful stress test for Vulkan LLM inference because its 60-layer prefill path makes every avoidable `vkQueueSubmit` visible. On AMD RDNA4, recording one command buffer per prompt removes dozens of CPU submission gaps without changing the shader math, so the same fix helps Gemma 4 and the broader ZINC prefill path.
 
 The 0.6-second `CPU and submit gap` bar in the [RDNA4 prefill phase budget](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s) was the most embarrassing slice of that chart. The kernels were doing the work the kernels are supposed to do. The reason 600 milliseconds of wall time on a Qwen3.5-35B prompt was sitting on the CPU side of the timeline is that the Vulkan backend was issuing one `vkQueueSubmit` per layer, and the cost of a `vkQueueSubmit` on `amdgpu` is not zero. On a 60-layer model that adds up fast.
 

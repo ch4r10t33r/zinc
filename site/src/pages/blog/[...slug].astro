@@ -21,8 +21,10 @@ const { Content } = await render(post);
 
 <PostLayout
   title={post.data.title}
+  seoTitle={post.data.seoTitle}
   date={post.data.date}
   excerpt={post.data.excerpt}
+  seoDescription={post.data.seoDescription}
   tags={post.data.tags}
   keywords={post.data.keywords}
   faqs={post.data.faqs}

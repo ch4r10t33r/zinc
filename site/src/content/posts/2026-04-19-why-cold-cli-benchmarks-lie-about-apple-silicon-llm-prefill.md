@@ -1,5 +1,6 @@
 ---
 title: "Why cold-CLI benchmarks lie about Apple Silicon LLM prefill"
+seoTitle: "Apple Silicon LLM Benchmarking"
 date: "2026-04-19"
 tags:
   - zinc
@@ -25,7 +26,10 @@ keywords:
   - ZINC_PREFILL_PROFILE
   - llama-server warmup
 excerpt: "Our own benchmark harness made ZINC look slower than it is. The April 18 Metal suite reported 1.0 tok/s prefill on Qwen3.5-35B-A3B. The April 15 run reported 2.1. Same engine, same model, same machine. The difference was measurement, not regression. Here is why cold-process CLI benchmarks stop working once the model mmaps 21 GiB of weights."
+seoDescription: "Why Apple Silicon LLM benchmarks need warm-server runs: mmap page faults, cold CLI launches, TTFT noise, and Metal prefill measurement."
 ---
+
+Quick answer: Apple Silicon LLM benchmarks are misleading when every measurement starts a fresh CLI process. Large GGUF models are mmaped, so the first prefill often measures page faults and process startup as much as model math. Use warm server or repeated in-process runs for fair Metal throughput.
 
 The April 18 Metal suite reported `qwen35-35b-a3b-q4k-xl` core prefill at a median of **1.0 tok/s**. Three days earlier, the same harness reported **2.1 tok/s**. Nothing about the engine changed between those runs that should have halved prefill throughput.
 

@@ -5,6 +5,7 @@ const posts = defineCollection({
   loader: glob({ pattern: '**/*.md', base: './src/content/posts' }),
   schema: z.object({
     title: z.string(),
+    seoTitle: z.string().optional(),
     date: z.coerce.date(),
     tags: z.array(z.string()).optional().default([]),
     keywords: z.array(z.string()).optional().default([]),
@@ -13,6 +14,7 @@ const posts = defineCollection({
       answer: z.string(),
     })).optional().default([]),
     excerpt: z.string(),
+    seoDescription: z.string().optional(),
     draft: z.boolean().optional().default(false),
   }),
 });

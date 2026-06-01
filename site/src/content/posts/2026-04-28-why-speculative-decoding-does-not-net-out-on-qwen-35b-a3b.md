@@ -1,5 +1,6 @@
 ---
 title: "Why speculative decoding does not net out on Qwen 35B-A3B local inference"
+seoTitle: "Qwen Speculative Decoding Failure"
 date: "2026-04-28"
 tags:
   - zinc
@@ -24,7 +25,17 @@ keywords:
   - acceptance rate cost ratio c
   - EAGLE-3 vs draft model 35B
 excerpt: "A vocab-matched 0.8B draft model on Qwen 3.6 35B-A3B with llama.cpp's speculative decoding path failed to beat the baseline across nineteen public benchmark configurations on a single RTX 3090. The reason is not tuning. The same hybrid MoE-plus-SSM structure that put yesterday's KV crossover at 16k tokens also breaks the cost ratio that classical speculative decoding depends on. With only three billion active parameters in the verifier, a 0.8B draft is not small enough to be free, and the gated delta-net hidden state adds a rewind tax on every rejected token."
+seoDescription: "Why draft-model speculative decoding fails on Qwen 35B-A3B: MoE active weights, SSM rollback, acceptance rate, and cost ratio."
 ---
+
+Quick answer: a separate 0.8B draft model is too expensive relative to a Qwen 35B-A3B verifier that only activates a few billion parameters per token. Speculative decoding can still work for this model family, but it needs hidden-state-aligned MTP or EAGLE-style heads and partial recurrent-state rollback, not a generic vocab-matched draft model.
+
+| Constraint | Why it hurts speculative decoding |
+| --- | --- |
+| Sparse MoE verifier | The verifier is cheaper than a dense 35B model, so the draft is not relatively free. |
+| Cross-family draft | Acceptance rate falls because the draft lacks the verifier's MoE and SSM structure. |
+| Gated DeltaNet state | Rejected tokens require recurrent-state bookkeeping that dense-transformer KV truncation does not pay. |
+| Better path | Use [MTP heads](/blog/2026-05-08-why-mtp-heads-are-the-speculative-decode-draft-qwen3-a3b-deserves) or verifier-trained draft heads. |
 
 The first public benchmark of [llama.cpp speculative decoding on Qwen 3.6 35B-A3B](https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090) ran nineteen configurations on a single RTX 3090. None of them beat the baseline. The repository's own headline finding is "no variant achieves net speedup on Ampere + A3B MoE", and that result holds across both the n-gram cache draft, the n-gram modulated draft, and the classic vocab-matched 0.8B draft model.
 

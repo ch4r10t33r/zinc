@@ -1,5 +1,6 @@
 ---
 title: "The FP4 wave breaks at RDNA4 and FP8 WMMA already does what local Qwen3 needs"
+seoTitle: "FP4 vs FP8 for RDNA4 Inference"
 date: "2026-05-09"
 tags:
   - zinc
@@ -28,7 +29,10 @@ keywords:
   - bandwidth bound vs compute bound RDNA4
   - Qwen3 30B FP8 vLLM speedup
 excerpt: "FP4 weight formats landed across the GGUF ecosystem in the last two weeks: NVFP4 in mainline llama.cpp, MXFP4 in ik_llama.cpp, with Blackwell-native FP4 tensor cores flipped on in build b8967. The bandwidth math is right on every card. The compute math only works where the tensor cores speak FP4. The RDNA4 ISA on the Radeon AI PRO R9700 lists v_wmma_f32_16x16x16 in fp16, bf16, fp8_e4m3, int8, and iu4 forms but no fp4 form, so an NVFP4 or MXFP4 weight on gfx1201 dequantizes to FP16 before the matmul and lands at the 191 TFLOPS dense FP16 ceiling. The format that earns its place on this card is FP8 E4M3FN, where 383 TFLOPS dense WMMA already exists in hardware and the only thing standing in the way is a small AITER patch and a handful of tuned kernel configs that route gfx1201 through the MI350X Triton path. Skip the FP4 wave on RDNA4. Ship FP8 weights with the patch."
+seoDescription: "FP4 vs FP8 on AMD RDNA4 for local LLM inference: why Radeon AI PRO R9700 lacks FP4 WMMA but accelerates FP8 E4M3."
 ---
+
+Quick answer: FP4 saves memory on RDNA4, but it does not map to a native FP4 WMMA instruction on gfx1201. FP8 E4M3 is the format that has the useful hardware path on Radeon AI PRO R9700, so local Qwen inference should prioritize FP8 kernels before chasing FP4 compute speedups.
 
 NVFP4 has been the headline of the GGUF release cycle for two weeks. The type ID merged into mainline llama.cpp as `GGML_TYPE_NVFP4 = 40` through a sequence of pull requests in late March and April, and [build b8967 on April 29 flipped on the Blackwell-native FP4 tensor-core path on `sm_120`](https://insiderllm.com/guides/fp4-inference-llamacpp-nvfp4-mxfp4/), measuring +43% to +68% prefill on Qwen3.6-27B-NVFP4 against the previous build on an RTX 5090. The companion MXFP4 path in ik_llama.cpp has been live since the [Nov 2025 gguf-py constants merge](https://github.com/ikawrakow/ik_llama.cpp/pull/1007), with the OCP open-standard kernels filling in over the months since. The marketing read is that FP4 is now general-purpose for local inference. It is not. Not on RDNA4.
 

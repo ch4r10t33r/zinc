@@ -1,2 +1,21 @@
-/zinc/docs/gpu-reference     /zinc/docs/amd-gpu-reference     301
-/zinc/docs/gpu-reference/    /zinc/docs/amd-gpu-reference/    301
+http://zolotukhin.ai/*       https://zolotukhin.ai/:splat             301
+http://www.zolotukhin.ai/*   https://zolotukhin.ai/:splat             301
+https://www.zolotukhin.ai/*  https://zolotukhin.ai/:splat             301
+
+/about                       /about/                                  301
+/blog                        /blog/                                   301
+/blog/:slug                  /blog/:slug/                             301
+/zinc                        /zinc/                                   301
+/zinc/benchmarks             /zinc/benchmarks/                        301
+/zinc/performance            /zinc/benchmarks/                        301
+/zinc/performance/           /zinc/benchmarks/                        301
+/zinc/docs                   /zinc/docs/                              301
+/zinc/docs/getting-started   /zinc/docs/getting-started/              301
+/zinc/docs/apple-silicon-reference /zinc/docs/apple-silicon-reference/ 301
+/zinc/docs/spec              /zinc/docs/spec/                         301
+/zinc/docs/amd-gpu-reference /zinc/docs/amd-gpu-reference/            301
+/zinc/docs/turboquant-spec   /zinc/docs/turboquant-spec/              301
+/zinc/docs/zig-api/:module   /zinc/docs/zig-api/:module/              301
+
+/zinc/docs/gpu-reference     /zinc/docs/amd-gpu-reference/            301
+/zinc/docs/gpu-reference/    /zinc/docs/amd-gpu-reference/            301
