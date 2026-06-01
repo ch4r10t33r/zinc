@@ -151,6 +151,12 @@ test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
   expect(guessFamily("qwen36-27b-q4k-m")).toBe("Qwen 3.6");
 });
 
+test("performance suite canonicalizes RDNA Gemma GGUF filenames to published ids", () => {
+  expect(canonicalModelIdFromPath("/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf")).toBe("gemma4-26b-a4b-q4k-m");
+  expect(canonicalModelIdFromPath("/root/models/gemma-4-31B-it-Q4_K_M.gguf")).toBe("gemma4-31b-q4k-m");
+  expect(guessFamily("gemma4-26b-a4b-q4k-m")).toBe("Gemma 4");
+});
+
 test("local ZINC command prefers managed model ids when using the default cache", () => {
   const cmd = localZincCommand({
     model_id: "qwen35-9b-q4k-m",

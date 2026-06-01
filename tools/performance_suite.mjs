@@ -1448,6 +1448,8 @@ export function defaultMetalCases(modelRoot) {
 }
 
 function titleFromId(id) {
+  if (id === "gemma4-26b-a4b-q4k-m") return "Gemma 4 26B-A4B MoE Q4_K_M";
+  if (id === "gemma4-31b-q4k-m") return "Gemma 4 31B Q4_K_M";
   return id
     .split("-")
     .map((chunk) => (chunk.length <= 3 ? chunk.toUpperCase() : `${chunk[0].toUpperCase()}${chunk.slice(1)}`))
@@ -1478,7 +1480,9 @@ export function canonicalModelIdFromPath(modelFile) {
     .replace(/^qwen-3-/, "qwen3-")
     .replace(/-ud-(q[0-9].*)$/, "-$1")
     .replace(/-q([0-9])-k-([a-z0-9]+)/g, "-q$1k-$2")
-    .replace(/-q([0-9])-k$/g, "-q$1k");
+    .replace(/-q([0-9])-k$/g, "-q$1k")
+    .replace(/^gemma-4-/, "gemma4-")
+    .replace(/-it-(q[0-9].*)$/, "-$1");
 }
 
 export function guessFamily(id) {
