@@ -63,6 +63,13 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "release", "Deprecated compatibility flag; prefer -Doptimize")) |release| {
         optimize = if (release) .ReleaseFast else .Debug;
     }
+    const build_version = b.option([]const u8, "version", "Version string embedded in `zinc --version`") orelse
+        b.graph.env_map.get("ZINC_VERSION") orelse
+        "dev";
+    const build_commit = b.option([]const u8, "commit", "Git commit hash embedded in `zinc --version`") orelse
+        b.graph.env_map.get("ZINC_COMMIT") orelse
+        b.graph.env_map.get("GITHUB_SHA") orelse
+        "unknown";
     const full_tests = b.option(bool, "full-tests", "Require integration smoke tests and fail when their environment is missing") orelse false;
     const install_hot_bench = b.option(bool, "install-hot-bench", "Install the zinc-hot-bench binary as part of the default install step") orelse false;
 
@@ -86,6 +93,21 @@ pub fn build(b: *std.Build) void {
     if (selected_backend == .vulkan and !is_linux) {
         @panic("-Dbackend=vulkan currently requires a Linux target");
     }
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", build_version);
+    build_options.addOption([]const u8, "commit", build_commit);
+    build_options.addOption(
+        []const u8,
+        "target",
+        b.fmt("{s}-{s}-{s}", .{
+            @tagName(target.result.cpu.arch),
+            @tagName(target.result.os.tag),
+            @tagName(target.result.abi),
+        }),
+    );
+    build_options.addOption([]const u8, "optimize", @tagName(optimize));
+    build_options.addOption([]const u8, "backend", @tagName(selected_backend));
 
     const zinc_rt_gguf_mod = b.createModule(.{
         .root_source_file = b.path("src/model/gguf.zig"),
@@ -267,6 +289,14 @@ pub fn build(b: *std.Build) void {
             b.getInstallStep().dependOn(&b.addInstallFile(spv_output, "share/zinc/shaders/" ++ spv_file).step);
         }
     }
+    if (selected_backend == .metal) {
+        const metal_shaders_install = b.addInstallDirectory(.{
+            .source_dir = b.path("src/shaders/metal"),
+            .install_dir = .prefix,
+            .install_subdir = "share/zinc/shaders/metal",
+        });
+        b.getInstallStep().dependOn(&metal_shaders_install.step);
+    }
 
     // --- Main executable ---
     const exe_mod = b.createModule(.{
@@ -275,6 +305,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.addOptions("build_options", build_options);
 
     if (selected_backend == .zinc_rt) {
         // M0 T-CPU scaffold is pure Zig. GPU tier linking starts when
@@ -307,6 +338,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    hot_bench_mod.addOptions("build_options", build_options);
     configureVulkanModule(b, target, hot_bench_mod);
 
     const hot_bench = b.addExecutable(.{
@@ -477,6 +509,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addOptions("build_options", build_options);
     if (selected_backend == .zinc_rt) {
         // Pure Zig T-CPU tests; no platform GPU runtime linked.
         test_mod.addImport("gguf", zinc_rt_gguf_mod);

@@ -4,7 +4,9 @@
 //! and the single-process decode loop used for prompt-mode execution.
 const builtin = @import("builtin");
 const std = @import("std");
+const build_info = @import("build_info.zig");
 const gpu = @import("gpu/interface.zig");
+const runtime_assets = @import("runtime_assets.zig");
 const catalog_mod = @import("model/catalog.zig");
 const diagnostics_mod = if (gpu.is_vulkan)
     @import("diagnostics.zig")
@@ -115,6 +117,8 @@ comptime {
     _ = @import("model/gguf.zig");
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
+    _ = @import("build_info.zig");
+    _ = @import("runtime_assets.zig");
     _ = @import("regression_tests.zig");
     _ = @import("server/http.zig");
     _ = @import("server/runtime.zig");
@@ -164,6 +168,8 @@ pub const Config = struct {
     show_help: bool = false,
     /// Show extended help including developer-only flags.
     show_help_all: bool = false,
+    /// Print version/build metadata and exit.
+    show_version: bool = false,
     /// Run diagnostics and exit.
     check: bool = false,
     /// Optional model-management command.
@@ -435,6 +441,7 @@ const banner =
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
+    \\  --version                Show version and build metadata
     \\  -h, --help               Show this help
     \\  --help-all               Show diagnostics and developer-only flags too
     \\
@@ -478,6 +485,7 @@ const banner_full =
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
+    \\  --version                Show version and build metadata
     \\
     \\Analysis and developer options:
     \\  --graph-report <path>    Write decode-graph analysis JSON report
@@ -512,6 +520,9 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--help-all")) {
             config.show_help = true;
             config.show_help_all = true;
+            return config;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            config.show_version = true;
             return config;
         } else if (std.mem.eql(u8, arg, "chat")) {
             if (config.command != .run) return error.UnknownArgument;
@@ -1551,6 +1562,14 @@ pub fn main() !void {
         return;
     }
 
+    if (config.show_version) {
+        var stdout_buffer: [512]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        try build_info.writeVersion(&stdout_writer.interface);
+        try stdout_writer.interface.flush();
+        return;
+    }
+
     if (config.check) {
         var check_target = resolveCheckTarget(config, allocator) catch |err| {
             log.err("Failed to resolve model for diagnostics: {s}", .{@errorName(err)});
@@ -1558,14 +1577,22 @@ pub fn main() !void {
         };
         defer check_target.deinit(allocator);
 
+        const check_shader_dir_owned = runtime_assets.resolveShaderDir(allocator, if (gpu.is_metal) .metal else .spirv) catch |err| blk: {
+            log.warn("Could not resolve shader directory before diagnostics: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer if (check_shader_dir_owned) |shader_dir| allocator.free(shader_dir);
+        const check_shader_dir = check_shader_dir_owned orelse if (gpu.is_metal)
+            "src/shaders/metal"
+        else
+            "zig-out/share/zinc/shaders";
+
         diagnostics_mod.run(.{
             .device_index = config.device_index,
             .model_path = check_target.model_path,
             .requested_context_length = config.context_length,
             .managed_model = check_target.managed_model,
-            .shader_dir = if (gpu.is_metal) "src/shaders/metal" else blk: {
-                break :blk resolveShaderDir(allocator) catch "zig-out/share/zinc/shaders";
-            },
+            .shader_dir = check_shader_dir,
         }, allocator) catch |err| {
             log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
             std.process.exit(1);
@@ -2081,6 +2108,12 @@ test "parseArgs: help-all flag" {
     try std.testing.expect(config.show_help_all);
 }
 
+test "parseArgs: version flag" {
+    const args = [_][:0]const u8{ "zinc", "--version" };
+    const config = try parseArgs(&args);
+    try std.testing.expect(config.show_version);
+}
+
 test "parseArgs: invalid kv-quant" {
     const args = [_][:0]const u8{ "zinc", "--kv-quant", "5" };
     try std.testing.expectError(error.InvalidKvQuant, parseArgs(&args));
@@ -2234,44 +2267,17 @@ test "resolveCheckTarget prefers managed model id over raw gguf path" {
     }
 }
 
-/// Locate the compiled SPIR-V shader directory.
-///
-/// Resolution order:
-/// 1. `zig-out/share/zinc/shaders`  — local dev build (CWD-relative)
-/// 2. `share/zinc/shaders`          — when CWD is the install prefix
-/// 3. `<exe_dir>/../share/zinc/shaders` — installed layout (Nix store, /usr/local, etc.)
-///
-/// Returns an allocated slice owned by the caller.
+/// Locate the compiled SPIR-V shader directory. Returns an allocated slice
+/// owned by the caller.
 fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
-    return resolveShaderDirFrom(allocator, std.fs.cwd(), null);
+    return runtime_assets.resolveShaderDir(allocator, .spirv);
 }
 
 /// Test-friendly variant: probe `base_dir` for the cwd-relative candidates,
 /// then fall back to `exe_dir_override/../share/zinc/shaders` (or the
 /// running executable's directory when override is null).
 fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.fs.Dir, exe_dir_override: ?[]const u8) ![]u8 {
-    const candidates = [_][]const u8{
-        "zig-out/share/zinc/shaders",
-        "share/zinc/shaders",
-    };
-    for (candidates) |candidate| {
-        base_dir.access(candidate, .{}) catch continue;
-        return allocator.dupe(u8, candidate);
-    }
-    // Derive from the running executable's directory: bin/../share/zinc/shaders
-    if (exe_dir_override) |exe_dir| {
-        const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
-        errdefer allocator.free(derived);
-        std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
-        return derived;
-    }
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
-    const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
-    errdefer allocator.free(derived);
-    std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
-    return derived;
+    return runtime_assets.resolveShaderDirFrom(allocator, base_dir, exe_dir_override, .spirv);
 }
 
 test "resolveShaderDirFrom finds first cwd-relative candidate" {

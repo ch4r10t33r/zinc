@@ -8,6 +8,7 @@ const ModelConfig = config_mod.ModelConfig;
 const gguf = @import("../model/gguf.zig");
 const memory_plan = @import("../gpu/memory_plan.zig");
 const metal_loader = @import("../model/loader_metal.zig");
+const runtime_assets = @import("../runtime_assets.zig");
 const metal_device = @import("../metal/device.zig");
 const metal_buffer = @import("../metal/buffer.zig");
 const MetalBuffer = metal_buffer.MetalBuffer;
@@ -6539,8 +6540,19 @@ pub const InferenceEngine = struct {
 // ---------------------------------------------------------------------------
 
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
-    var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{name}) catch return error.PathTooLong;
+    const allocator = std.heap.page_allocator;
+    const shader_dir = runtime_assets.resolveShaderDir(allocator, .metal) catch |err| {
+        log.err("Failed to resolve Metal shader directory for '{s}': {s}", .{ name, @errorName(err) });
+        return error.ShaderNotFound;
+    };
+    defer allocator.free(shader_dir);
+
+    const file_name = std.fmt.allocPrint(allocator, "{s}.metal", .{name}) catch return error.OutOfMemory;
+    defer allocator.free(file_name);
+
+    const path = std.fs.path.join(allocator, &.{ shader_dir, file_name }) catch return error.OutOfMemory;
+    defer allocator.free(path);
+
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         log.err("Failed to open shader '{s}': {s}", .{ name, @errorName(err) });
         return error.ShaderNotFound;
@@ -7830,7 +7842,7 @@ fn dispatchQwenSsmDualRepackedQ8K2048Conv1dOnCmd(
         .d_conv = d_conv,
     };
     const bufs = [_]*const MetalBuffer{
-        weight0_buf, weight1_buf, input_buf, output0_buf, output1_buf,
+        weight0_buf,     weight1_buf,    input_buf,    output0_buf, output1_buf,
         conv_kernel_buf, conv_state_buf, conv_out_buf,
     };
     // Cycle-36: double block_size 128 → 256 (4 → 8 simdgroups per TG) so the
@@ -8054,7 +8066,7 @@ fn dispatchFusedNormDualQ8DmmvConv1dOnCmd(
         .d_conv = d_conv,
     };
     const bufs = [_]*const MetalBuffer{
-        weight0_buf, weight1_buf, hidden_buf, output0_buf, output1_buf, norm_weight_buf,
+        weight0_buf,     weight1_buf,    hidden_buf,   output0_buf, output1_buf, norm_weight_buf,
         conv_kernel_buf, conv_state_buf, conv_out_buf,
     };
     const total_rows = M0 + M1;

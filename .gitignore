@@ -17,6 +17,14 @@ src/.zig-api-cache/
 *.a
 *.exe
 
+# Release packaging outputs
+dist/
+release/
+*.tar.gz
+*.tgz
+*.zip
+SHA256SUMS.txt
+
 # Bun / Node
 node_modules/
 bun.lock
