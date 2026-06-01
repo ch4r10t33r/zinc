@@ -9792,12 +9792,12 @@ pub const InferenceEngine = struct {
         const f32_bytes: u32 = @sizeOf(f32);
         var chunk_start: u32 = 0;
         const cfg = self.model.config;
-        const prefer_serial_qwen36_dense_down = self.isQwen36DenseHybrid27B() and
+        const prefer_serial_qwen_dense_down = self.isQwenDenseHybridLayerMajorPrefillModel() and
             tensor.info.type_ == .q6_k and
             M == cfg.hidden_dim and
             K == cfg.intermediate_dim and
             n_tokens >= 16;
-        const qwen36_ssm_qkv_shape = self.isQwen36DenseHybrid27B() and
+        const qwen_dense_ssm_qkv_shape = self.isQwenDenseHybridLayerMajorPrefillModel() and
             tensor.info.type_ == .q6_k and
             M == cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state and
             K == cfg.hidden_dim and
@@ -9805,14 +9805,14 @@ pub const InferenceEngine = struct {
         // SSM out projection: hidden_dim x d_inner Q5_K. This is the last
         // batched projection still falling through to dmmv_q5k (one WG per row
         // + subgroup reduction); route it through the tiled mul_mm_q5k GEMM.
-        const qwen36_ssm_out_shape = self.isQwen36DenseHybrid27B() and
+        const qwen_dense_ssm_out_shape = self.isQwenDenseHybridLayerMajorPrefillModel() and
             tensor.info.type_ == .q5_k and
             M == cfg.hidden_dim and
             K == cfg.ssm_d_inner and
             n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
-            if (prefer_serial_qwen36_dense_down) break :blk null;
+            if (prefer_serial_qwen_dense_down) break :blk null;
             switch (tensor.info.type_) {
                 .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
                 .q5_k => break :blk if (self.dmmv.pipeline_q5k) |*p| p else null,
@@ -9865,8 +9865,8 @@ pub const InferenceEngine = struct {
         }
         if (self.use_qwen36_q6_prefill_mul_mm and
             tensor.info.type_ == .q6_k and
-            self.isQwen36DenseHybrid27B() and
-            (prefer_serial_qwen36_dense_down or qwen36_ssm_qkv_shape) and
+            self.isQwenDenseHybridLayerMajorPrefillModel() and
+            (prefer_serial_qwen_dense_down or qwen_dense_ssm_qkv_shape) and
             n_tokens >= 16 and
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q6k != null)
@@ -9934,7 +9934,7 @@ pub const InferenceEngine = struct {
             return;
         }
         if (self.use_qwen36_q5_ssm_out_mul_mm and
-            qwen36_ssm_out_shape and
+            qwen_dense_ssm_out_shape and
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q5k != null)
         {
@@ -12676,6 +12676,24 @@ pub const InferenceEngine = struct {
             cfg.n_layers > 4;
     }
 
+    fn isQwen35DenseHybrid9B(self: *const InferenceEngine) bool {
+        const cfg = self.model.config;
+        return cfg.architecture == .qwen35 and
+            cfg.n_experts == 0 and
+            cfg.ssm_d_inner == 4096 and
+            cfg.ssm_d_state == 128 and
+            cfg.ssm_dt_rank == 32 and
+            cfg.ssm_n_group == 16 and
+            cfg.full_attn_interval == 4 and
+            cfg.hidden_dim == 4096 and
+            cfg.intermediate_dim == 12288 and
+            cfg.n_layers == 32;
+    }
+
+    fn isQwenDenseHybridLayerMajorPrefillModel(self: *const InferenceEngine) bool {
+        return self.isQwen36DenseHybrid27B() or self.isQwen35DenseHybrid9B();
+    }
+
     fn isAmdRdna(self: *const InferenceEngine) bool {
         return self.gpu_config.vendor == .amd_rdna3 or
             self.gpu_config.vendor == .amd_rdna4 or
@@ -13958,7 +13976,7 @@ pub const InferenceEngine = struct {
 
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
-        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         return self.instance.push_descriptor_fn != null and
             self.elementwise.pipeline_ssm_gated_norm != null;
@@ -13968,7 +13986,7 @@ pub const InferenceEngine = struct {
         if (n_tokens < 16) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
-        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.use_ssm_delta_normed_qk) return false;
@@ -14005,7 +14023,7 @@ pub const InferenceEngine = struct {
         const is_amd = self.gpu_config.vendor == .amd_rdna3 or
             self.gpu_config.vendor == .amd_rdna4 or
             self.gpu_config.vendor == .amd_rdna4_apu;
-        if (!self.isQwen36DenseHybrid27B()) return 0;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return 0;
         if (mode == null and !is_amd) return 0;
 
         // Tiny prompts (<=8 tok) use a deep prefix because the layer-major
@@ -14044,7 +14062,7 @@ pub const InferenceEngine = struct {
         if (std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE")) |mode| {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
-        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         return n_tokens >= 16;
     }
@@ -14073,7 +14091,7 @@ pub const InferenceEngine = struct {
     fn qwen36DensePrefillSegmentLayers(self: *const InferenceEngine, prompt_len: usize, prefix_layers: u32, out: *[qwen36_dense_prefill_max_segments]u32) usize {
         if (prompt_len < 16 or self.validation_diagnostics_enabled) return 0;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
-        if (!self.isQwen36DenseHybrid27B()) return 0;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return 0;
         if (!self.isAmdRdna()) return 0;
 
         const cfg = self.model.config;
@@ -14103,7 +14121,7 @@ pub const InferenceEngine = struct {
         }
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
-        if (full_attn_interval == 4 and cfg.n_layers > 52) {
+        if (full_attn_interval == 4 and (cfg.n_layers > 52 or self.isQwen35DenseHybrid9B())) {
             // Effort-15 run-3 cycle 4: extend the segment lower bound from
             // hardcoded 4 down to prefix_layers (= 3 for context prompts).
             // Layer 3 is the first full-attn layer ((3+1)%4 == 0) and was
@@ -14120,6 +14138,11 @@ pub const InferenceEngine = struct {
             //
             // The previous "Layer 3 still adds setup overhead" comment was
             // written before the cycle-13 full-attn batched path existed.
+            //
+            // Effort-17 cycle 2: apply the same all-layer segment sweep to the
+            // exact Qwen3.5 9B dense-hybrid shape. The earlier 9B gate-only
+            // attempt only reached the 3-layer prefix plus full-attention
+            // layers, leaving most dense FFNs token-major.
             var segment_layer: u32 = prefix_layers;
             const last_segment_layer = cfg.n_layers - 1;
             while (segment_layer <= last_segment_layer) : (segment_layer += 1) {
@@ -15776,7 +15799,7 @@ pub const InferenceEngine = struct {
         if (n_tokens < 16) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
-        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.attention.pipeline_batched == null) return false;
@@ -15834,7 +15857,7 @@ pub const InferenceEngine = struct {
         const swiglu_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
         const hidden_batch_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
         const use_fused_gateup = self.use_qwen36_batched_fused_gateup and
-            self.isQwen36DenseHybrid27B() and
+            self.isQwenDenseHybridLayerMajorPrefillModel() and
             gate_t.info.type_ == .q4_k and
             up_t.info.type_ == .q4_k and
             n_tokens >= 16 and
@@ -16315,7 +16338,7 @@ pub const InferenceEngine = struct {
         const n_segment_layers = self.qwen36DensePrefillSegmentLayers(prompt_tokens.len, prefix_layers, &segment_layers);
         for (segment_layers[0..n_segment_layers]) |segment_layer| {
             if (segment_layer < tail_start_layer) continue;
-            log.debug("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
+            log.debug("Qwen dense-hybrid layer-major prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
                 segment_layer,
                 tail_start_layer,
             });
