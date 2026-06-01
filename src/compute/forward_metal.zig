@@ -466,6 +466,15 @@ fn defaultGemmaMoePostNormResidualDecodeEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
+fn isGemma26Q8ExplicitMoeFallbackLayer(cfg: ModelConfig, lt: LayerTensors) bool {
+    if (!isGemma26A4BMoeShape(cfg)) return false;
+    if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
+
+    const gate_up_exps = lt.ffn_gate_up_exps orelse return false;
+    const down_exps = lt.ffn_down_exps orelse return false;
+    return gate_up_exps.info.type_ == .q4_k and down_exps.info.type_ == .q8_0;
+}
+
 fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
     return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
         readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
@@ -18031,6 +18040,7 @@ fn runDecodeStep(
         for (engine.layer_tensors, 0..) |lt, layer_idx| {
             if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
             if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
+            if (isGemma26Q8ExplicitMoeFallbackLayer(cfg, lt)) continue;
             break :blk false;
         }
         break :blk true;
@@ -18055,7 +18065,7 @@ fn runDecodeStep(
     }
     var shared_cmd_storage: MetalCommand = undefined;
     const using_external_shared_cmd = external_shared_cmd != null;
-    const shared_cmd: ?*MetalCommand = if (external_shared_cmd) |cmd|
+    var shared_cmd: ?*MetalCommand = if (external_shared_cmd) |cmd|
         cmd
     else if (use_single_gpu_cmd) blk: {
         shared_cmd_storage = try beginProfiledCommand(engine, profile);
@@ -19221,6 +19231,11 @@ fn runDecodeStep(
         if (is_moe and !use_gpu_routed_moe) {
             if (profile) |p| p.fallback_moe_layers += 1;
             if (hasExplicitGemmaMoeTensors(cfg, lt)) {
+                if (shared_cmd) |cmd| {
+                    if (using_external_shared_cmd) return error.InvalidPrefillCommandMode;
+                    commitAndWaitProfiled(cmd, profile);
+                    shared_cmd = null;
+                }
                 try runGemmaExplicitMoeFallback(engine, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
             } else {
                 // CPU topK softmax
@@ -25364,6 +25379,78 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, false, true));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.qwen35, false, false));
+}
+
+test "gemma26 q8 explicit moe layer can break shared command at fallback boundary" {
+    const null_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    const gate_up = metal_loader.LoadedTensor{
+        .info = .{
+            .name = "blk.29.ffn_gate_up_exps.weight",
+            .n_dims = 3,
+            .dims = .{ 2816, 1408, 128, 1 },
+            .type_ = .q4_k,
+            .offset = 0,
+        },
+        .gpu_buffer = null_buf,
+    };
+    var down = metal_loader.LoadedTensor{
+        .info = .{
+            .name = "blk.29.ffn_down_exps.weight",
+            .n_dims = 3,
+            .dims = .{ 704, 2816, 128, 1 },
+            .type_ = .q8_0,
+            .offset = 0,
+        },
+        .gpu_buffer = null_buf,
+    };
+    const norm = metal_loader.LoadedTensor{
+        .info = .{
+            .name = "blk.29.pre_ffw_norm_2.weight",
+            .n_dims = 1,
+            .dims = .{ 2816, 1, 1, 1 },
+            .type_ = .f32,
+            .offset = 0,
+        },
+        .gpu_buffer = null_buf,
+    };
+
+    var gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 0,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 0,
+        .shared_expert_intermediate_dim = 2112,
+    };
+    const lt = LayerTensors{
+        .ffn_gate_up_exps = &gate_up,
+        .ffn_down_exps = &down,
+        .pre_ffw_norm_2 = &norm,
+    };
+
+    try std.testing.expect(isGemma26Q8ExplicitMoeFallbackLayer(gemma_cfg, lt));
+
+    down.info.type_ = .q5_1;
+    try std.testing.expect(!isGemma26Q8ExplicitMoeFallbackLayer(gemma_cfg, lt));
+
+    down.info.type_ = .q8_0;
+    gemma_cfg.hidden_dim = 4096;
+    try std.testing.expect(!isGemma26Q8ExplicitMoeFallbackLayer(gemma_cfg, lt));
 }
 
 test "defaultKvCacheQ8Enabled disables Gemma ISWA q8 KV cache" {
