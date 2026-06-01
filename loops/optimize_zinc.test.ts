@@ -4,6 +4,7 @@ import {
   parseTokensGenerated,
   parseBandwidthUtil,
   parseEffectiveBW,
+  parsePrefillTokenCount,
   parsePrefillPhaseBudget,
   detectPhase,
   isGarbageOutput,
@@ -82,6 +83,18 @@ info(forward): Generating: 0 prompt tokens, max 256 output tokens
 info(forward): Prefill complete at position 0
 info(forward): Generated 256 tokens`;
     expect(parseTokensGenerated(output)).toBe(256);
+  });
+});
+
+describe("parsePrefillTokenCount", () => {
+  test("extracts prompt token count from prefill timing", () => {
+    expect(
+      parsePrefillTokenCount("info(forward): Prefill complete: 64 tokens in 78.3 ms (817.62 tok/s)"),
+    ).toBe(64);
+  });
+
+  test("returns null when prefill timing is absent", () => {
+    expect(parsePrefillTokenCount("Generated 16 tokens in 100 ms")).toBeNull();
   });
 });
 
@@ -193,6 +206,7 @@ describe("detectPhase", () => {
     runOutput: "",
     phase: "fix",
     tokPerSec: null,
+    prefillTokens: null,
     tokensGenerated: 0,
     garbageOutput: false,
     coherentText: false,

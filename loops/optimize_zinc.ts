@@ -144,6 +144,7 @@ export type BuildRunResult = {
   runOutput: string;
   phase: Phase;
   tokPerSec: number | null;
+  prefillTokens: number | null;
   tokensGenerated: number;
   garbageOutput: boolean;
   coherentText: boolean; // true if decoded text contains real words
@@ -176,6 +177,11 @@ export function parsePrefillTokPerSec(output: string): number | null {
     if (seconds > 0) return tokens / seconds;
   }
   return null;
+}
+
+export function parsePrefillTokenCount(output: string): number | null {
+  const m = output.match(/Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)/i);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 /** Parse decode tok/s from ZINC output, falling back to prefill tok/s if decode is absent. */
@@ -538,6 +544,7 @@ async function buildAndRun(modelPath: string): Promise<BuildRunResult> {
       runOutput: "",
       phase: "fix",
       tokPerSec: null,
+      prefillTokens: null,
       tokensGenerated: 0,
       garbageOutput: false,
       coherentText: false,
@@ -550,6 +557,7 @@ async function buildAndRun(modelPath: string): Promise<BuildRunResult> {
   // Run
   const run = await remoteRun(modelPath, "The capital of France is");
   const tps = parseTokPerSec(run.output);
+  const prefillTokens = parsePrefillTokenCount(run.output);
   const tokensGenerated = parseTokensGenerated(run.output);
   const garbage = isGarbageOutput(run.output);
   const coherent = isCoherentText(run.output);
@@ -563,6 +571,7 @@ async function buildAndRun(modelPath: string): Promise<BuildRunResult> {
     runOutput: run.output,
     phase: "fix",
     tokPerSec: tps,
+    prefillTokens,
     tokensGenerated,
     garbageOutput: garbage || (!coherent && tokensGenerated > 10),
     coherentText: coherent,
@@ -964,7 +973,8 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
     const bwInfo = lastResult.bandwidthUtil != null
       ? ` | modeled ${lastResult.effectiveBW?.toFixed(0) ?? "?"} GB/s (${lastResult.bandwidthUtil.toFixed(0)}% of 576 GB/s)`
       : "";
-    diagnosis.push(`## Status: RUNNING — ${lastResult.tokPerSec.toFixed(1)} tok/s (DECODE), ${lastResult.tokensGenerated} tokens${bwInfo}`);
+    const prefillInfo = lastResult.prefillTokens != null ? `, prefill prompt ${lastResult.prefillTokens} tokens` : "";
+    diagnosis.push(`## Status: RUNNING — ${lastResult.tokPerSec.toFixed(1)} tok/s (DECODE), ${lastResult.tokensGenerated} tokens${prefillInfo}${bwInfo}`);
     if (lastResult.garbageOutput && !lastResult.coherentText) {
       diagnosis.push("");
       diagnosis.push("⚠ CRITICAL: Output is GARBAGE — decoded text contains no recognizable words.");
@@ -1304,7 +1314,8 @@ async function runCycle(
       ? (buildRun.coherentText ? clr("1;33", " [REPETITIVE]") : clr("1;31", " [GARBAGE - NOT COHERENT]"))
       : (buildRun.coherentText ? clr("1;32", " [COHERENT ✓]") : "");
     const bwTag = buildRun.bandwidthUtil != null ? `, ${buildRun.effectiveBW?.toFixed(0) ?? "?"} GB/s (${buildRun.bandwidthUtil.toFixed(0)}% BW)` : "";
-    console.log(clr("1;32", `  ✅ RUNNING — ${buildRun.tokPerSec.toFixed(1)} tok/s, ${buildRun.tokensGenerated} tokens${bwTag}`) + qualityTag);
+    const prefillTag = buildRun.prefillTokens != null ? `, prefill ${buildRun.prefillTokens} tok` : "";
+    console.log(clr("1;32", `  ✅ RUNNING — ${buildRun.tokPerSec.toFixed(1)} tok/s, ${buildRun.tokensGenerated} tokens${prefillTag}${bwTag}`) + qualityTag);
   } else {
     console.log(clr("1;33", `  ⚠ ENGINE NOT GENERATING — build OK, ${buildRun.tokensGenerated} tokens produced`));
   }
@@ -1378,6 +1389,7 @@ async function runCycle(
         runOutput: "",
         phase: "fix",
         tokPerSec: null,
+        prefillTokens: null,
         tokensGenerated: 0,
         garbageOutput: false,
         coherentText: false,
@@ -1398,6 +1410,7 @@ async function runCycle(
       runOutput: "",
       phase: "fix",
       tokPerSec: null,
+      prefillTokens: null,
       tokensGenerated: 0,
       garbageOutput: false,
       coherentText: false,

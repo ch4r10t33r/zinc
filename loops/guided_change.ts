@@ -65,6 +65,8 @@ type ModelBaseline = {
   path: string;
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens: number | null;
+  promptTokenSamples: number[];
   correct: boolean;
   outputPreview: string;
 };
@@ -90,6 +92,11 @@ function parseTokPerSec(output: string): number | null {
   }
   const m2 = output.match(/(\d+\.?\d*)\s*tok\/s/i);
   return m2 ? parseFloat(m2[1]) : null;
+}
+
+function parsePrefillTokenCount(output: string): number | null {
+  const m = output.match(/Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)/i);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 function parseOutputText(output: string): string {
@@ -561,6 +568,7 @@ async function runTests(): Promise<{ ok: boolean; output: string }> {
 
 async function benchmarkModel(model: { id: string; path: string }): Promise<ModelBaseline> {
   const samples: number[] = [];
+  const promptTokenSamples: number[] = [];
   let lastOutput = "";
 
   for (let i = 0; i < BENCHMARK_RUNS; i++) {
@@ -575,11 +583,15 @@ async function benchmarkModel(model: { id: string; path: string }): Promise<Mode
     if (run.exitCode !== 0) break;
 
     const tps = parseTokPerSec(combined);
+    const promptTokens = parsePrefillTokenCount(combined);
     if (tps != null) samples.push(tps);
+    if (promptTokens != null) promptTokenSamples.push(promptTokens);
   }
 
   const sorted = [...samples].sort((a, b) => a - b);
   const median = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : null;
+  const sortedPromptTokens = [...promptTokenSamples].sort((a, b) => a - b);
+  const promptTokens = sortedPromptTokens.length > 0 ? sortedPromptTokens[Math.floor(sortedPromptTokens.length / 2)] : null;
   const outputText = parseOutputText(lastOutput);
 
   return {
@@ -587,6 +599,8 @@ async function benchmarkModel(model: { id: string; path: string }): Promise<Mode
     path: model.path,
     tokPerSec: median,
     tokPerSecSamples: samples,
+    promptTokens,
+    promptTokenSamples,
     correct: outputText.toLowerCase().includes("paris"),
     outputPreview: outputText.slice(0, 100),
   };
@@ -601,7 +615,8 @@ async function benchmarkAll(models: { id: string; path: string }[]): Promise<Mod
       const range = baseline.tokPerSecSamples.length > 1
         ? ` [${baseline.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}]`
         : "";
-      console.log(clr("1;36", `     ${baseline.tokPerSec.toFixed(2)} tok/s${range} ${baseline.correct ? "✅" : "❌"}`));
+      const promptShape = baseline.promptTokens != null ? ` prompt=${baseline.promptTokens}tok` : "";
+      console.log(clr("1;36", `     ${baseline.tokPerSec.toFixed(2)} tok/s${range}${promptShape} ${baseline.correct ? "✅" : "❌"}`));
     } else {
       console.log(clr("1;31", `     Failed to benchmark`));
     }
@@ -722,7 +737,8 @@ function buildAgentPrompt(
   );
   for (const b of baselines) {
     if (b.tokPerSec != null) {
-      sections.push(`  - ${b.id}: ${b.tokPerSec.toFixed(2)} tok/s [${b.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] ${b.correct ? "✅correct" : "❌wrong"}`);
+      const promptShape = b.promptTokens != null ? `; prompt=${b.promptTokens}tok [${b.promptTokenSamples.join(", ")}]` : "";
+      sections.push(`  - ${b.id}: ${b.tokPerSec.toFixed(2)} tok/s [${b.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}]${promptShape} ${b.correct ? "✅correct" : "❌wrong"}`);
     }
   }
   sections.push("");

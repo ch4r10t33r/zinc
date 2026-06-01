@@ -28,6 +28,7 @@ import { join, resolve } from "node:path";
 import {
   parseTokPerSec,
   parsePrefillTokPerSec,
+  parsePrefillTokenCount,
   parseBandwidthUtil,
   parsePrefillPhaseBudget,
   type PrefillPhaseBudget,
@@ -306,6 +307,7 @@ export type LlamaCppBaseline = {
   scenario: string;
   prefillTokPerSec: number;
   decodeTokPerSec: number;
+  promptTokens?: number;
   // Which baseline corresponds to the loop's primaryMetric. Matched
   // case-insensitively against primaryMetricLabel (e.g. a label of
   // "Qwen3.6-27B prefill tok/s" matches isPrimary when metricMode is
@@ -641,10 +643,10 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     // the project-success criterion is to beat these on at least 3 of 4
     // scenarios across {prefill, decode}.
     llamaCppBaselines: [
-      { scenario: "core",              prefillTokPerSec: 61.12,  decodeTokPerSec: 34.43 },
-      { scenario: "context-medium",    prefillTokPerSec: 195.01, decodeTokPerSec: 34.40, isPrimary: true },
-      { scenario: "context-long",      prefillTokPerSec: 69.89,  decodeTokPerSec: 44.33 },
-      { scenario: "decode-extended",   prefillTokPerSec: 97.29,  decodeTokPerSec: 31.29 },
+      { scenario: "core",              promptTokens: 36,  prefillTokPerSec: 61.12,  decodeTokPerSec: 34.43 },
+      { scenario: "context-medium",    promptTokens: 174, prefillTokPerSec: 195.01, decodeTokPerSec: 34.40, isPrimary: true },
+      { scenario: "context-long",      promptTokens: 322, prefillTokPerSec: 69.89,  decodeTokPerSec: 44.33 },
+      { scenario: "decode-extended",   promptTokens: 64,  prefillTokPerSec: 97.29,  decodeTokPerSec: 31.29 },
     ],
   },
   17: {
@@ -687,10 +689,10 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       },
     ],
     llamaCppBaselines: [
-      { scenario: "core",              prefillTokPerSec: 548.94, decodeTokPerSec: 85.51 },
-      { scenario: "context-medium",    prefillTokPerSec: 202.32, decodeTokPerSec: 85.10 },
-      { scenario: "context-long",      prefillTokPerSec: 205.64, decodeTokPerSec: 85.15 },
-      { scenario: "decode-extended",   prefillTokPerSec: 855.82, decodeTokPerSec: 84.96, isPrimary: true },
+      { scenario: "core",              promptTokens: 36,  prefillTokPerSec: 548.94, decodeTokPerSec: 85.51 },
+      { scenario: "context-medium",    promptTokens: 174, prefillTokPerSec: 202.32, decodeTokPerSec: 85.10 },
+      { scenario: "context-long",      promptTokens: 322, prefillTokPerSec: 205.64, decodeTokPerSec: 85.15 },
+      { scenario: "decode-extended",   promptTokens: 64,  prefillTokPerSec: 855.82, decodeTokPerSec: 84.96, isPrimary: true },
     ],
     llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md): close the Qwen3.5-9B RDNA prefill gap without giving back ZINC's decode lead. Primary target is decode-extended prefill, where llama.cpp is 855.82 tok/s and ZINC is 105.91 tok/s in the published artifact. A keep must preserve coherent output and should be checked against core/context-medium/context-long before being treated as public progress.",
   },
@@ -739,10 +741,10 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       },
     ],
     llamaCppBaselines: [
-      { scenario: "core",              prefillTokPerSec: 497.08, decodeTokPerSec: 102.00 },
-      { scenario: "context-medium",    prefillTokPerSec: 186.67, decodeTokPerSec: 100.84 },
-      { scenario: "context-long",      prefillTokPerSec: 169.18, decodeTokPerSec: 100.40 },
-      { scenario: "decode-extended",   prefillTokPerSec: 647.16, decodeTokPerSec: 101.05, isPrimary: true },
+      { scenario: "core",              promptTokens: 49,  prefillTokPerSec: 497.08, decodeTokPerSec: 102.00 },
+      { scenario: "context-medium",    promptTokens: 192, prefillTokPerSec: 186.67, decodeTokPerSec: 100.84 },
+      { scenario: "context-long",      promptTokens: 346, prefillTokPerSec: 169.18, decodeTokPerSec: 100.40 },
+      { scenario: "decode-extended",   promptTokens: 70,  prefillTokPerSec: 647.16, decodeTokPerSec: 101.05, isPrimary: true },
     ],
     llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_18_RDNA_GEMMA26_PREFILL.md): close the Gemma 4 26B-A4B RDNA prefill gap on all four public scenarios while preserving Gemma-specific correctness. Primary target is decode-extended prefill, where llama.cpp is 647.16 tok/s and ZINC is 92.68 tok/s in the published artifact. Core prefill is also a major target at 497.08 tok/s llama.cpp vs 89.10 tok/s ZINC.",
   },
@@ -791,10 +793,10 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       },
     ],
     llamaCppBaselines: [
-      { scenario: "core",              prefillTokPerSec: 201.97, decodeTokPerSec: 28.55 },
-      { scenario: "context-medium",    prefillTokPerSec: 50.01,  decodeTokPerSec: 28.19 },
-      { scenario: "context-long",      prefillTokPerSec: 46.82,  decodeTokPerSec: 28.09 },
-      { scenario: "decode-extended",   prefillTokPerSec: 242.37, decodeTokPerSec: 28.21, isPrimary: true },
+      { scenario: "core",              promptTokens: 49,  prefillTokPerSec: 201.97, decodeTokPerSec: 28.55 },
+      { scenario: "context-medium",    promptTokens: 192, prefillTokPerSec: 50.01,  decodeTokPerSec: 28.19 },
+      { scenario: "context-long",      promptTokens: 346, prefillTokPerSec: 46.82,  decodeTokPerSec: 28.09 },
+      { scenario: "decode-extended",   promptTokens: 70,  prefillTokPerSec: 242.37, decodeTokPerSec: 28.21, isPrimary: true },
     ],
     llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_19_RDNA_GEMMA31_PREFILL.md): close the Gemma 4 31B RDNA prefill gaps without regressing the context-medium/context-long rows where ZINC already beats llama.cpp. Primary target is decode-extended prefill, where llama.cpp is 242.37 tok/s and ZINC is 49.24 tok/s in the published artifact. Core prefill must also move toward 201.97 tok/s.",
   },
@@ -1200,6 +1202,8 @@ export type BenchResult = {
   buildOutput: string;
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   correct: boolean;
   outputText: string;
   bandwidthUtil: number | null;
@@ -1228,6 +1232,8 @@ export type CycleRecord = {
   categoryTags: string[];
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   bandwidthUtil: number | null;
   bandwidthSamples: number[];
   correct: boolean;
@@ -1244,6 +1250,8 @@ export type BenchCheckpoint = {
   cycle: number;
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   bandwidthUtil: number | null;
   bandwidthSamples: number[];
   outputText: string;
@@ -1513,6 +1521,8 @@ function benchResultToCheckpoint(result: BenchResult, cycle: number, commitHash:
     cycle,
     tokPerSec: result.tokPerSec,
     tokPerSecSamples: [...result.tokPerSecSamples],
+    promptTokens: result.promptTokens ?? null,
+    promptTokenSamples: [...(result.promptTokenSamples ?? [])],
     bandwidthUtil: result.bandwidthUtil,
     bandwidthSamples: [...result.bandwidthSamples],
     outputText: result.outputText,
@@ -1526,6 +1536,8 @@ function checkpointToBenchResult(checkpoint: BenchCheckpoint): BenchResult {
     buildOutput: "",
     tokPerSec: checkpoint.tokPerSec,
     tokPerSecSamples: [...checkpoint.tokPerSecSamples],
+    promptTokens: checkpoint.promptTokens ?? null,
+    promptTokenSamples: [...(checkpoint.promptTokenSamples ?? [])],
     correct: true,
     outputText: checkpoint.outputText,
     bandwidthUtil: checkpoint.bandwidthUtil,
@@ -1548,6 +1560,14 @@ function formatSampleList(samples: number[], digits = 2): string {
 function summarizeBenchMetric(value: number | null, samples: number[], unit: string, digits = 2): string {
   if (value == null) return "unknown";
   return `${value.toFixed(digits)} ${unit}${formatSampleList(samples, digits)}`;
+}
+
+function summarizePromptTokens(value: number | null | undefined, samples: number[] | undefined): string {
+  if (value == null) return "unknown";
+  const sampleList = samples && samples.length > 0
+    ? ` [${samples.map((s) => String(s)).join(", ")}]`
+    : "";
+  return `${value} prompt tokens${sampleList}`;
 }
 
 export function formatPhaseBudget(
@@ -1658,8 +1678,9 @@ function buildCycleHistoryEntry(cycle: CycleRecord): string {
         ? "REVERTED-BROKEN"
         : "REVERTED";
   const metric = cycle.tokPerSec != null ? ` (${cycle.tokPerSec.toFixed(2)} tok/s)` : "";
+  const promptShape = cycle.promptTokens != null ? ` prompt=${cycle.promptTokens}tok` : "";
   const tags = cycle.categoryTags.length > 0 ? ` [${cycle.categoryTags.join(", ")}]` : "";
-  return `#${cycle.cycle}: ${outcome}${metric}${tags} ${trunc(cycle.description || cycle.decisionReason, 96)}`;
+  return `#${cycle.cycle}: ${outcome}${metric}${promptShape}${tags} ${trunc(cycle.description || cycle.decisionReason, 96)}`;
 }
 
 function buildHistoryFromCycles(cycles: CycleRecord[]): string {
@@ -1975,10 +1996,11 @@ export function formatLlamaCppComparison(
     "structural gap remains (<70%)";
   const otherLines = baselines
     .filter((b) => b !== primary)
-    .map((b) => `  - ${b.scenario.padEnd(18)} prefill: ${b.prefillTokPerSec.toFixed(2)} tok/s   decode: ${b.decodeTokPerSec.toFixed(2)} tok/s`)
+    .map((b) => `  - ${b.scenario.padEnd(18)}${b.promptTokens != null ? ` prompt: ${String(b.promptTokens).padStart(3)} tok   ` : " "}${`prefill: ${b.prefillTokPerSec.toFixed(2)} tok/s`.padEnd(27)} decode: ${b.decodeTokPerSec.toFixed(2)} tok/s`)
     .join("\n");
   return [
     `Primary metric (${primaryMetricLabel}):`,
+    primary.promptTokens != null ? `  scenario:        ${primary.scenario} (${primary.promptTokens} prompt tokens)` : `  scenario:        ${primary.scenario}`,
     `  ZINC best:       ${bestTokPerSec != null ? bestTokPerSec.toFixed(2) : "—"} tok/s`,
     `  llama.cpp:       ${llamaPrimary.toFixed(2)} tok/s`,
     `  ratio:           ${ratioStr}   (${tier})`,
@@ -2163,16 +2185,20 @@ ${plan}
 ## Benchmark Focus
 - primary metric: ${primaryMetricLabel}
 - benchmark method: ${benchmarkMethod}
+- measured prompt shape: ${summarizePromptTokens(currentBest.promptTokens, currentBest.promptTokenSamples)}
 - success is judged on the primary metric above, not on one lucky decode sample from a different workload.
+- prompt-token thresholds are part of the workload contract. If a change helps the measured shape but is likely to miss or regress nearby public prompt lengths, call that out and prefer the general fix.
 
 ## Current Checked-Out Code (build on this code)
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
+- prompt tokens: ${summarizePromptTokens(currentBest.promptTokens, currentBest.promptTokenSamples)}
 - bandwidth utilization: ${summarizeBenchMetric(currentBest.bandwidthUtil, currentBest.bandwidthSamples, "%", 1)}
 - output: "${currentBest.outputText}" (coherence tested with ${COHERENCE_CHECKS.length} prompts on ${COHERENCE_MODELS.length} models after every change)
 - This is the performance of the code currently checked out in the worktree.
 
 ## Best Accepted Performance Checkpoint
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(bestPerf.tokPerSec, bestPerf.tokPerSecSamples, "tok/s")}
+- prompt tokens: ${summarizePromptTokens(bestPerf.promptTokens, bestPerf.promptTokenSamples)}
 - bandwidth utilization: ${summarizeBenchMetric(bestPerf.bandwidthUtil, bestPerf.bandwidthSamples, "%", 1)}
 - output: "${bestPerf.outputText}"
 - cycle: ${bestPerf.cycle}${bestPerf.commitHash ? `, commit ${bestPerf.commitHash.slice(0, 8)}` : ""}
@@ -2180,6 +2206,7 @@ ${currentVsBestNote}
 
 ## Original Run Baseline (for total gain only)
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
+- prompt tokens: ${summarizePromptTokens(originalBaseline.promptTokens, originalBaseline.promptTokenSamples)}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
 ${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
@@ -2345,9 +2372,12 @@ ${plan}
 ## Benchmark Focus
 - primary metric: ${primaryMetricLabel}
 - benchmark method: ${benchmarkMethod}
+- measured prompt shape: ${summarizePromptTokens(currentBest.promptTokens, currentBest.promptTokenSamples)}
+- prompt-token thresholds are part of the workload contract; do not pick a pivot that only helps one exact boundary unless it also explains the nearby public prompt lengths.
 
 ## Current Best Checkpoint
 - ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
+- prompt tokens: ${summarizePromptTokens(currentBest.promptTokens, currentBest.promptTokenSamples)}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
 ${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
@@ -2579,6 +2609,7 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     `  Benchmarking (${samplePlan} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
   ));
   const tokPerSecSamples: number[] = [];
+  const promptTokenSamples: number[] = [];
   const bandwidthSamples: number[] = [];
   for (let sample = 0; sample < BENCHMARK_MAX_SAMPLES; sample++) {
     if (sample >= BENCHMARK_MIN_SAMPLES && !shouldCollectExtraBenchSample(tokPerSecSamples)) {
@@ -2605,19 +2636,22 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     }
 
     const tps = parseMetric(benchOutput);
+    const promptTokens = parsePrefillTokenCount(benchOutput);
     const bw = effortSpec.metricMode === "decode" ? parseBandwidthUtil(benchOutput) : null;
     if (tps != null) tokPerSecSamples.push(tps);
+    if (promptTokens != null) promptTokenSamples.push(promptTokens);
     if (bw != null) bandwidthSamples.push(bw);
     const sampleLabel = sample < BENCHMARK_MIN_SAMPLES
       ? `${sample + 1}/${BENCHMARK_MIN_SAMPLES}`
       : `extra ${sample + 1}/${BENCHMARK_MAX_SAMPLES}`;
     console.log(c(
       "2",
-      `    sample ${sampleLabel}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
+      `    sample ${sampleLabel}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${promptTokens != null ? `, prompt ${promptTokens} tok` : ""}${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
     ));
   }
 
   const tokPerSec = median(tokPerSecSamples);
+  const promptTokens = median(promptTokenSamples);
   const bandwidthUtil = median(bandwidthSamples);
 
   return {
@@ -2625,6 +2659,8 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     buildOutput,
     tokPerSec,
     tokPerSecSamples,
+    promptTokens,
+    promptTokenSamples,
     correct,
     outputText,
     bandwidthUtil,
@@ -3120,6 +3156,8 @@ type LogEntry = {
   effort: number;
   tokPerSec: number | null;
   tokPerSecSamples?: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   bandwidthUtil: number | null;
   bandwidthSamples?: number[];
   correct: boolean;
@@ -3918,6 +3956,8 @@ ${result.buildOutput.slice(-2000)}
       categoryTags,
       tokPerSec: result.tokPerSec,
       tokPerSecSamples: result.tokPerSecSamples,
+      promptTokens: result.promptTokens ?? null,
+      promptTokenSamples: result.promptTokenSamples ?? [],
       bandwidthUtil: result.bandwidthUtil,
       bandwidthSamples: result.bandwidthSamples,
       correct,
@@ -3972,6 +4012,8 @@ ${result.buildOutput.slice(-2000)}
       effort,
       tokPerSec: result.tokPerSec,
       tokPerSecSamples: result.tokPerSecSamples,
+      promptTokens: result.promptTokens ?? null,
+      promptTokenSamples: result.promptTokenSamples ?? [],
       bandwidthUtil: result.bandwidthUtil,
       bandwidthSamples: result.bandwidthSamples,
       correct,

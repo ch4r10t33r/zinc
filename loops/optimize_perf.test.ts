@@ -1982,6 +1982,20 @@ describe("formatLlamaCppComparison", () => {
     expect(out).not.toContain("195.01"); // not the prefill row
   });
 
+  test("renders scenario prompt-token shapes when available", () => {
+    const out = formatLlamaCppComparison(
+      [
+        { scenario: "core", promptTokens: 36, prefillTokPerSec: 61.12, decodeTokPerSec: 34.43 },
+        { scenario: "decode-extended", promptTokens: 64, prefillTokPerSec: 855.82, decodeTokPerSec: 84.96, isPrimary: true },
+      ],
+      "Qwen3.5-9B long-draft prefill tok/s",
+      "prefill",
+      817.62,
+    );
+    expect(out).toContain("decode-extended (64 prompt tokens)");
+    expect(out).toContain("prompt:  36 tok");
+  });
+
   test("renders an effort-specific success rule when provided", () => {
     const out = formatLlamaCppComparison(baselines, "x", "prefill", 150.95, "Project success rule: custom effort rule.");
     expect(out).toContain("Project success rule: custom effort rule.");

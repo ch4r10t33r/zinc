@@ -1125,6 +1125,8 @@ function buildOptimizationPrompt(state: RunState): string {
     `- Generation: ${bl.generation_tps.toFixed(1)} tok/s`,
     `- Prefill: ${bl.prefill_tps.toFixed(1)} tok/s`,
     `- Cognitive: ${bl.cognitive_score}/${bl.cognitive_total}`,
+    ...bl.details.map((d) => `- ${d.trim()}`),
+    "- Treat prompt-token and generated-token counts as part of the benchmark shape. A change that only wins on one favorable length should be called out before it is kept.",
     "",
     "## Optimization History (last 15 cycles)",
     historyBlock,

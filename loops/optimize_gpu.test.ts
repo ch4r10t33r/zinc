@@ -227,6 +227,7 @@ Output: "Paris"
 
     expect(metrics.prefillTokPerSec).toBe(200);
     expect(metrics.decodeTokPerSec).toBe(100);
+    expect(metrics.promptTokens).toBe(12);
     expect(metrics.outputText).toBe("Paris");
     expect(metrics.coherent).toBe(true);
   });
@@ -239,6 +240,7 @@ Output: "Paris"
 
     expect(metrics.prefillTokPerSec).toBe(200);
     expect(metrics.decodeTokPerSec).toBeNull();
+    expect(metrics.promptTokens).toBe(12);
   });
 
   test("extracts llama-bench JSON tg and pp rows", () => {
@@ -249,6 +251,7 @@ Output: "Paris"
 
     expect(llama.prefillTokPerSec).toBe(512.5);
     expect(llama.decodeTokPerSec).toBe(93.25);
+    expect(llama.promptTokens).toBe(128);
     expect(llama.source).toBe("llama-bench");
   });
 
@@ -261,6 +264,7 @@ llama_perf_context_print:        eval time =   474.72 ms /    15 runs   (   31.6
 
     expect(llama.prefillTokPerSec).toBe(104.87);
     expect(llama.decodeTokPerSec).toBe(31.60);
+    expect(llama.promptTokens).toBe(16);
     expect(llama.source).toBe("llama-completion");
   });
 
@@ -292,6 +296,7 @@ describe("optimize_gpu agent prompt", () => {
       samples: [74, 75, 76],
       decodeSamples: [74, 75, 76],
       prefillSamples: [210, 211, 212],
+      promptTokenSamples: [128, 128, 128],
       outputText: "Paris",
       coherent: true,
     } satisfies Parameters<typeof buildAgentPrompt>[3];
@@ -312,6 +317,7 @@ describe("optimize_gpu agent prompt", () => {
       llamaBaseline: {
         decodeTokPerSec: 50,
         prefillTokPerSec: 500,
+        promptTokens: 128,
         raw: "[]",
       },
       cycles: [],
@@ -326,6 +332,7 @@ describe("optimize_gpu agent prompt", () => {
     expect(prompt).toContain("All-cycle memory:");
     expect(prompt).toContain("decode=75.00 [74.00, 75.00, 76.00]");
     expect(prompt).toContain("prefill=211.00 [210.00, 211.00, 212.00]");
+    expect(prompt).toContain("measured prompt shape: 128tok [128, 128, 128]");
     expect(prompt).toContain("Do not commit, push, reset, stash, or edit secrets.");
     expect(prompt).toContain("STEP_KIND");
   });

@@ -905,6 +905,8 @@ export type BuildRunResult = {
   phase: Phase;
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   tokensGenerated: number;
   outputText: string;
   containsReference: boolean;
@@ -920,6 +922,8 @@ export type ResultSnapshot = {
   phase: Phase;
   tokPerSec: number | null;
   tokPerSecSamples: number[];
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
   tokensGenerated: number;
   outputText: string;
   containsReference: boolean;
@@ -966,6 +970,11 @@ export function parseTokPerSec(output: string, mode: MetricMode = "decode"): num
   }
   const m2 = output.match(/(\d+\.?\d*)\s*tok\/s/i);
   return m2 ? parseFloat(m2[1]) : null;
+}
+
+export function parsePrefillTokenCount(output: string): number | null {
+  const m = output.match(/Prefill(?:\s+complete)?:\s*(\d+)\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)/i);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 function parseTokensGenerated(output: string): number {
@@ -1062,6 +1071,8 @@ export function snapshotFromResult(cycle: number, result: BuildRunResult): Resul
     phase: result.phase,
     tokPerSec: result.tokPerSec,
     tokPerSecSamples: result.tokPerSecSamples,
+    promptTokens: result.promptTokens ?? null,
+    promptTokenSamples: result.promptTokenSamples ?? [],
     tokensGenerated: result.tokensGenerated,
     outputText: result.outputText,
     containsReference: result.containsReference,
@@ -1256,6 +1267,12 @@ export type SampleAggregate = {
   bimodal: boolean;
 };
 
+function medianNumber(samples: number[]): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? null;
+}
+
 /**
  * Aggregate raw timed tok/s samples into a single representative number.
  * Default is the median; with `trim` enabled the symmetric high+low extremes
@@ -1333,8 +1350,9 @@ async function collectTimedSamples(
   maxTokens: number,
   runs: number,
   label: string,
-): Promise<{ samples: number[]; lastRun: RunResult; lastCombined: string; droppedShort: number }> {
+): Promise<{ samples: number[]; promptTokenSamples: number[]; lastRun: RunResult; lastCombined: string; droppedShort: number }> {
   const samples: number[] = [];
+  const promptTokenSamples: number[] = [];
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
   let droppedShort = 0;
@@ -1353,6 +1371,7 @@ async function collectTimedSamples(
     lastCombined = run.stderr + run.stdout;
     if (run.exitCode !== 0) break; // crash — no point running more samples
     const tps = parseTokPerSec(lastCombined, METRIC_MODE);
+    const promptTokens = parsePrefillTokenCount(lastCombined);
     const tokens = parseTokensGenerated(lastCombined);
     // Reject samples that didn't generate enough tokens to give a stable
     // throughput estimate. A model that EOS'd after 1 token reports a
@@ -1371,10 +1390,11 @@ async function collectTimedSamples(
     }
     if (tps != null) {
       samples.push(tps);
-      console.log(clr("2", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL}${tokens > 0 ? ` (${tokens} tok)` : ""}`));
+      if (promptTokens != null) promptTokenSamples.push(promptTokens);
+      console.log(clr("2", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL}${promptTokens != null ? ` prompt=${promptTokens}tok` : ""}${tokens > 0 ? ` (${tokens} tok)` : ""}`));
     }
   }
-  return { samples, lastRun, lastCombined, droppedShort };
+  return { samples, promptTokenSamples, lastRun, lastCombined, droppedShort };
 }
 
 /**
@@ -1480,6 +1500,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   const warmupLabel = BENCHMARK_WARMUPS > 0 ? `${BENCHMARK_WARMUPS} warmup + ` : "";
   console.log(clr("1;33", `  🚀 Running inference (${maxTokens} tokens, ${warmupLabel}${BENCHMARK_RUNS} samples, ${PROMPT_MODE} prompt)...`));
   const tokPerSecSamples: number[] = [];
+  const promptTokenSamples: number[] = [];
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
 
@@ -1499,8 +1520,9 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     lastCombined = run.stderr + run.stdout;
     if (run.exitCode !== 0) break; // crash — surface immediately, don't pretend to measure
     const tps = parseTokPerSec(lastCombined, METRIC_MODE);
+    const promptTokens = parsePrefillTokenCount(lastCombined);
     if (tps != null) {
-      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} ${METRIC_LABEL} (discarded)`));
+      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} ${METRIC_LABEL}${promptTokens != null ? ` prompt=${promptTokens}tok` : ""} (discarded)`));
     }
   }
 
@@ -1521,6 +1543,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   if (!warmupCrashed) {
     const timed = await collectTimedSamples(maxTokens, BENCHMARK_RUNS, "sample");
     tokPerSecSamples.push(...timed.samples);
+    promptTokenSamples.push(...timed.promptTokenSamples);
     lastRun = timed.lastRun;
     lastCombined = timed.lastCombined;
     droppedShortSamples += timed.droppedShort;
@@ -1531,6 +1554,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
 
   const agg = aggregateTimedSamples(tokPerSecSamples);
   const tokPerSec = agg.tokPerSec;
+  const promptTokens = medianNumber(promptTokenSamples);
   const tokensGenerated = parseTokensGenerated(lastCombined);
   const outputText = parseOutputText(lastCombined);
   const evaluation = evaluateOutputText(outputText);
@@ -1553,6 +1577,8 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     phase: "implement",
     tokPerSec,
     tokPerSecSamples,
+    promptTokens,
+    promptTokenSamples,
     tokensGenerated,
     outputText,
     containsReference: evaluation.containsReference,
@@ -2226,6 +2252,9 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
     const bestKept = Math.max(bestKeptCorrectTokPerSec(state), correctResultTokPerSec(lastResult));
     diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} ${METRIC_LABEL} → target ≥${TARGET_TOK_PER_SEC}`);
+    if (lastResult.promptTokens != null) {
+      diagnosis.push(`Benchmark prompt shape: ${lastResult.promptTokens} prompt tokens${lastResult.promptTokenSamples?.length ? ` [${lastResult.promptTokenSamples.join(", ")}]` : ""}. Treat this as part of the workload contract; do not overfit one exact boundary without checking nearby public prompt lengths.`);
+    }
     diagnosis.push(`Gap: ${gap.toFixed(1)} ${METRIC_LABEL} (need ${pctNeeded}% improvement)`);
     if (currentAccepted > 0 || bestKept > 0) {
       diagnosis.push(`Accepted baseline: current tree ${currentAccepted.toFixed(2)} ${METRIC_LABEL}; highest kept-correct ${bestKept.toFixed(2)} ${METRIC_LABEL}.`);
@@ -3387,6 +3416,8 @@ async function main() {
       const confirm = await collectTimedSamples(currentMaxTokens, BENCHMARK_CONFIRM_RUNS, "confirm");
       if (confirm.samples.length > 0) {
         verify.tokPerSecSamples = [...verify.tokPerSecSamples, ...confirm.samples];
+        verify.promptTokenSamples = [...(verify.promptTokenSamples ?? []), ...confirm.promptTokenSamples];
+        verify.promptTokens = medianNumber(verify.promptTokenSamples);
         const merged = aggregateTimedSamples(verify.tokPerSecSamples);
         if (merged.tokPerSec != null) {
           const flag = merged.bimodal ? " ⚠ STILL BIMODAL" : "";

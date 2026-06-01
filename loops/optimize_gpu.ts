@@ -25,7 +25,7 @@ import {
   type ClaudeStreamState,
 } from "./optimize_perf";
 import { formatElapsed } from "./optimize_llm_tps";
-import { parsePrefillTokPerSec } from "./optimize_zinc";
+import { parsePrefillTokPerSec, parsePrefillTokenCount } from "./optimize_zinc";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const RESULTS_DIR = join(REPO_ROOT, ".gpu_optimize");
@@ -180,6 +180,7 @@ export type CommandResult = {
 type BenchmarkMetrics = {
   decodeTokPerSec: number | null;
   prefillTokPerSec: number | null;
+  promptTokens: number | null;
   outputText: string;
   coherent: boolean;
 };
@@ -190,6 +191,7 @@ type BenchmarkSummary = {
   samples: number[];
   decodeSamples: number[];
   prefillSamples: number[];
+  promptTokenSamples: number[];
   outputText: string;
   coherent: boolean;
 };
@@ -197,6 +199,7 @@ type BenchmarkSummary = {
 type LlamaSummary = {
   decodeTokPerSec: number | null;
   prefillTokPerSec: number | null;
+  promptTokens: number | null;
   raw: string;
   source?: "llama-cli" | "llama-completion" | "llama-bench";
 };
@@ -488,6 +491,7 @@ function parseDecodeTokPerSec(output: string): number | null {
 export function parseZincMetrics(output: string, expect: string[] = []): BenchmarkMetrics {
   const decodeTokPerSec = parseDecodeTokPerSec(output);
   const prefillTokPerSec = parsePrefillTokPerSec(output);
+  const promptTokens = parsePrefillTokenCount(output);
   const outputText =
     output.match(/Output text:\s*"([^"]*)"/)?.[1] ??
     output.match(/Output text:\s*([^\n]*)/)?.[1]?.trim() ??
@@ -497,7 +501,7 @@ export function parseZincMetrics(output: string, expect: string[] = []): Benchma
   const coherent = expect.length === 0
     ? outputText.trim().length > 0
     : expect.some((needle) => outputText.toLowerCase().includes(needle.toLowerCase()));
-  return { decodeTokPerSec, prefillTokPerSec, outputText, coherent };
+  return { decodeTokPerSec, prefillTokPerSec, promptTokens, outputText, coherent };
 }
 
 function numberFromAny(obj: Record<string, unknown>, keys: string[]): number | null {
@@ -512,6 +516,7 @@ function numberFromAny(obj: Record<string, unknown>, keys: string[]): number | n
 export function parseLlamaBenchMetrics(output: string): LlamaSummary {
   let decodeTokPerSec: number | null = null;
   let prefillTokPerSec: number | null = null;
+  let promptTokens: number | null = null;
   try {
     const jsonStart = output.indexOf("[");
     const data = JSON.parse(jsonStart >= 0 ? output.slice(jsonStart) : output);
@@ -524,7 +529,10 @@ export function parseLlamaBenchMetrics(output: string): LlamaSummary {
       const nGen = Number(rec.n_gen ?? rec.gen ?? 0);
       const nPrompt = Number(rec.n_prompt ?? rec.prompt ?? 0);
       if (tps != null && (test.includes("tg") || nGen > 0)) decodeTokPerSec = tps;
-      if (tps != null && (test.includes("pp") || (nPrompt > 0 && nGen === 0))) prefillTokPerSec = tps;
+      if (tps != null && (test.includes("pp") || (nPrompt > 0 && nGen === 0))) {
+        prefillTokPerSec = tps;
+        promptTokens = nPrompt > 0 ? nPrompt : promptTokens;
+      }
     }
   } catch {
     const tg = output.match(/(?:tg|decode)[^|\n]*\|\s*(\d+(?:\.\d+)?)\s*(?:±|\+\/-)?/i);
@@ -532,7 +540,7 @@ export function parseLlamaBenchMetrics(output: string): LlamaSummary {
     if (tg) decodeTokPerSec = Number(tg[1]);
     if (pp) prefillTokPerSec = Number(pp[1]);
   }
-  return { decodeTokPerSec, prefillTokPerSec, raw: output, source: "llama-bench" };
+  return { decodeTokPerSec, prefillTokPerSec, promptTokens, raw: output, source: "llama-bench" };
 }
 
 function parseLlamaTimingLine(line: string): number | null {
@@ -543,15 +551,18 @@ function parseLlamaTimingLine(line: string): number | null {
 export function parseLlamaCliMetrics(output: string): LlamaSummary {
   let decodeTokPerSec: number | null = null;
   let prefillTokPerSec: number | null = null;
+  let promptTokens: number | null = null;
   const source = output.includes("ZINC_LLAMA_SOURCE=llama-completion") ? "llama-completion" : "llama-cli";
   for (const line of output.split(/\r?\n/)) {
     if (/prompt eval time\s*=/.test(line)) {
       prefillTokPerSec = parseLlamaTimingLine(line) ?? prefillTokPerSec;
+      const tokenMatch = line.match(/\/\s*(\d+)\s+tokens/i);
+      if (tokenMatch) promptTokens = Number(tokenMatch[1]);
     } else if (/\beval time\s*=/.test(line)) {
       decodeTokPerSec = parseLlamaTimingLine(line) ?? decodeTokPerSec;
     }
   }
-  return { decodeTokPerSec, prefillTokPerSec, raw: output, source };
+  return { decodeTokPerSec, prefillTokPerSec, promptTokens, raw: output, source };
 }
 
 export function combinedCommandOutput(result: Pick<CommandResult, "stdout" | "stderr">): string {
@@ -676,6 +687,7 @@ async function prepareRemote(opts: LoopOptions, target: ModelTarget): Promise<vo
 async function benchmarkZinc(opts: LoopOptions, target: ModelTarget): Promise<BenchmarkSummary> {
   const decodeSamples: number[] = [];
   const prefillSamples: number[] = [];
+  const promptTokenSamples: number[] = [];
   let outputText = "";
   let coherent = true;
   for (let i = 0; i < opts.samples; i++) {
@@ -683,9 +695,10 @@ async function benchmarkZinc(opts: LoopOptions, target: ModelTarget): Promise<Be
     const metrics = parseZincMetrics(res, target.expect);
     if (metrics.decodeTokPerSec != null) decodeSamples.push(metrics.decodeTokPerSec);
     if (metrics.prefillTokPerSec != null) prefillSamples.push(metrics.prefillTokPerSec);
+    if (metrics.promptTokens != null) promptTokenSamples.push(metrics.promptTokens);
     outputText = metrics.outputText;
     coherent = coherent && metrics.coherent;
-    console.log(`    ZINC sample ${i + 1}/${opts.samples}: decode=${metrics.decodeTokPerSec?.toFixed(2) ?? "?"} prefill=${metrics.prefillTokPerSec?.toFixed(2) ?? "?"} coherent=${metrics.coherent ? "yes" : "no"}`);
+    console.log(`    ZINC sample ${i + 1}/${opts.samples}: decode=${metrics.decodeTokPerSec?.toFixed(2) ?? "?"} prefill=${metrics.prefillTokPerSec?.toFixed(2) ?? "?"}${metrics.promptTokens != null ? ` prompt=${metrics.promptTokens}tok` : ""} coherent=${metrics.coherent ? "yes" : "no"}`);
   }
   const samples = opts.metric === "decode" ? decodeSamples : prefillSamples;
   return {
@@ -694,6 +707,7 @@ async function benchmarkZinc(opts: LoopOptions, target: ModelTarget): Promise<Be
     samples,
     decodeSamples,
     prefillSamples,
+    promptTokenSamples,
     outputText,
     coherent,
   };
@@ -885,13 +899,20 @@ function summarizeBench(summary: BenchmarkSummary | null): string {
   const selected = summary.value == null ? "?" : `${summary.value.toFixed(2)} [${summary.samples.map((v) => v.toFixed(2)).join(", ")}]`;
   const decode = summarizeMetricSamples(summary.decodeSamples);
   const prefill = summarizeMetricSamples(summary.prefillSamples);
-  return `${summary.metric}=${selected} tok/s; decode=${decode}; prefill=${prefill}; coherent=${summary.coherent ? "yes" : "no"}`;
+  const promptTokens = summarizePromptTokenSamples(summary.promptTokenSamples);
+  return `${summary.metric}=${selected} tok/s; decode=${decode}; prefill=${prefill}; prompt=${promptTokens}; coherent=${summary.coherent ? "yes" : "no"}`;
 }
 
 function summarizeMetricSamples(samples: number[]): string {
   const value = median(samples);
   if (value == null) return "?";
   return `${value.toFixed(2)} [${samples.map((v) => v.toFixed(2)).join(", ")}]`;
+}
+
+function summarizePromptTokenSamples(samples: number[]): string {
+  const value = median(samples);
+  if (value == null) return "?";
+  return `${value}tok [${samples.map((v) => String(v)).join(", ")}]`;
 }
 
 function cycleMetricValue(cycle: CycleRecord, metric: MetricKind): number | null {
@@ -995,7 +1016,7 @@ export function buildAgentPrompt(state: RunState, opts: LoopOptions, target: Mod
   const failed = state.failedApproaches.slice(-10).map((f) => `- ${f}`).join("\n") || "(none)";
   const llamaSource = llama?.source ? `${llama.source} ` : "";
   const llamaLine = llama
-    ? `llama.cpp ${llamaSource}same-prompt baseline: decode=${llama.decodeTokPerSec?.toFixed(2) ?? "?"} tok/s, prefill=${llama.prefillTokPerSec?.toFixed(2) ?? "?"} tok/s`
+    ? `llama.cpp ${llamaSource}same-prompt baseline: decode=${llama.decodeTokPerSec?.toFixed(2) ?? "?"} tok/s, prefill=${llama.prefillTokPerSec?.toFixed(2) ?? "?"} tok/s${llama.promptTokens != null ? `, prompt=${llama.promptTokens}tok` : ""}`
     : "llama.cpp baseline unavailable or skipped";
   const goal = formatLlamaGoal(baseline, llama, target.label);
   return `
@@ -1005,6 +1026,7 @@ Target:
 - model: ${target.label}
 - model path: ${target.modelPath}
 - harness metric: ${opts.metric} tok/s; keep decisions prefer the largest remaining llama.cpp gap when a llama.cpp baseline exists
+- measured prompt shape: ${summarizePromptTokenSamples(baseline.promptTokenSamples)}
 - current ZINC baseline: ${summarizeBench(baseline)}
 - ${llamaLine}
 - remote: ${opts.user}@${opts.host}:${opts.port} ${opts.remoteDir}
