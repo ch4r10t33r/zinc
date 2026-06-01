@@ -1071,6 +1071,85 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
+fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimeProfile {
+    var delta: RuntimeProfile = .{};
+    delta.decode_steps = total.decode_steps -| prefix.decode_steps;
+    delta.shared_cmd_steps = total.shared_cmd_steps -| prefix.shared_cmd_steps;
+    delta.command_buffers = total.command_buffers -| prefix.command_buffers;
+    delta.commit_waits = total.commit_waits -| prefix.commit_waits;
+    delta.dispatch_calls = total.dispatch_calls -| prefix.dispatch_calls;
+    delta.barrier_calls = total.barrier_calls -| prefix.barrier_calls;
+    delta.embed_barrier_calls = total.embed_barrier_calls -| prefix.embed_barrier_calls;
+    delta.full_attn_barrier_calls = total.full_attn_barrier_calls -| prefix.full_attn_barrier_calls;
+    delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
+    delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
+    delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
+    delta.fallback_moe_barrier_calls = total.fallback_moe_barrier_calls -| prefix.fallback_moe_barrier_calls;
+    delta.dense_ffn_barrier_calls = total.dense_ffn_barrier_calls -| prefix.dense_ffn_barrier_calls;
+    delta.final_barrier_calls = total.final_barrier_calls -| prefix.final_barrier_calls;
+    delta.sample_calls = total.sample_calls -| prefix.sample_calls;
+    delta.full_attn_layers = total.full_attn_layers -| prefix.full_attn_layers;
+    delta.ssm_layers = total.ssm_layers -| prefix.ssm_layers;
+    delta.gpu_routed_moe_layers = total.gpu_routed_moe_layers -| prefix.gpu_routed_moe_layers;
+    delta.fallback_moe_layers = total.fallback_moe_layers -| prefix.fallback_moe_layers;
+    delta.dense_ffn_layers = total.dense_ffn_layers -| prefix.dense_ffn_layers;
+    delta.embedding_ns = total.embedding_ns -| prefix.embedding_ns;
+    delta.layer_record_ns = total.layer_record_ns -| prefix.layer_record_ns;
+    delta.router_cpu_ns = total.router_cpu_ns -| prefix.router_cpu_ns;
+    delta.gpu_routed_moe_record_ns = total.gpu_routed_moe_record_ns -| prefix.gpu_routed_moe_record_ns;
+    delta.fallback_moe_record_ns = total.fallback_moe_record_ns -| prefix.fallback_moe_record_ns;
+    delta.dense_ffn_record_ns = total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns;
+    delta.final_record_ns = total.final_record_ns -| prefix.final_record_ns;
+    delta.gpu_completion_wait_ns = total.gpu_completion_wait_ns -| prefix.gpu_completion_wait_ns;
+    delta.sample_ns = total.sample_ns -| prefix.sample_ns;
+    delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
+    delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
+    delta.dmmv_total_bytes = total.dmmv_total_bytes -| prefix.dmmv_total_bytes;
+    delta.dmmv_q4k_bytes = total.dmmv_q4k_bytes -| prefix.dmmv_q4k_bytes;
+    delta.dmmv_q5_1_bytes = total.dmmv_q5_1_bytes -| prefix.dmmv_q5_1_bytes;
+    delta.dmmv_q5k_bytes = total.dmmv_q5k_bytes -| prefix.dmmv_q5k_bytes;
+    delta.dmmv_q6k_bytes = total.dmmv_q6k_bytes -| prefix.dmmv_q6k_bytes;
+    delta.dmmv_q8_0_bytes = total.dmmv_q8_0_bytes -| prefix.dmmv_q8_0_bytes;
+    delta.dmmv_f16_bytes = total.dmmv_f16_bytes -| prefix.dmmv_f16_bytes;
+    delta.dmmv_f32_bytes = total.dmmv_f32_bytes -| prefix.dmmv_f32_bytes;
+    delta.lm_head_bytes = total.lm_head_bytes -| prefix.lm_head_bytes;
+    delta.ssm_bytes = total.ssm_bytes -| prefix.ssm_bytes;
+    delta.ssm_projection_bytes = total.ssm_projection_bytes -| prefix.ssm_projection_bytes;
+    delta.ssm_qkv_projection_bytes = total.ssm_qkv_projection_bytes -| prefix.ssm_qkv_projection_bytes;
+    delta.ssm_gate_projection_bytes = total.ssm_gate_projection_bytes -| prefix.ssm_gate_projection_bytes;
+    delta.ssm_tail_projection_bytes = total.ssm_tail_projection_bytes -| prefix.ssm_tail_projection_bytes;
+    delta.ssm_out_bytes = total.ssm_out_bytes -| prefix.ssm_out_bytes;
+    delta.full_attn_bytes = total.full_attn_bytes -| prefix.full_attn_bytes;
+    delta.full_attn_projection_bytes = total.full_attn_projection_bytes -| prefix.full_attn_projection_bytes;
+    delta.full_attn_output_bytes = total.full_attn_output_bytes -| prefix.full_attn_output_bytes;
+    delta.router_bytes = total.router_bytes -| prefix.router_bytes;
+    delta.router_topk_calls = total.router_topk_calls -| prefix.router_topk_calls;
+    delta.route_pack_layers = total.route_pack_layers -| prefix.route_pack_layers;
+    delta.route_pack_slots = total.route_pack_slots -| prefix.route_pack_slots;
+    delta.route_pack_active_block_upper_bound = total.route_pack_active_block_upper_bound -| prefix.route_pack_active_block_upper_bound;
+    delta.route_pack_dense_dispatch_blocks = total.route_pack_dense_dispatch_blocks -| prefix.route_pack_dense_dispatch_blocks;
+    delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
+    delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
+    delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
+    delta.dense_ffn_bytes = total.dense_ffn_bytes -| prefix.dense_ffn_bytes;
+    delta.moe_expert_bytes = total.moe_expert_bytes -| prefix.moe_expert_bytes;
+    delta.moe_expert_gate_up_bytes = total.moe_expert_gate_up_bytes -| prefix.moe_expert_gate_up_bytes;
+    delta.moe_expert_down_bytes = total.moe_expert_down_bytes -| prefix.moe_expert_down_bytes;
+    delta.full_attn_flash_calls = total.full_attn_flash_calls -| prefix.full_attn_flash_calls;
+    delta.full_attn_kv_write_calls = total.full_attn_kv_write_calls -| prefix.full_attn_kv_write_calls;
+    delta.ssm_conv_calls = total.ssm_conv_calls -| prefix.ssm_conv_calls;
+    delta.ssm_delta_calls = total.ssm_delta_calls -| prefix.ssm_delta_calls;
+    delta.ssm_gated_norm_calls = total.ssm_gated_norm_calls -| prefix.ssm_gated_norm_calls;
+    delta.gpu_moe_finalizer_scalar_seed_norm_calls = total.gpu_moe_finalizer_scalar_seed_norm_calls -| prefix.gpu_moe_finalizer_scalar_seed_norm_calls;
+    delta.gpu_moe_finalizer_scalar_calls = total.gpu_moe_finalizer_scalar_calls -| prefix.gpu_moe_finalizer_scalar_calls;
+    delta.gpu_moe_finalizer_f32_seed_norm_calls = total.gpu_moe_finalizer_f32_seed_norm_calls -| prefix.gpu_moe_finalizer_f32_seed_norm_calls;
+    delta.gpu_moe_finalizer_f32_norm_calls = total.gpu_moe_finalizer_f32_norm_calls -| prefix.gpu_moe_finalizer_f32_norm_calls;
+    delta.gpu_moe_finalizer_f32_calls = total.gpu_moe_finalizer_f32_calls -| prefix.gpu_moe_finalizer_f32_calls;
+    delta.gpu_moe_finalizer_shared_calls = total.gpu_moe_finalizer_shared_calls -| prefix.gpu_moe_finalizer_shared_calls;
+    delta.gpu_moe_finalizer_routed_only_calls = total.gpu_moe_finalizer_routed_only_calls -| prefix.gpu_moe_finalizer_routed_only_calls;
+    return delta;
+}
+
 fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps == 0 and profile.dmmv_total_bytes == 0) return;
 
@@ -5938,6 +6017,12 @@ pub const InferenceEngine = struct {
             profile.dense_ffn_record_ns +
             profile.final_record_ns;
         const traced_request_ns = profile.total_step_ns + profile.sample_ns;
+        const has_prefill_split = self.prefill_profile.decode_steps > 0 and
+            profile.decode_steps >= self.prefill_profile.decode_steps;
+        const decode_profile: RuntimeProfile = if (has_prefill_split)
+            profileDeltaForSplit(profile, self.prefill_profile)
+        else
+            .{};
 
         log.info("Metal profile ({s}): steps={d} prompt={d} completion={d} shared_steps={d} cmds={d} commits={d}", .{
             label,
@@ -5948,6 +6033,24 @@ pub const InferenceEngine = struct {
             profile.command_buffers,
             profile.commit_waits,
         });
+        if (has_prefill_split) {
+            log.info("Metal profile split ({s}): prefill_steps={d} decode_steps={d} prefill_cmds={d} decode_cmds={d} prefill_commits={d} decode_commits={d} kernel_timing={s}", .{
+                label,
+                self.prefill_profile.decode_steps,
+                decode_profile.decode_steps,
+                self.prefill_profile.command_buffers,
+                decode_profile.command_buffers,
+                self.prefill_profile.commit_waits,
+                decode_profile.commit_waits,
+                if (kernel_timing.enabled) "on" else "off",
+            });
+            log.info("  split waits: prefill {d:.2} ms decode {d:.2} ms | dmmv prefill {d:.2} GiB decode {d:.2} GiB", .{
+                nsToMs(self.prefill_profile.gpu_completion_wait_ns),
+                nsToMs(decode_profile.gpu_completion_wait_ns),
+                bytesToGiB(self.prefill_profile.dmmv_total_bytes),
+                bytesToGiB(decode_profile.dmmv_total_bytes),
+            });
+        }
         log.info("  cpu: embed {d:.2} ms ({d:.3} ms/step) | record {d:.2} ms ({d:.3} ms/step) | router {d:.2} ms | sample {d:.2} ms ({d:.3} ms/sample)", .{
             nsToMs(profile.embedding_ns),
             avgMs(profile.embedding_ns, profile.decode_steps),
@@ -6061,8 +6164,9 @@ pub const InferenceEngine = struct {
                 bytesToGiB(profile.lm_head_bytes),
                 bytesToGiB(profile.router_bytes),
             });
-            if (self.prefill_profile.decode_steps > 0) {
+            if (has_prefill_split) {
                 logDetailedProfileBuckets("prefill", self.prefill_profile);
+                logDetailedProfileBuckets("decode", decode_profile);
             } else {
                 logDetailedProfileBuckets(label, profile);
             }
