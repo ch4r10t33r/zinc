@@ -1726,6 +1726,7 @@ const RouterF32TopkBatchedPush = extern struct {
     input_offset: u32,
     input_stride: u32,
     output_stride: u32,
+    logit_scale_bits: u32,
 };
 
 const RouterF32TopkBatchedSharedGatePush = extern struct {
@@ -1737,6 +1738,7 @@ const RouterF32TopkBatchedSharedGatePush = extern struct {
     input_offset: u32,
     input_stride: u32,
     output_stride: u32,
+    logit_scale_bits: u32,
 };
 
 const RouterQ8TopkPush = extern struct {
@@ -11442,7 +11444,9 @@ fn dispatchRouterF32TopkBiasOnCmd(
 fn canUseRouterF32TopkBatched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32, n_tokens: u32) bool {
     return !engine.debug_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
-        engine.config.architecture == .qwen2_moe and
+        !engine.gemma_moe_validation_enabled and
+        (engine.config.architecture == .qwen2_moe or engine.config.architecture == .gemma) and
+        engine.config.n_experts > 0 and
         tensor.info.type_ == .f32 and
         n_experts <= 256 and
         n_experts % 2 == 0 and
@@ -11457,6 +11461,35 @@ fn canUseRouterF32TopkBatched(engine: *const InferenceEngine, tensor: *const met
         engine.router_f32_topk_batched_pipe.max_threads_per_threadgroup >= 512;
 }
 
+fn dispatchRouterF32TopkBatchedScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+    input_byte_offset: u32,
+    logit_scale: f32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    const push = RouterF32TopkBatchedPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .input_offset = input_byte_offset,
+        .input_stride = hidden_dim,
+        .output_stride = k * 2,
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
+    cmd.dispatchV2(&engine.router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+}
+
 fn dispatchRouterF32TopkBatchedOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -11469,19 +11502,7 @@ fn dispatchRouterF32TopkBatchedOnCmd(
     n_tokens: u32,
     input_byte_offset: u32,
 ) void {
-    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
-    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
-    const push = RouterF32TopkBatchedPush{
-        .n_experts = n_experts,
-        .K = hidden_dim,
-        .k = k,
-        .a_offset = tensorPageOffset(engine.model, tensor),
-        .input_offset = input_byte_offset,
-        .input_stride = hidden_dim,
-        .output_stride = k * 2,
-    };
-    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
-    cmd.dispatchV2(&engine.router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+    dispatchRouterF32TopkBatchedScaledOnCmd(engine, cmd, tensor, input, output, n_experts, k, hidden_dim, n_tokens, input_byte_offset, 1.0);
 }
 
 fn canUseRouterF32TopkBatchedSharedGate(
@@ -11493,12 +11514,46 @@ fn canUseRouterF32TopkBatchedSharedGate(
     hidden_dim: u32,
     n_tokens: u32,
 ) bool {
-    return canUseRouterF32TopkBatched(engine, router, n_experts, k, hidden_dim, n_tokens) and
+    return engine.config.architecture == .qwen2_moe and
+        canUseRouterF32TopkBatched(engine, router, n_experts, k, hidden_dim, n_tokens) and
         shared_gate.info.type_ == .f32 and
         shared_gate.info.numElements() == hidden_dim and
         engine.router_f32_topk_batched_shared_gate_pipe.handle != null and
         engine.router_f32_topk_batched_shared_gate_pipe.thread_execution_width == 32 and
         engine.router_f32_topk_batched_shared_gate_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchRouterF32TopkBatchedSharedGateScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    router: *const metal_loader.LoadedTensor,
+    shared_gate: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    shared_gate_output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+    input_byte_offset: u32,
+    logit_scale: f32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    recordDmmvProfile(engine, shared_gate, 1, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    const push = RouterF32TopkBatchedSharedGatePush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .router_offset = tensorPageOffset(engine.model, router),
+        .shared_gate_offset = tensorPageOffset(engine.model, shared_gate),
+        .input_offset = input_byte_offset,
+        .input_stride = hidden_dim,
+        .output_stride = k * 2,
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
+    };
+    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, output, &shared_gate.gpu_buffer, shared_gate_output };
+    cmd.dispatchV2(&engine.router_f32_topk_batched_shared_gate_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedSharedGatePush), 1);
 }
 
 fn dispatchRouterF32TopkBatchedSharedGateOnCmd(
@@ -11515,21 +11570,7 @@ fn dispatchRouterF32TopkBatchedSharedGateOnCmd(
     n_tokens: u32,
     input_byte_offset: u32,
 ) void {
-    recordDmmvProfile(engine, router, n_experts, hidden_dim);
-    recordDmmvProfile(engine, shared_gate, 1, hidden_dim);
-    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
-    const push = RouterF32TopkBatchedSharedGatePush{
-        .n_experts = n_experts,
-        .K = hidden_dim,
-        .k = k,
-        .router_offset = tensorPageOffset(engine.model, router),
-        .shared_gate_offset = tensorPageOffset(engine.model, shared_gate),
-        .input_offset = input_byte_offset,
-        .input_stride = hidden_dim,
-        .output_stride = k * 2,
-    };
-    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, output, &shared_gate.gpu_buffer, shared_gate_output };
-    cmd.dispatchV2(&engine.router_f32_topk_batched_shared_gate_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedSharedGatePush), 1);
+    dispatchRouterF32TopkBatchedSharedGateScaledOnCmd(engine, cmd, router, shared_gate, input, output, shared_gate_output, n_experts, k, hidden_dim, n_tokens, input_byte_offset, 1.0);
 }
 
 fn canUseRouterQ8Topk(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32) bool {
@@ -17663,6 +17704,8 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     hidden_dim: u32,
     inter_dim: u32,
     shexp_inter_dim: u32,
+    router_output_ready: bool,
+    precomputed_shared_gate: ?QwenSharedGateScalar,
 ) !void {
     const cfg = engine.config;
     const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
@@ -17677,9 +17720,15 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
     const down_shexp = lt.ffn_down_shexp orelse return error.MissingTensor;
     const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+    const shared_gate_precomputed = blk: {
+        const gate = precomputed_shared_gate orelse break :blk false;
+        break :blk gate.buf == &engine.router_logits_buf and gate.byte_offset == 0;
+    };
 
-    const router_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
-    dispatchSoftmaxTopkScaledOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, router_scale);
+    if (!router_output_ready) {
+        const router_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
+        dispatchSoftmaxTopkScaledOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, router_scale);
+    }
 
     // llama.cpp's build_moe_ffn keeps selected_experts on device and feeds it
     // into mul_mat_id. For Gemma decode N=1, router_output_buf is that compact
@@ -17768,7 +17817,9 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         dispatchDmmvOnCmd(engine, cmd, up_shexp, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
     }
     if (lt.ffn_gate_inp_shexp) |gate_tensor| {
-        dispatchDmmvOnCmd(engine, cmd, gate_tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+        if (!shared_gate_precomputed) {
+            dispatchDmmvOnCmd(engine, cmd, gate_tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+        }
     }
     profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up/shared projections visible before GeGLU
 
@@ -17947,7 +17998,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
 ) !bool {
     const cfg = engine.config;
     if (cfg.architecture == .gemma) {
-        try recordGemmaGpuRoutedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+        try recordGemmaGpuRoutedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, router_output_ready, precomputed_shared_gate);
         return false;
     }
     const gate_exps = lt.ffn_gate_exps orelse return error.MissingTensor;
@@ -18900,6 +18951,10 @@ fn runDecodeStep(
                     use_fused_f32_router and
                     fused_f32_router_shared_gate != null and
                     canUseRouterF32TopkBatchedSharedGate(engine, router_t, fused_f32_router_shared_gate.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const router_logit_scale: f32 = if (cfg.architecture == .gemma)
+                    1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)))
+                else
+                    1.0;
                 const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
@@ -18915,7 +18970,7 @@ fn runDecodeStep(
                     // MoE reducer consumes compact routing metadata instead of
                     // rereading the FFN norm row for a separate gate dot.
                     if (use_fused_f32_router_shared_gate) {
-                        dispatchRouterF32TopkBatchedSharedGateOnCmd(
+                        dispatchRouterF32TopkBatchedSharedGateScaledOnCmd(
                             engine,
                             cmd,
                             router_t,
@@ -18928,10 +18983,11 @@ fn runDecodeStep(
                             hidden_dim,
                             1,
                             0,
+                            router_logit_scale,
                         );
                         precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
                     } else {
-                        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, 0);
+                        dispatchRouterF32TopkBatchedScaledOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, 0, router_logit_scale);
                     }
                 } else {
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
@@ -19610,6 +19666,10 @@ fn runDecodeStep(
                     use_fused_f32_router and
                     fused_f32_router_shared_gate != null and
                     canUseRouterF32TopkBatchedSharedGate(engine, router_t, fused_f32_router_shared_gate.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const router_logit_scale: f32 = if (cfg.architecture == .gemma)
+                    1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)))
+                else
+                    1.0;
                 const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_prefill_router) {
                     const route_words = cfg.n_experts_used * 2;
@@ -19636,7 +19696,7 @@ fn runDecodeStep(
                     // MoE reducer consumes compact routing metadata instead of
                     // rereading the FFN norm row for a separate gate dot.
                     if (use_fused_f32_router_shared_gate) {
-                        dispatchRouterF32TopkBatchedSharedGateOnCmd(
+                        dispatchRouterF32TopkBatchedSharedGateScaledOnCmd(
                             engine,
                             cmd,
                             router_t,
@@ -19649,10 +19709,11 @@ fn runDecodeStep(
                             hidden_dim,
                             1,
                             router_in_byte_offset,
+                            router_logit_scale,
                         );
                         precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
                     } else {
-                        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, router_in_byte_offset);
+                        dispatchRouterF32TopkBatchedScaledOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, router_in_byte_offset, router_logit_scale);
                     }
                 } else {
                     dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
@@ -28790,6 +28851,7 @@ test "router_f32_topk_batched shader routes each prompt token" {
     const n_experts: usize = 96;
     const K: usize = 64;
     const k: usize = 4;
+    const logit_scale: f32 = 0.5;
 
     var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&weight_buf);
@@ -28823,6 +28885,7 @@ test "router_f32_topk_batched shader routes each prompt token" {
         .input_offset = 0,
         .input_stride = @intCast(K),
         .output_stride = @intCast(k * 2),
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
     };
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
 
@@ -28855,7 +28918,10 @@ test "router_f32_topk_batched shader routes each prompt token" {
             logits[best_idx] = -std.math.inf(f32);
         }
         var max_sel = -std.math.inf(f32);
-        for (selected_vals) |v| max_sel = @max(max_sel, v);
+        for (&selected_vals) |*v| {
+            v.* *= logit_scale;
+            max_sel = @max(max_sel, v.*);
+        }
         var sum: f32 = 0.0;
         var expected_weights: [k]f32 = undefined;
         for (0..k) |slot| {
@@ -28886,6 +28952,7 @@ test "router_f32_topk_batched_shared_gate shader also writes shared gate scalar"
     const n_experts: usize = 96;
     const K: usize = 64;
     const k: usize = 4;
+    const logit_scale: f32 = 0.5;
 
     var router_weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&router_weight_buf);
@@ -28930,6 +28997,7 @@ test "router_f32_topk_batched_shared_gate shader also writes shared gate scalar"
         .input_offset = 0,
         .input_stride = @intCast(K),
         .output_stride = @intCast(k * 2),
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
     };
     const bufs = [_]*const MetalBuffer{ &router_weight_buf, &input_buf, &output_buf, &shared_gate_weight_buf, &shared_gate_buf };
 
@@ -28963,7 +29031,10 @@ test "router_f32_topk_batched_shared_gate shader also writes shared gate scalar"
             logits[best_idx] = -std.math.inf(f32);
         }
         var max_sel = -std.math.inf(f32);
-        for (selected_vals) |v| max_sel = @max(max_sel, v);
+        for (&selected_vals) |*v| {
+            v.* *= logit_scale;
+            max_sel = @max(max_sel, v.*);
+        }
         var sum: f32 = 0.0;
         var expected_weights: [k]f32 = undefined;
         for (0..k) |slot| {

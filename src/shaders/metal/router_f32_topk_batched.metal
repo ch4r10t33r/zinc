@@ -16,6 +16,7 @@ struct RouterF32TopkBatchedPush {
     uint input_offset;
     uint input_stride;
     uint output_stride;
+    uint logit_scale_bits;
 };
 
 #define TG_SIZE 512
@@ -37,6 +38,7 @@ kernel void main0(
     threadgroup float4 x_cache4[MAX_K_VEC4];
     threadgroup float values[MAX_EXPERTS];
     threadgroup float selected_val[MAX_K_USED];
+    const float logit_scale = as_type<float>(p.logit_scale_bits);
 
     if (p.n_experts == 0u || p.n_experts > MAX_EXPERTS ||
         p.k == 0u || p.k > MAX_K_USED ||
@@ -118,7 +120,7 @@ kernel void main0(
             }
 
             const bool weight_lane = lane < 8u;
-            const float score = weight_lane ? selected_score[lane] : -INFINITY;
+            const float score = weight_lane ? selected_score[lane] * logit_scale : -INFINITY;
             const float max_sel = simd_max(score);
             const float exp_score = weight_lane ? fast::exp(score - max_sel) : 0.0f;
             const float sum = simd_sum(exp_score);
@@ -149,6 +151,7 @@ kernel void main0(
 
         float max_sel = -INFINITY;
         for (uint slot = 0u; slot < k; slot++) {
+            selected_val[slot] *= logit_scale;
             max_sel = max(max_sel, selected_val[slot]);
         }
 
