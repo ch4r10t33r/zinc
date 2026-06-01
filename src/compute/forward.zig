@@ -161,6 +161,11 @@ const ProfilePhase = enum(u8) {
     dense_ffn_gate,
     dense_ffn_up,
     dense_ffn_down,
+    dense_ffn_gateup_quant,
+    dense_ffn_gateup_matmul,
+    dense_ffn_down_quant,
+    dense_ffn_down_matmul,
+    dense_ffn_residual_acc,
     final_tail,
     final_norm,
     final_lm_head,
@@ -201,6 +206,11 @@ const ProfilePhase = enum(u8) {
             .dense_ffn_gate => "dense_ffn_gate",
             .dense_ffn_up => "dense_ffn_up",
             .dense_ffn_down => "dense_ffn_down",
+            .dense_ffn_gateup_quant => "dense_ffn_gateup_quant",
+            .dense_ffn_gateup_matmul => "dense_ffn_gateup_matmul",
+            .dense_ffn_down_quant => "dense_ffn_down_quant",
+            .dense_ffn_down_matmul => "dense_ffn_down_matmul",
+            .dense_ffn_residual_acc => "dense_ffn_residual_acc",
             .final_tail => "tail",
             .final_norm => "tail_norm",
             .final_lm_head => "tail_lm_head",
@@ -13165,6 +13175,7 @@ pub const InferenceEngine = struct {
         }
         dp4a_cols_out.* = full_cols;
         if (!input_pre_quantized) {
+            const gateup_quant_phase = self.beginProfilePhase();
             // One-shot quantize of the f32 RMS-normed hidden. For long Qwen3.6
             // prompts, scratch is over-allocated to a 32-token multiple so the
             // full-tile DP4a GEMM can cover the ragged real-token tail and
@@ -13187,7 +13198,9 @@ pub const InferenceEngine = struct {
                 .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
             };
             self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+            self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
         }
+        const gateup_matmul_phase = self.beginProfilePhase();
         if (fuse_q8) {
             const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
             const swiglu_scale = self.batched_scratch_swiglu_scale.?;
@@ -13283,6 +13296,7 @@ pub const InferenceEngine = struct {
                 full_cols * inter_dim,
             );
         }
+        self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
         if (fuse_q8) return .q8_swiglu;
         if (fuse_q8_1) return .q8_1_swiglu;
         return .f32_swiglu;
@@ -13377,6 +13391,7 @@ pub const InferenceEngine = struct {
                 const swiglu_scale = self.batched_scratch_swiglu_scale.?;
                 const push_fn = self.instance.push_descriptor_fn;
                 if (!swiglu_already_q8) {
+                    const down_quant_phase = self.beginProfilePhase();
                     // One-shot quantize of the f32 SwiGLU activation (full cols).
                     // The fused gate+up+SwiGLU+Q8 path emits this directly, so
                     // skip the standalone dispatch + barrier when it ran.
@@ -13397,7 +13412,9 @@ pub const InferenceEngine = struct {
                         .{ .buffer = swiglu_scale.handle, .size = swiglu_scale.size },
                     };
                     self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                    self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
                 }
+                const down_matmul_phase = self.beginProfilePhase();
                 try self.dmmv.recordMulMmQ6KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -13435,6 +13452,7 @@ pub const InferenceEngine = struct {
                         full_cols * hidden_dim,
                     );
                 }
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
                 return;
             }
         }
@@ -13497,6 +13515,7 @@ pub const InferenceEngine = struct {
                 const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
                 const push_fn = self.instance.push_descriptor_fn;
                 if (!swiglu_already_q8_1) {
+                    const down_quant_phase = self.beginProfilePhase();
                     // Q8_1 (scale + dsum) quantize of the f32 SwiGLU activation
                     // (full cols). Q4_K weights are factor*nibble - bias; the GEMM
                     // needs the dsum bias-correction term that Q8_0 (scale-only)
@@ -13520,7 +13539,9 @@ pub const InferenceEngine = struct {
                         .{ .buffer = swiglu_sd.handle, .size = swiglu_sd.size },
                     };
                     self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+                    self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
                 }
+                const down_matmul_phase = self.beginProfilePhase();
                 try self.dmmv.recordMulMmQ4KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -13560,10 +13581,13 @@ pub const InferenceEngine = struct {
                         full_cols * hidden_dim,
                     );
                 }
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
                 return;
             }
         }
+        const down_matmul_phase = self.beginProfilePhase();
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
     }
 
     /// SSM wqkv projection (Q6_K/Q5_K, K=hidden_dim, M=conv_channels) for Qwen dense-hybrid
@@ -16174,6 +16198,7 @@ pub const InferenceEngine = struct {
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
         try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu, dp4a_result == .q8_1_swiglu, dp4a_gateup_cols);
+        const dense_ffn_residual_phase = self.beginProfilePhase();
         self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
         try self.dispatchScaleAcc(
             scratch_hidden.handle,
@@ -16183,6 +16208,7 @@ pub const InferenceEngine = struct {
             n_tokens * hidden_dim,
             1.0,
         );
+        self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
         self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
         self.endProfilePhase(.dense_ffn, dense_ffn_phase);
         const layer_output_scale = self.layer_output_scales[layer];
@@ -18704,13 +18730,23 @@ pub fn generate(
             const dense_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gate)];
             const dense_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_up)];
             const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
+            const dense_gateup_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_quant)];
+            const dense_gateup_matmul_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul)];
+            const dense_down_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_quant)];
+            const dense_down_matmul_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul)];
+            const dense_residual_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_residual_acc)];
             log.info(
-                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} ms",
+                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} gateup_quant={d:.1} gateup_matmul={d:.1} down_quant={d:.1} down_matmul={d:.1} residual_acc={d:.1} ms",
                 .{
                     to_ms(dense_gateup_ns),
                     to_ms(dense_gate_ns),
                     to_ms(dense_up_ns),
                     to_ms(dense_down_ns),
+                    to_ms(dense_gateup_quant_ns),
+                    to_ms(dense_gateup_matmul_ns),
+                    to_ms(dense_down_quant_ns),
+                    to_ms(dense_down_matmul_ns),
+                    to_ms(dense_residual_ns),
                 },
             );
         }
@@ -18861,11 +18897,16 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.shared_down),
                 engine.avgProfilePhaseMs(.shared_gate_acc),
             });
-            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms", .{
+            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms gateup_quant={d:.2} ms gateup_matmul={d:.2} ms down_quant={d:.2} ms down_matmul={d:.2} ms residual_acc={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.dense_ffn_gateup),
                 engine.avgProfilePhaseMs(.dense_ffn_gate),
                 engine.avgProfilePhaseMs(.dense_ffn_up),
                 engine.avgProfilePhaseMs(.dense_ffn_down),
+                engine.avgProfilePhaseMs(.dense_ffn_gateup_quant),
+                engine.avgProfilePhaseMs(.dense_ffn_gateup_matmul),
+                engine.avgProfilePhaseMs(.dense_ffn_down_quant),
+                engine.avgProfilePhaseMs(.dense_ffn_down_matmul),
+                engine.avgProfilePhaseMs(.dense_ffn_residual_acc),
             });
             log.info("PROFILE: avg tail subphases norm={d:.2} ms lm_head={d:.2} ms argmax={d:.2} ms copy={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.final_norm),
