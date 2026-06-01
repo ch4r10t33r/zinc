@@ -16,6 +16,7 @@ struct Push {
 };
 
 #define MAX_PER_THREAD 16
+#define MAX_N_USED 16
 
 kernel void main0(
     constant Push& p [[buffer(0)]],
@@ -37,11 +38,21 @@ kernel void main0(
     threadgroup float expert_sums[32];
     threadgroup float shared_sums[32];
     threadgroup float combined_sums[32];
+    threadgroup float route_weights[MAX_N_USED];
 
     device const float* expert_scales = expert_scales_base + p.scale_offset;
     device const float* expert_weights = expert_weights_base + p.expert_weight_offset;
     device const float* shared_weights = shared_weights_base + p.shared_weight_offset;
     const float gate = p.has_gate != 0u ? 1.0f / (1.0f + exp(-gate_buf[0])) : 1.0f;
+
+    if (p.n_used > MAX_N_USED) {
+        return;
+    }
+    if (tid < p.n_used) {
+        const uint expert_id = routing[tid];
+        route_weights[tid] = as_type<float>(routing[p.n_used + tid]) * expert_scales[expert_id];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float expert_vals[MAX_PER_THREAD];
     float shared_vals[MAX_PER_THREAD];
@@ -52,10 +63,19 @@ kernel void main0(
     float shared_sum_sq = 0.0f;
     for (uint i = tid; i < p.n; i += tg_size) {
         float e = 0.0f;
-        for (uint slot = 0u; slot < p.n_used; slot++) {
-            const uint expert_id = routing[slot];
-            const float weight = as_type<float>(routing[p.n_used + slot]) * expert_scales[expert_id];
-            e = fma(weight, expert_down[slot * p.src_stride + i], e);
+        if (p.n_used == 8u) {
+            e = fma(route_weights[0], expert_down[i], e);
+            e = fma(route_weights[1], expert_down[p.src_stride + i], e);
+            e = fma(route_weights[2], expert_down[2u * p.src_stride + i], e);
+            e = fma(route_weights[3], expert_down[3u * p.src_stride + i], e);
+            e = fma(route_weights[4], expert_down[4u * p.src_stride + i], e);
+            e = fma(route_weights[5], expert_down[5u * p.src_stride + i], e);
+            e = fma(route_weights[6], expert_down[6u * p.src_stride + i], e);
+            e = fma(route_weights[7], expert_down[7u * p.src_stride + i], e);
+        } else {
+            for (uint slot = 0u; slot < p.n_used; slot++) {
+                e = fma(route_weights[slot], expert_down[slot * p.src_stride + i], e);
+            }
         }
         const float s = shared_in[i];
         expert_sum_sq = fma(e, e, expert_sum_sq);
