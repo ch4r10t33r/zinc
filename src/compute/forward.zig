@@ -9470,27 +9470,30 @@ pub const InferenceEngine = struct {
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), n_tokens, 1, 1);
     }
 
-    /// Effort-15 cycle 16: env-gated wrapper around dispatchResidualRmsNormQuantQ8_1.
+    /// Env-gated wrapper around dispatchResidualRmsNormQuantQ8_1.
     /// Returns true if the fused path ran, false to indicate the caller should
     /// use the standard dispatchResidualRmsNorm + the downstream gate+up path
     /// will run its own quantize_act_q8_1 dispatch.
-    fn qwen36DenseFuseRmsQuantEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+    fn qwenDenseFuseRmsQuantEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
-        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
-        if (!self.qwen36Dp4aDownEnabled()) return false;
+        if (!self.qwenDenseFfnDp4aEnabled(n_tokens)) return false;
         if (self.elementwise.pipeline_residual_rms_norm_quant_q8_1 == null) return false;
         if (self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a == null) return false;
         if (self.batched_scratch_hidden_i8 == null) return false;
         if (self.batched_scratch_hidden_scale_dsum == null) return false;
         const cfg = self.model.config;
         if ((cfg.hidden_dim & 255) != 0) return false;
-        // Threshold matches the DP4a gate+up path so the fused shader's output
-        // is actually consumed (n_tokens < 128 falls back to the f32 path).
-        if (n_tokens < 128) return false;
-        if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
-            if (std.mem.eql(u8, v, "0")) return false;
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): 128 tokens for the
+        // 27B dense hybrid, 64 tokens for the Qwen3.5 9B public long-draft
+        // prompt. That guarantees the fused shader's packed output is
+        // consumed by the downstream dense gate+up DP4a path.
+        if (self.isQwen36DenseHybrid27B()) {
+            if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
+                if (std.mem.eql(u8, v, "0")) return false;
+            }
         }
         return true;
     }
@@ -9502,12 +9505,12 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         scratch_swiglu: Buffer,
     ) bool {
-        if (!self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) return false;
+        if (!self.qwenDenseFuseRmsQuantEnabled(n_tokens)) return false;
         if (!self.use_qwen36_batched_fused_gateup) return false;
         const layer_idx: usize = @intCast(layer);
         if (layer_idx >= self.layer_tensors.len) return false;
         if ((hidden_dim & 255) != 0) return false;
-        if (n_tokens < 128) return false;
+        if (!self.qwenDenseFfnDp4aEnabled(n_tokens)) return false;
 
         const cfg = self.model.config;
         const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
@@ -14715,7 +14718,7 @@ pub const InferenceEngine = struct {
                 // FFN call will run its DP4a gate+up path, emit the packed
                 // Q8_1 activation here in the same dispatch so the dense FFN
                 // skips its quantize_act_q8_1 pre-pass.
-                if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+                if (self.qwenDenseFuseRmsQuantEnabled(n_tokens)) {
                     const h_i8 = self.batched_scratch_hidden_i8.?;
                     const h_sd = self.batched_scratch_hidden_scale_dsum.?;
                     const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_swiglu);
@@ -15022,7 +15025,7 @@ pub const InferenceEngine = struct {
                 // FFN call will run its DP4a gate+up path, emit the packed
                 // Q8_1 activation here in the same dispatch so the dense FFN
                 // skips its quantize_act_q8_1 pre-pass.
-                if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+                if (self.qwenDenseFuseRmsQuantEnabled(n_tokens)) {
                     const h_i8 = self.batched_scratch_hidden_i8.?;
                     const h_sd = self.batched_scratch_hidden_scale_dsum.?;
                     const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_swiglu);
@@ -15637,7 +15640,7 @@ pub const InferenceEngine = struct {
         // layer-major path added in cycle 13. The caller propagates
         // input_pre_quantized=true to prefillQwen36RunBatchedDenseFfnLayer
         // via the segment loop's segment_pre_quantized.
-        if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
+        if (self.qwenDenseFuseRmsQuantEnabled(n_tokens)) {
             const h_i8 = self.batched_scratch_hidden_i8.?;
             const h_sd = self.batched_scratch_hidden_scale_dsum.?;
             const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_packed_qgate);
@@ -16348,7 +16351,7 @@ pub const InferenceEngine = struct {
             // decodeStep loop builds scratch_norm element-by-element so its
             // RMS norm cannot inline a per-32-block activation quant.
             const prefix_ran_ssm_segment = !is_full_attn and !use_ssm_preproj;
-            const prefix_pre_quantized = prefix_ran_ssm_segment and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
+            const prefix_pre_quantized = prefix_ran_ssm_segment and self.qwenDenseFuseRmsQuantEnabled(n_tokens);
             if (prefix_ran_ssm_segment) {
                 try self.prefillQwen36RunSsmLayerToFfnNorm(
                     state,
@@ -16447,7 +16450,7 @@ pub const InferenceEngine = struct {
             const segment_full_attn_layer_major = segment_is_full_attn and
                 self.qwen36DensePrefillFullAttnBatchedEnabled(n_tokens);
             const segment_layer_major = !segment_is_full_attn or segment_full_attn_layer_major;
-            const segment_pre_quantized = segment_layer_major and self.qwen36DenseFuseRmsQuantEnabled(n_tokens);
+            const segment_pre_quantized = segment_layer_major and self.qwenDenseFuseRmsQuantEnabled(n_tokens);
             const segment_is_final_layer = segment_layer + 1 == cfg.n_layers;
             if (segment_is_final_layer and segment_full_attn_layer_major) {
                 try self.prefillQwen36RunFinalFullAttnKvOnly(
