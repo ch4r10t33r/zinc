@@ -12129,6 +12129,15 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         n_tokens < 32 and
         engine.moe_route_ids_pipe.handle != null and
         engine.moe_route_scatter_direct_scaled_pipe.handle != null;
+    const use_active_blocks = !use_route_slot_moe and engine.moe_route_pack_blocks_pipe.handle != null;
+    const active_block_upper_bound = if (use_active_blocks)
+        maxPackedMoeRouteBlocks(route_slots, cfg.n_experts)
+    else
+        0;
+    if (!use_route_slot_moe) {
+        const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+        recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
+    }
 
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
     cmd.barrier();
@@ -12141,6 +12150,19 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     cmd.barrier();
     if (use_route_slot_moe) {
         dispatchMoeRouteIdsOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_packed_ids, n_tokens, cfg.n_experts_used);
+    } else if (use_active_blocks) {
+        dispatchMoeRoutePackBlocksOnCmd(
+            engine,
+            cmd,
+            &scratch.moe_routing,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_block_count,
+            &scratch.moe_active_blocks,
+            n_tokens,
+            cfg.n_experts,
+            cfg.n_experts_used,
+        );
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
     }
@@ -12179,6 +12201,47 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             gate_up_layout.up_expert_stride,
             hidden_dim,
             gate_up_layout.up_base_offset,
+        );
+    } else if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            1,
+            active_block_upper_bound,
+        );
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            1,
+            active_block_upper_bound,
         );
     } else {
         try dispatchDmmvMoeColsOnCmd(
@@ -12244,6 +12307,27 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
             inter_dim,
             0,
+        );
+    } else if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            active_block_upper_bound,
         );
     } else {
         try dispatchDmmvMoeColsOnCmd(
