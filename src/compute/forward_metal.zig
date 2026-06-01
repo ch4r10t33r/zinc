@@ -18912,6 +18912,7 @@ fn runDecodeStep(
         };
     };
     var initial_attn_norm_ready = false;
+    var initial_hidden_barrier_deferred = false;
     if (engine.private_decode_buffers or embed_src_override != null) {
         const cmd = shared_cmd orelse return error.PrivateDecodeFastPathRequiresSharedCommand;
         if (qwen_branch_hidden_seed == null) {
@@ -18937,8 +18938,13 @@ fn runDecodeStep(
                     hidden_dim,
                     embed_src_offset,
                 );
-                profileBarrierBuffers(cmd, profile, .embed, &.{ &engine.hidden_buf, &engine.norm_buf });
+                // The immediate Q/K/V projections consume only norm_buf. Defer
+                // hidden_buf's resource edge until the layer-0 residual add so
+                // the concurrent encoder does not serialize that unrelated
+                // consumer at the embedding boundary.
+                profileBarrierBuffers(cmd, profile, .embed, &.{&engine.norm_buf});
                 initial_attn_norm_ready = true;
+                initial_hidden_barrier_deferred = true;
             } else {
                 dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
                 // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
@@ -19079,7 +19085,12 @@ fn runDecodeStep(
             } else {
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
             }
-            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
+            if (initial_hidden_barrier_deferred and layer_idx == 0) {
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.down_buf, &engine.hidden_buf });
+                initial_hidden_barrier_deferred = false;
+            } else {
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
+            }
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
                 dispatchAddBiasOnCmd(engine, cmd, &engine.down_buf, b, hidden_dim);
