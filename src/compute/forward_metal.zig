@@ -1909,6 +1909,18 @@ const GemmaMoePostNormResidualPush = extern struct {
     has_final_norm: u32,
 };
 
+const GemmaMoeWeightedPostNormResidualPush = extern struct {
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    scale_offset: u32,
+    expert_weight_offset: u32,
+    shared_weight_offset: u32,
+    has_gate: u32,
+    has_final_norm: u32,
+    eps: f32,
+};
+
 /// Push constants for fused MoE weighted acc + shared expert (matches moe_weighted_acc_shared.metal: buffer(3)).
 /// Eliminates one barrier per layer vs separate moe_weighted_acc + sigmoid_scale_acc.
 const MoeWeightedAccSharedPush = extern struct {
@@ -3227,6 +3239,7 @@ pub const InferenceEngine = struct {
     rms_norm_pipe: MetalPipeline,
     rms_norm_offset_pipe: MetalPipeline,
     gemma_moe_post_norm_residual_pipe: MetalPipeline,
+    gemma_moe_weighted_post_norm_residual_pipe: MetalPipeline,
     moe_acc_pipe: MetalPipeline,
     moe_acc_batched_pipe: MetalPipeline,
     moe_acc_batched_bias_pipe: MetalPipeline,
@@ -3884,6 +3897,7 @@ pub const InferenceEngine = struct {
         self.rms_norm_pipe = try loadShaderPipeline(ctx, "rms_norm_mul");
         self.rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
         self.gemma_moe_post_norm_residual_pipe = try loadShaderPipeline(ctx, "gemma_moe_post_norm_residual");
+        self.gemma_moe_weighted_post_norm_residual_pipe = try loadShaderPipeline(ctx, "gemma_moe_weighted_post_norm_residual");
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
         self.moe_acc_batched_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
         self.moe_acc_batched_bias_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias");
@@ -4823,6 +4837,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.rms_norm_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_offset_pipe);
         metal_pipeline.freePipeline(&self.gemma_moe_post_norm_residual_pipe);
+        metal_pipeline.freePipeline(&self.gemma_moe_weighted_post_norm_residual_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_bias_pipe);
@@ -9942,6 +9957,53 @@ fn dispatchGemmaMoePostNormResidualOnCmd(
         if (n >= 1024) @as(u32, 1024) else if (n >= 256) @as(u32, 256) else @as(u32, 32),
     );
     cmd.dispatchV2(&engine.gemma_moe_post_norm_residual_pipe, .{ 1, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(GemmaMoePostNormResidualPush), 0);
+}
+
+fn dispatchGemmaMoeWeightedPostNormResidualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    expert_down: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    expert_scales: *const metal_loader.LoadedTensor,
+    shared_in: *const MetalBuffer,
+    hidden: *const MetalBuffer,
+    expert_weights: *const metal_loader.LoadedTensor,
+    shared_weights: *const metal_loader.LoadedTensor,
+    final_weights: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    has_gate: bool,
+    has_final_norm: bool,
+) void {
+    const push = GemmaMoeWeightedPostNormResidualPush{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .scale_offset = @intCast(tensorPageOffset(engine.model, expert_scales) / @sizeOf(f32)),
+        .expert_weight_offset = @intCast(tensorPageOffset(engine.model, expert_weights) / @sizeOf(f32)),
+        .shared_weight_offset = @intCast(tensorPageOffset(engine.model, shared_weights) / @sizeOf(f32)),
+        .has_gate = if (has_gate) 1 else 0,
+        .has_final_norm = if (has_final_norm) 1 else 0,
+        .eps = engine.config.rms_norm_eps,
+    };
+    const bufs = [_]*const MetalBuffer{
+        expert_down,
+        routing,
+        &expert_scales.gpu_buffer,
+        shared_in,
+        hidden,
+        &expert_weights.gpu_buffer,
+        &shared_weights.gpu_buffer,
+        final_weights,
+        gate_buf,
+    };
+    const tg_size: u32 = @min(
+        @max(engine.gemma_moe_weighted_post_norm_residual_pipe.max_threads_per_threadgroup, 32),
+        if (n >= 1024) @as(u32, 1024) else if (n >= 256) @as(u32, 256) else @as(u32, 32),
+    );
+    cmd.dispatchV2(&engine.gemma_moe_weighted_post_norm_residual_pipe, .{ 1, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(GemmaMoeWeightedPostNormResidualPush), 0);
 }
 
 /// Fused residual-add + RMS norm: hidden += scale * residual; norm_out = weights * normalize(hidden).
@@ -17341,6 +17403,42 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     profileBarrier(cmd, profile, .gpu_routed_moe); // down outputs visible before accumulate
 
     const validate_moe = shouldValidateGemmaMoe(engine, layer_idx);
+    const use_fused_post_norm_residual =
+        !validate_moe and
+        (engine.in_prefill_phase or engine.gemma_moe_post_norm_residual_decode_enabled) and
+        hidden_dim <= 16 * 1024 and
+        engine.gemma_moe_post_norm_residual_pipe.handle != null;
+    const use_fused_weighted_post_norm_residual =
+        use_fused_post_norm_residual and
+        engine.in_prefill_phase and
+        engine.gemma_moe_weighted_post_norm_residual_pipe.handle != null;
+    if (use_fused_weighted_post_norm_residual) {
+        // Fuse Gemma's scaled top-k expert reduce into the post-MoE norm/residual
+        // tail. This removes the standalone moe_weighted_acc_scaled dispatch and
+        // its dependency barrier on the token-major prefill path while preserving
+        // the same ffn_down_exps_scale folding.
+        dispatchGemmaMoeWeightedPostNormResidualOnCmd(
+            engine,
+            cmd,
+            &engine.expert_down_batch_buf,
+            &engine.router_output_buf,
+            down_scales,
+            &engine.down_buf,
+            &engine.hidden_buf,
+            post_ffw_norm_2,
+            post_ffw_norm_1,
+            &engine.post_ffn_norm_bufs[layer_idx],
+            &engine.router_logits_buf,
+            hidden_dim,
+            cfg.n_experts_used,
+            hidden_dim,
+            lt.ffn_gate_inp_shexp != null,
+            engine.post_ffn_norm_present[layer_idx],
+        );
+        profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+        return;
+    }
+
     dispatchMoeWeightedAccScaledOnCmd(
         engine,
         cmd,
@@ -17354,11 +17452,6 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     );
     profileBarrier(cmd, profile, .gpu_routed_moe); // expert contribution visible before post expert norm
 
-    const use_fused_post_norm_residual =
-        !validate_moe and
-        (engine.in_prefill_phase or engine.gemma_moe_post_norm_residual_decode_enabled) and
-        hidden_dim <= 16 * 1024 and
-        engine.gemma_moe_post_norm_residual_pipe.handle != null;
     if (use_fused_post_norm_residual) {
         dispatchGemmaMoePostNormResidualOnCmd(
             engine,
@@ -21632,6 +21725,145 @@ test "gemma_moe_post_norm_residual fuses post MoE tail" {
 
     for (0..n) |i| {
         try std.testing.expectApproxEqAbs(expected[i], hidden[i], 0.00001);
+    }
+}
+
+test "gemma_moe_weighted_post_norm_residual folds scaled expert reduce" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemma_moe_weighted_post_norm_residual");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n: u32 = 10;
+    const n_used: u32 = 3;
+    const src_stride: u32 = n;
+    const n_experts: u32 = 5;
+    const scale_offset: u32 = 2;
+    const expert_weight_offset: u32 = 3;
+    const shared_weight_offset: u32 = 4;
+    const eps: f32 = 1e-6;
+
+    var expert_buf = try metal_buffer.createBuffer(ctx, n_used * src_stride * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&expert_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var scales_buf = try metal_buffer.createBuffer(ctx, (scale_offset + n_experts) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&scales_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var expert_weights_buf = try metal_buffer.createBuffer(ctx, (expert_weight_offset + n) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&expert_weights_buf);
+    var shared_weights_buf = try metal_buffer.createBuffer(ctx, (shared_weight_offset + n) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_weights_buf);
+    var final_weights_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&final_weights_buf);
+    var gate_buf = try metal_buffer.createBuffer(ctx, @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_buf);
+
+    const expert: [*]f32 = @ptrCast(@alignCast(expert_buf.cpu_ptr.?));
+    const routing: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const scales: [*]f32 = @ptrCast(@alignCast(scales_buf.cpu_ptr.?));
+    const shared: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const hidden: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    const expert_weights: [*]f32 = @ptrCast(@alignCast(expert_weights_buf.cpu_ptr.?));
+    const shared_weights: [*]f32 = @ptrCast(@alignCast(shared_weights_buf.cpu_ptr.?));
+    const final_weights: [*]f32 = @ptrCast(@alignCast(final_weights_buf.cpu_ptr.?));
+    const gate: [*]f32 = @ptrCast(@alignCast(gate_buf.cpu_ptr.?));
+
+    const expert_ids = [_]u32{ 2, 0, 4 };
+    const route_weights = [_]f32{ 0.20, 0.35, 0.45 };
+    for (0..n_used) |slot| {
+        routing[slot] = expert_ids[slot];
+        routing[n_used + slot] = @as(u32, @bitCast(route_weights[slot]));
+    }
+    for (0..scale_offset + n_experts) |i| scales[i] = -7.0;
+    scales[scale_offset + 0] = 0.75;
+    scales[scale_offset + 1] = 1.25;
+    scales[scale_offset + 2] = 1.50;
+    scales[scale_offset + 3] = 0.50;
+    scales[scale_offset + 4] = 1.10;
+
+    for (0..expert_weight_offset + n) |i| expert_weights[i] = -9.0;
+    for (0..shared_weight_offset + n) |i| shared_weights[i] = -8.0;
+    for (0..n) |i| {
+        const ii: f32 = @floatFromInt(i);
+        shared[i] = -0.07 * (ii - 5.0);
+        hidden[i] = 0.5 + 0.04 * ii;
+        expert_weights[expert_weight_offset + i] = 0.90 + 0.02 * ii;
+        shared_weights[shared_weight_offset + i] = 1.05 - 0.015 * ii;
+        final_weights[i] = 0.80 + 0.01 * ii;
+        for (0..n_used) |slot| {
+            const ss: f32 = @floatFromInt(slot);
+            expert[slot * src_stride + i] = 0.03 * (ii + 1.0) * (ss + 1.0) - 0.11 * ss;
+        }
+    }
+    gate[0] = -0.4;
+
+    var expected: [n]f32 = undefined;
+    var expert_reduced: [n]f32 = undefined;
+    for (0..n) |i| {
+        expected[i] = hidden[i];
+        expert_reduced[i] = 0.0;
+        for (0..n_used) |slot| {
+            const eid = expert_ids[slot];
+            expert_reduced[i] += route_weights[slot] * scales[scale_offset + eid] * expert[slot * src_stride + i];
+        }
+    }
+
+    var expert_sum: f32 = 0;
+    var shared_sum: f32 = 0;
+    for (0..n) |i| {
+        expert_sum += expert_reduced[i] * expert_reduced[i];
+        shared_sum += shared[i] * shared[i];
+    }
+    const expert_rms = 1.0 / @sqrt(expert_sum / @as(f32, @floatFromInt(n)) + eps);
+    const shared_rms = 1.0 / @sqrt(shared_sum / @as(f32, @floatFromInt(n)) + eps);
+    const gate_value = 1.0 / (1.0 + @exp(-gate[0]));
+    var combined: [n]f32 = undefined;
+    var combined_sum: f32 = 0;
+    for (0..n) |i| {
+        combined[i] = expert_weights[expert_weight_offset + i] * (expert_reduced[i] * expert_rms) +
+            gate_value * shared_weights[shared_weight_offset + i] * (shared[i] * shared_rms);
+        combined_sum += combined[i] * combined[i];
+    }
+    const combined_rms = 1.0 / @sqrt(combined_sum / @as(f32, @floatFromInt(n)) + eps);
+    for (0..n) |i| {
+        expected[i] += final_weights[i] * (combined[i] * combined_rms);
+    }
+
+    const push = GemmaMoeWeightedPostNormResidualPush{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .scale_offset = scale_offset,
+        .expert_weight_offset = expert_weight_offset,
+        .shared_weight_offset = shared_weight_offset,
+        .has_gate = 1,
+        .has_final_norm = 1,
+        .eps = eps,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &expert_buf,
+        &routing_buf,
+        &scales_buf,
+        &shared_buf,
+        &hidden_buf,
+        &expert_weights_buf,
+        &shared_weights_buf,
+        &final_weights_buf,
+        &gate_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(GemmaMoeWeightedPostNormResidualPush), 0);
+    cmd.commitAndWait();
+
+    for (0..n) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], hidden[i], 0.00002);
     }
 }
 
