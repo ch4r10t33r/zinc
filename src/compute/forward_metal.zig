@@ -12141,8 +12141,6 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
 
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
     cmd.barrier();
-    const router_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
-    dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, total_hidden, router_scale, null, .router);
     dispatchGemmBatchedOnCmd(engine, cmd, router_t, &scratch.down, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
     cmd.barrier();
 
