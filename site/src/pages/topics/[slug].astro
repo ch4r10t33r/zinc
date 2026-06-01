@@ -79,10 +79,39 @@ const jsonLd = {
       <p>{hub.practicalAnswer}</p>
     </section>
 
+    <section aria-labelledby="best-use">
+      <h2 id="best-use">When This Page Helps</h2>
+      <p class="section-note">{hub.bestUse}</p>
+    </section>
+
+    <section aria-labelledby="action-plan">
+      <h2 id="action-plan">Action Plan</h2>
+      <ol class="brief-list">
+        {hub.actionPlan.map((item) => (
+          <li>
+            <strong>{item.label}</strong>
+            <span>{item.detail}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+
     <section aria-labelledby="what-matters">
       <h2 id="what-matters">What Matters</h2>
       <ul class="clean-list">
         {hub.whatMatters.map((item) => <li>{item}</li>)}
+      </ul>
+    </section>
+
+    <section aria-labelledby="pitfalls">
+      <h2 id="pitfalls">Common Traps</h2>
+      <ul class="brief-list plain">
+        {hub.pitfalls.map((item) => (
+          <li>
+            <strong>{item.label}</strong>
+            <span>{item.detail}</span>
+          </li>
+        ))}
       </ul>
     </section>
 
@@ -136,12 +165,15 @@ const jsonLd = {
 <style>
   .topic-hub {
     display: grid;
-    gap: var(--space-xl);
+    gap: var(--space-lg);
   }
 
   .topic-header {
-    padding-bottom: var(--space-lg);
-    border-bottom: 1px solid var(--color-border);
+    padding-bottom: var(--space-sm);
+  }
+
+  .topic-hub h2 {
+    margin-top: 0;
   }
 
   .eyebrow {
@@ -159,7 +191,7 @@ const jsonLd = {
   }
 
   .answer-band {
-    padding: var(--space-lg) 0;
+    padding: var(--space-md) 0 var(--space-lg);
     border-top: 1px solid var(--color-border);
     border-bottom: 1px solid var(--color-border);
   }
@@ -173,10 +205,51 @@ const jsonLd = {
     font-size: 1.04rem;
   }
 
+  .section-note {
+    max-width: 48rem;
+    color: var(--color-text-muted);
+  }
+
   .clean-list {
     display: grid;
     gap: var(--space-sm);
     padding-left: 1.2rem;
+  }
+
+  .brief-list {
+    display: grid;
+    gap: var(--space-sm);
+    max-width: 54rem;
+    padding-left: 1.25rem;
+  }
+
+  .brief-list.plain {
+    list-style: none;
+    padding-left: 0;
+  }
+
+  .brief-list li {
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .brief-list li:last-child {
+    border-bottom: none;
+  }
+
+  .brief-list strong,
+  .brief-list span {
+    display: block;
+  }
+
+  .brief-list strong {
+    margin-bottom: 0.2rem;
+  }
+
+  .brief-list span {
+    color: var(--color-text-muted);
+    font-size: 0.94rem;
+    line-height: 1.55;
   }
 
   .link-grid {

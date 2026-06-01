@@ -4,6 +4,12 @@ https://www.zolotukhin.ai/*  https://zolotukhin.ai/:splat             301
 
 /about                       /about/                                  301
 /blog                        /blog/                                   301
+/blog/*.svg                  /blog/:splat.svg                         200
+/blog/*.png                  /blog/:splat.png                         200
+/blog/*.jpg                  /blog/:splat.jpg                         200
+/blog/*.jpeg                 /blog/:splat.jpeg                        200
+/blog/*.gif                  /blog/:splat.gif                         200
+/blog/*.webp                 /blog/:splat.webp                        200
 /blog/:slug                  /blog/:slug/                             301
 /topics                      /topics/                                 301
 /topics/:slug                /topics/:slug/                           301
