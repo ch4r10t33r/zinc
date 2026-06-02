@@ -12627,7 +12627,13 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     cmd.barrier();
 
-    dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
+    // vLLM's fused MoE route-slot kernels write each output block directly;
+    // for Gemma's <32-token direct route path, do the same and skip the
+    // full [N,H] zero dispatch. The expert-grouped scatter still accumulates
+    // into scratch.down, so it keeps the zero.
+    if (!use_route_slot_moe) {
+        dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
+    }
     if (use_route_slot_moe) {
         try dispatchDmmvMoeRoutesOnCmd(
             engine,
@@ -28450,7 +28456,7 @@ test "moe_route_scatter_scaled folds per-expert scale into routing weight" {
     }
 }
 
-test "moe_route_scatter_direct_scaled accumulates route-order outputs" {
+test "moe_route_scatter_direct_scaled materializes route-order outputs" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
     defer shim.mtl_destroy(ctx);
@@ -28517,10 +28523,7 @@ test "moe_route_scatter_direct_scaled accumulates route-order outputs" {
     cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterDirectScaledPush), 0);
     cmd.commitAndWait();
 
-    var expected = [_]f32{
-        1.0, 1.0, 1.0, 1.0,
-        2.0, 2.0, 2.0, 2.0,
-    };
+    var expected = [_]f32{0.0} ** (n_tokens * hidden_dim);
     for (0..n_tokens) |token| {
         const row = token * routing_stride;
         for (0..k) |slot| {

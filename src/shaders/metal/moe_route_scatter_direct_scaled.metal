@@ -6,6 +6,9 @@ using namespace metal;
 // src is [n_tokens * k][hidden_dim] in route order.
 // routing is [n_tokens][ids(k), weights(k)].
 // dst is [n_tokens][hidden_dim].
+//
+// This direct route-order path materializes the full weighted sum for each
+// token/dimension. The caller does not need to pre-zero dst.
 
 struct Params {
     uint n_tokens;
@@ -46,5 +49,5 @@ kernel void main0(
         sum += weight * scales[p.scale_offset + expert_id] * src[(token * p.k + slot) * p.hidden_dim + dim];
     }
 
-    dst[id] += sum;
+    dst[id] = sum;
 }
