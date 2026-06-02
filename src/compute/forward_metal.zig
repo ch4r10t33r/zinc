@@ -13446,11 +13446,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             n_tokens,
         );
     }
-    if (use_fused_gate_up_geglu_routes or use_fused_gate_up_geglu_cols) {
-        profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{&scratch.moe_expert_swiglu});
-    } else {
-        profileGpuMoeBarrierBuffers(cmd, profile, .gate_up, &.{ &scratch.moe_expert_gate, &scratch.moe_expert_up });
-    }
+    profileGpuMoeBarrier(cmd, profile, if (use_fused_gate_up_geglu_routes or use_fused_gate_up_geglu_cols) .activation else .gate_up);
 
     if (!use_fused_gate_up_geglu_routes and !use_fused_gate_up_geglu_cols) {
         const push = SwiGLUPush{ .n = inter_dim };
