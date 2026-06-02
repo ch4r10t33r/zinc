@@ -240,8 +240,9 @@ export function buildCodingContinuationGuardMessage(body) {
   return [
     "OpenCode continuation guard: Continue the coding task with tool calls.",
     "Do not summarize instead of acting when tests are still failing.",
+    "If you have identified multiple source bugs, fix all known source bugs in one edit before yielding.",
     "Never call edit or write on package.json or files under /test/ unless the user explicitly asks to change tests.",
-    `${source} Run the project tests after source edits.`,
+    `${source} Run the project tests after source edits, and do not give the final response until the tests pass.`,
   ].join("\n");
 }
 

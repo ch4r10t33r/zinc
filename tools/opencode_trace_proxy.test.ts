@@ -116,7 +116,9 @@ describe("request shaping", () => {
     const guard = buildPathGuardMessage(body);
     expect(guard).toContain("src/cart.mjs");
     expect(guard).toContain("package and test files are read-only");
-    expect(buildCodingContinuationGuardMessage(body)).toContain("Run the project tests");
+    const continuation = buildCodingContinuationGuardMessage(body);
+    expect(continuation).toContain("fix all known source bugs in one edit");
+    expect(continuation).toContain("do not give the final response until the tests pass");
   });
 
   test("extractKnownFilePaths promotes directory entries", () => {
