@@ -1114,6 +1114,24 @@ fn profileFullAttnQkvBarrier(
     profileBarrierBuffers(cmd, profile, .full_attn, bufs[0..count]);
 }
 
+fn profileBatchedPrefillQkvBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, use_k_as_v: bool) void {
+    if (use_k_as_v) {
+        profileResourceBarrierBuffers(cmd, profile, .full_attn, &.{ &scratch.q, &scratch.k });
+    } else {
+        profileResourceBarrierBuffers(cmd, profile, .full_attn, &.{ &scratch.q, &scratch.k, &scratch.v });
+    }
+}
+
+fn profileBatchedPrefillQkBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, include_q: bool, include_k: bool) void {
+    if (include_q and include_k) {
+        profileResourceBarrierBuffers(cmd, profile, .full_attn, &.{ &scratch.q, &scratch.k });
+    } else if (include_q) {
+        profileResourceBarrierBuffers(cmd, profile, .full_attn, &.{&scratch.q});
+    } else if (include_k) {
+        profileResourceBarrierBuffers(cmd, profile, .full_attn, &.{&scratch.k});
+    }
+}
+
 fn fullAttentionInterval(cfg: ModelConfig) u32 {
     return if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
 }
@@ -6766,25 +6784,25 @@ pub const InferenceEngine = struct {
             const is_gemma_moe = cfg.architecture == .gemma and hasExplicitGemmaMoeTensors(cfg, lt);
 
             dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{&scratch.norm});
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
             }
-            cmd.barrier();
+            profileBatchedPrefillQkvBarrier(&cmd, profile, &scratch, attn.use_k_as_v);
 
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
             if (apply_v_unit_norm) {
                 const v_src = if (attn.use_k_as_v) &scratch.k else &scratch.v;
                 dispatchRmsNormOnCmd(self, &cmd, v_src, &scratch.v, &self.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads * n_tokens);
                 if (attn.use_k_as_v) {
-                    cmd.barrier();
+                    profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{ &scratch.k, &scratch.v });
                 }
             } else if (attn.use_k_as_v) {
                 dispatchCopyF32OnCmd(self, &cmd, &scratch.k, &scratch.v, n_tokens * attn.kv_dim);
-                cmd.barrier();
+                profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{ &scratch.k, &scratch.v });
             }
             if (self.attn_q_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.q, &scratch.q, &self.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
@@ -6792,14 +6810,12 @@ pub const InferenceEngine = struct {
             if (self.attn_k_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.k, &scratch.k, &self.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
             }
-            if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx] or apply_v_unit_norm) {
-                cmd.barrier();
-            }
+            profileBatchedPrefillQkBarrier(&cmd, profile, &scratch, self.attn_q_norm_present[layer_idx], self.attn_k_norm_present[layer_idx]);
 
             const rope_freq_buf = selectRopeFreqBuffer(self, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.k, &scratch.k, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{ &scratch.k, &scratch.v });
 
             const kv_len = position_base + n_tokens;
             if (self.kv_cache_q8) {
@@ -6810,7 +6826,7 @@ pub const InferenceEngine = struct {
                 const dst_elements = position_base * attn.kv_dim;
                 dispatchKvCacheWriteBatchedOnCmd(self, &cmd, layer_idx, &scratch.k, &scratch.v, dst_elements, n_tokens * attn.kv_dim);
             }
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{ &scratch.q, &self.kv_k_cache[layer_idx], &self.kv_v_cache[layer_idx] });
 
             if (self.kv_cache_q8) {
                 dispatchFlashAttnBatchedQ8OnCmd(
@@ -6849,13 +6865,13 @@ pub const InferenceEngine = struct {
                     attn.sliding_window_size,
                 );
             }
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{&scratch.attn_out});
 
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{&scratch.down});
             if (self.post_attn_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                cmd.barrier();
+                profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{&scratch.down});
             }
 
             {
@@ -6863,7 +6879,7 @@ pub const InferenceEngine = struct {
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
-            cmd.barrier();
+            profileResourceBarrierBuffers(&cmd, profile, .full_attn, &.{ &scratch.hidden, &scratch.norm });
 
             if (is_gemma_moe) {
                 try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
