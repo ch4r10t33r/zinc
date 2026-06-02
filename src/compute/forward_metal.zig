@@ -18762,7 +18762,32 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             dispatchDmmvOnCmd(engine, cmd, gate_tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
         }
     }
-    profileGpuMoeBarrier(cmd, profile, .gate_up); // gate/up/shared projections visible before GeGLU
+    {
+        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: the next
+        // kernels consume only the routed/shared activation inputs and optional
+        // shared-gate scalar, so order those buffers instead of flushing the
+        // whole encoder at this hot Gemma token-major MoE edge.
+        var barrier_bufs: [5]*const MetalBuffer = undefined;
+        var barrier_count: usize = 0;
+        if (use_fused_gate_up_geglu) {
+            barrier_bufs[barrier_count] = &engine.expert_swiglu_batch_buf;
+            barrier_count += 1;
+        } else {
+            barrier_bufs[barrier_count] = &engine.expert_gate_batch_buf;
+            barrier_count += 1;
+            barrier_bufs[barrier_count] = &engine.expert_up_batch_buf;
+            barrier_count += 1;
+        }
+        barrier_bufs[barrier_count] = &engine.gate_buf;
+        barrier_count += 1;
+        barrier_bufs[barrier_count] = &engine.up_buf;
+        barrier_count += 1;
+        if (lt.ffn_gate_inp_shexp != null and !shared_gate_precomputed) {
+            barrier_bufs[barrier_count] = &engine.router_logits_buf;
+            barrier_count += 1;
+        }
+        profileGpuMoeBarrierBuffers(cmd, profile, .gate_up, barrier_bufs[0..barrier_count]);
+    }
 
     if (!use_fused_gate_up_geglu) {
         const push = SwiGLUPush{ .n = inter_dim };
@@ -18770,7 +18795,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
-    profileGpuMoeBarrier(cmd, profile, .activation); // activations visible before down projections
+    profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{ &engine.expert_swiglu_batch_buf, &engine.swiglu_buf }); // activations visible before down projections
 
     try dispatchDmmvMoeOnCmd(
         engine,
