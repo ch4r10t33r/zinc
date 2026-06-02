@@ -18502,7 +18502,15 @@ fn runGemmaExplicitMoeFallback(
         dispatchDmmvOnCmd(engine, &cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, &cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
     }
-    profileBarrier(&cmd, profile, .fallback_moe);
+    if (use_batched_moe_dispatch) {
+        if (has_shexp) {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_gate_batch_buf, &engine.expert_up_batch_buf, &engine.gate_buf, &engine.up_buf });
+        } else {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_gate_batch_buf, &engine.expert_up_batch_buf });
+        }
+    } else {
+        profileBarrier(&cmd, profile, .fallback_moe);
+    }
 
     if (use_batched_moe_dispatch) {
         // Batched GeGLU across all n_experts_used experts in one dispatch.
@@ -18517,7 +18525,15 @@ fn runGemmaExplicitMoeFallback(
     if (has_shexp) {
         dispatchFfnActivationOnCmd(engine, &cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
     }
-    profileBarrier(&cmd, profile, .fallback_moe);
+    if (use_batched_moe_dispatch) {
+        if (has_shexp) {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_swiglu_batch_buf, &engine.swiglu_buf });
+        } else {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{&engine.expert_swiglu_batch_buf});
+        }
+    } else {
+        profileBarrier(&cmd, profile, .fallback_moe);
+    }
 
     const down_supported = engine.dmmvPipelineForType(down_exps, hidden_dim, inter_dim) != null;
     const use_batched_q8_down =
@@ -18665,7 +18681,11 @@ fn runGemmaExplicitMoeFallback(
     // projections above. Let the following barrier join both producer sets
     // before the weighted accumulate instead of serializing zero after down.
     dispatchZeroF32OnCmd(engine, &cmd, &engine.moe_out_buf, hidden_dim);
-    profileBarrier(&cmd, profile, .fallback_moe);
+    if (use_batched_down) {
+        profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.moe_out_buf, &engine.expert_down_batch_buf, &engine.down_buf });
+    } else {
+        profileBarrier(&cmd, profile, .fallback_moe);
+    }
     if (cfg.n_experts_used == 8) {
         if (use_batched_down) {
             const moe_push = MoeAccBatchedPush{
