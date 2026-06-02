@@ -1322,6 +1322,36 @@ export function hasDirectDecodeModelSliceEvidence(output: string): boolean {
   );
 }
 
+function maxPositiveCounter(output: string, names: string[]): number {
+  const pattern = new RegExp(`\\b(?:${names.join("|")})\\s*=\\s*(\\d+)\\b`, "ig");
+  let max = 0;
+  for (const match of output.matchAll(pattern)) {
+    max = Math.max(max, Number(match[1]));
+  }
+  return max;
+}
+
+function fieldValue(line: string, name: string): string | null {
+  const match = new RegExp(`\\b${name}\\s*=\\s*([a-z0-9_:-]+)`, "i").exec(line);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function directDecodeModelSliceOps(output: string): Set<string> {
+  const ops = new Set<string>();
+  for (const line of output.split(/\r?\n/)) {
+    if (!/\bphase\s*=\s*decode\b/i.test(line)) continue;
+    if (!hasUsefulModelSliceKind(line)) continue;
+    if (
+      !hasConsumedGpuModelValue(line) &&
+      !hasPositiveCounter(line, ["direct_compute_ops", "direct_model_ops"])
+    ) continue;
+
+    const op = fieldValue(line, "op") ?? fieldValue(line, "direct_compute_kind");
+    if (op != null) ops.add(op);
+  }
+  return ops;
+}
+
 export function isShortcutFreeZincRtOutput(output: string): boolean {
   if (!output.trim()) return false;
   if (isZincRtBenchmarkShortcut(output)) return false;
@@ -1429,7 +1459,21 @@ function hasNewDirectModelSliceSignal(before: ABBenchmark, after: ABBenchmark): 
 }
 
 function hasNewDirectDecodeModelSliceSignal(before: ABBenchmark, after: ABBenchmark): boolean {
-  return !hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput) && hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput);
+  if (!hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput)) {
+    return hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput);
+  }
+
+  const beforeCount = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const afterCount = maxPositiveCounter(after.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  if (afterCount > beforeCount) return true;
+
+  const beforeOps = directDecodeModelSliceOps(before.zinc_rt.runOutput);
+  const afterOps = directDecodeModelSliceOps(after.zinc_rt.runOutput);
+  for (const op of afterOps) {
+    if (!beforeOps.has(op)) return true;
+  }
+
+  return false;
 }
 
 function foundationPerformanceEnvelopeOk(before: ABBenchmark, after: ABBenchmark): boolean {

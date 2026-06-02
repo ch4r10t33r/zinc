@@ -109,6 +109,28 @@ describe("M1 migration keep signals", () => {
     expect(decision.reason).toContain("decode-phase");
   });
 
+  test("keeps incremental decode-phase model-slice evidence with bounded slowdown", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 3.37,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=5 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase=decode row=13 cols=4096 cpu=20.351450 gpu=20.351440 abs_delta=0.000010",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=1 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 3.37,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=4 direct_compute_kind=dmmv_row_range op=ssm_alpha_q4_0_row0 phase=decode layer=0 row=0 cols=4096 cpu=3.656229 gpu=3.656232 abs_delta=0.000003",
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=6 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase=decode row=13 cols=4096 cpu=20.351450 gpu=20.351423 abs_delta=0.000027",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=2 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+
+    const decision = decideMigrateKeep(before, after, null);
+    expect(decision.keep).toBe(true);
+    expect(decision.reason).toContain("decode-phase");
+  });
+
   test("keeps shortcut-free M1 measurement cleanup despite scalar slowdown", () => {
     const before = abBenchmark(benchmarkResult({
       decodeTps: 3.81,
