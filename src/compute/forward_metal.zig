@@ -2491,40 +2491,20 @@ fn resolveMoeGateUpLayout(lt: LayerTensors, inter_dim: u32, hidden_dim: u32) !Mo
 ///               checks against a real model.
 const BatchedPrefillMode = enum { off, on, validate };
 
-fn parseBatchedPrefillMode(raw: ?[]const u8) BatchedPrefillMode {
-    const value = raw orelse return .off;
-    if (std.mem.eql(u8, value, "1")) return .on;
-    if (std.mem.eql(u8, value, "validate")) return .validate;
-    return .off;
-}
-
 fn batchedPrefillMode() BatchedPrefillMode {
-    return parseBatchedPrefillMode(std.posix.getenv("ZINC_BATCHED_PREFILL"));
+    const raw = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return .off;
+    if (std.mem.eql(u8, raw, "1")) return .on;
+    if (std.mem.eql(u8, raw, "validate")) return .validate;
+    return .off;
 }
 
 fn batchedPrefillEnvPresent() bool {
     return std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
 }
 
-fn gemmaBatchedPrefillMode() BatchedPrefillMode {
-    return parseBatchedPrefillMode(std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL"));
-}
-
 fn gemmaBatchedPrefillEnabled() bool {
-    return gemmaBatchedPrefillMode() != .off;
-}
-
-fn effectiveBatchedPrefillMode(
-    cfg: ModelConfig,
-    requested_mode: BatchedPrefillMode,
-    generic_env_present: bool,
-    gemma_mode: BatchedPrefillMode,
-    dense_default: bool,
-) BatchedPrefillMode {
-    if (requested_mode != .off or generic_env_present) return requested_mode;
-    if (cfg.architecture == .gemma and cfg.n_experts > 0 and gemma_mode != .off) return gemma_mode;
-    if (dense_default) return .on;
-    return .off;
+    const raw = std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "validate");
 }
 
 fn supportsBatchedGemmQuant(t: GGMLType) bool {
@@ -5753,13 +5733,10 @@ pub const InferenceEngine = struct {
     fn defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
         if (!isGemma26A4BMoeShape(cfg)) return 1;
         if (prompt_len < 4) return 1;
-        // Keep the exact 20-token Gemma chat verifier on the accepted
-        // [1,5,7,7] split below. Longer public-suite prompts otherwise spend
-        // too much time at 4-token command-buffer boundaries; use the largest
-        // post-cycle-98 safe chunk size while staying below the known-bad
-        // 8-token basin.
+        // Keep the exact 20-token Gemma chat verifier on five 4-token command
+        // buffers: it starts GPU work one token earlier than the 5-token split
+        // while avoiding the known-bad 8-token basin.
         if (prompt_len == 20) return 4;
-        if (prompt_len > 20) return 7;
         if (prompt_len >= 17 and prompt_len <= 19) return 5;
         return 4;
     }
@@ -5782,18 +5759,6 @@ pub const InferenceEngine = struct {
             if (token_idx == 1) return 5;
             if (token_idx == 6) return 7;
             if (token_idx == 13) return 7;
-        }
-        if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len > 20 and base_chunk == 7) {
-            const remaining = prompt_len - token_idx;
-            if (remaining <= base_chunk) return remaining;
-
-            // Avoid a 1- or 2-token final command on public-suite lengths such
-            // as 50/51. Those tails add a queue boundary without enough GPU
-            // work to hide CPU recording, so borrow from the preceding chunk.
-            const tail_after_base = remaining - base_chunk;
-            if (tail_after_base > 0 and tail_after_base < 3) {
-                return base_chunk - (3 - tail_after_base);
-            }
         }
         return base_chunk;
     }
@@ -6170,13 +6135,12 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
-        const mode = effectiveBatchedPrefillMode(
-            self.config,
-            requested_mode,
-            batchedPrefillEnvPresent(),
-            gemmaBatchedPrefillMode(),
-            shouldDefaultDenseGemmaBatchedPrefill(self),
-        );
+        const mode: BatchedPrefillMode = if (requested_mode == .off and
+            !batchedPrefillEnvPresent() and
+            shouldDefaultDenseGemmaBatchedPrefill(self))
+            .on
+        else
+            requested_mode;
         if (mode == .off or !canUseBatchedPrefill(self)) {
             return self.prefillBatch(state, prompt_tokens);
         }
@@ -12627,13 +12591,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     cmd.barrier();
 
-    // vLLM's fused MoE route-slot kernels write each output block directly;
-    // for Gemma's <32-token direct route path, do the same and skip the
-    // full [N,H] zero dispatch. The expert-grouped scatter still accumulates
-    // into scratch.down, so it keeps the zero.
-    if (!use_route_slot_moe) {
-        dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
-    }
+    dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
     if (use_route_slot_moe) {
         try dispatchDmmvMoeRoutesOnCmd(
             engine,
@@ -26575,60 +26533,6 @@ test "q8 lm head stays on GPU" {
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
 
-test "gemma batched prefill env can select mode without generic gate" {
-    var gemma_moe_cfg = ModelConfig{
-        .architecture = .gemma,
-        .n_layers = 30,
-        .n_heads = 16,
-        .n_kv_heads = 8,
-        .head_dim = 512,
-        .hidden_dim = 2816,
-        .intermediate_dim = 704,
-        .vocab_size = 0,
-        .context_length = 0,
-        .rope_freq_base = 1_000_000.0,
-        .rope_freq_base_swa = 10_000.0,
-        .n_experts = 128,
-        .n_experts_used = 8,
-        .rope_dim = 512,
-        .ssm_d_conv = 0,
-        .ssm_d_inner = 0,
-        .ssm_d_state = 0,
-        .ssm_dt_rank = 0,
-        .ssm_n_group = 0,
-        .full_attn_interval = 1,
-        .shared_expert_intermediate_dim = 2112,
-    };
-
-    try std.testing.expectEqual(BatchedPrefillMode.off, parseBatchedPrefillMode(null));
-    try std.testing.expectEqual(BatchedPrefillMode.on, parseBatchedPrefillMode("1"));
-    try std.testing.expectEqual(BatchedPrefillMode.validate, parseBatchedPrefillMode("validate"));
-    try std.testing.expectEqual(BatchedPrefillMode.off, parseBatchedPrefillMode("0"));
-
-    try std.testing.expectEqual(
-        BatchedPrefillMode.validate,
-        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, false, .validate, false),
-    );
-    try std.testing.expectEqual(
-        BatchedPrefillMode.off,
-        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, true, .validate, false),
-    );
-
-    gemma_moe_cfg.n_experts = 0;
-    try std.testing.expectEqual(
-        BatchedPrefillMode.on,
-        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, false, .validate, true),
-    );
-
-    var qwen_cfg = gemma_moe_cfg;
-    qwen_cfg.architecture = .qwen35;
-    qwen_cfg.n_experts = 128;
-    try std.testing.expectEqual(
-        BatchedPrefillMode.off,
-        effectiveBatchedPrefillMode(qwen_cfg, .off, false, .validate, false),
-    );
-}
-
 test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     var gemma_cfg = ModelConfig{
         .architecture = .gemma,
@@ -26714,56 +26618,6 @@ test "gemma26 exact 20 token prefill keeps accepted queued split" {
         token_idx += actual;
     }
     try std.testing.expectEqual(@as(usize, 20), token_idx);
-}
-
-test "gemma26 public prompt prefill uses longer queued chunks" {
-    const gemma_cfg = ModelConfig{
-        .architecture = .gemma,
-        .n_layers = 30,
-        .n_heads = 16,
-        .n_kv_heads = 8,
-        .head_dim = 512,
-        .hidden_dim = 2816,
-        .intermediate_dim = 704,
-        .vocab_size = 0,
-        .context_length = 0,
-        .rope_freq_base = 1_000_000.0,
-        .rope_freq_base_swa = 10_000.0,
-        .n_experts = 128,
-        .n_experts_used = 8,
-        .rope_dim = 512,
-        .ssm_d_conv = 0,
-        .ssm_d_inner = 0,
-        .ssm_d_state = 0,
-        .ssm_dt_rank = 0,
-        .ssm_n_group = 0,
-        .full_attn_interval = 1,
-        .shared_expert_intermediate_dim = 2112,
-    };
-
-    const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 49, null);
-    try std.testing.expectEqual(@as(usize, 7), base_chunk);
-
-    const expected = [_]usize{ 7, 7, 7, 7, 7, 7, 7 };
-    var token_idx: usize = 0;
-    for (expected) |chunk_len| {
-        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 49, token_idx, base_chunk, false);
-        try std.testing.expectEqual(chunk_len, actual);
-        token_idx += actual;
-    }
-    try std.testing.expectEqual(@as(usize, 49), token_idx);
-
-    const base_chunk_50 = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 50, null);
-    try std.testing.expectEqual(@as(usize, 7), base_chunk_50);
-    token_idx = 0;
-    var final_chunk: usize = 0;
-    while (token_idx < 50) {
-        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 50, token_idx, base_chunk_50, false);
-        final_chunk = actual;
-        token_idx += actual;
-    }
-    try std.testing.expectEqual(@as(usize, 50), token_idx);
-    try std.testing.expectEqual(@as(usize, 3), final_chunk);
 }
 
 test "gemma26 queued prefill can skip nonterminal final layer tail" {
@@ -28456,7 +28310,7 @@ test "moe_route_scatter_scaled folds per-expert scale into routing weight" {
     }
 }
 
-test "moe_route_scatter_direct_scaled materializes route-order outputs" {
+test "moe_route_scatter_direct_scaled accumulates route-order outputs" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
     defer shim.mtl_destroy(ctx);
@@ -28523,7 +28377,10 @@ test "moe_route_scatter_direct_scaled materializes route-order outputs" {
     cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterDirectScaledPush), 0);
     cmd.commitAndWait();
 
-    var expected = [_]f32{0.0} ** (n_tokens * hidden_dim);
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
     for (0..n_tokens) |token| {
         const row = token * routing_stride;
         for (0..k) |slot| {
