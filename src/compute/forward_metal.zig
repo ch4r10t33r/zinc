@@ -2907,6 +2907,124 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         engine.scale_acc_pipe.handle != null;
 }
 
+const GemmaBatchedPrefillGuardAudit = struct {
+    reason: []const u8,
+    layer: u32 = std.math.maxInt(u32),
+
+    fn ok() GemmaBatchedPrefillGuardAudit {
+        return .{ .reason = "ok" };
+    }
+
+    fn global(reason: []const u8) GemmaBatchedPrefillGuardAudit {
+        return .{ .reason = reason };
+    }
+
+    fn layerReason(reason: []const u8, layer: usize) GemmaBatchedPrefillGuardAudit {
+        return .{ .reason = reason, .layer = @intCast(@min(layer, @as(usize, std.math.maxInt(u32)))) };
+    }
+
+    fn layerForLog(self: GemmaBatchedPrefillGuardAudit) i32 {
+        return if (self.layer == std.math.maxInt(u32)) -1 else @intCast(self.layer);
+    }
+};
+
+fn gemmaBatchedPrefillGuardAudit(engine: *const InferenceEngine, allow_attn_gate: bool) GemmaBatchedPrefillGuardAudit {
+    const cfg = engine.config;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
+    if (cfg.architecture != .gemma or cfg.n_experts == 0) return .global("not_gemma_moe");
+    if (cfg.ssm_d_inner > 0) return .global("ssm_d_inner");
+    if (engine.private_decode_buffers and shouldCpuLmHeadFallback(engine)) return .global("private_cpu_lm_head");
+    if (fullAttentionInterval(cfg) != 1) return .global("full_attention_interval");
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return .global("lm_head_quant");
+
+    for (0..cfg.n_layers) |i| {
+        if (engine.layer_output_scales[i] != 1.0) return .layerReason("output_scale", i);
+
+        const lt = engine.layer_tensors[i];
+        if (lt.attn_gate) |gate| {
+            if (!allow_attn_gate) return .layerReason("attn_gate", i);
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_)) return .layerReason("attn_gate_quant", i);
+        }
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null) return .layerReason("attn_bias", i);
+
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch return .layerReason("attention_params", i);
+        const q = lt.attn_q orelse return .layerReason("attn_q_missing", i);
+        const k = lt.attn_k orelse return .layerReason("attn_k_missing", i);
+        const o = lt.attn_output orelse return .layerReason("attn_output_missing", i);
+        if (!supportsBatchedGemmQuant(engine, q.info.type_) or !supportsBatchedGemmQuant(engine, k.info.type_) or
+            !supportsBatchedGemmQuant(engine, o.info.type_)) return .layerReason("attn_quant", i);
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse return .layerReason("attn_v_missing", i);
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) return .layerReason("attn_v_quant", i);
+        }
+
+        const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
+        if (q_rows >= attn.q_dim * 2) return .layerReason("packed_q_gate", i);
+
+        if (!hasExplicitGemmaMoeTensors(cfg, lt)) return .layerReason("explicit_moe_tensors", i);
+        const gate_inp = lt.ffn_gate_inp orelse return .layerReason("router_missing", i);
+        const gate_scale = lt.ffn_gate_inp_scale orelse return .layerReason("router_scale_missing", i);
+        const f32_router_supported = canUseGemmaRmsNormRouterF32TopkBatched(
+            engine,
+            gate_inp,
+            gate_scale,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            cfg.hidden_dim,
+            1,
+        );
+        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_) and !f32_router_supported) return .layerReason("router_quant", i);
+        if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
+            lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return .layerReason("moe_bias", i);
+
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, cfg.hidden_dim) catch return .layerReason("gate_up_layout", i);
+        if (gate_up_layout.gate_tensor.info.type_ != .q4_k or gate_up_layout.up_tensor.info.type_ != .q4_k) return .layerReason("gate_up_quant", i);
+        const down_exps = lt.ffn_down_exps orelse return .layerReason("down_missing", i);
+        if (!supportsGroupedGemmaMoeCols(engine, down_exps.info.type_)) return .layerReason("down_quant", i);
+
+        const gate_shexp = lt.ffn_gate_shexp orelse return .layerReason("shared_gate_missing", i);
+        const up_shexp = lt.ffn_up_shexp orelse return .layerReason("shared_up_missing", i);
+        const down_shexp = lt.ffn_down_shexp orelse return .layerReason("shared_down_missing", i);
+        if (!supportsBatchedGemmQuant(engine, gate_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, up_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, down_shexp.info.type_)) return .layerReason("shared_quant", i);
+        if (lt.ffn_gate_inp_shexp) |gate| {
+            const f32_shared_gate_supported =
+                canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+                    engine,
+                    gate_inp,
+                    gate_scale,
+                    gate,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                    cfg.hidden_dim,
+                    1,
+                ) or canUseQwenSsmProjectionTailF32Batched(engine, gate, 1, cfg.hidden_dim);
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_) and !f32_shared_gate_supported) return .layerReason("shared_gate_input_quant", i);
+        }
+
+        if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
+            !isF32Tensor(lt.post_ffw_norm_1) or !isF32Tensor(lt.post_ffw_norm_2) or
+            !isF32Tensor(lt.ffn_down_exps_scale))
+        {
+            return .layerReason("f32_metadata", i);
+        }
+    }
+
+    if (engine.softmax_topk_batched_pipe.handle == null) return .global("pipeline_softmax_topk_batched");
+    if (engine.moe_route_pack_pipe.handle == null) return .global("pipeline_moe_route_pack");
+    if (engine.moe_route_ids_pipe.handle == null) return .global("pipeline_moe_route_ids");
+    if (engine.moe_route_gather_pipe.handle == null) return .global("pipeline_moe_route_gather");
+    if (engine.moe_route_scatter_scaled_pipe.handle == null) return .global("pipeline_moe_route_scatter_scaled");
+    if (engine.moe_route_scatter_direct_scaled_pipe.handle == null) return .global("pipeline_moe_route_scatter_direct_scaled");
+    if (engine.geglu_batched_pipe.handle == null) return .global("pipeline_geglu_batched");
+    if (engine.sigmoid_scale_acc_batched_pipe.handle == null) return .global("pipeline_sigmoid_scale_acc_batched");
+    if (engine.zero_f32_pipe.handle == null) return .global("pipeline_zero_f32");
+    if (engine.scale_acc_pipe.handle == null) return .global("pipeline_scale_acc");
+    return .ok();
+}
+
 fn logGemmaBatchedPrefillDecision(
     engine: *const InferenceEngine,
     prompt_len: usize,
@@ -7083,13 +7201,27 @@ pub const InferenceEngine = struct {
                 bytesToGiB(decode_profile.dmmv_total_bytes),
             });
             if (self.config.architecture == .gemma and self.config.n_experts > 0) {
+                const structural_batched = canUseBatchedPrefill(self);
                 log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d}", .{
                     gemmaMoePrefillPathName(self.prefill_profile),
                     if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens)) "yes" else "no",
-                    if (canUseBatchedPrefill(self)) "yes" else "no",
+                    if (structural_batched) "yes" else "no",
                     self.prefill_profile.route_pack_layers,
                     self.prefill_profile.queued_prefill_chunks,
                 });
+                if (!structural_batched) {
+                    const first_guard = gemmaBatchedPrefillGuardAudit(self, false);
+                    const after_attn_gate_guard = if (std.mem.eql(u8, first_guard.reason, "attn_gate"))
+                        gemmaBatchedPrefillGuardAudit(self, true)
+                    else
+                        first_guard;
+                    log.info("  prefill structural guard: first={s} layer={d} after_attn_gate={s} layer={d}", .{
+                        first_guard.reason,
+                        first_guard.layerForLog(),
+                        after_attn_gate_guard.reason,
+                        after_attn_gate_guard.layerForLog(),
+                    });
+                }
             }
         }
         log.info("  cpu: embed {d:.2} ms ({d:.3} ms/step) | record {d:.2} ms ({d:.3} ms/step) | router {d:.2} ms | sample {d:.2} ms ({d:.3} ms/sample)", .{
