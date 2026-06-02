@@ -360,7 +360,6 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             else => true,
         },
         .gemma26_prefill_hot => switch (case_id) {
-            .router_f32_fused,
             .attn_q,
             .attn_k,
             .attn_v,

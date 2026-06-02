@@ -53,7 +53,7 @@ export type MetricMode = "decode" | "prefill";
 const METRIC_MODE = parseMetricModeEnv("ZINC_METRIC_MODE", "decode");
 const METRIC_LABEL = METRIC_MODE === "prefill" ? "prefill tok/s" : "decode tok/s";
 const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable throughput measurement
-const REFERENCE_TEXT = "Paris"; // Expected in correct output
+const REFERENCE_TEXT = process.env.ZINC_REFERENCE_TEXT ?? "Paris"; // Expected in correct output
 const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
 const QWEN36_PREFILL_INTERMEDIATE_TARGET = Math.max(50, TARGET_TOK_PER_SEC);
 const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
@@ -1095,27 +1095,38 @@ function normalizeOutputText(text: string): string {
     .trim();
 }
 
-export function evaluateOutputText(text: string): OutputEvaluation {
+export function evaluateOutputText(text: string, referenceText: string = REFERENCE_TEXT): OutputEvaluation {
   const normalizedText = normalizeOutputText(text);
+  const normalizedReference = normalizeOutputText(referenceText);
   const lower = normalizedText.toLowerCase();
-  const containsReference = lower.includes(REFERENCE_TEXT.toLowerCase());
-  const contradictoryCapitalTerms = [
-    "capital of germany",
-    "capital of italy",
-    "capital of spain",
-    "capital of portugal",
-    "berlin",
-    "rome",
-    "madrid",
-    "lisbon",
-  ].some((pattern) => lower.includes(pattern));
+  const referenceLower = normalizedReference.toLowerCase();
+  const usesParisOracle = referenceLower === "paris";
+  const containsReference = referenceLower.length === 0
+    ? normalizedText.length > 0
+    : lower.includes(referenceLower);
+  const contradictoryCapitalTerms = usesParisOracle &&
+    [
+      "capital of germany",
+      "capital of italy",
+      "capital of spain",
+      "capital of portugal",
+      "berlin",
+      "rome",
+      "madrid",
+      "lisbon",
+    ].some((pattern) => lower.includes(pattern));
   const offTopic = containsReference && contradictoryCapitalTerms;
+  const startsWithReference = referenceLower.length > 0 && lower.startsWith(referenceLower);
   const strongAnswer = containsReference && !offTopic &&
-    (/^paris\b/i.test(normalizedText) || /^paris[.!?,\s]/i.test(normalizedText));
+    (usesParisOracle
+      ? (/^paris\b/i.test(normalizedText) || /^paris[.!?,\s]/i.test(normalizedText))
+      : normalizedText.length >= 8);
   const evaluationNotes: string[] = [];
   if (offTopic) evaluationNotes.push("contains contradictory capital/country terms");
-  if (containsReference && normalizedText.toLowerCase().startsWith("paris")) {
-    evaluationNotes.push("starts with Paris");
+  if (containsReference && startsWithReference) {
+    evaluationNotes.push(`starts with ${normalizedReference}`);
+  } else if (!usesParisOracle && containsReference && normalizedReference.length > 0) {
+    evaluationNotes.push(`contains ${normalizedReference}`);
   }
   const outputQualityScore = strongAnswer ? 4 : containsReference ? 1 : normalizedText ? 0 : 0;
   return {

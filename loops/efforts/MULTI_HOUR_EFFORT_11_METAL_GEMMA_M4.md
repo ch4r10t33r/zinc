@@ -94,9 +94,9 @@ Interpretation:
 
 ## Loop recipes
 
-Use the Paris chat prompt for `implement_metal.ts` because the harness still
-uses that prompt as its correctness oracle. Validate public-suite workloads
-separately before publishing.
+The default correctness oracle is still the Paris chat prompt. For public-suite
+prefill work, set `ZINC_REFERENCE_TEXT` to a stable word from the expected
+answer and start a fresh loop instead of resuming the exact-20 Paris state.
 
 ### Decode-focused loop
 
@@ -150,6 +150,41 @@ ZINC_METAL_SHAPES_EVERY=3 \
 ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 20 --iterations 80 --warmup 10" \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
 bun loops/implement_metal.ts --resume --effort 11 --agent codex --model gpt-5.5 --cycles 100
+```
+
+### Public-prompt prefill loop
+
+Use this after cycle 118. Do not `--resume` from the Paris loop: its 88.30 tok/s
+best is an exact-20-token schedule baseline and is not comparable to the public
+site prompt.
+
+```bash
+PROMPT="Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput."
+
+ZINC_MODEL_ID=gemma4-26b-a4b-q4k-m \
+ZINC_METRIC_MODE=prefill \
+ZINC_PROMPT_MODE=chat \
+ZINC_TEST_PROMPT="$PROMPT" \
+ZINC_REFERENCE_TEXT=benchmark \
+ZINC_MAX_TOKENS=32 \
+ZINC_TARGET_TOK_PER_SEC=200 \
+ZINC_STOP_ON_TARGET=0 \
+ZINC_BENCHMARK_RUNS=5 \
+ZINC_BENCHMARK_WARMUPS=1 \
+ZINC_PROFILE_EVERY=1 \
+ZINC_BUILD_OPTIMIZE=ReleaseFast \
+ZINC_TEST_TIMEOUT_MS=300000 \
+ZINC_RUN_TIMEOUT_MS=900000 \
+ZINC_CROSS_EFFORT_PROMPT="What is the capital of France?" \
+ZINC_CROSS_EFFORT_METRIC=decode \
+ZINC_CROSS_EFFORT_PROMPT_MODE=chat \
+ZINC_CROSS_EFFORT_MAX_TOKENS=96 \
+ZINC_CROSS_EFFORT_EVERY=3 \
+ZINC_GEMMA_PLATEAU_STALL_CYCLES=6 \
+ZINC_METAL_SHAPES_EVERY=3 \
+ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 70 --iterations 80 --warmup 10" \
+ZINC_CODEX_REASONING_EFFORT=xhigh \
+bun loops/implement_metal.ts --effort 11 --agent codex --model gpt-5.5 --cycles 60
 ```
 
 ### Public-suite validation
@@ -452,8 +487,10 @@ surrounding path has changed substantially:
 
 ## Next best targets after cycle 98
 
-1. Consume `bench-metal-shapes --case gemma26_prefill_hot --pipeline production
-   --route-tokens 20` evidence before another shared-Q8 or finalizer retune.
+1. Consume `bench-metal-shapes --case gemma26_prefill_hot --pipeline production`
+   evidence before another shared-Q8 or finalizer retune. Use `--route-tokens
+   20` for Paris-only reproduction and `--route-tokens 70` for the public
+   coding-plan prompt.
 2. Audit the exact guard blockers preventing the full Gemma batched-prefill path
    from becoming default-on under public-suite prompt lengths.
 3. Validate the cycle-98 tree on the public performance suite before publishing

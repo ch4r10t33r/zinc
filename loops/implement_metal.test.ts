@@ -132,6 +132,17 @@ describe("evaluateOutputText", () => {
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(true);
   });
+
+  test("accepts a configurable public-prompt reference", () => {
+    const result = evaluateOutputText(
+      "Here is an implementation plan for a stable benchmark preset.",
+      "benchmark",
+    );
+    expect(result.containsReference).toBe(true);
+    expect(result.strongAnswer).toBe(true);
+    expect(result.offTopic).toBe(false);
+    expect(result.evaluationNotes).toContain("contains benchmark");
+  });
 });
 
 // ── parseTokPerSec ──────────────────────────────────────────────────
