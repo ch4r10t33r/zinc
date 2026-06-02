@@ -22,9 +22,9 @@ const std = @import("std");
 
 /// Upper bound on worker threads supported by a single `FastPool`.
 /// The slot table is sized to this constant so dispatches stay branch-free
-/// and cache-friendly; eight covers the decode matvec fan-out on every
-/// targeted host CPU.
-pub const max_workers: usize = 8;
+/// and cache-friendly; this matches the decode matvec scheduler's current
+/// maximum so high-core hosts do not silently fall back to std.Thread.Pool.
+pub const max_workers: usize = 16;
 
 const Slot = struct {
     /// Worker's task fn. Set by the dispatcher before bumping `seq`.
