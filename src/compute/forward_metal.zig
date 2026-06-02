@@ -2814,6 +2814,13 @@ fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u3
     });
 }
 
+fn gemmaBatchedPrefillNeedsLayerOutputScale(engine: *const InferenceEngine) bool {
+    for (engine.layer_output_scales) |scale| {
+        if (scale != 1.0) return true;
+    }
+    return false;
+}
+
 fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
     const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
@@ -2824,8 +2831,6 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) return false;
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
@@ -2904,7 +2909,8 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         engine.geglu_batched_pipe.handle != null and
         engine.sigmoid_scale_acc_batched_pipe.handle != null and
         engine.zero_f32_pipe.handle != null and
-        engine.scale_acc_pipe.handle != null;
+        engine.scale_acc_pipe.handle != null and
+        (!gemmaBatchedPrefillNeedsLayerOutputScale(engine) or engine.scale_in_place_pipe.handle != null);
 }
 
 fn logGemmaBatchedPrefillDecision(
@@ -2970,11 +2976,6 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) {
-            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
-            return;
-        }
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
@@ -3183,6 +3184,8 @@ fn logGemmaBatchedPrefillDecision(
         log.info("Metal profile: Gemma batched prefill guard failed: zero_f32 pipeline missing", .{});
     } else if (engine.scale_acc_pipe.handle == null) {
         log.info("Metal profile: Gemma batched prefill guard failed: scale_acc pipeline missing", .{});
+    } else if (gemmaBatchedPrefillNeedsLayerOutputScale(engine) and engine.scale_in_place_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: scale_in_place pipeline missing for non-unit layer_output_scale", .{});
     } else {
         log.info("Metal profile: Gemma batched prefill guard failed: unknown mismatch after structural pass", .{});
     }
@@ -6906,7 +6909,8 @@ pub const InferenceEngine = struct {
 
             const layer_output_scale = self.layer_output_scales[layer_idx];
             if (layer_output_scale != 1.0) {
-                dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, null, .dense_ffn);
+                const scale_barrier_class: BarrierClass = if (is_gemma_moe) .gpu_routed_moe else .dense_ffn;
+                dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, scale_barrier_class);
             }
 
             const next_layer = layer_idx + 1;
