@@ -91,6 +91,45 @@ kernel void main0(
     device const uchar* src = W + expert_base + ulong(row) * ulong(nb) * ulong(bpb);
 
     float4 acc0 = float4(0.0f);
+    const bool single_col_tail = packed_base + 1u >= count;
+    if (single_col_tail) {
+        float acc = 0.0f;
+        for (uint b = tid; b < nb; b += 32u) {
+            device const uchar* block = src + b * bpb;
+
+            const float d = float(*((device const half*)block));
+            const float m = float(*((device const half*)(block + 2)));
+            const uint qh = uint(block[4]) | (uint(block[5]) << 8)
+                          | (uint(block[6]) << 16) | (uint(block[7]) << 24);
+            device const uchar* qs = block + 8;
+            const uint base = b * 32u;
+
+            float sum_qx = 0.0f;
+            float sum_x = 0.0f;
+            for (uint j = 0u; j < 16u; j++) {
+                const uchar q_byte = qs[j];
+                const uint lo = q_byte & 0x0F;
+                const uint hi = q_byte >> 4;
+                const uint q0 = lo | (((qh >> j) & 1u) << 4);
+                const uint q1 = hi | (((qh >> (j + 16u)) & 1u) << 4);
+
+                const float x_lo = x0[base + j];
+                const float x_hi = x0[base + 16u + j];
+                sum_qx += float(q0) * x_lo + float(q1) * x_hi;
+                sum_x += x_lo + x_hi;
+            }
+
+            acc += d * sum_qx + m * sum_x;
+        }
+
+        const float out = simd_sum(acc);
+        device float* y_base = Y + (p.y_offset / 4u);
+        if (tid == 0u) {
+            y_base[route0 * p.M + row] = out;
+        }
+        return;
+    }
+
     const bool four_col_tail = packed_base + 4u >= count;
     if (four_col_tail) {
         for (uint b = tid; b < nb; b += 32u) {
