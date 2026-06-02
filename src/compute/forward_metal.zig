@@ -780,20 +780,6 @@ const BarrierClass = enum(u8) {
     final,
 };
 
-const FullAttnBarrierPhase = enum(u8) {
-    norm,
-    qkv,
-    v_prep,
-    head_norm,
-    rope,
-    kv_write,
-    flash,
-    attn_gate,
-    out_proj,
-    post_norm,
-    residual,
-};
-
 const SsmBarrierPhase = enum(u8) {
     proj_norm,
     qkv,
@@ -833,17 +819,6 @@ pub const RuntimeProfile = struct {
     barrier_calls: u32 = 0,
     embed_barrier_calls: u32 = 0,
     full_attn_barrier_calls: u32 = 0,
-    full_attn_norm_barrier_calls: u32 = 0,
-    full_attn_qkv_barrier_calls: u32 = 0,
-    full_attn_v_prep_barrier_calls: u32 = 0,
-    full_attn_head_norm_barrier_calls: u32 = 0,
-    full_attn_rope_barrier_calls: u32 = 0,
-    full_attn_kv_write_barrier_calls: u32 = 0,
-    full_attn_flash_barrier_calls: u32 = 0,
-    full_attn_gate_barrier_calls: u32 = 0,
-    full_attn_out_proj_barrier_calls: u32 = 0,
-    full_attn_post_norm_barrier_calls: u32 = 0,
-    full_attn_residual_barrier_calls: u32 = 0,
     ssm_barrier_calls: u32 = 0,
     ssm_proj_norm_barrier_calls: u32 = 0,
     ssm_qkv_barrier_calls: u32 = 0,
@@ -1024,32 +999,6 @@ fn profileResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, 
         .dense_ffn => p.dense_ffn_barrier_calls += 1,
         .final => p.final_barrier_calls += 1,
     };
-}
-
-fn recordFullAttnBarrierPhase(profile: ?*RuntimeProfile, phase: FullAttnBarrierPhase) void {
-    if (profile) |p| {
-        p.full_attn_barrier_calls += 1;
-        switch (phase) {
-            .norm => p.full_attn_norm_barrier_calls += 1,
-            .qkv => p.full_attn_qkv_barrier_calls += 1,
-            .v_prep => p.full_attn_v_prep_barrier_calls += 1,
-            .head_norm => p.full_attn_head_norm_barrier_calls += 1,
-            .rope => p.full_attn_rope_barrier_calls += 1,
-            .kv_write => p.full_attn_kv_write_barrier_calls += 1,
-            .flash => p.full_attn_flash_barrier_calls += 1,
-            .attn_gate => p.full_attn_gate_barrier_calls += 1,
-            .out_proj => p.full_attn_out_proj_barrier_calls += 1,
-            .post_norm => p.full_attn_post_norm_barrier_calls += 1,
-            .residual => p.full_attn_residual_barrier_calls += 1,
-        }
-    }
-}
-
-fn profileFullAttnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: FullAttnBarrierPhase) void {
-    const before_count = cmd.barrier_count;
-    cmd.barrier();
-    if (cmd.barrier_count == before_count) return;
-    recordFullAttnBarrierPhase(profile, phase);
 }
 
 fn recordSsmBarrierPhase(profile: ?*RuntimeProfile, phase: SsmBarrierPhase) void {
@@ -1298,17 +1247,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.barrier_calls = total.barrier_calls -| prefix.barrier_calls;
     delta.embed_barrier_calls = total.embed_barrier_calls -| prefix.embed_barrier_calls;
     delta.full_attn_barrier_calls = total.full_attn_barrier_calls -| prefix.full_attn_barrier_calls;
-    delta.full_attn_norm_barrier_calls = total.full_attn_norm_barrier_calls -| prefix.full_attn_norm_barrier_calls;
-    delta.full_attn_qkv_barrier_calls = total.full_attn_qkv_barrier_calls -| prefix.full_attn_qkv_barrier_calls;
-    delta.full_attn_v_prep_barrier_calls = total.full_attn_v_prep_barrier_calls -| prefix.full_attn_v_prep_barrier_calls;
-    delta.full_attn_head_norm_barrier_calls = total.full_attn_head_norm_barrier_calls -| prefix.full_attn_head_norm_barrier_calls;
-    delta.full_attn_rope_barrier_calls = total.full_attn_rope_barrier_calls -| prefix.full_attn_rope_barrier_calls;
-    delta.full_attn_kv_write_barrier_calls = total.full_attn_kv_write_barrier_calls -| prefix.full_attn_kv_write_barrier_calls;
-    delta.full_attn_flash_barrier_calls = total.full_attn_flash_barrier_calls -| prefix.full_attn_flash_barrier_calls;
-    delta.full_attn_gate_barrier_calls = total.full_attn_gate_barrier_calls -| prefix.full_attn_gate_barrier_calls;
-    delta.full_attn_out_proj_barrier_calls = total.full_attn_out_proj_barrier_calls -| prefix.full_attn_out_proj_barrier_calls;
-    delta.full_attn_post_norm_barrier_calls = total.full_attn_post_norm_barrier_calls -| prefix.full_attn_post_norm_barrier_calls;
-    delta.full_attn_residual_barrier_calls = total.full_attn_residual_barrier_calls -| prefix.full_attn_residual_barrier_calls;
     delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
@@ -6828,25 +6766,25 @@ pub const InferenceEngine = struct {
             const is_gemma_moe = cfg.architecture == .gemma and hasExplicitGemmaMoeTensors(cfg, lt);
 
             dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-            profileFullAttnBarrier(&cmd, profile, .norm);
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
             }
-            profileFullAttnBarrier(&cmd, profile, .qkv);
+            profileBarrier(&cmd, profile, .full_attn);
 
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
             if (apply_v_unit_norm) {
                 const v_src = if (attn.use_k_as_v) &scratch.k else &scratch.v;
                 dispatchRmsNormOnCmd(self, &cmd, v_src, &scratch.v, &self.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads * n_tokens);
                 if (attn.use_k_as_v) {
-                    profileFullAttnBarrier(&cmd, profile, .v_prep);
+                    profileBarrier(&cmd, profile, .full_attn);
                 }
             } else if (attn.use_k_as_v) {
                 dispatchCopyF32OnCmd(self, &cmd, &scratch.k, &scratch.v, n_tokens * attn.kv_dim);
-                profileFullAttnBarrier(&cmd, profile, .v_prep);
+                profileBarrier(&cmd, profile, .full_attn);
             }
             if (self.attn_q_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.q, &scratch.q, &self.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
@@ -6855,13 +6793,13 @@ pub const InferenceEngine = struct {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.k, &scratch.k, &self.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
             }
             if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx] or apply_v_unit_norm) {
-                profileFullAttnBarrier(&cmd, profile, .head_norm);
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             const rope_freq_buf = selectRopeFreqBuffer(self, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.k, &scratch.k, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
-            profileFullAttnBarrier(&cmd, profile, .rope);
+            profileBarrier(&cmd, profile, .full_attn);
 
             const kv_len = position_base + n_tokens;
             if (self.kv_cache_q8) {
@@ -6872,7 +6810,7 @@ pub const InferenceEngine = struct {
                 const dst_elements = position_base * attn.kv_dim;
                 dispatchKvCacheWriteBatchedOnCmd(self, &cmd, layer_idx, &scratch.k, &scratch.v, dst_elements, n_tokens * attn.kv_dim);
             }
-            profileFullAttnBarrier(&cmd, profile, .kv_write);
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (self.kv_cache_q8) {
                 dispatchFlashAttnBatchedQ8OnCmd(
@@ -6911,13 +6849,13 @@ pub const InferenceEngine = struct {
                     attn.sliding_window_size,
                 );
             }
-            profileFullAttnBarrier(&cmd, profile, .flash);
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
-            profileFullAttnBarrier(&cmd, profile, .out_proj);
+            profileBarrier(&cmd, profile, .full_attn);
             if (self.post_attn_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                profileFullAttnBarrier(&cmd, profile, .post_norm);
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             {
@@ -6925,7 +6863,7 @@ pub const InferenceEngine = struct {
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
-            profileFullAttnBarrier(&cmd, profile, .residual);
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (is_gemma_moe) {
                 try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
@@ -7202,41 +7140,6 @@ pub const InferenceEngine = struct {
                 @as(f64, @floatFromInt(profile.dense_ffn_barrier_calls)) / steps_f,
                 @as(f64, @floatFromInt(profile.final_barrier_calls)) / steps_f,
             });
-            const full_attn_breakdown_profile = if (has_prefill_split) self.prefill_profile else profile;
-            const full_attn_breakdown_label = if (has_prefill_split) "prefill" else "request";
-            if (full_attn_breakdown_profile.full_attn_barrier_calls > 0) {
-                const typed_full_attn_barriers =
-                    full_attn_breakdown_profile.full_attn_norm_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_qkv_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_v_prep_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_head_norm_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_rope_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_kv_write_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_flash_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_gate_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_out_proj_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_post_norm_barrier_calls +
-                    full_attn_breakdown_profile.full_attn_residual_barrier_calls;
-                const other_full_attn_barriers = if (full_attn_breakdown_profile.full_attn_barrier_calls > typed_full_attn_barriers)
-                    full_attn_breakdown_profile.full_attn_barrier_calls - typed_full_attn_barriers
-                else
-                    0;
-                log.info("  full-attn barriers/{s}: norm {d} qkv {d} v-prep {d} head-norm {d} rope {d} kv-write {d} flash {d} gate {d} out {d} post-norm {d} residual {d} other {d}", .{
-                    full_attn_breakdown_label,
-                    full_attn_breakdown_profile.full_attn_norm_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_qkv_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_v_prep_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_head_norm_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_rope_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_kv_write_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_flash_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_gate_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_out_proj_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_post_norm_barrier_calls,
-                    full_attn_breakdown_profile.full_attn_residual_barrier_calls,
-                    other_full_attn_barriers,
-                });
-            }
             if (profile.ssm_barrier_calls > 0) {
                 const typed_ssm_barriers =
                     profile.ssm_proj_norm_barrier_calls +
