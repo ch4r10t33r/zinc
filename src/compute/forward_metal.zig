@@ -2697,7 +2697,7 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
     if (cfg.architecture != .gemma or cfg.n_experts == 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
-    if (engine.private_decode_buffers) return false;
+    if (engine.private_decode_buffers and shouldCpuLmHeadFallback(engine)) return false;
     if (fullAttentionInterval(cfg) != 1) return false;
     if (engine.attn_sink_values != null) return false;
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
@@ -2808,9 +2808,10 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     if (can_batched_prefill) {
-        log.info("Metal profile: Gemma batched prefill enabled: mode={s} prompt_len={d}", .{
+        log.info("Metal profile: Gemma batched prefill enabled: mode={s} prompt_len={d} private_decode={s}", .{
             @tagName(mode),
             prompt_len,
+            if (engine.private_decode_buffers) "yes" else "no",
         });
         return;
     }
@@ -2820,8 +2821,8 @@ fn logGemmaBatchedPrefillDecision(
         log.info("Metal profile: Gemma batched prefill guard failed: ssm_d_inner={d}", .{cfg.ssm_d_inner});
         return;
     }
-    if (engine.private_decode_buffers) {
-        log.info("Metal profile: Gemma batched prefill guard failed: private_decode_buffers enabled", .{});
+    if (engine.private_decode_buffers and shouldCpuLmHeadFallback(engine)) {
+        log.info("Metal profile: Gemma batched prefill guard failed: private decode with CPU LM-head fallback", .{});
         return;
     }
     if (fullAttentionInterval(cfg) != 1) {
@@ -6739,6 +6740,7 @@ pub const InferenceEngine = struct {
 
         if (shouldCpuLmHeadFallback(self)) {
             cmd.commitAndWait();
+            if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
             const dst_ptr: [*]f32 = @ptrCast(@alignCast(self.hidden_buf.cpu_ptr.?));
@@ -6751,11 +6753,16 @@ pub const InferenceEngine = struct {
             dispatchLmHeadWithInputOffset(self, &cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
             cmd.barrier();
             dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
+            if (mode == .validate and self.private_decode_buffers) {
+                dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
+            }
             cmd.commitAndWait();
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
-            const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
-            const dst_ptr: [*]f32 = @ptrCast(@alignCast(self.hidden_buf.cpu_ptr.?));
-            @memcpy(dst_ptr[0..hidden_dim], src_ptr[src_base .. src_base + hidden_dim]);
+            if (self.hidden_buf.cpu_ptr) |dst_bytes| {
+                const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
+                const dst_ptr: [*]f32 = @ptrCast(@alignCast(dst_bytes));
+                @memcpy(dst_ptr[0..hidden_dim], src_ptr[src_base .. src_base + hidden_dim]);
+            }
         }
 
         self.position = position_base + n_tokens;
@@ -6768,7 +6775,10 @@ pub const InferenceEngine = struct {
             const vocab = cfg.vocab_size;
             const batched_snapshot = try self.allocator.alloc(f32, vocab);
             defer self.allocator.free(batched_snapshot);
-            const batched_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+            const batched_logits: [*]const f32 = if (self.private_decode_buffers)
+                @ptrCast(@alignCast(self.logits_readback_buf.cpu_ptr.?))
+            else
+                @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
             @memcpy(batched_snapshot, batched_logits[0..vocab]);
 
             self.position = 0;
