@@ -28,6 +28,19 @@ fn m0MaxDecodeTokens() u32 {
     return m0_max_decode_tokens_default;
 }
 
+fn fullForwardMaxDecodeTokensForEnv(requested: u32, raw_override: ?[]const u8) u32 {
+    if (raw_override) |raw| {
+        if (std.fmt.parseInt(u32, raw, 10) catch null) |parsed| {
+            if (parsed > 0) return @min(requested, parsed);
+        }
+    }
+    return requested;
+}
+
+fn fullForwardMaxDecodeTokens(requested: u32) u32 {
+    return fullForwardMaxDecodeTokensForEnv(requested, std.posix.getenv("ZINC_RT_MAX_DECODE_TOKENS"));
+}
+
 const WeightView = struct {
     raw: []const u8,
     type_: gguf.GGMLType,
@@ -1238,7 +1251,7 @@ fn generateNoLayer(
     eos_token_id: u32,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
-    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
+    const effective_max_tokens = fullForwardMaxDecodeTokens(max_tokens);
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
 
@@ -1493,7 +1506,7 @@ fn generateScalarHybrid(
     allocator: std.mem.Allocator,
     options: GenerateOptions,
 ) !GenerateResult {
-    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
+    const effective_max_tokens = fullForwardMaxDecodeTokens(max_tokens);
     const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
     defer state.deinit();
@@ -6222,6 +6235,14 @@ test "BenchmarkShortcutFlags reports any active shortcut" {
     try std.testing.expect((BenchmarkShortcutFlags{ .decode_moe_topk_zero = true }).any());
     try std.testing.expect((BenchmarkShortcutFlags{ .lm_head_rows_capped = true }).any());
     try std.testing.expect((BenchmarkShortcutFlags{ .decode_budget_clamped = true }).any());
+}
+
+test "fullForwardMaxDecodeTokens honors requested budget by default" {
+    try std.testing.expectEqual(@as(u32, 96), fullForwardMaxDecodeTokensForEnv(96, null));
+    try std.testing.expectEqual(@as(u32, 96), fullForwardMaxDecodeTokensForEnv(96, "0"));
+    try std.testing.expectEqual(@as(u32, 96), fullForwardMaxDecodeTokensForEnv(96, "bad"));
+    try std.testing.expectEqual(@as(u32, 8), fullForwardMaxDecodeTokensForEnv(96, "8"));
+    try std.testing.expectEqual(@as(u32, 96), fullForwardMaxDecodeTokensForEnv(96, "256"));
 }
 
 test "resolveQwen36MoeTopkLimit mirrors Vulkan default and env escape hatch" {
