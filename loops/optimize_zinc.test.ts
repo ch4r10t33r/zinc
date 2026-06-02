@@ -177,6 +177,25 @@ describe("isCoherentText", () => {
     ).toBe(true);
   });
 
+  test("detects multiline coherent output before the next log line", () => {
+    expect(
+      isCoherentText(
+        [
+          "info(zinc_rt): Output text:  Paris.",
+          "A. True",
+          "B. False",
+          "Answer:",
+          "A",
+          "",
+          "What is the capital of the state of New York?",
+          "A. Albany",
+          "B. New York City",
+          "info(zinc_rt): Output tokens (96): first20={ 11751, 13 }",
+        ].join("\n"),
+      ),
+    ).toBe(true);
+  });
+
   test("detects reasoning output", () => {
     expect(
       isCoherentText(

@@ -1017,11 +1017,42 @@ fn allocChatPrompt(
     return error.BufferTooSmall;
 }
 
-fn buildChatTranscriptPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, buf: []u8) ![]const u8 {
+fn buildChatTranscriptPrompt(
+    allocator: std.mem.Allocator,
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    enable_thinking: ?bool,
+    skip_thinking_template: bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
+    buf: []u8,
+) ![]const u8 {
+    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .add_generation_prompt = false,
         .enable_thinking = enable_thinking,
+        .skip_thinking_template = skip_thinking_template,
+        .tools = tools_for_template,
+        .tool_format = tf,
+        .tool_render_allocator = allocator,
     }, buf);
+}
+
+fn isTransientChatReuseHint(role: []const u8, content: []const u8) bool {
+    if (!std.mem.eql(u8, role, "system")) return false;
+    const trimmed = std.mem.trimLeft(u8, content, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "Tool path guard:") or
+        std.mem.startsWith(u8, trimmed, "OpenCode continuation guard:");
+}
+
+fn persistentChatHistoryLen(roles: []const []const u8, contents: []const []const u8) usize {
+    var len = @min(roles.len, contents.len);
+    while (len > 0 and isTransientChatReuseHint(roles[len - 1], contents[len - 1])) {
+        len -= 1;
+    }
+    return len;
 }
 
 fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, display_name: []const u8) bool {
@@ -1036,6 +1067,9 @@ fn warmChatReuseCache(
     tokenizer: *const tokenizer_mod.Tokenizer,
     engine: *forward_mod.InferenceEngine,
     thinking_enabled: bool,
+    skip_thinking_template: bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
     session_id: []const u8,
     roles: []const []const u8,
     contents: []const []const u8,
@@ -1049,21 +1083,23 @@ fn warmChatReuseCache(
     const now_ns = std.time.nanoTimestamp();
 
     const processed_prefix_len = prompt_tokens.len + processed_generated_tokens.len;
-    const transcript_count = roles.len + 1;
+    const persistent_count = persistentChatHistoryLen(roles, contents);
+    const trimmed_transient_hints = persistent_count < @min(roles.len, contents.len);
+    const transcript_count = persistent_count + 1;
     const transcript_roles = try allocator.alloc([]const u8, transcript_count);
     defer allocator.free(transcript_roles);
     const transcript_contents = try allocator.alloc([]const u8, transcript_count);
     defer allocator.free(transcript_contents);
 
-    @memcpy(transcript_roles[0..roles.len], roles);
-    @memcpy(transcript_contents[0..contents.len], contents);
-    transcript_roles[roles.len] = "assistant";
-    transcript_contents[contents.len] = assistant_content;
+    @memcpy(transcript_roles[0..persistent_count], roles[0..persistent_count]);
+    @memcpy(transcript_contents[0..persistent_count], contents[0..persistent_count]);
+    transcript_roles[persistent_count] = "assistant";
+    transcript_contents[persistent_count] = assistant_content;
 
-    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, false, &.{}) + assistant_content.len + 64;
+    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, thinking_enabled, tools) + assistant_content.len + 512;
     const transcript_buf = try allocator.alloc(u8, transcript_capacity);
     defer allocator.free(transcript_buf);
-    const transcript_prompt = try buildChatTranscriptPrompt(tokenizer, transcript_roles, transcript_contents, thinking_enabled, transcript_buf);
+    const transcript_prompt = try buildChatTranscriptPrompt(allocator, tokenizer, transcript_roles, transcript_contents, thinking_enabled, skip_thinking_template, tools, tool_choice, transcript_buf);
     const transcript_tokens = try tokenizer.encodePrompt(transcript_prompt, allocator);
     defer allocator.free(transcript_tokens);
 
@@ -1078,6 +1114,7 @@ fn warmChatReuseCache(
 
     const can_incremental =
         state.position == processed_prefix_len and
+        !trimmed_transient_hints and
         transcript_tokens.len >= processed_prefix_len and
         prompt_mismatch == null and
         response_mismatch == null;
@@ -1085,7 +1122,7 @@ fn warmChatReuseCache(
     if (can_incremental) {
         const suffix_tokens = transcript_tokens[processed_prefix_len..];
         if (suffix_tokens.len > 0) {
-            try engine.prefillBatch(state, suffix_tokens);
+            try engine.prefillBatched(state, suffix_tokens);
         }
         log.info("chat cache updated: session={s} prefix={d} suffix={d}", .{
             session_id,
@@ -1093,7 +1130,9 @@ fn warmChatReuseCache(
             transcript_tokens.len - processed_prefix_len,
         });
     } else {
+        var rebuild_reason: []const u8 = if (trimmed_transient_hints) "transient_hints_trimmed" else "prefix_mismatch";
         if (state.position != processed_prefix_len) {
+            rebuild_reason = "state_position_mismatch";
             log.info("chat cache skipped: state position mismatch state={d} processed={d}", .{
                 state.position,
                 processed_prefix_len,
@@ -1117,7 +1156,16 @@ fn warmChatReuseCache(
                 processed_generated_tokens.len,
             });
         }
-        return error.CachePrefixMismatch;
+        if (transcript_tokens.len > resources.context_capacity_tokens) return error.ContextLengthExceeded;
+        state.position = 0;
+        state.generated_tokens.clearRetainingCapacity();
+        try engine.prefillBatched(state, transcript_tokens);
+        server_state.setActiveContextTokens(state.position);
+        log.info("chat cache rebuilt canonical transcript: session={s} reason={s} prefix={d}", .{
+            session_id,
+            rebuild_reason,
+            transcript_tokens.len,
+        });
     }
 
     try server_state.chat_reuse_cache.store(session_id, resources.model_path, transcript_tokens, now_ns);
@@ -1130,6 +1178,19 @@ fn firstTokenMismatch(a: []const u32, b: []const u32) ?usize {
     }
     if (a.len != b.len) return n;
     return null;
+}
+
+fn appendAssistantToolCallHistoryBlock(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    arguments_json: []const u8,
+) !void {
+    try buf.appendSlice(allocator, "<tool_call>\n{\"name\": \"");
+    try buf.appendSlice(allocator, name);
+    try buf.appendSlice(allocator, "\", \"arguments\": ");
+    try buf.appendSlice(allocator, arguments_json);
+    try buf.appendSlice(allocator, "}\n</tool_call>\n");
 }
 
 fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatRequest {
@@ -1173,17 +1234,20 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
 
     for (messages) |message| {
         if (message.role.len == 0) continue;
-        // Assistant message with tool_calls but no text content — render as <tool_call> blocks.
-        // Only when tool calling is enabled; otherwise the assistant turn is treated as
-        // empty and skipped (matching pre-tool-calling behavior).
-        if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.content.text.len == 0 and message.tool_calls.len > 0) {
+        // Assistant messages with historical tool_calls must be replayed as
+        // assistant-visible <tool_call> blocks so the next tool result/user turn
+        // has the same semantic context the model originally produced.
+        if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.tool_calls.len > 0) {
             var rendered: std.ArrayList(u8) = .{};
+            if (message.content.text.len > 0) {
+                const sanitized = sanitizeAssistantHistoryContent(message.content.text);
+                try rendered.appendSlice(arena_alloc, sanitized);
+                if (sanitized.len > 0 and sanitized[sanitized.len - 1] != '\n') {
+                    try rendered.appendSlice(arena_alloc, "\n");
+                }
+            }
             for (message.tool_calls) |tc| {
-                try rendered.appendSlice(arena_alloc, "<tool_call>\n{\"name\": \"");
-                try rendered.appendSlice(arena_alloc, tc.function.name);
-                try rendered.appendSlice(arena_alloc, "\", \"arguments\": ");
-                try rendered.appendSlice(arena_alloc, tc.function.arguments);
-                try rendered.appendSlice(arena_alloc, "}\n</tool_call>\n");
+                try appendAssistantToolCallHistoryBlock(&rendered, arena_alloc, tc.function.name, tc.function.arguments);
             }
             roles[count] = "assistant";
             contents[count] = try rendered.toOwnedSlice(arena_alloc);
@@ -1586,6 +1650,48 @@ fn historyAssistantContent(
     return transportAssistantContent(tokenizer, answer, false, transport_buf);
 }
 
+fn deinitParsedChatmlAssistantOutput(parsed: *const tool_format.ParsedAssistantOutput, allocator: std.mem.Allocator) void {
+    for (parsed.tool_calls) |c| {
+        allocator.free(c.id);
+        allocator.free(c.name);
+        allocator.free(c.arguments_json);
+    }
+    allocator.free(parsed.tool_calls);
+    allocator.free(parsed.text_content);
+}
+
+fn historyAssistantContentWithTools(
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    tool_fmt: tool_format.ToolFormat,
+    tools_active: bool,
+    text: []const u8,
+    transport_buf: []u8,
+    tool_history_buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    if (!tools_active or !std.mem.eql(u8, tokenizer.detectTemplateKindName(), "chatml")) {
+        return historyAssistantContent(tokenizer, text, transport_buf);
+    }
+
+    const parsed_output = try tool_fmt.parseAssistantToolCalls(text, allocator);
+    defer deinitParsedChatmlAssistantOutput(&parsed_output, allocator);
+    if (parsed_output.tool_calls.len == 0) {
+        return historyAssistantContent(tokenizer, text, transport_buf);
+    }
+
+    tool_history_buf.clearRetainingCapacity();
+    const answer = assistantAnswerForHistory(parsed_output.text_content);
+    if (answer.len > 0) {
+        try tool_history_buf.appendSlice(allocator, answer);
+        if (answer[answer.len - 1] != '\n') try tool_history_buf.appendSlice(allocator, "\n");
+    }
+    for (parsed_output.tool_calls) |tc| {
+        try appendAssistantToolCallHistoryBlock(tool_history_buf, allocator, tc.name, tc.arguments_json);
+    }
+
+    return transportAssistantContent(tokenizer, tool_history_buf.items, false, transport_buf);
+}
+
 fn compactHistoryAnswer(answer: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, answer, " \t\r\n");
     if (trimmed.len <= chat_history_answer_limit_bytes) return trimmed;
@@ -1729,6 +1835,15 @@ fn lastCompleteUtf8End(bytes: []const u8) usize {
     const have = bytes.len - (i - 1);
     if (have >= expected) return bytes.len;
     return i - 1;
+}
+
+fn pendingGeneratedText(text: []const u8, sent_len: *usize, hold_back: usize) []const u8 {
+    const emit_end = if (text.len > hold_back) text.len - hold_back else 0;
+    if (sent_len.* > emit_end) sent_len.* = emit_end;
+    if (emit_end <= sent_len.*) return "";
+    const pending = text[sent_len.*..emit_end];
+    sent_len.* = emit_end;
+    return pending;
 }
 
 fn trimDanglingHeading(text: []const u8) ?[]const u8 {
@@ -1938,6 +2053,9 @@ fn handleChatCompletions(
                     tokenizer,
                     engine,
                     thinking_enabled,
+                    skip_thinking_template,
+                    parsed.tools,
+                    parsed.tool_choice,
                     parsed.session_id,
                     parsed.roles,
                     parsed.contents,
@@ -2225,7 +2343,9 @@ fn handleChatCompletions(
         if (cacheable_session) {
             const trimmed_stream_text = sanitizeAssistantHistoryContent(gen_text_buf[0..gen_text_len]);
             var transport_buf: [32768]u8 = undefined;
-            const transport_text = historyAssistantContent(tokenizer, trimmed_stream_text, &transport_buf) catch trimmed_stream_text;
+            var tool_history_buf: std.ArrayList(u8) = .{};
+            defer tool_history_buf.deinit(allocator);
+            const transport_text = historyAssistantContentWithTools(tokenizer, stream_tool_fmt, tools_active, trimmed_stream_text, &transport_buf, &tool_history_buf, allocator) catch trimmed_stream_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
         }
     } else {
@@ -2346,7 +2466,9 @@ fn handleChatCompletions(
         }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
-            const transport_text = historyAssistantContent(tokenizer, response_text, &transport_buf) catch response_text;
+            var tool_history_buf: std.ArrayList(u8) = .{};
+            defer tool_history_buf.deinit(allocator);
+            const transport_text = historyAssistantContentWithTools(tokenizer, tool_fmt, parsed.tools.len > 0, response_text, &transport_buf, &tool_history_buf, allocator) catch response_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
         }
     }
@@ -3441,6 +3563,49 @@ test "buildChatPrompt succeeds for large Goose-style tool prompts" {
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
 }
 
+test "persistentChatHistoryLen drops trailing OpenCode proxy hints" {
+    const roles = [_][]const u8{ "system", "user", "system", "system" };
+    const contents = [_][]const u8{
+        "be direct",
+        "fix the project",
+        "Tool path guard: use only /tmp/app/src/cart.mjs",
+        "OpenCode continuation guard: edit the source file next",
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), persistentChatHistoryLen(&roles, &contents));
+}
+
+test "persistentChatHistoryLen keeps non-trailing proxy-looking history" {
+    const roles = [_][]const u8{ "system", "user", "assistant" };
+    const contents = [_][]const u8{
+        "Tool path guard: this was part of the original prompt",
+        "fix the project",
+        "done",
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), persistentChatHistoryLen(&roles, &contents));
+}
+
+test "buildChatTranscriptPrompt renders tools without generation suffix" {
+    var tok = makeTestTokenizer(null);
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{ "system", "user", "assistant" };
+    const contents = [_][]const u8{ "be precise", "read package.json", "I will inspect it." };
+    const tools = [_]tool_format.ToolDefinition{.{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"}}}",
+    }};
+
+    var buf: [4096]u8 = undefined;
+    const prompt = try buildChatTranscriptPrompt(std.testing.allocator, &tok, &roles, &contents, false, false, &tools, .auto, &buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "# Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"name\": \"read\"") != null);
+    try std.testing.expect(!std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
+}
+
 test "formatStreamingToolCallChunk handles large arguments payloads" {
     var big_args: [24000]u8 = undefined;
     @memset(&big_args, 'a');
@@ -3682,6 +3847,22 @@ test "parseChatRequest replays assistant tool_calls as tool_call blocks" {
     try std.testing.expect(found_tool_call_block);
 }
 
+test "parseChatRequest preserves assistant text before historical tool_calls" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":"I'll read the source first.","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"/tmp/app/src/cart.mjs\"}"}}]},{"role":"tool","content":"export function subtotalCents() {}","tool_call_id":"c1"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("assistant", parsed.roles[2]);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "I'll read the source first.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "\"name\": \"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "/tmp/app/src/cart.mjs") != null);
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Gate-off regression tests for ZINC_TOOL_CALLING.
 //
@@ -3831,6 +4012,29 @@ test "historyAssistantContent strips streamed reasoning before caching" {
         &transport_buf,
     );
     try std.testing.expectEqualStrings("<think>\n\n</think>\n\nAnswer text.", cached);
+}
+
+test "historyAssistantContentWithTools keeps assistant tool calls in cached history" {
+    var qwen_tok = makeTestTokenizer(null);
+    defer qwen_tok.token_to_id.deinit();
+
+    var transport_buf: [512]u8 = undefined;
+    var tool_history_buf: std.ArrayList(u8) = .{};
+    defer tool_history_buf.deinit(std.testing.allocator);
+    const cached = try historyAssistantContentWithTools(
+        &qwen_tok,
+        tool_format.chatmlToolFormat(),
+        true,
+        "I'll read it.\n<tool_call>\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"/tmp/app/src/cart.mjs\"}}\n</tool_call>\n",
+        &transport_buf,
+        &tool_history_buf,
+        std.testing.allocator,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, cached, "I'll read it.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "\"name\": \"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "/tmp/app/src/cart.mjs") != null);
 }
 
 test "stripThinkingForDisabledResponse removes complete think block and keeps answer" {

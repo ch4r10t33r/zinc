@@ -276,6 +276,16 @@ export function parseTokensGenerated(output: string): number {
   return m ? parseInt(m[1], 10) : 0;
 }
 
+function extractOutputText(output: string): string | null {
+  const marker = output.match(/Output text:\s*/i);
+  if (!marker || marker.index === undefined) return null;
+
+  const rest = output.slice(marker.index + marker[0].length);
+  const nextLog = rest.search(/\n(?:trace|debug|info|warn|error)(?:\([^)]+\))?:/i);
+  const text = (nextLog >= 0 ? rest.slice(0, nextLog) : rest).trim();
+  return text.length > 0 ? text : null;
+}
+
 /** Check if output tokens look like garbage (e.g. same token repeated). */
 export function isGarbageOutput(output: string): boolean {
   // Match "Output tokens (N): { t1, t2, t3, ... }"
@@ -300,9 +310,9 @@ export function isGarbageOutput(output: string): boolean {
     }
   }
   // Also check via decoded text: if output is just numbers, punctuation, or BPE fragments
-  const textMatch = output.match(/Output text:\s*(.+)/i);
-  if (textMatch) {
-    const text = textMatch[1].trim().slice(0, 200);
+  const outputText = extractOutputText(output);
+  if (outputText) {
+    const text = outputText.slice(0, 200);
     // If >60% of characters are digits or single-char punctuation, it's garbage
     const alphaCount = (text.match(/[a-zA-Z]{2,}/g) ?? []).join("").length;
     if (text.length > 20 && alphaCount / text.length < 0.3) return true;
@@ -312,9 +322,8 @@ export function isGarbageOutput(output: string): boolean {
 
 /** Check if decoded output text looks like coherent, CORRECT language (not just echoing the prompt). */
 export function isCoherentText(output: string): boolean {
-  const m = output.match(/Output text:\s*(.+)/i);
-  if (!m) return false;
-  const text = m[1].trim();
+  const text = extractOutputText(output);
+  if (!text) return false;
   if (text.length < 10) return false;
 
   // Reject: output that just repeats the prompt or a short pattern

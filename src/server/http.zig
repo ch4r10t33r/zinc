@@ -178,6 +178,18 @@ pub const Connection = struct {
         try self.stream.writeAll("\r\n");
     }
 
+    /// Write a chunked SSE comment. Useful as a keepalive when a client/proxy
+    /// gives up on a quiet stream before the next model token is ready.
+    pub fn writeSseComment(self: *Connection, text: []const u8) !void {
+        var size_buf: [16]u8 = undefined;
+        const chunk_len = ": ".len + text.len + "\n\n".len;
+        const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{chunk_len}) catch unreachable;
+        try self.stream.writeAll(size_str);
+        try self.stream.writeAll(": ");
+        try self.stream.writeAll(text);
+        try self.stream.writeAll("\n\n\r\n");
+    }
+
     /// Write the final SSE `[DONE]` event and send the chunked transfer terminator.
     /// @param self Active connection to write to.
     pub fn writeSseDone(self: *Connection) !void {
@@ -187,22 +199,15 @@ pub const Connection = struct {
     }
 
     /// Check whether the remote peer has already closed the streaming connection.
-    /// Uses a non-blocking poll + recv peek so the decode loop can stop without
-    /// waiting for the next write to fail.
+    /// HTTP/1.1 clients commonly half-close the upload side after sending the
+    /// request; a recv(MSG_PEEK) of zero then looks like a closed socket even
+    /// though response writes are still valid. Let write failures be the source
+    /// of truth so long OpenAI-compatible streams do not self-abort.
     /// @param self Active connection to inspect.
-    /// @returns True when the peer is gone, false when it still appears connected.
+    /// @returns True when the peer is known gone, false otherwise.
     pub fn isPeerClosed(self: *Connection) bool {
-        var probe: [1]u8 = undefined;
-        const peek_flags = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
-        const bytes = std.posix.recv(self.stream.handle, &probe, peek_flags) catch |err| switch (err) {
-            error.WouldBlock => return false,
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.SocketNotConnected,
-            => return true,
-            else => return false,
-        };
-        return bytes == 0;
+        _ = self;
+        return false;
     }
 
     /// Close the underlying TCP stream.
