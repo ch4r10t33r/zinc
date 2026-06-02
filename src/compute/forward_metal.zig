@@ -13283,15 +13283,19 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
         profileGpuMoeBarrier(cmd, profile, .gate_up);
     }
-    dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    const expert_input_buf: *const MetalBuffer = if (use_route_slot_moe) &scratch.moe_route_input else &scratch.down;
+    const expert_x_route_divisor: u32 = if (use_route_slot_moe) 1 else cfg.n_experts_used;
+    if (use_route_slot_moe) {
+        dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    }
     {
-        // Route pack writes are first consumed by the grouped expert DMMVs, not
-        // by the token gather. Join route-pack and gather at that edge so the
-        // gather can overlap with pack work, while still ordering every buffer
-        // the DMMV kernels read.
+        // llama.cpp `mul_mat_id` and Qwen's route-packed prefix path consume
+        // packed IDs by indexing token rows as `route / k`. Gemma's grouped
+        // route path can do the same, so only the short route-slot path still
+        // materializes duplicated route input.
         var gate_up_barrier_bufs: [5]*const MetalBuffer = undefined;
         var gate_up_barrier_count: usize = 0;
-        gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_route_input;
+        gate_up_barrier_bufs[gate_up_barrier_count] = expert_input_buf;
         gate_up_barrier_count += 1;
         if (use_route_slot_moe) {
             gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_packed_ids;
@@ -13365,7 +13369,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.gate_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_swiglu,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13379,7 +13383,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
         } else {
@@ -13387,7 +13391,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.gate_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_gate,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13400,14 +13404,14 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
             try dispatchDmmvMoeColsActiveBlocksOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.up_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_up,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13420,7 +13424,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
         }
@@ -13429,7 +13433,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             engine,
             cmd,
             gate_up_layout.gate_tensor,
-            &scratch.moe_route_input,
+            expert_input_buf,
             &scratch.moe_expert_gate,
             &scratch.moe_expert_counts,
             &scratch.moe_packed_ids,
@@ -13440,7 +13444,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
-            1,
+            expert_x_route_divisor,
             cfg.n_experts,
             n_tokens,
         );
@@ -13448,7 +13452,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             engine,
             cmd,
             gate_up_layout.up_tensor,
-            &scratch.moe_route_input,
+            expert_input_buf,
             &scratch.moe_expert_up,
             &scratch.moe_expert_counts,
             &scratch.moe_packed_ids,
@@ -13459,7 +13463,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
-            1,
+            expert_x_route_divisor,
             cfg.n_experts,
             n_tokens,
         );
