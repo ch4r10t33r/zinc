@@ -1248,21 +1248,8 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.embed_barrier_calls = total.embed_barrier_calls -| prefix.embed_barrier_calls;
     delta.full_attn_barrier_calls = total.full_attn_barrier_calls -| prefix.full_attn_barrier_calls;
     delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
-    delta.ssm_proj_norm_barrier_calls = total.ssm_proj_norm_barrier_calls -| prefix.ssm_proj_norm_barrier_calls;
-    delta.ssm_qkv_barrier_calls = total.ssm_qkv_barrier_calls -| prefix.ssm_qkv_barrier_calls;
-    delta.ssm_tail_barrier_calls = total.ssm_tail_barrier_calls -| prefix.ssm_tail_barrier_calls;
-    delta.ssm_conv_barrier_calls = total.ssm_conv_barrier_calls -| prefix.ssm_conv_barrier_calls;
-    delta.ssm_delta_barrier_calls = total.ssm_delta_barrier_calls -| prefix.ssm_delta_barrier_calls;
-    delta.ssm_gated_norm_barrier_calls = total.ssm_gated_norm_barrier_calls -| prefix.ssm_gated_norm_barrier_calls;
-    delta.ssm_out_barrier_calls = total.ssm_out_barrier_calls -| prefix.ssm_out_barrier_calls;
-    delta.ssm_residual_barrier_calls = total.ssm_residual_barrier_calls -| prefix.ssm_residual_barrier_calls;
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
-    delta.gpu_moe_router_barrier_calls = total.gpu_moe_router_barrier_calls -| prefix.gpu_moe_router_barrier_calls;
-    delta.gpu_moe_gate_up_barrier_calls = total.gpu_moe_gate_up_barrier_calls -| prefix.gpu_moe_gate_up_barrier_calls;
-    delta.gpu_moe_activation_barrier_calls = total.gpu_moe_activation_barrier_calls -| prefix.gpu_moe_activation_barrier_calls;
-    delta.gpu_moe_down_barrier_calls = total.gpu_moe_down_barrier_calls -| prefix.gpu_moe_down_barrier_calls;
-    delta.gpu_moe_finalizer_barrier_calls = total.gpu_moe_finalizer_barrier_calls -| prefix.gpu_moe_finalizer_barrier_calls;
     delta.fallback_moe_barrier_calls = total.fallback_moe_barrier_calls -| prefix.fallback_moe_barrier_calls;
     delta.dense_ffn_barrier_calls = total.dense_ffn_barrier_calls -| prefix.dense_ffn_barrier_calls;
     delta.final_barrier_calls = total.final_barrier_calls -| prefix.final_barrier_calls;
@@ -1399,38 +1386,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.gpu_moe_finalizer_shared_calls,
         profile.gpu_moe_finalizer_routed_only_calls,
     });
-    if (profile.barrier_calls > 0) {
-        log.info("  {s} barriers: total {d} attn {d} ssm {d} gpu-moe {d} dense {d} final {d}", .{
-            label,
-            profile.barrier_calls,
-            profile.full_attn_barrier_calls,
-            profile.ssm_barrier_calls,
-            profile.gpu_routed_moe_barrier_calls,
-            profile.dense_ffn_barrier_calls,
-            profile.final_barrier_calls,
-        });
-    }
-    if (profile.gpu_routed_moe_barrier_calls > 0) {
-        const typed_gpu_moe_barriers =
-            profile.gpu_moe_router_barrier_calls +
-            profile.gpu_moe_gate_up_barrier_calls +
-            profile.gpu_moe_activation_barrier_calls +
-            profile.gpu_moe_down_barrier_calls +
-            profile.gpu_moe_finalizer_barrier_calls;
-        const other_gpu_moe_barriers = if (profile.gpu_routed_moe_barrier_calls > typed_gpu_moe_barriers)
-            profile.gpu_routed_moe_barrier_calls - typed_gpu_moe_barriers
-        else
-            0;
-        log.info("  {s} gpu-moe barriers: router {d} gate-up {d} activation {d} down {d} finalizer {d} other {d}", .{
-            label,
-            profile.gpu_moe_router_barrier_calls,
-            profile.gpu_moe_gate_up_barrier_calls,
-            profile.gpu_moe_activation_barrier_calls,
-            profile.gpu_moe_down_barrier_calls,
-            profile.gpu_moe_finalizer_barrier_calls,
-            other_gpu_moe_barriers,
-        });
-    }
     if (profile.route_pack_layers > 0) {
         const layers_f = @as(f64, @floatFromInt(profile.route_pack_layers));
         log.info("  {s} route pack: layers {d} slots {d} avg_slots/layer {d:.1} active_block_upper {d} dense_dispatch_blocks {d} active/dense {d:.1}%", .{
@@ -27488,50 +27443,6 @@ test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
     var qwen_cfg = gemma_cfg;
     qwen_cfg.architecture = .qwen35;
     try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(qwen_cfg, "blk.0.ffn_gate.weight", 2112, 2816));
-}
-
-test "profile split delta preserves typed barrier counters" {
-    var prefix: RuntimeProfile = .{};
-    prefix.barrier_calls = 10;
-    prefix.full_attn_barrier_calls = 3;
-    prefix.ssm_barrier_calls = 2;
-    prefix.ssm_conv_barrier_calls = 1;
-    prefix.gpu_routed_moe_barrier_calls = 5;
-    prefix.gpu_moe_router_barrier_calls = 1;
-    prefix.gpu_moe_gate_up_barrier_calls = 1;
-    prefix.gpu_moe_activation_barrier_calls = 1;
-    prefix.gpu_moe_down_barrier_calls = 1;
-    prefix.gpu_moe_finalizer_barrier_calls = 1;
-
-    var total = prefix;
-    total.barrier_calls += 27;
-    total.full_attn_barrier_calls += 8;
-    total.ssm_barrier_calls += 4;
-    total.ssm_conv_barrier_calls += 2;
-    total.ssm_delta_barrier_calls += 1;
-    total.ssm_residual_barrier_calls += 1;
-    total.gpu_routed_moe_barrier_calls += 15;
-    total.gpu_moe_router_barrier_calls += 3;
-    total.gpu_moe_gate_up_barrier_calls += 4;
-    total.gpu_moe_activation_barrier_calls += 2;
-    total.gpu_moe_down_barrier_calls += 3;
-    total.gpu_moe_finalizer_barrier_calls += 3;
-    total.final_barrier_calls += 1;
-
-    const delta = profileDeltaForSplit(total, prefix);
-    try std.testing.expectEqual(@as(u32, 27), delta.barrier_calls);
-    try std.testing.expectEqual(@as(u32, 8), delta.full_attn_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 4), delta.ssm_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 2), delta.ssm_conv_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 1), delta.ssm_delta_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 1), delta.ssm_residual_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 15), delta.gpu_routed_moe_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 3), delta.gpu_moe_router_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 4), delta.gpu_moe_gate_up_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 2), delta.gpu_moe_activation_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 3), delta.gpu_moe_down_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 3), delta.gpu_moe_finalizer_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 1), delta.final_barrier_calls);
 }
 
 test "gemma shared down q8 tensors stay GPU eligible" {
