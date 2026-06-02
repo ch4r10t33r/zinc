@@ -5753,10 +5753,13 @@ pub const InferenceEngine = struct {
     fn defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
         if (!isGemma26A4BMoeShape(cfg)) return 1;
         if (prompt_len < 4) return 1;
-        // Keep the exact 20-token Gemma chat verifier on five 4-token command
-        // buffers: it starts GPU work one token earlier than the 5-token split
-        // while avoiding the known-bad 8-token basin.
+        // Keep the exact 20-token Gemma chat verifier on the accepted
+        // [1,5,7,7] split below. Longer public-suite prompts otherwise spend
+        // too much time at 4-token command-buffer boundaries; use the largest
+        // post-cycle-98 safe chunk size while staying below the known-bad
+        // 8-token basin.
         if (prompt_len == 20) return 4;
+        if (prompt_len > 20) return 7;
         if (prompt_len >= 17 and prompt_len <= 19) return 5;
         return 4;
     }
@@ -5779,6 +5782,18 @@ pub const InferenceEngine = struct {
             if (token_idx == 1) return 5;
             if (token_idx == 6) return 7;
             if (token_idx == 13) return 7;
+        }
+        if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len > 20 and base_chunk == 7) {
+            const remaining = prompt_len - token_idx;
+            if (remaining <= base_chunk) return remaining;
+
+            // Avoid a 1- or 2-token final command on public-suite lengths such
+            // as 50/51. Those tails add a queue boundary without enough GPU
+            // work to hide CPU recording, so borrow from the preceding chunk.
+            const tail_after_base = remaining - base_chunk;
+            if (tail_after_base > 0 and tail_after_base < 3) {
+                return base_chunk - (3 - tail_after_base);
+            }
         }
         return base_chunk;
     }
@@ -26693,6 +26708,56 @@ test "gemma26 exact 20 token prefill keeps accepted queued split" {
         token_idx += actual;
     }
     try std.testing.expectEqual(@as(usize, 20), token_idx);
+}
+
+test "gemma26 public prompt prefill uses longer queued chunks" {
+    const gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 704,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 2112,
+    };
+
+    const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 49, null);
+    try std.testing.expectEqual(@as(usize, 7), base_chunk);
+
+    const expected = [_]usize{ 7, 7, 7, 7, 7, 7, 7 };
+    var token_idx: usize = 0;
+    for (expected) |chunk_len| {
+        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 49, token_idx, base_chunk, false);
+        try std.testing.expectEqual(chunk_len, actual);
+        token_idx += actual;
+    }
+    try std.testing.expectEqual(@as(usize, 49), token_idx);
+
+    const base_chunk_50 = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 50, null);
+    try std.testing.expectEqual(@as(usize, 7), base_chunk_50);
+    token_idx = 0;
+    var final_chunk: usize = 0;
+    while (token_idx < 50) {
+        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 50, token_idx, base_chunk_50, false);
+        final_chunk = actual;
+        token_idx += actual;
+    }
+    try std.testing.expectEqual(@as(usize, 50), token_idx);
+    try std.testing.expectEqual(@as(usize, 3), final_chunk);
 }
 
 test "gemma26 queued prefill can skip nonterminal final layer tail" {
