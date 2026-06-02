@@ -175,7 +175,7 @@ fn runPromptMode(rt: *const engine.Engine, options: CliOptions) !void {
     if (options.model_path) |model_path| {
         if (options.prompt) |prompt| {
             try stdout.interface.writeAll(
-                "info(zinc_rt): forward_zinc_rt M1 host-assisted path with direct token-boundary gate\n",
+                "info(zinc_rt): forward_zinc_rt M1 host-assisted path with native amdgpu_cs token-boundary gate (vulkan=0)\n",
             );
             try stdout.interface.flush();
             try runForwardPrompt(rt.tier, model_path, prompt, options.max_tokens, options.chat);
@@ -195,11 +195,11 @@ fn printTierStartupAndSmoke(stdout: anytype, tier: engine.Tier) !void {
     if (tier == .t_cpu) {
         try stdout.interface.writeAll("info(zinc_rt): ZINC_RT M0 runtime initialized (tier=t_cpu)\n");
     } else if (tier == .t2_umq) {
-        try stdout.interface.writeAll("info(zinc_rt): ZINC_RT M1 runtime initialized (tier=t2_umq)\n");
+        try stdout.interface.writeAll("info(zinc_rt): ZINC_RT M1 runtime initialized (tier=t2_umq driver=amdgpu_umq vulkan=0)\n");
         const smoke = zinc_rt.umq.createFreeSmokeDefault();
         try printUmqSmokeResult(stdout, smoke);
     } else if (tier == .t1_pm4) {
-        try stdout.interface.writeAll("info(zinc_rt): ZINC_RT M1 runtime initialized (tier=t1_pm4)\n");
+        try stdout.interface.writeAll("info(zinc_rt): ZINC_RT M1 runtime initialized (tier=t1_pm4 driver=amdgpu_cs vulkan=0)\n");
         const smoke = zinc_rt.kfd.createComputeQueueSmokeDefault();
         try printKfdSmokeResult(stdout, smoke);
         const cs_smoke = zinc_rt.cs.submitNopSmokeDefault();
@@ -287,7 +287,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
     });
     if (result.direct_token_boundary_copies > 0) {
         try stdout.interface.print(
-            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier={s} direct_token_boundary=amdgpu_cs_copy_data copies={d} ib_bytes={d} last_fence={d} direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} direct_compute_token={d} consumed_gpu_model_value={d} direct_model_value_bits=0x{x} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
+            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier={s} driver=amdgpu_cs vulkan=0 direct_token_boundary=amdgpu_cs_copy_data copies={d} ib_bytes={d} last_fence={d} direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} direct_compute_token={d} consumed_gpu_model_value={d} direct_model_value_bits=0x{x} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
             .{
                 modelExecutionName(result),
                 executionTierName(tier),
@@ -308,7 +308,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
         );
     } else {
         try stdout.interface.print(
-            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier=t_cpu direct_token_boundary=unavailable direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} consumed_gpu_model_value={d} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
+            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier=t_cpu driver=cpu vulkan=0 direct_token_boundary=unavailable direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} consumed_gpu_model_value={d} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
             .{
                 modelExecutionName(result),
                 result.direct_model_ops,

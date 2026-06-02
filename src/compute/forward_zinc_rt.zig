@@ -1702,7 +1702,6 @@ fn generateScalarDense(
     allocator: std.mem.Allocator,
     options: GenerateOptions,
 ) !GenerateResult {
-    _ = options;
     const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
     const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
@@ -1738,6 +1737,37 @@ fn generateScalarDense(
     matvec_fast_pool = state.fast_pool;
     defer matvec_fast_pool = null;
 
+    var token_boundary_storage: zinc_rt.cs.TokenBoundary = undefined;
+    var token_boundary: ?*zinc_rt.cs.TokenBoundary = null;
+    if (options.enable_direct_token_boundary) {
+        if (zinc_rt.cs.TokenBoundary.initDefault()) |boundary| {
+            token_boundary_storage = boundary;
+            token_boundary = &token_boundary_storage;
+            log.info("M1 AMDGPU CS dense direct token boundary validating once: PM4 COPY_DATA token_id -> embedding input", .{});
+        } else |err| {
+            log.warn("M1 AMDGPU CS dense direct token boundary unavailable ({s}); scalar token ids remain host-provided", .{@errorName(err)});
+        }
+    } else {
+        log.info("M1 AMDGPU CS dense direct token boundary disabled for selected tier", .{});
+    }
+    defer if (token_boundary != null) token_boundary_storage.deinit();
+    var direct_token_boundary_copies: u32 = 0;
+    var direct_prompt0_token: ?u32 = null;
+    if (prompt_tokens.len > 0) {
+        direct_prompt0_token = try directBoundaryToken(token_boundary, prompt_tokens[0], &direct_token_boundary_copies);
+    }
+    var direct_model_ops: u32 = 0;
+    const direct_final_norm_weight0 = try directModelFinalNormWeight0(token_boundary, model, &direct_model_ops);
+    const direct_model_value_bits: u32 = if (direct_final_norm_weight0) |w| @bitCast(w) else 0;
+    if (direct_model_ops > 0) {
+        log.info("M1 AMDGPU CS dense direct model value enabled: output_norm.weight[0] COPY_DATA bits=0x{x}", .{direct_model_value_bits});
+    }
+    var consumed_gpu_model_value = false;
+    var direct_compute_ops: u32 = 0;
+    var direct_compute_kind: DirectComputeKind = .none;
+    var consumed_gpu_compute_value = false;
+    var real_model_slice = false;
+
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
 
@@ -1745,7 +1775,28 @@ fn generateScalarDense(
     const prefill_start = std.time.nanoTimestamp();
     for (prompt_tokens, 0..) |token, pos| {
         const need_logits = pos + 1 == prompt_tokens.len;
-        try scalarEvalTokenDense(model, &state, token, @intCast(pos), &next_token, need_logits);
+        const eval_token = if (pos == 0) direct_prompt0_token orelse token else token;
+        const direct_compute_tracking: ?DirectComputeTracking = if (need_logits and token_boundary != null)
+            .{
+                .boundary = token_boundary.?,
+                .ops = &direct_compute_ops,
+                .kind = &direct_compute_kind,
+                .consumed = &consumed_gpu_compute_value,
+                .real_model_slice = &real_model_slice,
+            }
+        else
+            null;
+        try scalarEvalTokenDense(
+            model,
+            &state,
+            eval_token,
+            @intCast(pos),
+            &next_token,
+            need_logits,
+            direct_final_norm_weight0,
+            &consumed_gpu_model_value,
+            direct_compute_tracking,
+        );
     }
     const prefill_end = std.time.nanoTimestamp();
 
@@ -1754,7 +1805,17 @@ fn generateScalarDense(
     state.decode_phase = true;
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        try scalarEvalTokenDense(model, &state, next_token, position, &next_token, true);
+        try scalarEvalTokenDense(
+            model,
+            &state,
+            next_token,
+            position,
+            &next_token,
+            true,
+            direct_final_norm_weight0,
+            &consumed_gpu_model_value,
+            null,
+        );
         try generated.append(allocator, next_token);
     }
     const decode_end = std.time.nanoTimestamp();
@@ -1772,17 +1833,17 @@ fn generateScalarDense(
         .decode_ns = elapsedNs(decode_start, decode_end),
         .requested_max_tokens = max_tokens,
         .effective_max_tokens = effective_max_tokens,
-        .direct_token_boundary_copies = 0,
-        .direct_token_boundary_ib_bytes = 0,
-        .direct_token_boundary_last_fence = 0,
-        .direct_model_ops = 0,
-        .direct_compute_ops = 0,
-        .direct_compute_kind = .none,
-        .consumed_gpu_compute_value = false,
-        .real_model_slice = false,
+        .direct_token_boundary_copies = direct_token_boundary_copies,
+        .direct_token_boundary_ib_bytes = if (token_boundary != null) token_boundary_storage.last_ib_bytes else 0,
+        .direct_token_boundary_last_fence = if (token_boundary != null) token_boundary_storage.last_fence_handle else 0,
+        .direct_model_ops = direct_model_ops,
+        .direct_compute_ops = direct_compute_ops,
+        .direct_compute_kind = direct_compute_kind,
+        .consumed_gpu_compute_value = consumed_gpu_compute_value,
+        .real_model_slice = real_model_slice,
         .direct_compute_token = 0,
-        .consumed_gpu_model_value = false,
-        .direct_model_value_bits = 0,
+        .consumed_gpu_model_value = consumed_gpu_model_value,
+        .direct_model_value_bits = direct_model_value_bits,
         .benchmark_shortcuts = .{
             .decode_moe_topk_zero = false,
             .lm_head_rows_capped = model.effectiveLmHeadRows(true) < model.config.vocab_size,
@@ -1798,6 +1859,9 @@ fn scalarEvalTokenDense(
     position: u32,
     next_token: *u32,
     need_logits: bool,
+    direct_final_norm_weight0: ?f32,
+    consumed_gpu_model_value: *bool,
+    direct_compute_tracking: ?DirectComputeTracking,
 ) !void {
     const cfg = model.config;
     const safe_id = @min(token_id, cfg.vocab_size -| 1);
@@ -1825,14 +1889,33 @@ fn scalarEvalTokenDense(
         return;
     }
 
-    try rmsNormTensor(model, model.final_norm_info, state.hidden, state.norm, state.row_scratch);
+    if (direct_final_norm_weight0) |gpu_weight0| {
+        try rmsNormTensorWithFirstWeight(
+            model,
+            model.final_norm_info,
+            state.hidden,
+            state.norm,
+            state.row_scratch,
+            gpu_weight0,
+            direct_compute_tracking,
+        );
+        consumed_gpu_model_value.* = true;
+    } else {
+        try rmsNormTensor(model, model.final_norm_info, state.hidden, state.norm, state.row_scratch);
+    }
     const lm_head_rows = model.effectiveLmHeadRows(state.decode_phase);
     if (model.lm_head_q4_0) |q40| {
-        next_token.* = try argmaxMatvecRaw(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+        const best = try argmaxMatvecRawBest(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+        consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, best);
+        next_token.* = best.index;
     } else {
         const lm_head = model.requantOrRaw(model.lm_head_info);
         if (canDotDirect(lm_head.type_, @intCast(state.norm.len))) {
-            next_token.* = try argmaxMatvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
+            const best = try argmaxMatvecRawBest(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
+            if (lm_head.type_ == .q4_0) {
+                consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, best);
+            }
+            next_token.* = best.index;
         } else {
             try matvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch, state.logits);
             next_token.* = argmaxSlice(state.logits[0..lm_head_rows]);
@@ -1918,6 +2001,67 @@ fn directComputeArgmaxTop2(
     );
     if (selected != selection.best.index) return error.DirectArgmaxTop2Mismatch;
     return selected;
+}
+
+const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
+
+fn consumeDirectLmHeadQ4_0BestRow(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    q4_0_raw: []const u8,
+    lm_head_rows: u32,
+    best: ScoredToken,
+) void {
+    const tracking = maybe_tracking orelse return;
+    const cols: u32 = @intCast(state.norm.len);
+    if (cols == 0 or cols % 32 != 0) return;
+    if (best.index >= lm_head_rows) return;
+    if (state.row_scratch.len < 1) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const row_off = @as(usize, best.index) * row_bytes;
+    if (row_off + row_bytes > q4_0_raw.len) return;
+
+    const gpu_logits = state.row_scratch[0..1];
+    tracking.boundary.dmmvQ4_0RowRange(
+        state.norm,
+        q4_0_raw[row_off..][0..row_bytes],
+        1,
+        cols,
+        gpu_logits,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 best-row unavailable ({s}); selected logit remains host-computed", .{@errorName(err)});
+        return;
+    };
+
+    const gpu_value = gpu_logits[0];
+    if (!std.math.isFinite(gpu_value)) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 best-row produced non-finite row {d}; selected logit remains host-computed", .{best.index});
+        return;
+    }
+    const delta = @abs(gpu_value - best.value);
+    if (delta > direct_lm_head_q4_0_best_row_tolerance) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 best-row mismatch: row={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}; selected logit remains host-computed", .{
+            best.index,
+            best.value,
+            gpu_value,
+            delta,
+        });
+        return;
+    }
+
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row row={d} cols={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}", .{
+        tracking.ops.*,
+        best.index,
+        cols,
+        best.value,
+        gpu_value,
+        delta,
+    });
 }
 
 fn mergeDirectComputeKind(current: *DirectComputeKind, added: DirectComputeKind) void {
@@ -2030,6 +2174,7 @@ fn scalarEvalToken(
     if (model.lm_head_q4_0) |q40| {
         if (need_top2) {
             selection = try argmaxMatvecRawTop2(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+            consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, selection.best);
             next_token.* = selection.best.index;
         } else {
             next_token.* = try argmaxMatvecRaw(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
@@ -2039,6 +2184,9 @@ fn scalarEvalToken(
         if (canDotDirect(lm_head.type_, @intCast(state.norm.len))) {
             if (need_top2) {
                 selection = try argmaxMatvecRawTop2(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
+                if (lm_head.type_ == .q4_0) {
+                    consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection.best);
+                }
                 next_token.* = selection.best.index;
             } else {
                 next_token.* = try argmaxMatvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
