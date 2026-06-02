@@ -5994,6 +5994,9 @@ pub const InferenceEngine = struct {
 
     fn canUseSingleCommandQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
         if (!self.canUseQueuedTokenMajorPrefill(prompt_len)) return false;
+        if (isGemma26A4BMoeShape(self.config) and prompt_len >= 64 and prompt_len <= 96) {
+            return true;
+        }
         if (!defaultQwen36SsmPrefillProjectionEnabled(self.config)) return false;
         if (shouldCpuLmHeadFallback(self)) return false;
         return true;
@@ -6252,10 +6255,17 @@ pub const InferenceEngine = struct {
             try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
         }
 
-        if (self.canUseQwenLayer0RoutePackedPrefill(prompt_tokens.len)) {
-            return self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens);
+        const use_qwen_ssm_prefill = defaultQwen36SsmPrefillProjectionEnabled(self.config);
+        if (use_qwen_ssm_prefill) {
+            if (self.canUseQwenLayer0RoutePackedPrefill(prompt_tokens.len)) {
+                return self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens);
+            }
+            self.logQwenLayer0RoutePackedPrefillBlocker(prompt_tokens.len);
+        } else {
+            self.qwen_ssm_prefill_proj_active_tokens = 0;
+            self.qwen_ssm_prefill_branch_active_tokens = 0;
+            self.qwen_ssm_prefill_branch_norm_active_tokens = 0;
         }
-        self.logQwenLayer0RoutePackedPrefillBlocker(prompt_tokens.len);
 
         var precompute_cmd = MetalCommand{
             .handle = null,
@@ -6264,12 +6274,15 @@ pub const InferenceEngine = struct {
             .barrier_enabled = false,
         };
         defer if (precompute_cmd.handle != null) precompute_cmd.wait();
-        _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
+        if (use_qwen_ssm_prefill) {
+            _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
+        }
 
         const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
         const pending_token_count = prompt_tokens.len - 1;
         const split_token: usize = queuedTokenMajorEarlyCommitTokens(prompt_tokens.len);
         recordQueuedPrefillStart(profile, prompt_tokens.len, null, prompt_tokens.len);
+        var first_async_submit_ns: i128 = -1;
         var first_prompt_cmd = MetalCommand{
             .handle = null,
             .dispatch_count = 0,
@@ -6282,6 +6295,7 @@ pub const InferenceEngine = struct {
             recordQueuedPrefillChunk(profile, split_token, false);
             first_prompt_cmd = try beginProfiledCommand(self, profile);
             errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+            const first_record_start = profileStart(profile != null);
             for (prompt_tokens[0..split_token], 0..) |_, i| {
                 const embed_offset: u32 = @intCast(i * hidden_dim_usize);
                 const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
@@ -6290,11 +6304,14 @@ pub const InferenceEngine = struct {
                     &self.prefill_embed_buf;
                 try runDecodeStep(self, false, embed_src, embed_offset, null, &first_prompt_cmd, 0);
             }
+            recordQueuedPrefillChunkWork(profile, &first_prompt_cmd, profileElapsedNs(first_record_start), false);
             commitAsyncProfiled(&first_prompt_cmd, profile);
+            recordQueuedPrefillAsyncSubmit(profile, &first_async_submit_ns);
         }
 
         var prompt_cmd = try beginProfiledCommand(self, profile);
         errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
+        const final_record_start = profileStart(profile != null);
 
         for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
             const embed_offset: u32 = @intCast(i * hidden_dim_usize);
@@ -6311,7 +6328,14 @@ pub const InferenceEngine = struct {
             &self.prefill_embed_buf;
         recordQueuedPrefillChunk(profile, prompt_tokens.len - split_token, true);
         try runDecodeStep(self, true, final_src, final_offset, null, &prompt_cmd, 0);
+        recordQueuedPrefillChunkWork(profile, &prompt_cmd, profileElapsedNs(final_record_start), true);
+        const final_wait_start = profileStart(profile != null);
+        const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
+            @intCast(final_wait_start - first_async_submit_ns)
+        else
+            0;
         commitAndWaitProfiled(&prompt_cmd, profile);
+        recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
         state.position = self.position;
     }
 
