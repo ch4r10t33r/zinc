@@ -2827,6 +2827,7 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         if (engine.layer_output_scales[i] != 1.0) return false;
 
         const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
             lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
 
@@ -2843,12 +2844,6 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 
         const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
         if (q_rows >= attn.q_dim * 2) return false;
-        if (lt.attn_gate) |gate| {
-            if (q_rows != attn.q_dim) return false;
-            if (!supportsBatchedGemmQuant(engine, gate.info.type_)) return false;
-            const gate_rows: u32 = @intCast(gate.info.numElements() / cfg.hidden_dim);
-            if (gate_rows != attn.q_dim) return false;
-        }
 
         if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
         const gate_inp = lt.ffn_gate_inp orelse return false;
@@ -2981,6 +2976,10 @@ fn logGemmaBatchedPrefillDecision(
         }
 
         const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
+            return;
+        }
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null or lt.attn_output_bias != null) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attention bias present q={s} k={s} v={s} o={s}", .{
                 i,
@@ -3034,22 +3033,6 @@ fn logGemmaBatchedPrefillDecision(
         if (q_rows >= attn.q_dim * 2) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} q_rows={d} q_dim={d}", .{ i, q_rows, attn.q_dim });
             return;
-        }
-        if (lt.attn_gate) |gate| {
-            if (q_rows != attn.q_dim) {
-                log.info("Metal profile: Gemma batched prefill guard failed: layer {d} separate attn_gate with q_rows={d} q_dim={d}", .{ i, q_rows, attn.q_dim });
-                return;
-            }
-            const gate_rows: u32 = @intCast(gate.info.numElements() / cfg.hidden_dim);
-            if (gate_rows != attn.q_dim or !supportsBatchedGemmQuant(engine, gate.info.type_)) {
-                log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate unsupported type={s} rows={d} q_dim={d}", .{
-                    i,
-                    @tagName(gate.info.type_),
-                    gate_rows,
-                    attn.q_dim,
-                });
-                return;
-            }
         }
 
         if (!hasExplicitGemmaMoeTensors(cfg, lt)) {
@@ -6782,9 +6765,6 @@ pub const InferenceEngine = struct {
             cmd.barrier();
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
-            if (lt.attn_gate) |gate_t| {
-                dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, attn.q_dim, hidden_dim, n_tokens);
-            }
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
@@ -6867,10 +6847,6 @@ pub const InferenceEngine = struct {
             }
             cmd.barrier();
 
-            if (lt.attn_gate != null) {
-                dispatchSigmoidMulOnCmd(self, &cmd, &scratch.gate, &scratch.attn_out, n_tokens * attn.q_dim);
-                cmd.barrier();
-            }
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
             cmd.barrier();
             if (self.post_attn_norm_present[layer_idx]) {
