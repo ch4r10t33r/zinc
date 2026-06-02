@@ -2509,6 +2509,10 @@ fn gemmaBatchedPrefillMode() BatchedPrefillMode {
     return .off;
 }
 
+fn gemmaBatchedPrefillEnvPresent() bool {
+    return std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") != null;
+}
+
 fn gemmaBatchedPrefillEnabled() bool {
     return gemmaBatchedPrefillMode() != .off;
 }
@@ -2663,7 +2667,6 @@ fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u3
 fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
     const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
-    if (!gemmaBatchedPrefillEnabled()) return false;
     if (cfg.architecture != .gemma or cfg.n_experts == 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
     if (engine.private_decode_buffers) return false;
@@ -2732,6 +2735,15 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         engine.sigmoid_scale_acc_batched_pipe.handle != null and
         engine.zero_f32_pipe.handle != null and
         engine.scale_acc_pipe.handle != null;
+}
+
+fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: usize) bool {
+    if (!isGemma26A4BMoeShape(cfg)) return false;
+    // The current public-suite planning prompt is 70 chat-template tokens.
+    // Keep the default experiment on that nearby band so short Paris decode
+    // guards and unrelated Gemma MoE prompts continue using the accepted queued
+    // token-major path unless explicitly opted in.
+    return prompt_len >= 64 and prompt_len <= 96;
 }
 
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -6163,11 +6175,22 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
-        const gemma_mode: BatchedPrefillMode = if (self.config.architecture == .gemma and self.config.n_experts > 0)
-            gemmaBatchedPrefillMode()
-        else
-            .off;
-        const mode: BatchedPrefillMode = if (gemma_mode != .off)
+        const is_gemma_moe_prefill = self.config.architecture == .gemma and self.config.n_experts > 0;
+        const gemma_env_present = gemmaBatchedPrefillEnvPresent();
+        const gemma_mode: BatchedPrefillMode = if (self.config.architecture == .gemma and self.config.n_experts > 0) blk: {
+            const explicit_mode = gemmaBatchedPrefillMode();
+            if (explicit_mode != .off or gemma_env_present) break :blk explicit_mode;
+            if (requested_mode == .off and
+                !batchedPrefillEnvPresent() and
+                shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens.len))
+            {
+                break :blk .on;
+            }
+            break :blk .off;
+        } else .off;
+        const mode: BatchedPrefillMode = if (is_gemma_moe_prefill and gemma_env_present and gemma_mode == .off)
+            .off
+        else if (gemma_mode != .off)
             gemma_mode
         else if (requested_mode == .off and
             !batchedPrefillEnvPresent() and
@@ -26678,6 +26701,12 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
         .full_attn_interval = 1,
         .shared_expert_intermediate_dim = 2112,
     };
+
+    try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 20));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 64));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 70));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 96));
+    try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 97));
 
     const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 70, null);
     try std.testing.expectEqual(@as(usize, 7), base_chunk);
