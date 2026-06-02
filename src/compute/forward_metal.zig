@@ -46,6 +46,15 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
+const moe_route_pack_profile_stats_per_layer: usize = 4;
+
+fn moeRoutePackProfileWords(n_layers: usize) usize {
+    return 1 + n_layers + n_layers * moe_route_pack_profile_stats_per_layer;
+}
+
+fn moeRoutePackProfileStatsBase(n_layers: usize, layer_idx: usize) usize {
+    return 1 + n_layers + layer_idx * moe_route_pack_profile_stats_per_layer;
+}
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -881,6 +890,10 @@ pub const RuntimeProfile = struct {
     route_pack_active_block_samples: u32 = 0,
     route_pack_active_block_min: u32 = 0,
     route_pack_active_block_max: u32 = 0,
+    route_pack_full_blocks_actual: u64 = 0,
+    route_pack_tail_blocks_actual: u64 = 0,
+    route_pack_single_tail_blocks_actual: u64 = 0,
+    route_pack_padding_slots_actual: u64 = 0,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1280,6 +1293,10 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.route_pack_active_block_min = total.route_pack_active_block_min;
         delta.route_pack_active_block_max = total.route_pack_active_block_max;
     }
+    delta.route_pack_full_blocks_actual = total.route_pack_full_blocks_actual -| prefix.route_pack_full_blocks_actual;
+    delta.route_pack_tail_blocks_actual = total.route_pack_tail_blocks_actual -| prefix.route_pack_tail_blocks_actual;
+    delta.route_pack_single_tail_blocks_actual = total.route_pack_single_tail_blocks_actual -| prefix.route_pack_single_tail_blocks_actual;
+    delta.route_pack_padding_slots_actual = total.route_pack_padding_slots_actual -| prefix.route_pack_padding_slots_actual;
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1385,6 +1402,19 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
                 100.0 - pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
             });
+            const active_capacity = profile.route_pack_active_blocks_actual * @as(u64, moe_route_block_cols);
+            if (active_capacity > 0) {
+                log.info("  {s} route pack occupancy: full {d} tail {d} singleton_tail {d} padding_slots {d} util {d:.1}% tail_blocks {d:.1}% singleton_tail {d:.1}%", .{
+                    label,
+                    profile.route_pack_full_blocks_actual,
+                    profile.route_pack_tail_blocks_actual,
+                    profile.route_pack_single_tail_blocks_actual,
+                    profile.route_pack_padding_slots_actual,
+                    pctOf(active_capacity, profile.route_pack_slots),
+                    pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
+                    pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
+                });
+            }
         }
     }
     if (profile.queued_prefill_requests > 0) {
@@ -2671,6 +2701,15 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
             p.route_pack_active_block_max = active_blocks;
         }
     }
+    if (words >= moeRoutePackProfileWords(n_layers)) {
+        for (0..n_layers) |i| {
+            const base = moeRoutePackProfileStatsBase(n_layers, i);
+            p.route_pack_full_blocks_actual += counts[base + 0];
+            p.route_pack_tail_blocks_actual += counts[base + 1];
+            p.route_pack_single_tail_blocks_actual += counts[base + 2];
+            p.route_pack_padding_slots_actual += counts[base + 3];
+        }
+    }
 }
 
 fn recordQueuedPrefillStart(
@@ -3418,7 +3457,7 @@ const BatchedPrefillScratch = struct {
             var mut = active_blocks;
             metal_buffer.freeBuffer(&mut);
         }
-        const active_block_count_words: usize = 1 + @as(usize, @intCast(engine.config.n_layers));
+        const active_block_count_words = moeRoutePackProfileWords(@intCast(engine.config.n_layers));
         const active_block_count = try metal_buffer.createBuffer(ctx, active_block_count_words * u32_sz);
         errdefer {
             var mut = active_block_count;
@@ -7147,6 +7186,18 @@ pub const InferenceEngine = struct {
                         profile.route_pack_active_block_max,
                         pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
                     });
+                    const active_capacity = profile.route_pack_active_blocks_actual * @as(u64, moe_route_block_cols);
+                    if (active_capacity > 0) {
+                        log.info("  route-pack occupancy: full {d} tail {d} singleton_tail {d} padding_slots {d} util {d:.1}% tail_blocks {d:.1}% singleton_tail {d:.1}%", .{
+                            profile.route_pack_full_blocks_actual,
+                            profile.route_pack_tail_blocks_actual,
+                            profile.route_pack_single_tail_blocks_actual,
+                            profile.route_pack_padding_slots_actual,
+                            pctOf(active_capacity, profile.route_pack_slots),
+                            pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
+                            pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
+                        });
+                    }
                 }
             }
             if (profile.dmmv_q8_0_bytes > 0) {
@@ -28566,7 +28617,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     defer metal_buffer.freeBuffer(&ids_buf);
     const profile_slots: usize = 4;
     const profile_index: usize = 2;
-    var active_count_buf = try metal_buffer.createBuffer(ctx, (1 + profile_slots) * @sizeOf(u32));
+    var active_count_buf = try metal_buffer.createBuffer(ctx, moeRoutePackProfileWords(profile_slots) * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&active_count_buf);
     var active_blocks_buf = try metal_buffer.createBuffer(ctx, route_slots * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&active_blocks_buf);
@@ -28607,6 +28658,13 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
     try std.testing.expectEqual(@as(u32, 6), active_count_ptr[0]);
     try std.testing.expectEqual(@as(u32, 6), active_count_ptr[1 + profile_index]);
+    {
+        const stats_base = moeRoutePackProfileStatsBase(profile_slots, profile_index);
+        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 0]);
+        try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 1]);
+        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 2]);
+        try std.testing.expectEqual(@as(u32, 33), active_count_ptr[stats_base + 3]);
+    }
 
     var seen_routes = [_]bool{false} ** route_slots;
     for (0..n_experts) |expert| {
@@ -29350,7 +29408,7 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * @sizeOf(u32)), scratch.moe_expert_counts.size);
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * n_tokens * @sizeOf(u32)), scratch.moe_packed_ids.size);
     try std.testing.expectEqual(@as(usize, route_slots * @sizeOf(u32)), scratch.moe_active_blocks.size);
-    try std.testing.expectEqual((1 + @as(usize, @intCast(engine.config.n_layers))) * @sizeOf(u32), scratch.moe_active_block_count.size);
+    try std.testing.expectEqual(moeRoutePackProfileWords(@intCast(engine.config.n_layers)) * @sizeOf(u32), scratch.moe_active_block_count.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
     try std.testing.expectEqual(@as(usize, route_slots * inter_dim * @sizeOf(f32)), scratch.moe_expert_gate.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);

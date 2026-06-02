@@ -14,6 +14,7 @@ struct Params {
 
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
+#define PROFILE_STATS_PER_LAYER 4u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -61,12 +62,34 @@ kernel void main0(
 
     if (tid == 0u) {
         uint total_blocks = 0u;
+        uint full_blocks = 0u;
+        uint tail_blocks = 0u;
+        uint singleton_tail_blocks = 0u;
+        uint padding_slots = 0u;
         for (uint expert = 0u; expert < p.n_experts; expert++) {
             total_blocks += block_counts[expert];
+            const uint stored_count = min(atomic_load_explicit(counts + expert, memory_order_relaxed), p.ids_stride);
+            if (stored_count == 0u) {
+                continue;
+            }
+            full_blocks += stored_count / NUM_COLS;
+            const uint tail_routes = stored_count % NUM_COLS;
+            if (tail_routes != 0u) {
+                tail_blocks += 1u;
+                padding_slots += NUM_COLS - tail_routes;
+                if (tail_routes == 1u) {
+                    singleton_tail_blocks += 1u;
+                }
+            }
         }
         atomic_store_explicit(active_block_count, total_blocks, memory_order_relaxed);
         if (p.profile_index < p.profile_slots) {
             atomic_store_explicit(active_block_count + 1u + p.profile_index, total_blocks, memory_order_relaxed);
+            device atomic_uint* layer_stats = active_block_count + 1u + p.profile_slots + p.profile_index * PROFILE_STATS_PER_LAYER;
+            atomic_store_explicit(layer_stats + 0u, full_blocks, memory_order_relaxed);
+            atomic_store_explicit(layer_stats + 1u, tail_blocks, memory_order_relaxed);
+            atomic_store_explicit(layer_stats + 2u, singleton_tail_blocks, memory_order_relaxed);
+            atomic_store_explicit(layer_stats + 3u, padding_slots, memory_order_relaxed);
         }
     }
 
