@@ -53,6 +53,7 @@
  *   bun loops/zinc_rt_autopilot.ts --runs-per-binary 5
  *   bun loops/zinc_rt_autopilot.ts --model-path /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
  *   bun loops/zinc_rt_autopilot.ts --target-ratio 1.05   # stop when zinc_rt ≥1.05× vulkan
+ *   bun loops/zinc_rt_autopilot.ts --baseline llama --target-ratio 1.03
  *
  * Designed to be safe to run overnight unattended. Survives:
  *   - GPU lock contention (uses flock)
@@ -105,26 +106,73 @@ const REPO_ROOT = resolve(import.meta.dir, "..");
 let PROJECT_ROOT = REPO_ROOT;
 let RESULTS_DIR = resolve(REPO_ROOT, ".zinc_rt_autopilot");
 
+function stripOptionalQuotes(value: string): string {
+  const v = value.trim();
+  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+    return v.slice(1, -1);
+  }
+  return v;
+}
+
 function loadEnv(): Record<string, string> {
   const envPath = join(REPO_ROOT, ".env");
   const vars: Record<string, string> = {};
   if (existsSync(envPath)) {
     const content = require("fs").readFileSync(envPath, "utf8") as string;
     for (const line of content.split("\n")) {
-      const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+?)\s*$/);
-      if (m) vars[m[1]] = m[2];
+      const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.+?)\s*$/);
+      if (m) vars[m[1]] = stripOptionalQuotes(m[2]);
     }
   }
   return vars;
 }
 
 const ENV = loadEnv();
-const ZINC_HOST = process.env.ZINC_HOST ?? ENV.ZINC_HOST ?? "127.0.0.1";
-const ZINC_PORT = Number(process.env.ZINC_PORT ?? ENV.ZINC_PORT ?? "22");
-const ZINC_USER = process.env.ZINC_USER ?? ENV.ZINC_USER ?? "root";
-let REMOTE_ZINC_DIR = "/root/zinc";
-const DEFAULT_MODEL = "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
+
+function envValue(...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = process.env[key] ?? ENV[key];
+    if (value != null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function nodeEnvKey(node: string, suffix: string): string {
+  const normalized = node
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `ZINC_${normalized}_${suffix}`;
+}
+
+function nodeEnvValue(suffixes: string[], fallbackKeys: string[]): string | undefined {
+  const node = envValue("ZINC_RDNA_NODE", "ZINC_NODE");
+  if (node) {
+    for (const suffix of suffixes) {
+      const value = envValue(nodeEnvKey(node, suffix));
+      if (value != null) return value;
+    }
+  }
+  return envValue(...fallbackKeys);
+}
+
+const ZINC_NODE = envValue("ZINC_RDNA_NODE", "ZINC_NODE") ?? "";
+const ZINC_HOST = nodeEnvValue(["HOST"], ["ZINC_RDNA_HOST", "ZINC_HOST"]) ?? "127.0.0.1";
+const ZINC_PORT = Number(nodeEnvValue(["PORT"], ["ZINC_RDNA_PORT", "ZINC_PORT"]) ?? "22");
+const ZINC_USER = nodeEnvValue(["USER"], ["ZINC_RDNA_USER", "ZINC_USER"]) ?? "root";
+let REMOTE_ZINC_DIR =
+  nodeEnvValue(["REMOTE_DIR", "WORKDIR"], ["ZINC_RDNA_REMOTE_DIR", "ZINC_RDNA_WORKDIR", "ZINC_REMOTE_DIR"]) ??
+  "/root/zinc";
+const DEFAULT_MODEL =
+  nodeEnvValue(
+    ["MODEL_PATH", "REMOTE_MODEL", "MODEL"],
+    ["ZINC_RDNA_MODEL_PATH", "ZINC_RDNA_REMOTE_MODEL", "ZINC_MODEL_PATH"],
+  ) ?? "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
 const DEFAULT_PROMPT = "The capital of France is";
+const DEFAULT_MAX_TOKENS = 96;
+const DEFAULT_LLAMA_CLI =
+  nodeEnvValue(["LLAMA_CLI_REMOTE", "LLAMA_CLI"], ["ZINC_LLAMA_CLI_REMOTE", "ZINC_LLAMA_CLI"]) ?? null;
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
 const CLAUDE_EFFORT = process.env.ZINC_CLAUDE_EFFORT ?? "max";
 const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
@@ -133,6 +181,15 @@ const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh
 const REMOTE_VULKAN_BIN = "./zig-out/bin/zinc-vulkan";
 const REMOTE_ZINC_RT_BIN = "./zig-out/bin/zinc-zinc_rt";
 const REMOTE_ENV_PREFIX = "export PATH=/root/.bun/bin:$PATH;";
+
+function shellQuote(value: string | number): string {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function maskedRemoteLabel(): string {
+  const node = ZINC_NODE ? `${ZINC_NODE}` : "remote";
+  return `${ZINC_USER}@${node}:masked`;
+}
 
 // Threshold above which ZINC_RT is considered "competitive" and we leave
 // MIGRATE phase. 0.6 = within 60% of Vulkan tok/s.
@@ -160,6 +217,8 @@ const BLOCKED_GIT_OPS = [
 const BLOCKED_FILE_OPS = [
   "Edit(.env)",
   "Write(.env)",
+  "Edit(.env.*)",
+  "Write(.env.*)",
   "Edit(.zinc_rt_autopilot/*)",
   "Write(.zinc_rt_autopilot/*)",
 ];
@@ -169,6 +228,15 @@ const BLOCKED_FILE_OPS = [
 // We do NOT block writes to docs/ZINC_RT_DESIGN.md.
 
 type AgentKind = "claude" | "codex";
+type ComparisonTarget = "vulkan" | "llama";
+
+function comparisonTargetLabel(target: ComparisonTarget): string {
+  return target === "llama" ? "llama.cpp" : "vulkan";
+}
+
+function comparisonTargetShort(target: ComparisonTarget): string {
+  return target === "llama" ? "llama" : "vk";
+}
 
 // ── Phase model ──────────────────────────────────────────────────────
 
@@ -208,9 +276,10 @@ export type BenchmarkResult = {
 };
 
 export type ABBenchmark = {
+  comparisonTarget: ComparisonTarget;
   vulkan: BenchmarkResult;
   zinc_rt: BenchmarkResult;
-  /** zinc_rt.decodeTps / vulkan.decodeTps. Null if either side missing. */
+  /** zinc_rt.decodeTps / baseline.decodeTps. Null if either side missing. */
   ratio: number | null;
   /** Same for prefill. */
   prefillRatio: number | null;
@@ -315,6 +384,8 @@ async function rsyncToRemote(): Promise<void> {
       "--exclude", "zig-cache",
       "--exclude", "node_modules",
       "--exclude", ".git",
+      "--exclude", ".env",
+      "--exclude", ".env.*",
       "--exclude", ".zinc_optimize",
       "--exclude", ".llm_optimize",
       "--exclude", ".zinc_rt_autopilot",
@@ -371,10 +442,8 @@ type BuildSummary = {
 
 async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary> {
   console.log(clr("2", `  build -Dbackend=${backend}...`));
-  // We pass -Dno-shaders=true for zinc_rt builds once they don't need legacy shaders.
-  // For now, we always build the shader set so the vulkan path remains
-  // testable; the zinc_rt build can compile additionally without harming Vulkan.
-  const cmd = `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && (zig build -Doptimize=ReleaseFast -Dbackend=${backend} 2>&1; echo __EXIT__=$?)`;
+  const shaderFlag = backend === "zinc_rt" ? " -Dshaders=false" : "";
+  const cmd = `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && (zig build -Doptimize=ReleaseFast -Dbackend=${backend}${shaderFlag} 2>&1; echo __EXIT__=$?)`;
   const { stdout, stderr } = await runCommand(
     "ssh",
     [
@@ -404,15 +473,18 @@ async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary>
   return { exitCode, output: combined.slice(-6000), flagRecognized };
 }
 
-async function remoteTest(): Promise<{ passed: boolean; output: string }> {
+async function remoteTest(comparisonTarget: ComparisonTarget): Promise<{ passed: boolean; output: string }> {
   console.log(clr("2", "  zig build test..."));
+  const testCommand = comparisonTarget === "llama"
+    ? "zig build test -Dbackend=zinc_rt -Dshaders=false --summary all"
+    : "zig build test --summary all";
   const { stdout, stderr, exitCode } = await runCommand(
     "ssh",
     [
       "-p", String(ZINC_PORT),
       "-o", "StrictHostKeyChecking=no",
       `${ZINC_USER}@${ZINC_HOST}`,
-      `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && zig build test --summary all 2>&1`,
+      `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && ${testCommand} 2>&1`,
     ],
     { streamOutput: false, timeout: 180_000 },
   );
@@ -429,11 +501,12 @@ async function runOnce(
   binary: string,
   modelPath: string,
   prompt: string,
+  maxTokens: number,
   envFlags: string,
 ): Promise<{ exitCode: number; output: string }> {
   // flock serializes GPU access on the remote node.
-  const inner = `${envFlags} timeout 90 ${binary} -m ${modelPath} --prompt "${prompt}" 2>&1`;
-  const wrapped = `cd ${REMOTE_ZINC_DIR} && flock /tmp/zinc-gpu.lock -c '${inner.replace(/'/g, "'\\''")}'`;
+  const inner = `${envFlags} timeout 120 ${shellQuote(binary)} -m ${shellQuote(modelPath)} --prompt ${shellQuote(prompt)} --max-tokens ${maxTokens} 2>&1`;
+  const wrapped = `cd ${shellQuote(REMOTE_ZINC_DIR)} && flock /tmp/zinc-gpu.lock -c ${shellQuote(inner)}`;
   const { stdout, stderr, exitCode } = await runCommand(
     "ssh",
     [
@@ -469,6 +542,7 @@ async function benchmarkBinary(
   binary: string,
   modelPath: string,
   prompt: string,
+  maxTokens: number,
   envFlags: string,
   runsPerBinary: number,
 ): Promise<BenchmarkResult> {
@@ -485,7 +559,7 @@ async function benchmarkBinary(
   for (let i = 0; i < runsPerBinary; i++) {
     const tag = `[${i + 1}/${runsPerBinary}]`;
     process.stdout.write(clr("2", `    ${tag} ${binary.split("/").pop()}... `));
-    const res = await runOnce(binary, modelPath, prompt, envFlags);
+    const res = await runOnce(binary, modelPath, prompt, maxTokens, envFlags);
     lastOutput = res.output;
     lastExit = res.exitCode;
 
@@ -533,43 +607,187 @@ async function benchmarkBinary(
   };
 }
 
+export function parseLlamaCliTimings(output: string): {
+  decodeTps: number | null;
+  prefillTps: number | null;
+  generatedTokens: number;
+} {
+  const bracketMatch = output.match(/\[\s*Prompt:\s*([\d.]+)\s*t\/s\s*\|\s*Generation:\s*([\d.]+)\s*t\/s\s*\]/i);
+  if (bracketMatch) {
+    return {
+      decodeTps: parseFloat(bracketMatch[2]),
+      prefillTps: parseFloat(bracketMatch[1]),
+      generatedTokens: 0,
+    };
+  }
+  const promptMatch = output.match(/^\s*llama_print_timings:\s+prompt eval time =\s*[\d.]+\s*ms\s*\/\s*(\d+)\s+tokens.*?,\s*([\d.]+)\s+tokens per second\)/m);
+  const decodeMatch = output.match(/^\s*llama_print_timings:\s+eval time =\s*[\d.]+\s*ms\s*\/\s*(\d+)\s+(?:runs|tokens).*?,\s*([\d.]+)\s+tokens per second\)/m);
+  return {
+    decodeTps: decodeMatch ? parseFloat(decodeMatch[2]) : null,
+    prefillTps: promptMatch ? parseFloat(promptMatch[2]) : null,
+    generatedTokens: decodeMatch ? parseInt(decodeMatch[1], 10) : 0,
+  };
+}
+
+async function detectRemoteLlamaCliPath(): Promise<string | null> {
+  if (DEFAULT_LLAMA_CLI) return DEFAULT_LLAMA_CLI;
+  const roots = [
+    "/root/llama.cpp",
+    "/root/workspace/llama.cpp",
+    "/workspace/llama.cpp",
+    `${ZINC_USER === "root" ? "/root" : `/home/${ZINC_USER}`}/llama.cpp`,
+  ];
+  const quotedRoots = roots.map((root) => shellQuote(root)).join(" ");
+  const command = `which llama-cli || command -v llama-cli || find ${quotedRoots} -name llama-cli -type f 2>/dev/null | head -n 1`;
+  const found = await sshSafe(command, 120_000);
+  const candidate = found?.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return candidate ?? null;
+}
+
+async function runLlamaOnce(
+  llamaCli: string,
+  modelPath: string,
+  prompt: string,
+  maxTokens: number,
+): Promise<{ exitCode: number; output: string }> {
+  const inner = [
+    "RADV_PERFTEST=coop_matrix",
+    "timeout 180",
+    shellQuote(llamaCli),
+    "-m", shellQuote(modelPath),
+    "-n", String(maxTokens),
+    "-p", shellQuote(prompt),
+    "--temp", "0",
+    "-ngl", "999",
+    "-dev", "Vulkan0",
+    "-fa", "on",
+    "-b", "4096",
+    "-ub", "1024",
+    "--perf",
+    "--single-turn",
+    "--simple-io",
+    "2>&1",
+  ].join(" ");
+  const wrapped = `flock /tmp/zinc-gpu.lock -c ${shellQuote(inner)}`;
+  const { stdout, stderr, exitCode } = await runCommand(
+    "ssh",
+    [
+      "-p", String(ZINC_PORT),
+      "-o", "StrictHostKeyChecking=no",
+      `${ZINC_USER}@${ZINC_HOST}`,
+      wrapped,
+    ],
+    { streamOutput: false, timeout: 300_000 },
+  );
+  return { exitCode, output: stdout + (stderr ? `\n${stderr}` : "") };
+}
+
+async function benchmarkLlama(
+  modelPath: string,
+  prompt: string,
+  maxTokens: number,
+  runsPerBinary: number,
+): Promise<BenchmarkResult> {
+  const llamaCli = await detectRemoteLlamaCliPath();
+  if (!llamaCli) {
+    return {
+      ...emptyResult(),
+      buildExitCode: 0,
+      backendFlagRecognized: true,
+      error: "llama-cli not found on remote",
+    };
+  }
+
+  const decodeSamples: number[] = [];
+  const prefillSamples: number[] = [];
+  let lastOutput = "";
+  let lastExit: number | null = null;
+  let lastTokensGenerated = 0;
+
+  for (let i = 0; i < runsPerBinary; i++) {
+    const tag = `[${i + 1}/${runsPerBinary}]`;
+    process.stdout.write(clr("2", `    ${tag} llama-cli... `));
+    const res = await runLlamaOnce(llamaCli, modelPath, prompt, maxTokens);
+    lastOutput = res.output;
+    lastExit = res.exitCode;
+
+    if (res.exitCode !== 0) {
+      process.stdout.write(clr("1;31", `crash (exit ${res.exitCode})\n`));
+      continue;
+    }
+
+    const parsed = parseLlamaCliTimings(res.output);
+    if (parsed.decodeTps != null) decodeSamples.push(parsed.decodeTps);
+    if (parsed.prefillTps != null) prefillSamples.push(parsed.prefillTps);
+    lastTokensGenerated = parsed.generatedTokens || maxTokens;
+    const decodeStr = parsed.decodeTps != null ? `${parsed.decodeTps.toFixed(1)} tok/s` : "—";
+    const prefillStr = parsed.prefillTps != null ? `${parsed.prefillTps.toFixed(1)} pref` : "";
+    process.stdout.write(`${decodeStr}${prefillStr ? " / " + prefillStr : ""}\n`);
+  }
+
+  return {
+    decodeTps: median(decodeSamples),
+    prefillTps: median(prefillSamples),
+    decodeSamples,
+    prefillSamples,
+    buildExitCode: 0,
+    buildOutput: "",
+    runOutput: lastOutput.slice(-6000),
+    runExitCode: lastExit,
+    coherentText: decodeSamples.length > 0,
+    garbageOutput: false,
+    tokensGenerated: lastTokensGenerated,
+    bandwidthUtil: null,
+    effectiveBW: null,
+    error: lastExit !== 0 ? `Last run exit ${lastExit}` : null,
+    backendFlagRecognized: true,
+  };
+}
+
 async function fullAB(
   modelPath: string,
   prompt: string,
+  maxTokens: number,
   runsPerBinary: number,
+  comparisonTarget: ComparisonTarget,
 ): Promise<ABBenchmark> {
-  // Build vulkan first
-  const vkBuild = await remoteBuild("vulkan");
   let vulkan: BenchmarkResult;
-  if (vkBuild.exitCode !== 0) {
-    vulkan = {
-      decodeTps: null,
-      prefillTps: null,
-      decodeSamples: [],
-      prefillSamples: [],
-      buildExitCode: vkBuild.exitCode,
-      buildOutput: vkBuild.output,
-      runOutput: "",
-      runExitCode: null,
-      coherentText: false,
-      garbageOutput: false,
-      tokensGenerated: 0,
-      bandwidthUtil: null,
-      effectiveBW: null,
-      error: "vulkan build failed",
-      backendFlagRecognized: true,
-    };
-    console.log(clr("1;31", "  ❌ vulkan build failed — A/B incomplete"));
+  if (comparisonTarget === "vulkan") {
+    const vkBuild = await remoteBuild("vulkan");
+    if (vkBuild.exitCode !== 0) {
+      vulkan = {
+        decodeTps: null,
+        prefillTps: null,
+        decodeSamples: [],
+        prefillSamples: [],
+        buildExitCode: vkBuild.exitCode,
+        buildOutput: vkBuild.output,
+        runOutput: "",
+        runExitCode: null,
+        coherentText: false,
+        garbageOutput: false,
+        tokensGenerated: 0,
+        bandwidthUtil: null,
+        effectiveBW: null,
+        error: "vulkan build failed",
+        backendFlagRecognized: true,
+      };
+      console.log(clr("1;31", "  ❌ vulkan build failed — A/B incomplete"));
+    } else {
+      vulkan = await benchmarkBinary(
+        REMOTE_VULKAN_BIN,
+        modelPath,
+        prompt,
+        maxTokens,
+        "RADV_PERFTEST=coop_matrix",
+        runsPerBinary,
+      );
+      vulkan.buildExitCode = vkBuild.exitCode;
+      vulkan.buildOutput = vkBuild.output;
+    }
   } else {
-    vulkan = await benchmarkBinary(
-      REMOTE_VULKAN_BIN,
-      modelPath,
-      prompt,
-      "RADV_PERFTEST=coop_matrix",
-      runsPerBinary,
-    );
-    vulkan.buildExitCode = vkBuild.exitCode;
-    vulkan.buildOutput = vkBuild.output;
+    console.log(clr("2", "  benchmark llama.cpp baseline..."));
+    vulkan = await benchmarkLlama(modelPath, prompt, maxTokens, runsPerBinary);
   }
 
   // Build zinc_rt
@@ -622,6 +840,7 @@ async function fullAB(
       REMOTE_ZINC_RT_BIN,
       modelPath,
       prompt,
+      maxTokens,
       envFlags,
       runsPerBinary,
     );
@@ -642,7 +861,7 @@ async function fullAB(
       ? zinc_rt.prefillTps / vulkan.prefillTps
       : null;
 
-  return { vulkan, zinc_rt, ratio, prefillRatio };
+  return { comparisonTarget, vulkan, zinc_rt, ratio, prefillRatio };
 }
 
 // ── Phase detection ──────────────────────────────────────────────────
@@ -1177,7 +1396,7 @@ function revertReason(cycle: CycleResult): string {
     return "lost coherent zinc_rt output";
   }
   if (cycle.beforeAB.vulkan.coherentText && !cycle.afterAB.vulkan.coherentText) {
-    return "lost coherent vulkan output";
+    return `lost coherent ${comparisonTargetLabel(cycle.beforeAB.comparisonTarget)} output`;
   }
   if (cycle.beforeAB.ratio != null && cycle.afterAB.ratio != null) {
     const delta = cycle.afterAB.ratio - cycle.beforeAB.ratio;
@@ -1216,7 +1435,7 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
   }
 
   if (isZincRtBenchmarkShortcut(before.zinc_rt.runOutput)) {
-    lines.push("- Benchmark-quality gap: current zinc_rt output uses a shortcut such as top-k=0, a capped LM-head row scan, or a clamped decode budget. Treat tok/s as a bring-up signal, not proof that the model path can beat Vulkan.");
+    lines.push(`- Benchmark-quality gap: current zinc_rt output uses a shortcut such as top-k=0, a capped LM-head row scan, or a clamped decode budget. Treat tok/s as a bring-up signal, not proof that the model path can beat ${comparisonTargetLabel(before.comparisonTarget)}.`);
   }
 
   if (recent.length > 0 && markerAttempts >= Math.max(4, Math.ceil(recent.length / 3))) {
@@ -1245,6 +1464,8 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
   const ratioStr = before.ratio != null
     ? `${before.ratio.toFixed(3)} (${(before.ratio * 100).toFixed(1)}%)`
     : "n/a";
+  const baselineLabel = comparisonTargetLabel(before.comparisonTarget);
+  const baselineShort = comparisonTargetShort(before.comparisonTarget);
   const vkTps = before.vulkan.decodeTps?.toFixed(1) ?? "n/a";
   const rtTps = before.zinc_rt.decodeTps?.toFixed(1) ?? "n/a";
   const vkCoh = before.vulkan.coherentText ? "✓" : "✗";
@@ -1262,7 +1483,7 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
           const vk = h.afterAB.vulkan.decodeTps?.toFixed(1) ?? "—";
           const ratio = h.afterAB.ratio?.toFixed(2) ?? "—";
           const agentTag = h.agent ? `[${h.agent}] ` : "";
-          return `  #${h.cycle}: ${agentTag}[${h.phase}] ${desc} → ${h.kept ? "KEPT" : "REVERTED"} (rt=${rt}, vk=${vk}, ratio=${ratio})`;
+          return `  #${h.cycle}: ${agentTag}[${h.phase}] ${desc} → ${h.kept ? "KEPT" : "REVERTED"} (rt=${rt}, ${comparisonTargetShort(h.afterAB.comparisonTarget)}=${vk}, ratio=${ratio})`;
         })
         .join("\n")
       : "  (none yet)";
@@ -1316,23 +1537,23 @@ Next useful work must do one of these:
   - wire one router/DMMV/LM-head row-range verifier whose result is consumed by current generation;
   - or emit a measured-dead report with remote evidence explaining exactly why direct execution cannot advance on this node.`;
   } else if (before.ratio != null && before.ratio < 0.3) {
-    milestoneHint = `**Current milestone: M0→M1 transition.** ZINC_RT is coherent but very slow (ratio ${(before.ratio * 100).toFixed(0)}% of Vulkan). This usually means you're still on T-CPU. To move to M1, implement the T2 UMQ tier (\`src/zinc_rt/ring/umq.zig\`) — it's the easier of the two AMD direct-submission paths and ships on kernel 6.16+. See §14 of the design doc.`;
+    milestoneHint = `**Current milestone: M0→M1 transition.** ZINC_RT is coherent but very slow (ratio ${(before.ratio * 100).toFixed(0)}% of ${baselineLabel}). This usually means you're still on T-CPU. To move to M1, implement the T2 UMQ tier (\`src/zinc_rt/ring/umq.zig\`) — it's the easier of the two AMD direct-submission paths and ships on kernel 6.16+. See §14 of the design doc.`;
   } else if (before.ratio != null && before.ratio < COMPETITIVE_THRESHOLD) {
-    milestoneHint = `**Current milestone: M1→M2 transition.** ZINC_RT is running but trails Vulkan at ${(before.ratio * 100).toFixed(0)}%. Likely fixes:
+    milestoneHint = `**Current milestone: M1→M2 transition.** ZINC_RT is running but trails ${baselineLabel} at ${(before.ratio * 100).toFixed(0)}%. Likely fixes:
   - Reduce per-token submits (target: 1 submit per decode token).
   - Eliminate descriptor-set churn (use the push-constant-only path from §11.3).
   - Add the T1 PM4 KFD path if not already; M2 ships T1 alongside T2 (§13).`;
   } else if (before.ratio != null && before.ratio < 1.0) {
-    milestoneHint = `**Current milestone: M2→M3.** ZINC_RT is close — ${(before.ratio * 100).toFixed(0)}% of Vulkan. To cross 100%, you need one of:
+    milestoneHint = `**Current milestone: M2→M3.** ZINC_RT is close — ${(before.ratio * 100).toFixed(0)}% of ${baselineLabel}. To cross 100%, you need one of:
   - Continuous-batching scheduler (§18) — even with one slot, the slot-table + zero-recompile graph reduces per-token overhead vs Vulkan's command-buffer model.
   - Paged KV v2 (§19) — GPU-resident metadata, fewer host roundtrips.
   - Chunked prefill if prefill is in the benchmark path.`;
   } else if (before.ratio != null && before.ratio < 1.2) {
-    milestoneHint = `**Current milestone: M3→M4.** ZINC_RT now BEATS Vulkan at ${(before.ratio * 100).toFixed(0)}%. To widen the gap toward the M4 target (1.5× of today, 220 tok/s on Qwen 3.6 35B-A3B):
+    milestoneHint = `**Current milestone: M3→M4.** ZINC_RT now BEATS ${baselineLabel} at ${(before.ratio * 100).toFixed(0)}%. To widen the gap toward the M4 target (1.5× of today, 220 tok/s on Qwen 3.6 35B-A3B):
   - Start porting top-time kernels from SPIR-V to RDNA4 GAS asm under \`src/zinc_rt/isa/gfx1201/\` (§11.4, §17).
   - WMMA path on prefill if prefill is in the benchmark.`;
   } else {
-    milestoneHint = `**Current milestone: M4→M5.** ZINC_RT is at ${(before.ratio * 100).toFixed(0)}% of Vulkan. The remaining win comes from the megakernel (§21) — collapsing the entire forward pass into one persistent kernel. This is unmapped territory on RDNA4. See §21 for the staged approach.`;
+    milestoneHint = `**Current milestone: M4→M5.** ZINC_RT is at ${(before.ratio * 100).toFixed(0)}% of ${baselineLabel}. The remaining win comes from the megakernel (§21) — collapsing the entire forward pass into one persistent kernel. This is unmapped territory on RDNA4. See §21 for the staged approach.`;
   }
 
   // Phase-specific diagnosis
@@ -1340,18 +1561,18 @@ Next useful work must do one of these:
   if (phase === "migrate") {
     diagnosis.push("## Status: MIGRATE — getting ZINC_RT to a competitive working state");
     diagnosis.push("");
-    diagnosis.push(`vulkan tok/s: **${vkTps}** ${vkCoh}`);
+    diagnosis.push(`${baselineLabel} tok/s: **${vkTps}** ${vkCoh}`);
     diagnosis.push(`zinc_rt tok/s:       **${rtTps}** ${rtCoh}`);
-    diagnosis.push(`ratio (zinc_rt / vulkan): **${ratioStr}**`);
+    diagnosis.push(`ratio (zinc_rt / ${baselineLabel}): **${ratioStr}**`);
     if (before.zinc_rt.error) {
       diagnosis.push(`error: ${before.zinc_rt.error}`);
     }
     diagnosis.push("");
     diagnosis.push(milestoneHint);
   } else {
-    diagnosis.push("## Status: OPTIMIZE — beating Vulkan on RDNA4");
+    diagnosis.push(`## Status: OPTIMIZE — beating ${baselineLabel} on RDNA`);
     diagnosis.push("");
-    diagnosis.push(`vulkan tok/s: **${vkTps}**`);
+    diagnosis.push(`${baselineLabel} tok/s: **${vkTps}**`);
     diagnosis.push(`zinc_rt tok/s:       **${rtTps}**`);
     diagnosis.push(`ratio: **${ratioStr}**`);
     if (bestRatio != null) {
@@ -1393,9 +1614,9 @@ Next useful work must do one of these:
     "",
     "## The Goal",
     "",
-    "Make `zinc_rt` (our own GPU runtime, see `docs/ZINC_RT_DESIGN.md`) beat `vulkan` tok/s on the validated catalog model.",
+    `Make \`zinc_rt\` (our own GPU runtime, see \`docs/ZINC_RT_DESIGN.md\`) beat \`${baselineLabel}\` tok/s on the validated catalog model.`,
     "",
-    "Every cycle this loop benchmarks BOTH backends head-to-head on the same RDNA4 node, same prompt, same model. The ratio (zinc_rt / vulkan) is the north star only after the run proves a real model slice is GPU-produced and consumed. Tiny PM4 probes such as top-2 argmax or one RMS element are validation signals, not proof that the decode path can beat Vulkan. Above 1.0 means we're winning only when benchmark shortcuts are absent.",
+    `Every cycle this loop benchmarks ZINC_RT against ${baselineLabel} on the same RDNA node, same prompt, same model, and same max token cap. The ratio (zinc_rt / ${baselineLabel}) is the north star only after the run proves a real model slice is GPU-produced and consumed. Tiny PM4 probes such as top-2 argmax or one RMS element are validation signals, not proof that the decode path can beat ${baselineLabel}. Above 1.0 means we're winning only when benchmark shortcuts are absent.`,
     "",
     "## Current Deep Profile",
     "",
@@ -1417,7 +1638,7 @@ Next useful work must do one of these:
     "",
     "Do NOT redesign. Follow the design. If the design has a gap that blocks your work, surface it in `@@@SELF_ANALYSIS` and propose a minimal extension — do not unilaterally change the architecture.",
     "",
-    "## Hardware (remote RDNA4 node)",
+    "## Hardware (remote RDNA node)",
     "",
     "- GPU: AMD Radeon AI PRO R9700 (RDNA4 / gfx1201, 32 GB VRAM, 576 GB/s)",
     "- 64 CUs, wave64 optimal, 32 KB L1/CU, 6 MB L2",
@@ -1445,12 +1666,14 @@ Next useful work must do one of these:
     "",
     "These restrictions are enforced by the harness where possible; outcome gates below are the real contract.",
     "",
-    "**Vulkan is not going away.** You may change Vulkan/shared code, but the Vulkan baseline must still build, pass tests, run coherently, and remain a fair comparison. If your change breaks or cheats the baseline, the loop reverts it.",
+    before.comparisonTarget === "vulkan"
+      ? "**Vulkan is not going away.** You may change Vulkan/shared code, but the Vulkan baseline must still build, pass tests, run coherently, and remain a fair comparison. If your change breaks or cheats the baseline, the loop reverts it."
+      : "**Vulkan is still a supported backend.** This run compares against llama.cpp, but do not delete or intentionally break the Vulkan backend while improving ZINC_RT.",
     "",
     "## A/B Benchmark Results This Cycle",
     "",
     "```",
-    `vulkan: decode=${vkTps} tok/s, prefill=${before.vulkan.prefillTps?.toFixed(1) ?? "n/a"}, coherent=${vkCoh}, exit=${before.vulkan.runExitCode}`,
+    `${baselineShort}: decode=${vkTps} tok/s, prefill=${before.vulkan.prefillTps?.toFixed(1) ?? "n/a"}, coherent=${vkCoh}, exit=${before.vulkan.runExitCode}`,
     `zinc_rt:       decode=${rtTps} tok/s, prefill=${before.zinc_rt.prefillTps?.toFixed(1) ?? "n/a"}, coherent=${rtCoh}, exit=${before.zinc_rt.runExitCode}`,
     `ratio:         ${ratioStr}`,
     `zinc_rt exec:  ${rtExecutionLabel}`,
@@ -1519,7 +1742,7 @@ Next useful work must do one of these:
     ] : []),
     "## Rules",
     "",
-    `1. Make ONE focused change toward beating Vulkan. ${phase === "migrate" ? "Correctness/coherent output > tok/s — fix the broken path first." : "Tok/s > everything else."}`,
+    `1. Make ONE focused change toward beating ${baselineLabel}. ${phase === "migrate" ? "Correctness/coherent output > tok/s — fix the broken path first." : "Tok/s > everything else."}`,
     ...(phase === "migrate" ? [
       "   MIGRATE progress must be exercised by the current benchmark or by a new harness-visible validation gate.",
       "   Do not add standalone future packet/building-block code unless this cycle also wires it into executed forward progress or a failing/passing validation gate.",
@@ -1527,8 +1750,10 @@ Next useful work must do one of these:
     ] : []),
     "2. Before printing the final `@@@` markers, self-verify changed files on the remote. Run repo-root `.env` + rsync + the exact build gates:",
     "   `set -a; source .env; set +a`",
-    `   \`rsync -az --delete --exclude '.git' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"\``,
-    `   \`ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt'\``,
+    `   \`rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"\``,
+    before.comparisonTarget === "vulkan"
+      ? `   \`ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``
+      : `   \`ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test -Dbackend=zinc_rt -Dshaders=false --summary all && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``,
     "   If any gate fails, fix it before final output. Do not leave trivial compile errors for the harness rollback.",
     "3. Both build flags MUST stay buildable: `-Dbackend=vulkan` and `-Dbackend=zinc_rt`.",
     "4. Output bit-equality is desirable but not strictly required during MIGRATE. Coherent output comes before absolute performance. In OPTIMIZE phase, zinc_rt MUST produce coherent, shortcut-free text: no top-k=0 decode, no capped LM-head row scan unless explicitly validating row-range quality, and no clamped decode-budget result counted as a win.",
@@ -1574,6 +1799,8 @@ type CycleResult = {
 
 type RunState = {
   runId: string;
+  comparisonTarget?: ComparisonTarget;
+  maxTokens?: number;
   cycles: CycleResult[];
   failedApproaches: string[];
   ideas: string[];
@@ -1605,7 +1832,7 @@ function summariseAB(label: string, ab: ABBenchmark): string {
   const ratio = ab.ratio?.toFixed(3) ?? "—";
   const vkCoh = ab.vulkan.coherentText ? "✓" : "✗";
   const rtCoh = ab.zinc_rt.coherentText ? "✓" : "✗";
-  return `${label}: vk=${vkTps}${vkCoh} rt=${rtTps}${rtCoh} ratio=${ratio}`;
+  return `${label}: ${comparisonTargetShort(ab.comparisonTarget)}=${vkTps}${vkCoh} rt=${rtTps}${rtCoh} ratio=${ratio}`;
 }
 
 type VerificationFailure = {
@@ -1625,14 +1852,15 @@ function failureOutputTail(output: string): string {
 }
 
 function detectRepairableVerificationFailure(after: ABBenchmark): VerificationFailure | null {
+  const baseline = comparisonTargetLabel(after.comparisonTarget);
   if (after.vulkan.buildExitCode !== 0) {
-    return { kind: "vulkan build failed", output: failureOutputTail(after.vulkan.buildOutput) };
+    return { kind: `${baseline} build failed`, output: failureOutputTail(after.vulkan.buildOutput) };
   }
   if (after.zinc_rt.backendFlagRecognized && after.zinc_rt.buildExitCode !== 0) {
     return { kind: "zinc_rt build failed", output: failureOutputTail(after.zinc_rt.buildOutput) };
   }
   if (after.vulkan.runExitCode !== null && after.vulkan.runExitCode !== 0) {
-    return { kind: "vulkan benchmark run failed", output: failureOutputTail(after.vulkan.runOutput) };
+    return { kind: `${baseline} benchmark run failed`, output: failureOutputTail(after.vulkan.runOutput) };
   }
   if (after.zinc_rt.runExitCode !== null && after.zinc_rt.runExitCode !== 0) {
     return { kind: "zinc_rt benchmark run failed", output: failureOutputTail(after.zinc_rt.runOutput) };
@@ -1644,11 +1872,13 @@ async function verifyCandidate(
   before: ABBenchmark,
   modelPath: string,
   prompt: string,
+  maxTokens: number,
   runsPerBinary: number,
+  comparisonTarget: ComparisonTarget,
 ): Promise<VerificationAttempt> {
   try {
     await rsyncToRemote();
-    const testRes = await remoteTest();
+    const testRes = await remoteTest(comparisonTarget);
     if (!testRes.passed) {
       console.log(clr("1;31", "  ❌ Tests broken — repair pass required before rollback"));
       const failure = {
@@ -1662,7 +1892,7 @@ async function verifyCandidate(
       };
     }
 
-    const after = await fullAB(modelPath, prompt, runsPerBinary);
+    const after = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
     console.log(clr("1;36", `  ${summariseAB("AFTER", after)}`));
 
     const failure = detectRepairableVerificationFailure(after);
@@ -1715,8 +1945,8 @@ function buildRepairPrompt(failure: VerificationFailure): string {
     "",
     "```bash",
     "set -a; source .env; set +a",
-    `rsync -az --delete --exclude '.git' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"`,
-    `ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt'`,
+    `rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"`,
+    `ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'`,
     "```",
     "",
     "If the self-verification fails, keep fixing until it passes or clearly report the blocker.",
@@ -1750,7 +1980,9 @@ async function runCycle(
   agent: AgentKind,
   modelPath: string,
   prompt: string,
+  maxTokens: number,
   runsPerBinary: number,
+  comparisonTarget: ComparisonTarget,
 ): Promise<CycleResult> {
   const cycleNum = state.cycles.length + 1;
   const cycleDir = join(runDir, `cycle-${String(cycleNum).padStart(3, "0")}`);
@@ -1766,6 +1998,7 @@ async function runCycle(
   } catch (e) {
     console.log(clr("1;31", `  ❌ rsync failed: ${e}`));
     const empty: ABBenchmark = {
+      comparisonTarget,
       vulkan: emptyResult(),
       zinc_rt: emptyResult(),
       ratio: null,
@@ -1792,7 +2025,7 @@ async function runCycle(
 
   // Step 2: BEFORE A/B benchmark
   console.log(clr("1;33", "\n  📊 Baseline A/B benchmark"));
-  const before = await fullAB(modelPath, prompt, runsPerBinary);
+  const before = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
   state.phase = detectPhase(before);
   console.log(clr("1;36", `  ${summariseAB("BEFORE", before)} (phase=${state.phase})`));
   await writeCycleFile(cycleDir, "before.json", JSON.stringify(before, null, 2));
@@ -1863,7 +2096,7 @@ async function runCycle(
 
   // Step 6: Verify — rsync + test + A/B
   console.log(clr("1;33", "\n  📊 Verification A/B benchmark"));
-  let verification = await verifyCandidate(before, modelPath, prompt, runsPerBinary);
+  let verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
   let after: ABBenchmark = verification.after;
   let verificationError: string | null = verification.verificationError;
 
@@ -1875,7 +2108,7 @@ async function runCycle(
     console.log(clr("1;33", `  ⚠ ${verification.repairFailure.kind}; asking agent to repair before reverting (${repairAttempt + 1}/${VERIFICATION_REPAIR_ATTEMPTS})`));
     await runRepairPass(agent, cycleDir, verification.repairFailure);
     console.log(clr("1;33", "\n  📊 Verification A/B benchmark after repair"));
-    verification = await verifyCandidate(before, modelPath, prompt, runsPerBinary);
+    verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
     after = verification.after;
     verificationError = verification.verificationError;
   }
@@ -1976,10 +2209,10 @@ async function runCycle(
       keep = false;
       keepReason = "regressed coherent output";
     }
-    // Don't break vulkan
+    // Don't break the selected baseline.
     if (keep && before.vulkan.coherentText && !after.vulkan.coherentText) {
       keep = false;
-      keepReason = "broke vulkan output coherence (vulkan must keep working)";
+      keepReason = `broke ${comparisonTargetLabel(before.comparisonTarget)} output coherence`;
     }
   } else {
     // OPTIMIZE: keep if ratio improved by at least RATIO_IMPROVEMENT_KEEP
@@ -2004,7 +2237,7 @@ async function runCycle(
     }
     if (keep && before.vulkan.coherentText && !after.vulkan.coherentText) {
       keep = false;
-      keepReason = "broke vulkan path";
+      keepReason = `broke ${comparisonTargetLabel(before.comparisonTarget)} path`;
     }
   }
 
@@ -2084,21 +2317,25 @@ type CliOptions = {
   cycles: number;
   modelPath: string;
   prompt: string;
+  maxTokens: number;
   runsPerBinary: number;
+  comparisonTarget: ComparisonTarget;
   dryRun: boolean;
   resumeDir?: string;
   targetRatio: number | null;
   targetTps: number | null;
 };
 
-function parseArgs(argv: string[]): CliOptions {
+export function parseArgs(argv: string[]): CliOptions {
   const opts: CliOptions = {
     agent: "codex",
     alternate: false,
     cycles: Infinity,
     modelPath: DEFAULT_MODEL,
     prompt: DEFAULT_PROMPT,
+    maxTokens: DEFAULT_MAX_TOKENS,
     runsPerBinary: 3,
+    comparisonTarget: "vulkan",
     dryRun: false,
     targetRatio: null,
     targetTps: null,
@@ -2120,9 +2357,21 @@ function parseArgs(argv: string[]): CliOptions {
       case "--prompt":
         opts.prompt = argv[++i];
         break;
+      case "--max-tokens":
+      case "-n":
+        opts.maxTokens = parseInt(argv[++i], 10);
+        break;
       case "--runs-per-binary":
         opts.runsPerBinary = parseInt(argv[++i], 10);
         break;
+      case "--baseline": {
+        const baseline = argv[++i] as ComparisonTarget;
+        if (baseline !== "vulkan" && baseline !== "llama") {
+          throw new Error(`Invalid --baseline '${baseline}'. Expected vulkan or llama.`);
+        }
+        opts.comparisonTarget = baseline;
+        break;
+      }
       case "--dry-run":
         opts.dryRun = true;
         break;
@@ -2156,6 +2405,9 @@ function parseArgs(argv: string[]): CliOptions {
           "  --model-path <path>        GGUF model on remote node",
           "                             (default: " + DEFAULT_MODEL + ")",
           "  --prompt <s>               Benchmark prompt (default: \"" + DEFAULT_PROMPT + "\")",
+          "  -n, --max-tokens N         Max generated tokens for both ZINC_RT and",
+          "                             llama.cpp/Vulkan baselines (default: " + DEFAULT_MAX_TOKENS + ")",
+          "  --baseline <vulkan|llama>  Comparison target (default: vulkan)",
           "  --runs-per-binary N        Runs per backend per benchmark (default: 3,",
           "                             median used)",
           "  --dry-run                  A/B benchmark only, no agent",
@@ -2163,12 +2415,14 @@ function parseArgs(argv: string[]): CliOptions {
           "                             Bare --resume resumes the latest run with state.json",
           "",
           "Stop conditions:",
-          "  --target-ratio R           Exit when zinc_rt/vulkan ratio ≥ R",
-          "                             (e.g. 1.05 = beat vulkan by 5%)",
+          "  --target-ratio R           Exit when zinc_rt/baseline ratio ≥ R",
+          "                             (e.g. 1.05 = beat baseline by 5%)",
           "  --target-tps T             Exit when zinc_rt tok/s ≥ T",
           "",
           "Environment overrides (read from process env or .env):",
           "  ZINC_HOST, ZINC_PORT, ZINC_USER     — remote node SSH",
+          "  ZINC_RDNA_NODE or ZINC_NODE          — selects ZINC_<NODE>_HOST/PORT/USER",
+          "  ZINC_LLAMA_CLI_REMOTE                — llama-cli path for --baseline llama",
           "  ZINC_RT_TIER                        — force T1/T2/T-CPU (default: auto)",
           "  ZINC_CLAUDE_MODEL                   — claude model (default: " + CLAUDE_MODEL + ")",
           "  ZINC_CLAUDE_EFFORT                  — claude effort (default: " + CLAUDE_EFFORT + ")",
@@ -2176,8 +2430,8 @@ function parseArgs(argv: string[]): CliOptions {
           "  ZINC_CODEX_REASONING_EFFORT         — codex effort (default: " + CODEX_REASONING_EFFORT + ")",
           "",
           "Each cycle:",
-          "  1. rsync, build BOTH `-Dbackend=vulkan` AND `-Dbackend=zinc_rt`",
-          "  2. benchmark each N times under flock, take median tok/s",
+          "  1. rsync and build `-Dbackend=zinc_rt`; also build Vulkan when selected",
+          "  2. benchmark each side N times under flock, take median tok/s",
           "  3. spawn agent (codex or claude) with the design doc + last cycle's results",
           "  4. agent edits files; re-build, re-benchmark, and gets one repair pass",
           "     before rollback if tests/builds/runs fail",
@@ -2185,9 +2439,9 @@ function parseArgs(argv: string[]): CliOptions {
           "     validation gate became benchmark-visible without a material slowdown",
           "  6. continue until --cycles or --target-* reached",
           "",
-          "Vulkan is a permanent supported backend, not a deletion target. Every",
-          "milestone keeps `-Dbackend=vulkan` building and passing tests. The loop",
-          "auto-reverts any change that breaks the Vulkan build.",
+          "Vulkan is a permanent supported backend, not a deletion target. The",
+          "default mode keeps `-Dbackend=vulkan` building and passing tests; the",
+          "llama baseline mode is for same-node ZINC_RT-vs-llama.cpp work.",
         ].join("\n"));
         process.exit(0);
     }
@@ -2216,6 +2470,9 @@ async function resolveResumeDir(requested: string): Promise<string> {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (!Number.isFinite(opts.maxTokens) || opts.maxTokens <= 0) {
+    throw new Error(`Invalid --max-tokens '${opts.maxTokens}'`);
+  }
 
   RESULTS_DIR = resolve(REPO_ROOT, ".zinc_rt_autopilot");
 
@@ -2224,12 +2481,14 @@ async function main() {
   await mkdir(runDir, { recursive: true });
 
   console.log(clr("1;35", DSEP));
-  console.log(clr("1;35", "  ZINC_RT AUTOPILOT — overnight A/B vs vulkan"));
+  console.log(clr("1;35", `  ZINC_RT AUTOPILOT — overnight A/B vs ${comparisonTargetLabel(opts.comparisonTarget)}`));
   console.log(clr("1;35", DSEP));
-  console.log(`  Remote:    ${clr("1", `${ZINC_USER}@${ZINC_HOST}:${ZINC_PORT}`)}`);
+  console.log(`  Remote:    ${clr("1", maskedRemoteLabel())}`);
   console.log(`  RemoteDir: ${clr("1", REMOTE_ZINC_DIR)}`);
+  console.log(`  Baseline:  ${clr("1", comparisonTargetLabel(opts.comparisonTarget))}`);
   console.log(`  Model:     ${clr("1", opts.modelPath)}`);
   console.log(`  Prompt:    ${clr("1", JSON.stringify(opts.prompt))}`);
+  console.log(`  MaxTok:    ${opts.maxTokens}`);
   const agentDetail = opts.alternate
     ? `alternating (codex ${CODEX_MODEL}/${CODEX_REASONING_EFFORT} ↔ claude ${CLAUDE_MODEL}/${CLAUDE_EFFORT})`
     : opts.agent === "claude"
@@ -2280,9 +2539,9 @@ async function main() {
 
   // Dry run
   if (opts.dryRun) {
-    console.log(clr("1;33", "\n  DRY RUN: rsync + build both + benchmark"));
+    console.log(clr("1;33", "\n  DRY RUN: rsync + build + benchmark"));
     await rsyncToRemote();
-    const ab = await fullAB(opts.modelPath, opts.prompt, opts.runsPerBinary);
+    const ab = await fullAB(opts.modelPath, opts.prompt, opts.maxTokens, opts.runsPerBinary, opts.comparisonTarget);
     console.log(clr("1;33", "\n  Result:"));
     console.log("  " + summariseAB("AB", ab));
     if (ab.ratio != null) {
@@ -2297,6 +2556,8 @@ async function main() {
   if (!state) {
     state = {
       runId,
+      comparisonTarget: opts.comparisonTarget,
+      maxTokens: opts.maxTokens,
       cycles: [],
       failedApproaches: [],
       ideas: [],
@@ -2308,6 +2569,8 @@ async function main() {
     await saveState(runDir, state);
   } else {
     console.log(clr("1;33", `\n  Resuming from cycle ${state.cycles.length}`));
+    state.comparisonTarget ??= opts.comparisonTarget;
+    state.maxTokens ??= opts.maxTokens;
   }
 
   // Main loop
@@ -2346,7 +2609,16 @@ async function main() {
       console.log(clr("1;36", `\n  Agent this cycle: ${cycleAgent}`));
     }
 
-    const cycleResult = await runCycle(runDir, state, cycleAgent, opts.modelPath, opts.prompt, opts.runsPerBinary);
+    const cycleResult = await runCycle(
+      runDir,
+      state,
+      cycleAgent,
+      opts.modelPath,
+      opts.prompt,
+      opts.maxTokens,
+      opts.runsPerBinary,
+      opts.comparisonTarget,
+    );
     state.cycles.push(cycleResult);
 
     // Track failed approaches
@@ -2406,7 +2678,7 @@ async function main() {
       console.log(clr("1;35", `  Best zinc_rt:   ${state.bestZincRtTps.toFixed(1)} tok/s`));
     }
     if (state.bestVulkanTps != null) {
-      console.log(clr("1;35", `  Best vulkan:    ${state.bestVulkanTps.toFixed(1)} tok/s`));
+      console.log(clr("1;35", `  Best ${comparisonTargetLabel(opts.comparisonTarget)}: ${state.bestVulkanTps.toFixed(1)} tok/s`));
     }
     console.log(clr("1;35", `  Kept: ${keptCount}/${state.cycles.length}`));
     console.log(clr("1;35", DSEP));
@@ -2432,7 +2704,7 @@ async function main() {
     console.log(clr("1;32", `  Best ratio: ${state.bestRatio.toFixed(3)} (${(state.bestRatio * 100).toFixed(1)}%)`));
   }
   if (state.bestZincRtTps != null && state.bestVulkanTps != null) {
-    console.log(clr("1;32", `  Best zinc_rt: ${state.bestZincRtTps.toFixed(1)}    Best vulkan: ${state.bestVulkanTps.toFixed(1)}`));
+    console.log(clr("1;32", `  Best zinc_rt: ${state.bestZincRtTps.toFixed(1)}    Best ${comparisonTargetLabel(opts.comparisonTarget)}: ${state.bestVulkanTps.toFixed(1)}`));
   }
   console.log(clr("1;32", `  Results: ${runDir}`));
   console.log(clr("1;32", DSEP));

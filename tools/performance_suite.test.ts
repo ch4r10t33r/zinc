@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import {
   buildArtifact,
@@ -232,6 +233,14 @@ test("benchmark failure reasons do not publish shell commands", () => {
   const diagnostic = new Error("Command failed (1): remote benchmark command with private args\nerr(zinc): Failed to init inference engine: QueueSubmitFailed");
   expect(benchmarkFailureReason("ZINC run failed", diagnostic)).toBe("ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed");
   expect(benchmarkFailureReason("Intel baseline failed", new Error("Remote server failed to start"))).toBe("Intel baseline failed: Remote server failed to start");
+});
+
+test("performance suite rsync excludes local secrets and run state", () => {
+  const source = readFileSync(new URL("./performance_suite.mjs", import.meta.url), "utf8");
+  expect(source).toContain("--exclude '.git'");
+  expect(source).toContain("--exclude '.env'");
+  expect(source).toContain("--exclude '.env.*'");
+  expect(source).toContain("--exclude '.zinc_rt_autopilot'");
 });
 
 test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {

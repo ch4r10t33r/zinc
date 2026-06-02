@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#132036"/>
+      <stop offset="1" stop-color="#182419"/>
+    </linearGradient>
+    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#ffad66"/>
+    </linearGradient>
+    <linearGradient id="decode" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#49d8ff"/>
+      <stop offset="1" stop-color="#57e6a6"/>
+    </linearGradient>
+    <linearGradient id="host" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#b6c4d8"/>
+      <stop offset="1" stop-color="#e1e8f2"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="680" fill="url(#bg)"/>
+
+  <text x="56" y="62" fill="#f6fbff" font-size="30" font-weight="760">A benchmark has three different waits</text>
+  <text x="56" y="94" fill="#b8c7d5" font-size="15">ZINC can be excellent in the token loop while still owing work in prompt ingestion or full request latency. Treat each metric as a different question.</text>
+
+  <g transform="translate(80,150)">
+    <line x1="0" y1="110" x2="1040" y2="110" stroke="#38506a" stroke-width="3"/>
+
+    <g transform="translate(0,0)">
+      <rect x="0" y="72" width="280" height="56" rx="8" fill="url(#prompt)"/>
+      <text x="140" y="106" text-anchor="middle" fill="#231404" font-size="18" font-weight="800">1. Prefill</text>
+      <text x="0" y="166" fill="#f6fbff" font-size="18" font-weight="750">How fast the prompt is read</text>
+      <text x="0" y="194" fill="#b8c7d5" font-size="14">This is the first-token wait: tokenize, load prompt</text>
+      <text x="0" y="216" fill="#b8c7d5" font-size="14">context, run attention/SSM/MoE over existing text.</text>
+      <text x="0" y="254" fill="#ffdb9a" font-size="13" font-weight="700">Typical ZINC gap today:</text>
+      <text x="0" y="276" fill="#d7e2ea" font-size="13">RDNA Qwen 3.6 35B A3B is 38.7%</text>
+      <text x="0" y="296" fill="#d7e2ea" font-size="13">of llama.cpp prefill in the dashboard.</text>
+    </g>
+
+    <g transform="translate(370,0)">
+      <rect x="0" y="72" width="280" height="56" rx="8" fill="url(#decode)"/>
+      <text x="140" y="106" text-anchor="middle" fill="#061a1e" font-size="18" font-weight="800">2. Decode</text>
+      <text x="0" y="166" fill="#f6fbff" font-size="18" font-weight="750">How fast each new token streams</text>
+      <text x="0" y="194" fill="#b8c7d5" font-size="14">This is the hot answer loop: one token at a time,</text>
+      <text x="0" y="216" fill="#b8c7d5" font-size="14">with weight reads, KV/SSM state, routing, and sampler.</text>
+      <text x="0" y="254" fill="#78eec2" font-size="13" font-weight="700">Current strongest signal:</text>
+      <text x="0" y="276" fill="#d7e2ea" font-size="13">Qwen 3.6 35B A3B decode beats llama.cpp</text>
+      <text x="0" y="296" fill="#d7e2ea" font-size="13">on RDNA and M4 Max in current data.</text>
+    </g>
+
+    <g transform="translate(740,0)">
+      <rect x="0" y="72" width="280" height="56" rx="8" fill="url(#host)"/>
+      <text x="140" y="106" text-anchor="middle" fill="#101827" font-size="18" font-weight="800">3. End-to-end</text>
+      <text x="0" y="166" fill="#f6fbff" font-size="18" font-weight="750">What the harness/user waits for</text>
+      <text x="0" y="194" fill="#b8c7d5" font-size="14">Includes process/server overhead, startup,</text>
+      <text x="0" y="216" fill="#b8c7d5" font-size="14">model management, request path,</text>
+      <text x="0" y="238" fill="#b8c7d5" font-size="14">prompt, and decode together.</text>
+      <text x="0" y="272" fill="#d8e3f0" font-size="13" font-weight="700">Why it stays low:</text>
+      <text x="0" y="294" fill="#d7e2ea" font-size="13">The dashboard intentionally measures</text>
+      <text x="0" y="314" fill="#d7e2ea" font-size="13">a harsher path than pure decode.</text>
+    </g>
+
+    <g transform="translate(0,384)">
+      <rect x="0" y="0" width="1040" height="96" rx="8" fill="#0f1724" stroke="#344458"/>
+      <text x="24" y="34" fill="#f6fbff" font-size="18" font-weight="750">The rule for reading ZINC benchmarks</text>
+      <text x="24" y="62" fill="#b8c7d5" font-size="14">Never ask whether an engine is simply "fast." Ask which wait got faster. Decode, prefill, and end-to-end latency are different engineering problems.</text>
+    </g>
+  </g>
+</svg>

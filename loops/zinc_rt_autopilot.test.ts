@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
-import { detectZincRtExecutionMode } from "./zinc_rt_autopilot";
+import { detectZincRtExecutionMode, parseArgs, parseLlamaCliTimings } from "./zinc_rt_autopilot";
 
 describe("detectZincRtExecutionMode", () => {
   test("treats direct admission plus T-CPU forward as CPU fallback after admission", () => {
@@ -37,5 +38,52 @@ describe("detectZincRtExecutionMode", () => {
     ].join("\n");
 
     expect(detectZincRtExecutionMode(output)).toBe("direct");
+  });
+});
+
+describe("zinc_rt autopilot CLI and baselines", () => {
+  test("parseArgs supports llama baseline and a shared max token cap", () => {
+    const args = parseArgs([
+      "--baseline",
+      "llama",
+      "--max-tokens",
+      "32",
+      "--runs-per-binary",
+      "1",
+      "--target-ratio",
+      "1.03",
+    ]);
+
+    expect(args.comparisonTarget).toBe("llama");
+    expect(args.maxTokens).toBe(32);
+    expect(args.runsPerBinary).toBe(1);
+    expect(args.targetRatio).toBe(1.03);
+  });
+
+  test("parseLlamaCliTimings extracts prompt and decode throughput", () => {
+    const parsed = parseLlamaCliTimings(`
+llama_print_timings: prompt eval time =   152.58 ms /    16 tokens (    9.54 ms per token,   104.87 tokens per second)
+llama_print_timings:        eval time =  1276.72 ms /    96 runs   (   13.30 ms per token,    75.20 tokens per second)
+`);
+
+    expect(parsed.prefillTps).toBe(104.87);
+    expect(parsed.decodeTps).toBe(75.2);
+    expect(parsed.generatedTokens).toBe(96);
+  });
+
+  test("parseLlamaCliTimings accepts bracket-style perf summaries", () => {
+    const parsed = parseLlamaCliTimings("[ Prompt: 171.2 t/s | Generation: 78.2 t/s ]");
+    expect(parsed.prefillTps).toBe(171.2);
+    expect(parsed.decodeTps).toBe(78.2);
+    expect(parsed.generatedTokens).toBe(0);
+  });
+
+  test("remote sync commands exclude local secrets and run state", () => {
+    const autopilot = readFileSync(new URL("./zinc_rt_autopilot.ts", import.meta.url), "utf8");
+    expect(autopilot).toContain('"--exclude", ".env"');
+    expect(autopilot).toContain('"--exclude", ".env.*"');
+    expect(autopilot).toContain('"--exclude", ".zinc_rt_autopilot"');
+    expect(autopilot).toContain("--exclude '.env'");
+    expect(autopilot).toContain("--exclude '.env.*'");
   });
 });
