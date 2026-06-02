@@ -1725,11 +1725,7 @@ fn lastCompleteUtf8End(bytes: []const u8) usize {
     }
     if (i == 0) return bytes.len; // all continuations, nothing to anchor on — flush as-is
     const lead = bytes[i - 1];
-    const expected: usize = if (lead < 0x80) 1
-        else if ((lead & 0xE0) == 0xC0) 2
-        else if ((lead & 0xF0) == 0xE0) 3
-        else if ((lead & 0xF8) == 0xF0) 4
-        else 1; // malformed lead — let it through
+    const expected: usize = if (lead < 0x80) 1 else if ((lead & 0xE0) == 0xC0) 2 else if ((lead & 0xF0) == 0xE0) 3 else if ((lead & 0xF8) == 0xF0) 4 else 1; // malformed lead — let it through
     const have = bytes.len - (i - 1);
     if (have >= expected) return bytes.len;
     return i - 1;
@@ -3327,6 +3323,14 @@ test "hasDanglingTrailingQuote detects unmatched punctuation quote suffix" {
     try std.testing.expect(hasDanglingTrailingQuote("Hello 😊\""));
     try std.testing.expect(!hasDanglingTrailingQuote("\"Paris.\""));
     try std.testing.expect(!hasDanglingTrailingQuote("He said \"hi\""));
+}
+
+test "pendingGeneratedText clamps stale sent cursor" {
+    const text = "abcdef";
+    var sent_len: usize = 9;
+    const pending = pendingGeneratedText(text, &sent_len, 3);
+    try std.testing.expectEqual(@as(usize, 3), sent_len);
+    try std.testing.expectEqualStrings("", pending);
 }
 
 test "buildChatPrompt uses qwen no-thinking generation suffix when template requests it" {
