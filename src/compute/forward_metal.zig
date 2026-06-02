@@ -2699,7 +2699,6 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (cfg.ssm_d_inner > 0) return false;
     if (engine.private_decode_buffers and shouldCpuLmHeadFallback(engine)) return false;
     if (fullAttentionInterval(cfg) != 1) return false;
-    if (engine.attn_sink_values != null) return false;
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
     for (0..cfg.n_layers) |i| {
@@ -2827,10 +2826,6 @@ fn logGemmaBatchedPrefillDecision(
     }
     if (fullAttentionInterval(cfg) != 1) {
         log.info("Metal profile: Gemma batched prefill guard failed: full_attention_interval={d}", .{fullAttentionInterval(cfg)});
-        return;
-    }
-    if (engine.attn_sink_values != null) {
-        log.info("Metal profile: Gemma batched prefill guard failed: attention sink values present", .{});
         return;
     }
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) {
@@ -6669,6 +6664,7 @@ pub const InferenceEngine = struct {
                 dispatchFlashAttnBatchedQ8OnCmd(
                     self,
                     &cmd,
+                    layer_idx,
                     &scratch.q,
                     &self.kv_k_cache[layer_idx],
                     &self.kv_v_cache[layer_idx],
@@ -6687,6 +6683,7 @@ pub const InferenceEngine = struct {
                 dispatchFlashAttnBatchedOnCmd(
                     self,
                     &cmd,
+                    layer_idx,
                     &scratch.q,
                     &self.kv_k_cache[layer_idx],
                     &self.kv_v_cache[layer_idx],
@@ -11528,6 +11525,7 @@ fn dispatchRopeBatchedOnCmd(
 fn dispatchFlashAttnBatchedOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
+    layer_idx: usize,
     q_buf: *const MetalBuffer,
     k_cache: *const MetalBuffer,
     v_cache: *const MetalBuffer,
@@ -11550,7 +11548,8 @@ fn dispatchFlashAttnBatchedOnCmd(
         .sliding_window_size = sliding_window_size,
         .attn_scale_bits = if (engine.config.attn_scale != 0) @as(u32, @bitCast(engine.config.attn_scale)) else 0,
     };
-    const bufs = [_]*const MetalBuffer{ q_buf, k_cache, v_cache, out_buf };
+    refreshAttentionSinksForLayer(engine, layer_idx, n_heads);
+    const bufs = [_]*const MetalBuffer{ q_buf, k_cache, v_cache, out_buf, &engine.attn_sinks_buf };
     cmd.dispatchV2(&engine.flash_attn_batched_pipe, .{ n_heads, n_queries, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(BatchedFlashAttnPush), 0);
 }
 
@@ -11559,6 +11558,7 @@ fn dispatchFlashAttnBatchedOnCmd(
 fn dispatchFlashAttnBatchedQ8OnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
+    layer_idx: usize,
     q_buf: *const MetalBuffer,
     k_cache: *const MetalBuffer,
     v_cache: *const MetalBuffer,
@@ -11585,7 +11585,8 @@ fn dispatchFlashAttnBatchedQ8OnCmd(
         .kv_head_stride_bytes = kv_head_stride_bytes,
         .kv_token_stride_bytes = kv_token_stride_bytes,
     };
-    const bufs = [_]*const MetalBuffer{ q_buf, k_cache, v_cache, out_buf };
+    refreshAttentionSinksForLayer(engine, layer_idx, n_heads);
+    const bufs = [_]*const MetalBuffer{ q_buf, k_cache, v_cache, out_buf, &engine.attn_sinks_buf };
     cmd.dispatchV2(&engine.flash_attn_batched_q8_pipe, .{ n_heads, n_queries, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(BatchedFlashAttnQ8Push), 0);
 }
 
@@ -11656,6 +11657,15 @@ fn dispatchDeinterleaveOnCmd(
     cmd.dispatchV2(&engine.deinterleave_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DeinterleavePush), 0);
 }
 
+fn refreshAttentionSinksForLayer(engine: *InferenceEngine, layer_idx: usize, n_heads: u32) void {
+    const sink_vals = engine.attn_sink_values orelse return;
+    const sink_ptr: [*]f32 = @ptrCast(@alignCast(engine.attn_sinks_buf.cpu_ptr.?));
+    for (0..n_heads) |i| sink_ptr[i] = std.math.nan(f32);
+    if (sink_vals[layer_idx].len > 0) {
+        @memcpy(sink_ptr[0..sink_vals[layer_idx].len], sink_vals[layer_idx]);
+    }
+}
+
 fn dispatchFlashAttnOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -11682,15 +11692,7 @@ fn dispatchFlashAttnOnCmd(
         .kv_head_stride_bytes = kv_cache_head_stride_bytes,
         .kv_token_stride_bytes = kv_cache_bytes_per_token,
     };
-    // Refresh per-head sink values every layer. Layers without sinks must reset to NaN
-    // so they do not inherit stale values from a prior layer that did have sinks.
-    const sink_ptr: [*]f32 = @ptrCast(@alignCast(engine.attn_sinks_buf.cpu_ptr.?));
-    for (0..n_heads) |i| sink_ptr[i] = std.math.nan(f32);
-    if (engine.attn_sink_values) |sink_vals| {
-        if (sink_vals[layer_idx].len > 0) {
-            @memcpy(sink_ptr[0..sink_vals[layer_idx].len], sink_vals[layer_idx]);
-        }
-    }
+    refreshAttentionSinksForLayer(engine, layer_idx, n_heads);
     const bufs = [_]*const MetalBuffer{
         &engine.page_table_buf,
         &engine.q_buf,
@@ -13754,6 +13756,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
         dispatchFlashAttnBatchedQ8OnCmd(
             engine,
             cmd,
+            layer_idx,
             &scratch.q,
             &engine.kv_k_cache[layer_idx],
             &engine.kv_v_cache[layer_idx],
@@ -13772,6 +13775,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
         dispatchFlashAttnBatchedOnCmd(
             engine,
             cmd,
+            layer_idx,
             &scratch.q,
             &engine.kv_k_cache[layer_idx],
             &engine.kv_v_cache[layer_idx],

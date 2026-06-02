@@ -16,6 +16,8 @@ using namespace metal;
 //   k_cache[token * n_kv_heads * head_dim + kv_head * head_dim + dim]
 //
 // Output layout: [n_queries × n_heads × head_dim] matching Q layout
+//
+// Sinks layout: [n_heads] per-layer learned attention sink values. NaN disables.
 
 struct BatchedFlashAttnPush {
     uint head_dim;
@@ -88,6 +90,7 @@ kernel void main0(
     device const float* k_cache [[buffer(2)]],
     device const float* v_cache [[buffer(3)]],
     device float* out [[buffer(4)]],
+    device const float* sinks [[buffer(5)]],
     uint3 group_id [[threadgroup_position_in_grid]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint subgroup_size [[thread_execution_width]],
@@ -190,7 +193,18 @@ kernel void main0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    float final_sum = running_sum;
+    const float sink_val = sinks[head];
+    if (!isnan(sink_val)) {
+        const float sink_max = fast::max(running_max, sink_val);
+        const float rescale_s = running_sum > 0.0f ? fast::exp(running_max - sink_max) : 0.0f;
+        final_sum = running_sum * rescale_s + fast::exp(sink_val - sink_max);
+        for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
+            acc_cache4[vi] *= rescale_s;
+        }
+    }
+
+    const float inv_sum = final_sum > 0.0f ? 1.0f / final_sum : 0.0f;
     for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
         *(device float4*)(out + out_base + (vi << 2)) = acc_cache4[vi] * inv_sum;
     }

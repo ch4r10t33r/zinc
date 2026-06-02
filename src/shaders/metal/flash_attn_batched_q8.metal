@@ -8,6 +8,7 @@ using namespace metal;
 // 34 bytes: 2 bytes scale (half) + 32 × i8 quants. Each head_dim worth of
 // KV at a token boundary is laid out as (head_dim / 32) contiguous blocks,
 // so dim `d` is at block `d/32`, quant index `d%32`.
+// Sinks are per-layer [n_heads] learned attention sink values. NaN disables.
 //
 // Grid: (n_heads, n_queries, 1), threadgroup: 64 threads.
 
@@ -93,6 +94,7 @@ kernel void main0(
     device const uchar* k_cache [[buffer(2)]],
     device const uchar* v_cache [[buffer(3)]],
     device float* out [[buffer(4)]],
+    device const float* sinks [[buffer(5)]],
     uint3 group_id [[threadgroup_position_in_grid]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint subgroup_size [[thread_execution_width]],
@@ -188,7 +190,18 @@ kernel void main0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    float final_sum = running_sum;
+    const float sink_val = sinks[head];
+    if (!isnan(sink_val)) {
+        const float sink_max = fast::max(running_max, sink_val);
+        const float rescale_s = running_sum > 0.0f ? fast::exp(running_max - sink_max) : 0.0f;
+        final_sum = running_sum * rescale_s + fast::exp(sink_val - sink_max);
+        for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
+            acc_cache4[vi] *= rescale_s;
+        }
+    }
+
+    const float inv_sum = final_sum > 0.0f ? 1.0f / final_sum : 0.0f;
     for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
         *(device float4*)(out + out_base + (vi << 2)) = acc_cache4[vi] * inv_sum;
     }
