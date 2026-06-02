@@ -106,7 +106,7 @@ function makeState(overrides: Partial<RunState> = {}): RunState {
 
 describe("evaluateOutputText", () => {
   test("accepts BPE-marked Paris prefix as a strong answer", () => {
-    const result = evaluateOutputText("ĠParis.ĠTheĠcapitalĠof");
+    const result = evaluateOutputText("ĠParis.ĠTheĠcapitalĠof", "Paris");
     expect(result.normalizedText).toBe("Paris. The capital of");
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(true);
@@ -114,7 +114,7 @@ describe("evaluateOutputText", () => {
   });
 
   test("penalizes contradictory continuations", () => {
-    const result = evaluateOutputText("ĠParis.ĠTheĠcapitalĠofĠGermanyĠisĠBerlin");
+    const result = evaluateOutputText("ĠParis.ĠTheĠcapitalĠofĠGermanyĠisĠBerlin", "Paris");
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(false);
     expect(result.offTopic).toBe(true);
@@ -128,7 +128,7 @@ describe("evaluateOutputText", () => {
   });
 
   test("detects Paris without BPE markers", () => {
-    const result = evaluateOutputText("Paris is the capital");
+    const result = evaluateOutputText("Paris is the capital", "Paris");
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(true);
   });
