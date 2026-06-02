@@ -724,7 +724,9 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
   if (q8Retunes.length >= 5) {
     lines.push(`- Cooldown: ${q8Retunes.length}/${recent.length} recent cycles touched Q8/finalizer/threadgroup-style retunes. The next such optimization needs exact-shape microbench or profile evidence showing the candidate can save at least 1 tok/s.`);
   }
-  if (evidence.trim().length > 0) {
+  if (evidence.trim().length > 0 && state.lastMetalShapesOk === false) {
+    lines.push(`- Latest Metal-shapes evidence run failed at cycle ${state.lastMetalShapesCycle ?? "?"}. Fix that evidence path or choose a non-shape retune; do not keep adding benchmark-output changes that the harness cannot capture.`);
+  } else if (evidence.trim().length > 0) {
     lines.push(`- Latest Metal-shapes evidence is available from cycle ${state.lastMetalShapesCycle ?? "?"}. Consume it before adding another microbench or shader retune.`);
   } else {
     lines.push("- No Metal-shapes evidence has been captured by the outer harness yet. If targeting shared Q8, first enable `ZINC_METAL_SHAPES_EVERY` or add a default-off exact-shape case and let the harness run it.");
@@ -2645,9 +2647,12 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
   }
 
   if (state.lastMetalShapesOutput) {
+    const metalShapesFailed = state.lastMetalShapesOk === false;
     sections.push(
-      `## Metal Shapes Evidence (cycle ${state.lastMetalShapesCycle})`,
-      "Outer-harness exact-shape benchmark output. Agents must consume this before proposing another same-shape shader retune.",
+      `## Metal Shapes Evidence (${metalShapesFailed ? "failed " : ""}cycle ${state.lastMetalShapesCycle})`,
+      metalShapesFailed
+        ? "Outer-harness exact-shape benchmark failed. Fix this evidence path or avoid relying on it before proposing another same-shape shader retune."
+        : "Outer-harness exact-shape benchmark output. Agents must consume this before proposing another same-shape shader retune.",
       "```",
       state.lastMetalShapesOutput.slice(-3000),
       "```",
@@ -2795,6 +2800,7 @@ export type RunState = {
   /// from benchmarking directly.
   lastMetalShapesOutput?: string | null;
   lastMetalShapesCycle?: number | null;
+  lastMetalShapesOk?: boolean | null;
   /// Most recent near-miss diagnostic run (see ZINC_NEAR_MISS_DIAGNOSTIC_ENV).
   /// Captured AFTER the keep verdict, runs the binary with extra env applied so
   /// validators / probes that the kept tree leaves default-off still fire and
@@ -2866,6 +2872,35 @@ export function shouldFinalizeBestTree(
   };
 }
 
+export function shouldRestorePromotedBestDuringPlateau(
+  state: RunState,
+  currentHead: string,
+): { restore: boolean; reason: string } {
+  const finalize = shouldFinalizeBestTree(state, currentHead);
+  if (!finalize.finalize) return { restore: false, reason: finalize.reason };
+
+  const cyclesSinceBest = cyclesSinceBestKept(state);
+  if (
+    isGemmaPrefillPostBreakthrough(state) &&
+    (state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES || cyclesSinceBest >= GEMMA_PLATEAU_STALL_CYCLES)
+  ) {
+    return {
+      restore: true,
+      reason: `Gemma plateau active (${state.stalledCycles} stalled, ${cyclesSinceBest} cycles since best); ${finalize.reason}`,
+    };
+  }
+
+  const plateauStop = detectAutoStopForPlateau(state);
+  if (plateauStop.stop) {
+    return {
+      restore: true,
+      reason: `plateau auto-stop condition met (${plateauStop.reason}); ${finalize.reason}`,
+    };
+  }
+
+  return { restore: false, reason: `plateau restore not active; ${finalize.reason}` };
+}
+
 async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
   const best = bestKeptCorrectCycle(state);
   if (!best || best.tokPerSec == null) return;
@@ -2884,6 +2919,21 @@ async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
   }
 }
 
+async function restoreBestTree(runDir: string, state: RunState, reason: string): Promise<void> {
+  if (!state.bestTree?.commitHash) return;
+
+  const best = state.bestTree;
+  console.log(clr("1;35", `  ↩ Restoring promoted-best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(2)} ${METRIC_LABEL}): ${reason}`));
+  await runCommand("git", ["restore", "--source", best.commitHash, "--staged", "--worktree", "--", ...LOOP_COMMIT_PATHS]);
+  const status = await runCommand("git", ["status", "--porcelain", "--", ...LOOP_COMMIT_PATHS]);
+  if (status.stdout.trim().length > 0) {
+    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
+    await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
+  }
+  state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };
+  await saveState(runDir, state);
+}
+
 async function finalizeBestTreeIfNeeded(runDir: string, state: RunState): Promise<void> {
   if (!FINALIZE_BEST_TREE) return;
   if (!state.bestTree?.commitHash) return;
@@ -2894,17 +2944,17 @@ async function finalizeBestTreeIfNeeded(runDir: string, state: RunState): Promis
     console.log(clr("2", `  best-tree finalize skipped: ${decision.reason}`));
     return;
   }
+  await restoreBestTree(runDir, state, decision.reason);
+}
 
-  const best = state.bestTree;
-  console.log(clr("1;35", `  ↩ Restoring promoted-best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(2)} ${METRIC_LABEL})...`));
-  await runCommand("git", ["restore", "--source", best.commitHash, "--staged", "--worktree", "--", ...LOOP_COMMIT_PATHS]);
-  const status = await runCommand("git", ["status", "--porcelain", "--", ...LOOP_COMMIT_PATHS]);
-  if (status.stdout.trim().length > 0) {
-    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
-    await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
-  }
-  state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };
-  await saveState(runDir, state);
+async function restorePromotedBestDuringPlateauIfNeeded(runDir: string, state: RunState): Promise<void> {
+  if (!FINALIZE_BEST_TREE) return;
+  if (!state.bestTree?.commitHash) return;
+  const head = await runCommand("git", ["rev-parse", "HEAD"]).catch(() => null);
+  const currentHead = head?.stdout.trim() ?? "";
+  const decision = shouldRestorePromotedBestDuringPlateau(state, currentHead);
+  if (!decision.restore) return;
+  await restoreBestTree(runDir, state, decision.reason);
 }
 
 async function runProfileBenchmark(): Promise<string> {
@@ -3416,6 +3466,7 @@ async function main() {
     state.lastProfileCycle ??= null;
     state.lastMetalShapesOutput ??= null;
     state.lastMetalShapesCycle ??= null;
+    state.lastMetalShapesOk ??= null;
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
@@ -3446,6 +3497,7 @@ async function main() {
     runId = state.runId;
     runDir = latestDir;
     startCycle = state.cycles.length + 1;
+    await restorePromotedBestDuringPlateauIfNeeded(runDir, state);
     console.log(clr("1;36", "╔══════════════════════════════════════════════════════════════╗"));
     console.log(clr("1;36", "║  ZINC Metal Optimization Loop — RESUMING                     ║"));
     console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
@@ -3479,6 +3531,7 @@ async function main() {
       lastProfileCycle: null,
       lastMetalShapesOutput: null,
       lastMetalShapesCycle: null,
+      lastMetalShapesOk: null,
       lastNearMissDiagnostic: null,
       crossEffortBaseline: null,
       lastCrossEffort: null,
@@ -3781,10 +3834,15 @@ async function main() {
       try {
         state.lastMetalShapesOutput = await runMetalShapesBenchmark();
         state.lastMetalShapesCycle = cycle;
+        state.lastMetalShapesOk = true;
         await writeFile(join(cycleDir, "metal_shapes.log"), state.lastMetalShapesOutput);
       } catch (err) {
-        const msg = err instanceof Error ? err.message.slice(-500) : String(err);
-        console.log(clr("1;33", `  ⚠ Metal-shapes evidence run failed, continuing: ${msg}`));
+        const msg = err instanceof Error ? err.message : String(err);
+        state.lastMetalShapesOutput = `FAILED metal-shapes evidence run:\n${msg}`;
+        state.lastMetalShapesCycle = cycle;
+        state.lastMetalShapesOk = false;
+        await writeFile(join(cycleDir, "metal_shapes_failed.log"), state.lastMetalShapesOutput);
+        console.log(clr("1;33", `  ⚠ Metal-shapes evidence run failed, continuing: ${msg.slice(-500)}`));
       }
     }
 
@@ -3878,6 +3936,7 @@ async function main() {
     }
 
     normalizeStateBestTokPerSec(state);
+    await restorePromotedBestDuringPlateauIfNeeded(runDir, state);
     await saveState(runDir, state);
 
     // Status summary

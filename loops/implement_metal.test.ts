@@ -31,6 +31,7 @@ import {
   shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
   shouldFinalizeBestTree,
+  shouldRestorePromotedBestDuringPlateau,
   shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
 } from "./implement_metal";
@@ -1663,6 +1664,52 @@ describe("plateau controls", () => {
       "best",
     );
     expect(decision.finalize).toBe(false);
+  });
+
+  test("Gemma plateau restore fires when current accepted tree fell below promoted best", () => {
+    const state = makeState({
+      metricMode: "prefill",
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Gemma M4 effort",
+      currentBest: { tokPerSec: 87.9, containsReference: true },
+      bestTokPerSec: 88.3,
+      bestTree: { cycle: 98, tokPerSec: 88.3, commitHash: "best-98" },
+      stalledCycles: 16,
+      cycles: [
+        makeCycle({ cycle: 98, kept: true, containsReference: true, tokPerSec: 88.3 }),
+        makeCycle({ cycle: 106, kept: true, containsReference: true, tokPerSec: 88.0 }),
+        makeCycle({ cycle: 110, kept: true, containsReference: true, tokPerSec: 87.9 }),
+        makeCycle({ cycle: 111, kept: false, containsReference: true, tokPerSec: 82.5 }),
+        makeCycle({ cycle: 112, kept: false, containsReference: true, tokPerSec: 86.7 }),
+        makeCycle({ cycle: 113, kept: false, containsReference: true, tokPerSec: 86.2 }),
+        makeCycle({ cycle: 114, kept: false, containsReference: true, tokPerSec: 86.4 }),
+      ],
+    });
+    const decision = shouldRestorePromotedBestDuringPlateau(state, "current-head");
+    expect(decision.restore).toBe(true);
+    expect(decision.reason).toContain("Gemma plateau active");
+    expect(decision.reason).toContain("cycle 98");
+  });
+
+  test("Gemma plateau restore skips when current accepted tree is already at promoted-best speed", () => {
+    const state = makeState({
+      metricMode: "prefill",
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Gemma M4 effort",
+      currentBest: { tokPerSec: 88.28, containsReference: true },
+      bestTokPerSec: 88.3,
+      bestTree: { cycle: 98, tokPerSec: 88.3, commitHash: "best-98" },
+      stalledCycles: 16,
+      cycles: [
+        makeCycle({ cycle: 98, kept: true, containsReference: true, tokPerSec: 88.3 }),
+        makeCycle({ cycle: 114, kept: false, containsReference: true, tokPerSec: 86.4 }),
+      ],
+    });
+    const decision = shouldRestorePromotedBestDuringPlateau(state, "current-head");
+    expect(decision.restore).toBe(false);
+    expect(decision.reason).toContain("within 0.05");
   });
 });
 
