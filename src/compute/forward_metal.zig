@@ -2584,6 +2584,26 @@ fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
     return n_experts * blocks_per_expert;
 }
 
+fn gemmaBatchedPrefillRouteModeForShape(
+    n_tokens: u32,
+    has_route_slot_ids: bool,
+    has_direct_scaled_scatter: bool,
+    has_active_blocks: bool,
+) []const u8 {
+    if (n_tokens < 32 and has_route_slot_ids and has_direct_scaled_scatter) return "route-slots";
+    if (has_active_blocks) return "active-blocks";
+    return "dense-expert";
+}
+
+fn gemmaBatchedPrefillRouteMode(engine: *const InferenceEngine, n_tokens: u32) []const u8 {
+    return gemmaBatchedPrefillRouteModeForShape(
+        n_tokens,
+        engine.moe_route_ids_pipe.handle != null,
+        engine.moe_route_scatter_direct_scaled_pipe.handle != null,
+        engine.moe_route_pack_blocks_pipe.handle != null,
+    );
+}
+
 fn recordRoutePackProfile(
     profile: ?*RuntimeProfile,
     n_tokens: u32,
@@ -2807,10 +2827,23 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     if (can_batched_prefill) {
-        log.info("Metal profile: Gemma batched prefill enabled: mode={s} prompt_len={d} private_decode={s}", .{
+        const n_tokens: u32 = @intCast(@min(prompt_len, @as(usize, std.math.maxInt(u32))));
+        const route_slots_u64 = @as(u64, n_tokens) * @as(u64, cfg.n_experts_used);
+        const route_slots: u32 = if (route_slots_u64 > std.math.maxInt(u32))
+            std.math.maxInt(u32)
+        else
+            @intCast(route_slots_u64);
+        const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, cfg.n_experts);
+        const dense_blocks = denseMoeColsDispatchBlocks(n_tokens, cfg.n_experts);
+        log.info("Metal profile: Gemma batched prefill enabled: mode={s} prompt_len={d} private_decode={s} route={s} route_slots={d} active_block_upper={d} dense_dispatch_blocks={d} upper/dense={d:.1}%", .{
             @tagName(mode),
             prompt_len,
             if (engine.private_decode_buffers) "yes" else "no",
+            gemmaBatchedPrefillRouteMode(engine, n_tokens),
+            route_slots,
+            active_block_upper_bound,
+            dense_blocks,
+            pctOf(dense_blocks, active_block_upper_bound),
         });
         return;
     }
@@ -29201,6 +29234,12 @@ test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
     try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * 8, 256));
+}
+
+test "gemma batched prefill route mode names active-block selection" {
+    try std.testing.expectEqualStrings("route-slots", gemmaBatchedPrefillRouteModeForShape(20, true, true, true));
+    try std.testing.expectEqualStrings("active-blocks", gemmaBatchedPrefillRouteModeForShape(70, true, true, true));
+    try std.testing.expectEqualStrings("dense-expert", gemmaBatchedPrefillRouteModeForShape(70, true, true, false));
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {
