@@ -868,8 +868,6 @@ pub const RuntimeProfile = struct {
     dense_ffn_record_ns: u64 = 0,
     final_record_ns: u64 = 0,
     gpu_completion_wait_ns: u64 = 0,
-    final_completion_wait_ns: u64 = 0,
-    final_commit_waits: u32 = 0,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1281,8 +1279,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_record_ns = total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns;
     delta.final_record_ns = total.final_record_ns -| prefix.final_record_ns;
     delta.gpu_completion_wait_ns = total.gpu_completion_wait_ns -| prefix.gpu_completion_wait_ns;
-    delta.final_completion_wait_ns = total.final_completion_wait_ns -| prefix.final_completion_wait_ns;
-    delta.final_commit_waits = total.final_commit_waits -| prefix.final_commit_waits;
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
     delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
@@ -1362,7 +1358,7 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
 fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps == 0 and profile.dmmv_total_bytes == 0) return;
 
-    log.info("  {s} buckets: embed {d:.2} ms | attn proj {d:.2} GiB out {d:.2} GiB flash {d} kv-write {d} | final record {d:.2} ms wait {d:.2} ms/{d} lm-head {d:.2} GiB", .{
+    log.info("  {s} buckets: embed {d:.2} ms | attn proj {d:.2} GiB out {d:.2} GiB flash {d} kv-write {d} | final {d:.2} ms lm-head {d:.2} GiB", .{
         label,
         nsToMs(profile.embedding_ns),
         bytesToGiB(profile.full_attn_projection_bytes),
@@ -1370,8 +1366,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.full_attn_flash_calls,
         profile.full_attn_kv_write_calls,
         nsToMs(profile.final_record_ns),
-        nsToMs(profile.final_completion_wait_ns),
-        profile.final_commit_waits,
         bytesToGiB(profile.lm_head_bytes),
     });
     log.info("  {s} buckets: ssm proj {d:.2} GiB (qkv {d:.2} gate {d:.2} tail {d:.2}) recurrent conv/delta/gated {d}/{d}/{d} out {d:.2} GiB | router {d:.2} GiB topk {d} cpu {d:.2} ms", .{
@@ -19645,7 +19639,7 @@ fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !Me
     return cmd;
 }
 
-fn commitAndWaitProfiledTagged(cmd: *MetalCommand, profile: ?*RuntimeProfile, is_final_phase: bool) void {
+fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
@@ -19653,23 +19647,10 @@ fn commitAndWaitProfiledTagged(cmd: *MetalCommand, profile: ?*RuntimeProfile, is
     const commit_start = profileStart(profile != null);
     cmd.commitAndWait();
     if (profile) |p| {
-        const wait_ns = profileElapsedNs(commit_start);
         p.commit_waits += 1;
         // This wall time is the full command-buffer completion wait, not just CPU submit overhead.
-        p.gpu_completion_wait_ns += wait_ns;
-        if (is_final_phase) {
-            p.final_commit_waits += 1;
-            p.final_completion_wait_ns += wait_ns;
-        }
+        p.gpu_completion_wait_ns += profileElapsedNs(commit_start);
     }
-}
-
-fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
-    commitAndWaitProfiledTagged(cmd, profile, false);
-}
-
-fn commitAndWaitFinalProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
-    commitAndWaitProfiledTagged(cmd, profile, true);
 }
 
 fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
@@ -21740,7 +21721,7 @@ fn runDecodeStep(
         if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
-            commitAndWaitFinalProfiled(cmd, profile);
+            commitAndWaitProfiled(cmd, profile);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -21750,7 +21731,7 @@ fn runDecodeStep(
             profileBarrier(cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            if (!using_external_shared_cmd) commitAndWaitFinalProfiled(cmd, profile);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             // Adapt llama.cpp `ggml_mem_ranges_check_dst`: LM head reads
@@ -21762,14 +21743,14 @@ fn runDecodeStep(
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            if (!using_external_shared_cmd) commitAndWaitFinalProfiled(cmd, profile);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
     } else {
         var cmd = try beginProfiledCommand(engine, profile);
         if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(&cmd, profile, .final);
-            commitAndWaitFinalProfiled(&cmd, profile);
+            commitAndWaitProfiled(&cmd, profile);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -21779,7 +21760,7 @@ fn runDecodeStep(
             profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitFinalProfiled(&cmd, profile);
+            commitAndWaitProfiled(&cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(&cmd, profile, .final);
@@ -21787,7 +21768,7 @@ fn runDecodeStep(
             profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitFinalProfiled(&cmd, profile);
+            commitAndWaitProfiled(&cmd, profile);
         }
     }
     releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
@@ -29585,30 +29566,6 @@ test "gemma moe prefill path name exposes mixed validation replay" {
 
     profile.queued_prefill_requests = 0;
     try std.testing.expectEqualStrings("batched-route-pack", gemmaMoePrefillPathName(profile));
-}
-
-test "profile split preserves final wait attribution" {
-    const prefix = RuntimeProfile{
-        .decode_steps = 70,
-        .commit_waits = 1,
-        .gpu_completion_wait_ns = 200,
-        .final_commit_waits = 1,
-        .final_completion_wait_ns = 50,
-    };
-    const total = RuntimeProfile{
-        .decode_steps = 102,
-        .commit_waits = 33,
-        .gpu_completion_wait_ns = 700,
-        .final_commit_waits = 33,
-        .final_completion_wait_ns = 370,
-    };
-    const delta = profileDeltaForSplit(total, prefix);
-
-    try std.testing.expectEqual(@as(u32, 32), delta.decode_steps);
-    try std.testing.expectEqual(@as(u32, 32), delta.commit_waits);
-    try std.testing.expectEqual(@as(u64, 500), delta.gpu_completion_wait_ns);
-    try std.testing.expectEqual(@as(u32, 32), delta.final_commit_waits);
-    try std.testing.expectEqual(@as(u64, 320), delta.final_completion_wait_ns);
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {
