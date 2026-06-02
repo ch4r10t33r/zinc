@@ -6766,25 +6766,25 @@ pub const InferenceEngine = struct {
             const is_gemma_moe = cfg.architecture == .gemma and hasExplicitGemmaMoeTensors(cfg, lt);
 
             dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
             if (apply_v_unit_norm) {
                 const v_src = if (attn.use_k_as_v) &scratch.k else &scratch.v;
                 dispatchRmsNormOnCmd(self, &cmd, v_src, &scratch.v, &self.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads * n_tokens);
                 if (attn.use_k_as_v) {
-                    cmd.barrier();
+                    profileBarrier(&cmd, profile, .full_attn);
                 }
             } else if (attn.use_k_as_v) {
                 dispatchCopyF32OnCmd(self, &cmd, &scratch.k, &scratch.v, n_tokens * attn.kv_dim);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
             if (self.attn_q_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.q, &scratch.q, &self.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
@@ -6793,13 +6793,13 @@ pub const InferenceEngine = struct {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.k, &scratch.k, &self.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
             }
             if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx] or apply_v_unit_norm) {
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             const rope_freq_buf = selectRopeFreqBuffer(self, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.k, &scratch.k, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             const kv_len = position_base + n_tokens;
             if (self.kv_cache_q8) {
@@ -6810,7 +6810,7 @@ pub const InferenceEngine = struct {
                 const dst_elements = position_base * attn.kv_dim;
                 dispatchKvCacheWriteBatchedOnCmd(self, &cmd, layer_idx, &scratch.k, &scratch.v, dst_elements, n_tokens * attn.kv_dim);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (self.kv_cache_q8) {
                 dispatchFlashAttnBatchedQ8OnCmd(
@@ -6849,13 +6849,13 @@ pub const InferenceEngine = struct {
                     attn.sliding_window_size,
                 );
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
             if (self.post_attn_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             {
@@ -6863,7 +6863,7 @@ pub const InferenceEngine = struct {
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (is_gemma_moe) {
                 try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
@@ -6873,7 +6873,7 @@ pub const InferenceEngine = struct {
                 const down_t = lt.ffn_down.?;
                 dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, inter_dim, hidden_dim, n_tokens);
                 dispatchGemmBatchedOnCmd(self, &cmd, up_t, &scratch.norm, &scratch.up, inter_dim, hidden_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
 
                 {
                     const push = SwiGLUPush{ .n = inter_dim };
@@ -6881,13 +6881,13 @@ pub const InferenceEngine = struct {
                     const pipe = if (usesGeglu(cfg)) &self.geglu_batched_pipe else &self.swiglu_batched_pipe;
                     cmd.dispatchV2(pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
                 }
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
 
                 dispatchGemmBatchedOnCmd(self, &cmd, down_t, &scratch.swiglu, &scratch.down, hidden_dim, inter_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
                 if (self.post_ffn_norm_present[layer_idx]) {
                     dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_ffn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                    cmd.barrier();
+                    profileBarrier(&cmd, profile, .dense_ffn);
                 }
 
                 {
@@ -6896,7 +6896,7 @@ pub const InferenceEngine = struct {
                     const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
                     cmd.dispatchV2(&self.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
                 }
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
             }
 
             if (profile) |p| {
@@ -6923,7 +6923,7 @@ pub const InferenceEngine = struct {
         }
 
         dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
-        cmd.barrier();
+        profileBarrier(&cmd, profile, .final);
 
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
@@ -6939,7 +6939,7 @@ pub const InferenceEngine = struct {
         } else {
             const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
             dispatchLmHeadWithInputOffset(self, &cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
             if (mode == .validate and self.private_decode_buffers) {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
