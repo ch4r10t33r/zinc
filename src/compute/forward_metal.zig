@@ -2491,20 +2491,40 @@ fn resolveMoeGateUpLayout(lt: LayerTensors, inter_dim: u32, hidden_dim: u32) !Mo
 ///               checks against a real model.
 const BatchedPrefillMode = enum { off, on, validate };
 
-fn batchedPrefillMode() BatchedPrefillMode {
-    const raw = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return .off;
-    if (std.mem.eql(u8, raw, "1")) return .on;
-    if (std.mem.eql(u8, raw, "validate")) return .validate;
+fn parseBatchedPrefillMode(raw: ?[]const u8) BatchedPrefillMode {
+    const value = raw orelse return .off;
+    if (std.mem.eql(u8, value, "1")) return .on;
+    if (std.mem.eql(u8, value, "validate")) return .validate;
     return .off;
+}
+
+fn batchedPrefillMode() BatchedPrefillMode {
+    return parseBatchedPrefillMode(std.posix.getenv("ZINC_BATCHED_PREFILL"));
 }
 
 fn batchedPrefillEnvPresent() bool {
     return std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
 }
 
+fn gemmaBatchedPrefillMode() BatchedPrefillMode {
+    return parseBatchedPrefillMode(std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL"));
+}
+
 fn gemmaBatchedPrefillEnabled() bool {
-    const raw = std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return false;
-    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "validate");
+    return gemmaBatchedPrefillMode() != .off;
+}
+
+fn effectiveBatchedPrefillMode(
+    cfg: ModelConfig,
+    requested_mode: BatchedPrefillMode,
+    generic_env_present: bool,
+    gemma_mode: BatchedPrefillMode,
+    dense_default: bool,
+) BatchedPrefillMode {
+    if (requested_mode != .off or generic_env_present) return requested_mode;
+    if (cfg.architecture == .gemma and cfg.n_experts > 0 and gemma_mode != .off) return gemma_mode;
+    if (dense_default) return .on;
+    return .off;
 }
 
 fn supportsBatchedGemmQuant(t: GGMLType) bool {
@@ -6135,12 +6155,13 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
-        const mode: BatchedPrefillMode = if (requested_mode == .off and
-            !batchedPrefillEnvPresent() and
-            shouldDefaultDenseGemmaBatchedPrefill(self))
-            .on
-        else
-            requested_mode;
+        const mode = effectiveBatchedPrefillMode(
+            self.config,
+            requested_mode,
+            batchedPrefillEnvPresent(),
+            gemmaBatchedPrefillMode(),
+            shouldDefaultDenseGemmaBatchedPrefill(self),
+        );
         if (mode == .off or !canUseBatchedPrefill(self)) {
             return self.prefillBatch(state, prompt_tokens);
         }
@@ -26531,6 +26552,60 @@ test "q8 lm head stays on GPU" {
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q4_k));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
+}
+
+test "gemma batched prefill env can select mode without generic gate" {
+    var gemma_moe_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 704,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 2112,
+    };
+
+    try std.testing.expectEqual(BatchedPrefillMode.off, parseBatchedPrefillMode(null));
+    try std.testing.expectEqual(BatchedPrefillMode.on, parseBatchedPrefillMode("1"));
+    try std.testing.expectEqual(BatchedPrefillMode.validate, parseBatchedPrefillMode("validate"));
+    try std.testing.expectEqual(BatchedPrefillMode.off, parseBatchedPrefillMode("0"));
+
+    try std.testing.expectEqual(
+        BatchedPrefillMode.validate,
+        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, false, .validate, false),
+    );
+    try std.testing.expectEqual(
+        BatchedPrefillMode.off,
+        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, true, .validate, false),
+    );
+
+    gemma_moe_cfg.n_experts = 0;
+    try std.testing.expectEqual(
+        BatchedPrefillMode.on,
+        effectiveBatchedPrefillMode(gemma_moe_cfg, .off, false, .validate, true),
+    );
+
+    var qwen_cfg = gemma_moe_cfg;
+    qwen_cfg.architecture = .qwen35;
+    qwen_cfg.n_experts = 128;
+    try std.testing.expectEqual(
+        BatchedPrefillMode.off,
+        effectiveBatchedPrefillMode(qwen_cfg, .off, false, .validate, false),
+    );
 }
 
 test "gemma q8 routed moe decode default gates Gemma 26B shape" {
