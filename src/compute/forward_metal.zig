@@ -807,6 +807,9 @@ const GpuMoeFinalizerKind = enum(u8) {
     f32,
     shared,
     routed_only,
+    gemma_weighted_post_norm,
+    gemma_post_norm,
+    gemma_staged,
 };
 
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
@@ -842,6 +845,9 @@ pub const RuntimeProfile = struct {
     gpu_moe_finalizer_f32_calls: u32 = 0,
     gpu_moe_finalizer_shared_calls: u32 = 0,
     gpu_moe_finalizer_routed_only_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_weighted_post_norm_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_post_norm_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_staged_calls: u32 = 0,
     fallback_moe_barrier_calls: u32 = 0,
     dense_ffn_barrier_calls: u32 = 0,
     final_barrier_calls: u32 = 0,
@@ -1060,6 +1066,9 @@ fn recordGpuMoeFinalizerKind(profile: ?*RuntimeProfile, kind: GpuMoeFinalizerKin
         .f32 => p.gpu_moe_finalizer_f32_calls += 1,
         .shared => p.gpu_moe_finalizer_shared_calls += 1,
         .routed_only => p.gpu_moe_finalizer_routed_only_calls += 1,
+        .gemma_weighted_post_norm => p.gpu_moe_finalizer_gemma_weighted_post_norm_calls += 1,
+        .gemma_post_norm => p.gpu_moe_finalizer_gemma_post_norm_calls += 1,
+        .gemma_staged => p.gpu_moe_finalizer_gemma_staged_calls += 1,
     };
 }
 
@@ -1323,6 +1332,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.gpu_moe_finalizer_f32_calls = total.gpu_moe_finalizer_f32_calls -| prefix.gpu_moe_finalizer_f32_calls;
     delta.gpu_moe_finalizer_shared_calls = total.gpu_moe_finalizer_shared_calls -| prefix.gpu_moe_finalizer_shared_calls;
     delta.gpu_moe_finalizer_routed_only_calls = total.gpu_moe_finalizer_routed_only_calls -| prefix.gpu_moe_finalizer_routed_only_calls;
+    delta.gpu_moe_finalizer_gemma_weighted_post_norm_calls = total.gpu_moe_finalizer_gemma_weighted_post_norm_calls -| prefix.gpu_moe_finalizer_gemma_weighted_post_norm_calls;
+    delta.gpu_moe_finalizer_gemma_post_norm_calls = total.gpu_moe_finalizer_gemma_post_norm_calls -| prefix.gpu_moe_finalizer_gemma_post_norm_calls;
+    delta.gpu_moe_finalizer_gemma_staged_calls = total.gpu_moe_finalizer_gemma_staged_calls -| prefix.gpu_moe_finalizer_gemma_staged_calls;
     delta.q8_repacked_tg128_bytes = total.q8_repacked_tg128_bytes -| prefix.q8_repacked_tg128_bytes;
     delta.q8_repacked_exact_qwen_bytes = total.q8_repacked_exact_qwen_bytes -| prefix.q8_repacked_exact_qwen_bytes;
     delta.q8_repacked_quad_bytes = total.q8_repacked_quad_bytes -| prefix.q8_repacked_quad_bytes;
@@ -1376,7 +1388,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.commit_waits,
         nsToMs(profile.gpu_completion_wait_ns),
     });
-    log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d}", .{
+    log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
         label,
         profile.gpu_moe_finalizer_scalar_seed_norm_calls,
         profile.gpu_moe_finalizer_scalar_calls,
@@ -1385,6 +1397,9 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.gpu_moe_finalizer_f32_calls,
         profile.gpu_moe_finalizer_shared_calls,
         profile.gpu_moe_finalizer_routed_only_calls,
+        profile.gpu_moe_finalizer_gemma_weighted_post_norm_calls,
+        profile.gpu_moe_finalizer_gemma_post_norm_calls,
+        profile.gpu_moe_finalizer_gemma_staged_calls,
     });
     if (profile.route_pack_layers > 0) {
         const layers_f = @as(f64, @floatFromInt(profile.route_pack_layers));
@@ -19056,6 +19071,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         // tail. This removes the standalone moe_weighted_acc_scaled dispatch and
         // its dependency barrier on the token-major prefill path while preserving
         // the same ffn_down_exps_scale folding.
+        recordGpuMoeFinalizerKind(profile, .gemma_weighted_post_norm);
         dispatchGemmaMoeWeightedPostNormResidualOnCmd(
             engine,
             cmd,
@@ -19092,6 +19108,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // expert contribution visible before post expert norm
 
     if (use_fused_post_norm_residual) {
+        recordGpuMoeFinalizerKind(profile, .gemma_post_norm);
         dispatchGemmaMoePostNormResidualOnCmd(
             engine,
             cmd,
@@ -19110,6 +19127,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         return;
     }
 
+    recordGpuMoeFinalizerKind(profile, .gemma_staged);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, post_ffw_norm_2, hidden_dim, 1);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.down_buf, &engine.down_buf, post_ffw_norm_1, hidden_dim, 1);
     profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{ &engine.moe_out_buf, &engine.down_buf }); // post expert/shared norms visible before shared add
