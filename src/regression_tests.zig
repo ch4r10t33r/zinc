@@ -65,7 +65,7 @@ test "Metal prefillBatched gates on env flag and supported architecture" {
     const src = @embedFile("compute/forward_metal.zig");
     try expectContains(src, "ZINC_BATCHED_PREFILL");
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "batchedPrefillMode()", 600);
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "canUseBatchedPrefill(self)", 600);
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "canUseBatchedPrefill(self)", 900);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "return self.prefillBatch(state, prompt_tokens);", 1200);
 }
 
@@ -74,6 +74,14 @@ test "Metal prefillBatched validate path diffs last-token logits within 1e-3" {
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "if (mode == .validate)", 16000);
     try expectContainsNear(src, "if (mode == .validate)", "const tol: f32 = 1e-3;", 1500);
     try expectContainsNear(src, "if (mode == .validate)", "try self.prefillBatch(state, prompt_tokens);", 1500);
+}
+
+test "Metal Gemma MoE batched prefill honors Gemma env and Q8 GEMM" {
+    const src = @embedFile("compute/forward_metal.zig");
+    try expectContains(src, "ZINC_GEMMA_BATCHED_PREFILL");
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "gemmaBatchedPrefillMode()", 900);
+    try expectContainsNear(src, "fn supportsBatchedGemmQuant", ".q8_0 => engine.gemm_q8_0_pipe.handle != null", 600);
+    try expectContainsNear(src, "fn dispatchGemmBatchedOnCmd", ".q8_0 => dispatchGemmQ8_0OnCmd", 800);
 }
 
 test "Metal Gemma MoE validation is env gated and fails above 1e-3" {

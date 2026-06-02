@@ -2502,13 +2502,24 @@ fn batchedPrefillEnvPresent() bool {
     return std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
 }
 
-fn gemmaBatchedPrefillEnabled() bool {
-    const raw = std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return false;
-    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "validate");
+fn gemmaBatchedPrefillMode() BatchedPrefillMode {
+    const raw = std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return .off;
+    if (std.mem.eql(u8, raw, "1")) return .on;
+    if (std.mem.eql(u8, raw, "validate")) return .validate;
+    return .off;
 }
 
-fn supportsBatchedGemmQuant(t: GGMLType) bool {
-    return t == .q4_k or t == .q6_k;
+fn gemmaBatchedPrefillEnabled() bool {
+    return gemmaBatchedPrefillMode() != .off;
+}
+
+fn supportsBatchedGemmQuant(engine: *const InferenceEngine, t: GGMLType) bool {
+    return switch (t) {
+        .q4_k => engine.gemm_q4k_pipe.handle != null,
+        .q6_k => engine.gemm_q6k_pipe.handle != null,
+        .q8_0 => engine.gemm_q8_0_pipe.handle != null,
+        else => false,
+    };
 }
 
 fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool {
@@ -2658,7 +2669,7 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (engine.private_decode_buffers) return false;
     if (fullAttentionInterval(cfg) != 1) return false;
     if (engine.attn_sink_values != null) return false;
-    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine.lm_head.info.type_)) return false;
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
     for (0..cfg.n_layers) |i| {
         if (engine.layer_output_scales[i] != 1.0) return false;
@@ -2672,11 +2683,11 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         const q = lt.attn_q orelse return false;
         const k = lt.attn_k orelse return false;
         const o = lt.attn_output orelse return false;
-        if (!supportsBatchedGemmQuant(q.info.type_) or !supportsBatchedGemmQuant(k.info.type_) or
-            !supportsBatchedGemmQuant(o.info.type_)) return false;
+        if (!supportsBatchedGemmQuant(engine, q.info.type_) or !supportsBatchedGemmQuant(engine, k.info.type_) or
+            !supportsBatchedGemmQuant(engine, o.info.type_)) return false;
         if (!attn.use_k_as_v) {
             const v = lt.attn_v orelse return false;
-            if (!supportsBatchedGemmQuant(v.info.type_)) return false;
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) return false;
         }
 
         const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
@@ -2684,7 +2695,7 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 
         if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
         const gate_inp = lt.ffn_gate_inp orelse return false;
-        if (!supportsBatchedGemmQuant(gate_inp.info.type_)) return false;
+        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_)) return false;
         if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
             lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
 
@@ -2696,11 +2707,11 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         const gate_shexp = lt.ffn_gate_shexp orelse return false;
         const up_shexp = lt.ffn_up_shexp orelse return false;
         const down_shexp = lt.ffn_down_shexp orelse return false;
-        if (!supportsBatchedGemmQuant(gate_shexp.info.type_) or
-            !supportsBatchedGemmQuant(up_shexp.info.type_) or
-            !supportsBatchedGemmQuant(down_shexp.info.type_)) return false;
+        if (!supportsBatchedGemmQuant(engine, gate_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, up_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, down_shexp.info.type_)) return false;
         if (lt.ffn_gate_inp_shexp) |gate| {
-            if (!supportsBatchedGemmQuant(gate.info.type_)) return false;
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_)) return false;
         }
 
         if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
@@ -2747,7 +2758,7 @@ fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (engine.private_decode_buffers) return false;
     if (fullAttentionInterval(cfg) != 1) return false;
     if (engine.attn_sink_values != null) return false;
-    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine.lm_head.info.type_)) return false;
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
     if (engine.geglu_batched_pipe.handle == null or
         engine.gemm_q4k_pipe.handle == null or
         engine.gemm_q6k_pipe.handle == null)
@@ -2769,11 +2780,11 @@ fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         const up = lt.ffn_up orelse return false;
         const down = lt.ffn_down orelse return false;
         for ([_]*const metal_loader.LoadedTensor{ q, k, o, gate, up, down }) |t| {
-            if (!supportsBatchedGemmQuant(t.info.type_)) return false;
+            if (!supportsBatchedGemmQuant(engine, t.info.type_)) return false;
         }
         if (!attn.use_k_as_v) {
             const v = lt.attn_v orelse return false;
-            if (!supportsBatchedGemmQuant(v.info.type_)) return false;
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) return false;
         }
 
         const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
@@ -3069,8 +3080,8 @@ const BatchedPrefillScratch = struct {
 };
 
 /// Dispatch a weight × matrix batched matmul using the appropriate GEMM kernel
-/// for the tensor's quant type. Only Q4_K and Q6_K are supported here — callers
-/// must have verified the type via `canUseBatchedPrefill`.
+/// for the tensor's quant type. Callers must have verified the type via
+/// `canUseBatchedPrefill`.
 fn dispatchGemmBatchedOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -3084,6 +3095,7 @@ fn dispatchGemmBatchedOnCmd(
     switch (weight.info.type_) {
         .q4_k => dispatchGemmQ4KOnCmd(engine, cmd, weight, input, output, M, K, N),
         .q6_k => dispatchGemmQ6KOnCmd(engine, cmd, weight, input, output, M, K, N),
+        .q8_0 => dispatchGemmQ8_0OnCmd(engine, cmd, weight, input, output, M, K, N),
         else => unreachable,
     }
 }
@@ -6151,7 +6163,13 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
-        const mode: BatchedPrefillMode = if (requested_mode == .off and
+        const gemma_mode: BatchedPrefillMode = if (self.config.architecture == .gemma and self.config.n_experts > 0)
+            gemmaBatchedPrefillMode()
+        else
+            .off;
+        const mode: BatchedPrefillMode = if (gemma_mode != .off)
+            gemma_mode
+        else if (requested_mode == .off and
             !batchedPrefillEnvPresent() and
             shouldDefaultDenseGemmaBatchedPrefill(self))
             .on
