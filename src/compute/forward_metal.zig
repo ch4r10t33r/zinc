@@ -7083,13 +7083,20 @@ pub const InferenceEngine = struct {
                 bytesToGiB(decode_profile.dmmv_total_bytes),
             });
             if (self.config.architecture == .gemma and self.config.n_experts > 0) {
+                const gemma_default_batched = shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens);
+                const gemma_structural_batched = canUseBatchedPrefill(self);
                 log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d}", .{
                     gemmaMoePrefillPathName(self.prefill_profile),
-                    if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens)) "yes" else "no",
-                    if (canUseBatchedPrefill(self)) "yes" else "no",
+                    if (gemma_default_batched) "yes" else "no",
+                    if (gemma_structural_batched) "yes" else "no",
                     self.prefill_profile.route_pack_layers,
                     self.prefill_profile.queued_prefill_chunks,
                 });
+                if (gemma_default_batched and !gemma_structural_batched) {
+                    // Keep the structural route-pack blocker beside the split
+                    // profile line the public-prompt loop already extracts.
+                    logGemmaBatchedPrefillDecision(self, prompt_tokens, .on, false);
+                }
             }
         }
         log.info("  cpu: embed {d:.2} ms ({d:.3} ms/step) | record {d:.2} ms ({d:.3} ms/step) | router {d:.2} ms | sample {d:.2} ms ({d:.3} ms/sample)", .{
