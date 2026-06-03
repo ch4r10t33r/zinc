@@ -3034,7 +3034,8 @@ async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
     state.bestTree.cycle >= best.cycle &&
     state.bestTree.tokPerSec >= best.tokPerSec - 0.05
   ) {
-    return;
+    const stillOnBranch = await runCommand("git", ["merge-base", "--is-ancestor", state.bestTree.commitHash, "HEAD"]).then(() => true).catch(() => false);
+    if (stillOnBranch) return;
   }
   const grep = `metal-loop: cycle-${best.cycle} `;
   const found = await runCommand("git", ["log", "--format=%H", "--grep", grep, "-1"]).catch(() => null);
