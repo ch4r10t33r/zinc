@@ -2,6 +2,7 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const DEFAULT_LISTEN = 9091;
@@ -328,11 +329,16 @@ export function buildCodingContinuationGuardMessage(body) {
   const source = editable ? ` Edit/write ${editable} for source fixes.` : "";
   return [
     "OpenCode continuation guard: Continue the coding task with tool calls.",
+    "Until tests pass, assistant turns should be tool calls only; do not emit visible prose before or after tool calls.",
     "Do not summarize instead of acting when tests are still failing.",
     "For JavaScript projects, search **/*.{js,mjs,cjs,ts,tsx,json} first; .mjs and .cjs are source files.",
+    "When the user names exact files, read every named file in the same assistant turn before analysis; do not read only a subset.",
     "Batch independent file discovery and reads in one assistant turn when paths are obvious.",
     "If you have identified multiple source bugs, fix all known source bugs in one edit before yielding.",
     "Do not split one obvious same-file fix across multiple edit turns when the failing tests already identify the cases.",
+    "For source files under about 120 lines, prefer write with the complete corrected file when replacing methods/classes or fixing multiple lines.",
+    "Use edit only when oldString is copied exactly from the latest read output; never invent spacing such as '< =' or '> ='.",
+    "If a source read shows duplicate method definitions or both old and new implementations, immediately rewrite the whole source file.",
     "Never call edit or write on package.json or files under /test/ unless the user explicitly asks to change tests.",
     `${source} Run the project tests after source edits, and do not give the final response until the tests pass.`,
   ].join("\n");
@@ -387,6 +393,53 @@ function coerceNumericArgs(value) {
       coerceNumericArgs(v);
     }
   }
+}
+
+function normalizeCodeOperatorSpacing(value) {
+  return String(value)
+    .replace(/<\s+=/g, "<=")
+    .replace(/>\s+=/g, ">=")
+    .replace(/!\s+=/g, "!=")
+    .replace(/=\s+=/g, "==")
+    .replace(/=\s+>/g, "=>");
+}
+
+function editFilePathArg(args) {
+  return args?.filePath ?? args?.file_path ?? args?.path ?? "";
+}
+
+export function repairEditOldStringArgs(args) {
+  const filePath = editFilePathArg(args);
+  if (!filePath || typeof filePath !== "string" || typeof args?.oldString !== "string") {
+    return { changed: false, blocked: false, args };
+  }
+
+  let current;
+  try {
+    current = readFileSync(filePath, "utf8");
+  } catch {
+    return { changed: false, blocked: false, args };
+  }
+
+  if (current.includes(args.oldString)) {
+    return { changed: false, blocked: false, args };
+  }
+
+  const normalizedOldString = normalizeCodeOperatorSpacing(args.oldString);
+  if (normalizedOldString !== args.oldString && current.includes(normalizedOldString)) {
+    return {
+      changed: true,
+      blocked: false,
+      args: { ...args, oldString: normalizedOldString },
+    };
+  }
+
+  return {
+    changed: true,
+    blocked: true,
+    filePath,
+    args,
+  };
 }
 
 function nearestKnownPath(raw, body, toolName) {
@@ -465,7 +518,27 @@ function repairToolCall(call, requestBody) {
   const name = call.function.name ?? call.name ?? "";
   const repaired = repairArgumentsJson(call.function.arguments, requestBody, name);
   call.function.arguments = repaired.text;
-  return repaired.changed;
+  let changed = repaired.changed;
+
+  if (name.toLowerCase() === "edit") {
+    try {
+      const args = JSON.parse(call.function.arguments || "{}");
+      const editRepair = repairEditOldStringArgs(args);
+      if (editRepair.blocked) {
+        call.function.name = "read";
+        call.function.arguments = JSON.stringify({ filePath: editRepair.filePath });
+        return true;
+      }
+      if (editRepair.changed) {
+        call.function.arguments = JSON.stringify(editRepair.args);
+        changed = true;
+      }
+    } catch {
+      return changed;
+    }
+  }
+
+  return changed;
 }
 
 export function parseXmlToolCallContent(content) {

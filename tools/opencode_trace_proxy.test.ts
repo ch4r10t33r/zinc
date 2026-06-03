@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   applyRequestOverrides,
@@ -16,6 +19,7 @@ import {
   parseXmlToolCallContent,
   preferredEditablePath,
   repairArgumentsJson,
+  repairEditOldStringArgs,
   repairOpenAiToolCalls,
   repairSseEvent,
   sendProxyErrorResponse,
@@ -24,6 +28,17 @@ import {
   syntheticResponseText,
   titleForOpenCodeRequest,
 } from "./opencode_trace_proxy.mjs";
+
+function withTempFile(content, fn) {
+  const dir = mkdtempSync(join(tmpdir(), "zinc-opencode-proxy-"));
+  const file = join(dir, "src.mjs");
+  writeFileSync(file, content);
+  try {
+    return fn(file);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 const body = {
   model: "zinc/qwen",
@@ -195,7 +210,11 @@ describe("request shaping", () => {
     expect(guard).toContain("src/cart.mjs");
     expect(guard).toContain("Package and test files are read-only");
     const continuation = buildCodingContinuationGuardMessage(body);
+    expect(continuation).toContain("tool calls only");
+    expect(continuation).toContain("read every named file in the same assistant turn");
     expect(continuation).toContain("fix all known source bugs in one edit");
+    expect(continuation).toContain("prefer write with the complete corrected file");
+    expect(continuation).toContain("oldString is copied exactly");
     expect(continuation).toContain("**/*.{js,mjs,cjs,ts,tsx,json}");
     expect(continuation).toContain("Batch independent file discovery and reads");
     expect(continuation).toContain("do not give the final response until the tests pass");
@@ -347,6 +366,51 @@ describe("tool argument repair", () => {
     expect(JSON.parse(payload.choices[0].delta.tool_calls[0].function.arguments).filePath).toBe(
       "/private/tmp/zinc-opencode-smoke4/src/cart.mjs",
     );
+  });
+
+  test("repairs common operator spacing inside edit oldString before OpenCode applies it", () => {
+    withTempFile("if (current - hit.time <= this.windowMs) {\n  keep();\n}\n", (filePath) => {
+      const repaired = repairEditOldStringArgs({
+        filePath,
+        oldString: "if (current - hit.time < = this.windowMs) {\n  keep();\n}",
+        newString: "if (current - hit.time < this.windowMs) {\n  keep();\n}",
+      });
+
+      expect(repaired.blocked).toBe(false);
+      expect(repaired.changed).toBe(true);
+      expect(repaired.args.oldString).toBe("if (current - hit.time <= this.windowMs) {\n  keep();\n}");
+    });
+  });
+
+  test("converts unsafe fuzzy edit calls into reads instead of letting them corrupt files", () => {
+    withTempFile("export const actual = 1;\n", (filePath) => {
+      const payload = {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    name: "edit",
+                    arguments: JSON.stringify({
+                      filePath,
+                      oldString: "export const imagined = 2;\n",
+                      newString: "export const actual = 3;\n",
+                    }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      expect(repairOpenAiToolCalls(payload, { messages: [{ role: "user", content: filePath }] })).toBe(true);
+      const call = payload.choices[0].delta.tool_calls[0];
+      expect(call.function.name).toBe("read");
+      expect(JSON.parse(call.function.arguments)).toEqual({ filePath });
+    });
   });
 
   test("repairs serialized SSE events", () => {
