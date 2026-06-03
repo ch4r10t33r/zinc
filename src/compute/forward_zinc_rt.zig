@@ -2445,17 +2445,81 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             gpu_window_delta,
         });
     }
-    if (selected_from_gpu_prefix or selected_from_gpu_window) {
-        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row phase={s} source={s} row={d} cols={d} score={d:.6} consumed_gpu_model_value=1", .{
-            tracking.ops.*,
-            directComputePhaseName(tracking.phase),
-            selected_source,
-            selection.best.index,
-            cols,
-            selection.best.value,
-        });
-    }
+    consumeDirectLmHeadQ4_0SelectedRow(
+        state,
+        tracking,
+        q4_0_raw,
+        lm_head_rows,
+        cols,
+        selected_source,
+        &selection.best,
+    );
     return selection;
+}
+
+fn consumeDirectLmHeadQ4_0SelectedRow(
+    state: *ScalarDecodeState,
+    tracking: DirectComputeTracking,
+    q4_0_raw: []const u8,
+    lm_head_rows: u32,
+    cols: u32,
+    selected_source: []const u8,
+    selected: *ScoredToken,
+) void {
+    if (selected.index >= lm_head_rows) return;
+    if (cols == 0 or cols % 32 != 0) return;
+    if (state.row_scratch.len < 1) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const row_off = @as(usize, selected.index) * row_bytes;
+    if (row_off + row_bytes > q4_0_raw.len) return;
+
+    const prior_value = selected.value;
+    const gpu_logits = state.row_scratch[0..1];
+    tracking.boundary.dmmvQ4_0RowRange(
+        state.norm,
+        q4_0_raw[row_off..][0..row_bytes],
+        1,
+        cols,
+        gpu_logits,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-row unavailable ({s}); selected logit remains prior-computed", .{@errorName(err)});
+        return;
+    };
+
+    const gpu_value = gpu_logits[0];
+    if (!std.math.isFinite(gpu_value)) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-row produced non-finite row {d}; selected logit remains prior-computed", .{selected.index});
+        return;
+    }
+    const delta = @abs(gpu_value - prior_value);
+    if (delta > direct_lm_head_q4_0_best_row_tolerance) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-row mismatch: row={d} prior={d:.6} gpu={d:.6} abs_delta={d:.6}; selected logit remains prior-computed", .{
+            selected.index,
+            prior_value,
+            gpu_value,
+            delta,
+        });
+        return;
+    }
+
+    selected.value = gpu_value;
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.phase == .decode) {
+        if (tracking.decode_model_slices) |slices| slices.* += 1;
+    }
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row phase={s} source={s} row={d} cols={d} gpu={d:.6} abs_delta={d:.6} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        directComputePhaseName(tracking.phase),
+        selected_source,
+        selected.index,
+        cols,
+        gpu_value,
+        delta,
+    });
 }
 
 fn consumeDirectLmHeadQ4_0BestRow(
