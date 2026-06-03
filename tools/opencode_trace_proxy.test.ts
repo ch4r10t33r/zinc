@@ -10,6 +10,8 @@ import {
   extractWorkingDirectory,
   injectSessionId,
   isBenignPartialStreamClose,
+  isOpenCodeSuccessfulTestFinalRequest,
+  isOpenCodeTitleRequest,
   parseArgs,
   parseXmlToolCallContent,
   preferredEditablePath,
@@ -18,6 +20,9 @@ import {
   repairSseEvent,
   sendProxyErrorResponse,
   stripToolBoundaryTail,
+  syntheticCompletionForRequest,
+  syntheticResponseText,
+  titleForOpenCodeRequest,
 } from "./opencode_trace_proxy.mjs";
 
 const body = {
@@ -51,6 +56,45 @@ const multiFileBody = {
       role: "tool",
       content:
         "<path>/private/tmp/zinc-opencode-smoke6/src</path><type>directory</type><entries>cart.mjs\npricing.mjs</entries>\n<path>/private/tmp/zinc-opencode-smoke6/test</path><type>directory</type><entries>cart.test.mjs</entries>",
+    },
+  ],
+};
+
+const titleBody = {
+  model: "zinc/qwen",
+  stream: true,
+  messages: [
+    {
+      role: "system",
+      content: "You are a title generator. You output ONLY a thread title.",
+    },
+    {
+      role: "user",
+      content: "Generate a title for this conversation:\n",
+    },
+    {
+      role: "user",
+      content:
+        '"Fix the failing tests in this rate limiter project. Read /private/tmp/x/src/rate_limiter.mjs and run npm test."',
+    },
+  ],
+};
+
+const successfulFinalBody = {
+  model: "zinc/qwen",
+  stream: true,
+  messages: [
+    {
+      role: "user",
+      content: "Fix the failing tests and stop after all tests pass.",
+    },
+    {
+      role: "assistant",
+      content: "",
+    },
+    {
+      role: "tool",
+      content: "\n> test\n> bun test\n\n 5 pass\n 0 fail\n 21 expect() calls\n",
     },
   ],
 };
@@ -129,6 +173,21 @@ describe("request shaping", () => {
     expect(out.messages.at(-1)?.content).toStartWith("OpenCode continuation guard:");
   });
 
+  test("does not inject coding guards into OpenCode title requests", () => {
+    const out = applyRequestOverrides(titleBody, {
+      model: "qwen36-35b-a3b-q4k-xl",
+      forceEnableThinking: false,
+      maxTokensCap: 768,
+      injectPathGuard: true,
+    });
+
+    expect(out.model).toBe("qwen36-35b-a3b-q4k-xl");
+    expect(out.enable_thinking).toBe(false);
+    expect(out.max_tokens).toBe(768);
+    expect(out.messages.some((m) => String(m.content).startsWith("Tool path guard:"))).toBe(false);
+    expect(out.messages.some((m) => String(m.content).startsWith("OpenCode continuation guard:"))).toBe(false);
+  });
+
   test("path guard extracts editable and read-only paths", () => {
     expect(extractWorkingDirectory(body)).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(preferredEditablePath(body)).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
@@ -158,6 +217,50 @@ describe("request shaping", () => {
 
   test("extractKnownFilePaths promotes directory entries", () => {
     expect(extractKnownFilePaths(body)).toContain("/private/tmp/zinc-opencode-smoke4/test/cart.test.mjs");
+  });
+});
+
+describe("synthetic OpenCode responses", () => {
+  test("detects and titles OpenCode title requests without model inference", () => {
+    expect(isOpenCodeTitleRequest(titleBody)).toBe(true);
+    expect(titleForOpenCodeRequest(titleBody)).toBe("Rate limiter test fixes");
+    expect(syntheticCompletionForRequest(titleBody)).toEqual({
+      kind: "title",
+      content: "Rate limiter test fixes",
+    });
+  });
+
+  test("detects final response requests only after explicit successful tests", () => {
+    expect(isOpenCodeSuccessfulTestFinalRequest(successfulFinalBody)).toBe(true);
+    expect(syntheticCompletionForRequest(successfulFinalBody)).toEqual({
+      kind: "tests_passed",
+      content: "Done. All tests pass.",
+    });
+
+    const failed = {
+      ...successfulFinalBody,
+      messages: [
+        ...successfulFinalBody.messages.slice(0, -1),
+        {
+          role: "tool",
+          content: "1 pass\n4 fail\n",
+        },
+      ],
+    };
+    expect(isOpenCodeSuccessfulTestFinalRequest(failed)).toBe(false);
+    expect(syntheticCompletionForRequest(failed)).toBe(null);
+  });
+
+  test("formats synthetic streaming and non-streaming OpenAI responses", () => {
+    const streamed = syntheticResponseText(titleBody, "Rate limiter test fixes");
+    expect(streamed).toContain('"role":"assistant"');
+    expect(streamed).toContain('"content":"Rate limiter test fixes"');
+    expect(streamed).toContain('"finish_reason":"stop"');
+    expect(streamed).toContain("data: [DONE]");
+
+    const json = JSON.parse(syntheticResponseText({ ...titleBody, stream: false }, "Done."));
+    expect(json.choices[0].message.content).toBe("Done.");
+    expect(json.choices[0].finish_reason).toBe("stop");
   });
 });
 
