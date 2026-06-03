@@ -10,7 +10,6 @@ struct Params {
     uint ids_stride;
     uint profile_index;
     uint profile_slots;
-    uint reserved;
 };
 
 #define NUM_COLS 8u

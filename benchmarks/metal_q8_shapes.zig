@@ -98,9 +98,6 @@ const MoeRoutePackPush = extern struct {
     k: u32,
     routing_stride: u32,
     ids_stride: u32,
-    profile_index: u32,
-    profile_slots: u32,
-    reserved: u32,
 };
 
 const ResidualRmsNormRouterF32TopkPush = extern struct {
@@ -131,21 +128,12 @@ const MoeGateUpDualDmmvPush = extern struct {
 };
 
 const moe_route_block_cols: u32 = 8;
-const moe_route_pack_profile_stats_per_slot: usize = 4;
 
 fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     if (route_slots == 0 or n_experts == 0) return 0;
     const first_blocks = @min(route_slots, n_experts);
     const remaining_routes = route_slots - first_blocks;
     return first_blocks + remaining_routes / moe_route_block_cols;
-}
-
-fn moeRoutePackProfileWords(profile_slots: usize) usize {
-    return 1 + profile_slots + profile_slots * moe_route_pack_profile_stats_per_slot;
-}
-
-fn moeRoutePackProfileStatsBase(profile_slots: usize, profile_index: usize) usize {
-    return 1 + profile_slots + profile_index * moe_route_pack_profile_stats_per_slot;
 }
 
 const CaseId = enum {
@@ -257,11 +245,6 @@ const BenchResult = struct {
     ms_per_iter: f64,
     gbps: f64,
     checksum: f64,
-    route_active_blocks: u32 = 0,
-    route_full_blocks: u32 = 0,
-    route_tail_blocks: u32 = 0,
-    route_singleton_tail_blocks: u32 = 0,
-    route_padding_slots: u32 = 0,
     output: []f32,
 };
 
@@ -1456,9 +1439,6 @@ fn runMoeColsDispatchBatch(
         .k = k,
         .routing_stride = k * 2,
         .ids_stride = n_tokens,
-        .profile_index = std.math.maxInt(u32),
-        .profile_slots = 0,
-        .reserved = 0,
     };
     const dmmv_push = MoeColsDmmvPush{
         .M = rows,
@@ -1528,9 +1508,6 @@ fn runMoeColsActiveBlocksDispatchBatch(
         .k = k,
         .routing_stride = k * 2,
         .ids_stride = n_tokens,
-        .profile_index = 0,
-        .profile_slots = 1,
-        .reserved = 0,
     };
     const dmmv_push = MoeColsDmmvPush{
         .M = rows,
@@ -2718,7 +2695,7 @@ fn benchmarkMoeColsActiveBlocksVariant(
     defer metal_buffer.freeBuffer(&counts_buf);
     var packed_ids_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @as(usize, route_tokens) * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&packed_ids_buf);
-    var active_block_count_buf = try metal_buffer.createBuffer(device.ctx, moeRoutePackProfileWords(1) * @sizeOf(u32));
+    var active_block_count_buf = try metal_buffer.createBuffer(device.ctx, @sizeOf(u32));
     defer metal_buffer.freeBuffer(&active_block_count_buf);
     var active_blocks_buf = try metal_buffer.createBuffer(device.ctx, @max(@as(usize, active_block_upper_bound) * @sizeOf(u32), 4));
     defer metal_buffer.freeBuffer(&active_blocks_buf);
@@ -2740,13 +2717,6 @@ fn benchmarkMoeColsActiveBlocksVariant(
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-    const active_count_ptr: [*]const u32 = @ptrCast(@alignCast(active_block_count_buf.cpu_ptr.?));
-    const stats_base = moeRoutePackProfileStatsBase(1, 0);
-    const route_active_blocks = active_count_ptr[1];
-    const route_full_blocks = active_count_ptr[stats_base + 0];
-    const route_tail_blocks = active_count_ptr[stats_base + 1];
-    const route_singleton_tail_blocks = active_count_ptr[stats_base + 2];
-    const route_padding_slots = active_count_ptr[stats_base + 3];
     const weight_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols) * active_block_upper_bound;
     const total_bytes = weight_bytes * iterations;
     const output_copy = try copyOutput(allocator, &output_buf, @intCast(output_elems));
@@ -2770,11 +2740,6 @@ fn benchmarkMoeColsActiveBlocksVariant(
         .ms_per_iter = ms_per_iter,
         .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
         .checksum = checksumOutput(output_copy),
-        .route_active_blocks = route_active_blocks,
-        .route_full_blocks = route_full_blocks,
-        .route_tail_blocks = route_tail_blocks,
-        .route_singleton_tail_blocks = route_singleton_tail_blocks,
-        .route_padding_slots = route_padding_slots,
         .output = output_copy,
     };
 }
@@ -3062,26 +3027,6 @@ fn printBenchResult(stdout: anytype, result: BenchResult) !void {
             result.checksum,
         },
     );
-    if (result.route_active_blocks > 0) {
-        const active_capacity = @as(u64, result.route_active_blocks) * moe_route_block_cols;
-        const route_slots = @as(u64, result.expert_slots);
-        const util_pct = if (active_capacity == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(route_slots)) / @as(f64, @floatFromInt(active_capacity));
-        const tail_pct = 100.0 * @as(f64, @floatFromInt(result.route_tail_blocks)) / @as(f64, @floatFromInt(result.route_active_blocks));
-        const singleton_pct = if (result.route_tail_blocks == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(result.route_singleton_tail_blocks)) / @as(f64, @floatFromInt(result.route_tail_blocks));
-        try stdout.interface.print(
-            "    route-blocks: active={d} full={d} tail={d} singleton_tail={d} padding_slots={d} util={d:.1}% tail_blocks={d:.1}% singleton_tail={d:.1}%\n",
-            .{
-                result.route_active_blocks,
-                result.route_full_blocks,
-                result.route_tail_blocks,
-                result.route_singleton_tail_blocks,
-                result.route_padding_slots,
-                util_pct,
-                tail_pct,
-                singleton_pct,
-            },
-        );
-    }
 }
 
 fn printDualBenchResult(stdout: anytype, result: DualBenchResult) !void {

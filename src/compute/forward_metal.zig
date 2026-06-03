@@ -1941,7 +1941,6 @@ const MoeRoutePackPush = extern struct {
     ids_stride: u32,
     profile_index: u32,
     profile_slots: u32,
-    reserved: u32,
 };
 
 /// Push constants for scattering grouped MoE route outputs back to token order.
@@ -12913,7 +12912,6 @@ fn dispatchMoeRoutePackOnCmd(
         .ids_stride = n_tokens,
         .profile_index = std.math.maxInt(u32),
         .profile_slots = 0,
-        .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids };
     cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
@@ -12941,7 +12939,6 @@ fn dispatchMoeRoutePackBlocksOnCmd(
         .ids_stride = n_tokens,
         .profile_index = profile_index,
         .profile_slots = profile_slots,
-        .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
     cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
@@ -28713,7 +28710,6 @@ test "moe_route_pack shader groups batched routing by expert" {
         .ids_stride = ids_stride,
         .profile_index = std.math.maxInt(u32),
         .profile_slots = 0,
-        .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf };
 
@@ -28789,7 +28785,6 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         .ids_stride = @intCast(ids_stride),
         .profile_index = @intCast(profile_index),
         .profile_slots = @intCast(profile_slots),
-        .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf, &active_count_buf, &active_blocks_buf };
 
@@ -28804,10 +28799,8 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
     try std.testing.expectEqual(@as(u32, 6), active_count_ptr[0]);
-    // The profile side-channel is optional; the route packing contract is
-    // covered by counts, ids, and active_blocks below.
-    if (active_count_ptr[1 + profile_index] != std.math.maxInt(u32)) {
-        try std.testing.expectEqual(@as(u32, 6), active_count_ptr[1 + profile_index]);
+    try std.testing.expectEqual(@as(u32, 6), active_count_ptr[1 + profile_index]);
+    {
         const stats_base = moeRoutePackProfileStatsBase(profile_slots, profile_index);
         try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 0]);
         try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 1]);
