@@ -99,31 +99,7 @@ kernel void main0(
     if (local_id < MAX_EXPERTS) {
         values[local_id] = -INFINITY;
     }
-
-    // Shared-gate uses the FFN norm row, not the router-scaled row. It is
-    // independent of the router matvec, so stage its partials before the
-    // router-input barrier and avoid a second threadgroup barrier later.
-    float shared_acc = 0.0f;
-    if (p.has_shared_gate != 0u) {
-        device const float* shared_input = shared_input_buf + (p.shared_input_offset >> 2) + token_idx * p.shared_input_stride;
-        device const float* shared_row = W_shared_gate + (p.shared_gate_offset >> 2);
-        for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
-            shared_acc += dot(*(device const float4*)(shared_row + (vi << 2)), *(device const float4*)(shared_input + (vi << 2)));
-        }
-    }
-    const float shared_sum = simd_sum(shared_acc);
-    if (lane == 0u) {
-        shared_partials[sg_idx] = shared_sum;
-    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (p.has_shared_gate != 0u && local_id == 0u) {
-        float shared_total = 0.0f;
-        #pragma unroll
-        for (uint i = 0u; i < N_SIMDGROUPS; ++i) {
-            shared_total += shared_partials[i];
-        }
-        shared_gate_out[token_idx] = shared_total;
-    }
 
     const uint weight_base = p.router_offset >> 2;
     for (uint row_block = 0u; row_block < p.n_experts; row_block += ROWS_PER_TG) {
@@ -151,6 +127,30 @@ kernel void main0(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Adapt vLLM's fused top-k/shared-gate materialization to Gemma's scaled
+    // router: shared-gate uses the FFN norm row, not the router-scaled row.
+    float shared_acc = 0.0f;
+    if (p.has_shared_gate != 0u) {
+        device const float* shared_input = shared_input_buf + (p.shared_input_offset >> 2) + token_idx * p.shared_input_stride;
+        device const float* shared_row = W_shared_gate + (p.shared_gate_offset >> 2);
+        for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
+            shared_acc += dot(*(device const float4*)(shared_row + (vi << 2)), *(device const float4*)(shared_input + (vi << 2)));
+        }
+    }
+    const float shared_sum = simd_sum(shared_acc);
+    if (lane == 0u) {
+        shared_partials[sg_idx] = shared_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p.has_shared_gate != 0u && local_id == 0u) {
+        float shared_total = 0.0f;
+        #pragma unroll
+        for (uint i = 0u; i < N_SIMDGROUPS; ++i) {
+            shared_total += shared_partials[i];
+        }
+        shared_gate_out[token_idx] = shared_total;
+    }
 
     if (p.n_experts == 128u && p.k == 8u) {
         if (sg_idx == 0u) {
