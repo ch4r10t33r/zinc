@@ -92,12 +92,36 @@ const MoeColsDmmvPush = extern struct {
     use_active_blocks: u32,
 };
 
+const MoeColsGateUpDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    use_active_blocks: u32,
+};
+
 const MoeRoutePackPush = extern struct {
     n_tokens: u32,
     n_experts: u32,
     k: u32,
     routing_stride: u32,
     ids_stride: u32,
+};
+
+const MoeRoutePackBlocksPush = extern struct {
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
+    profile_index: u32,
+    profile_slots: u32,
 };
 
 const ResidualRmsNormRouterF32TopkPush = extern struct {
@@ -136,6 +160,13 @@ fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     return first_blocks + remaining_routes / moe_route_block_cols;
 }
 
+fn moeRoutePackThreadgroupSize(n_experts: u32) u32 {
+    if (n_experts <= 32) return 32;
+    if (n_experts <= 64) return 64;
+    if (n_experts <= 128) return 128;
+    return 256;
+}
+
 const CaseId = enum {
     all,
     lm_head,
@@ -164,6 +195,7 @@ const CaseId = enum {
     moe_up_cols,
     moe_down_cols,
     moe_gate_up_geglu,
+    moe_gate_up_geglu_cols,
     moe_gate_up_swiglu,
     gemma26_prefill_hot,
 };
@@ -294,7 +326,7 @@ fn helpText() []const u8 {
     \\                            | shared_pair_swiglu
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
-    \\                            | moe_gate_up_geglu | moe_gate_up_swiglu
+    \\                            | moe_gate_up_geglu | moe_gate_up_geglu_cols | moe_gate_up_swiglu
     \\                            | gemma26_prefill_hot
     \\  --pipeline <mode>          runtime | production | k2048 | both (default: both)
     \\  --route-tokens <n>         Prompt tokens for route-packed MoE cols cases (default: 64)
@@ -344,6 +376,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "moe_up_cols")) return .moe_up_cols;
     if (std.mem.eql(u8, arg, "moe_down_cols")) return .moe_down_cols;
     if (std.mem.eql(u8, arg, "moe_gate_up_geglu")) return .moe_gate_up_geglu;
+    if (std.mem.eql(u8, arg, "moe_gate_up_geglu_cols")) return .moe_gate_up_geglu_cols;
     if (std.mem.eql(u8, arg, "moe_gate_up_swiglu")) return .moe_gate_up_swiglu;
     if (std.mem.eql(u8, arg, "gemma26_prefill_hot")) return .gemma26_prefill_hot;
     return error.InvalidCase;
@@ -353,6 +386,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
     return switch (selection) {
         .all => switch (case_id) {
             .moe_gate_up_geglu,
+            .moe_gate_up_geglu_cols,
             .shared_gate_gemm,
             .shared_up_gemm,
             .shared_down_gemm,
@@ -365,6 +399,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .attn_v,
             .attn_out,
             .moe_gate_up_geglu,
+            .moe_gate_up_geglu_cols,
             .moe_down_cols,
             .shared_gate_gemm,
             .shared_up_gemm,
@@ -872,7 +907,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .x_expert_stride = inter_dim,
             };
         },
-        .moe_gate_up_geglu => blk: {
+        .moe_gate_up_geglu, .moe_gate_up_geglu_cols => blk: {
+            const cols_case = case_id == .moe_gate_up_geglu_cols;
             const inter_dim = model.config.intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findFirstLayerTensor(model, "ffn_gate_up_exps.weight") orelse
@@ -881,8 +917,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             if ((try tensorCols(tensor)) != hidden_dim) return error.InvalidTensorShape;
             if ((try tensorRows(tensor)) != inter_dim * 2) return error.InvalidTensorShape;
             break :blk .{
-                .key = "moe_gate_up_geglu",
-                .label = "Gemma MoE fused gate+up Q4_K GeGLU",
+                .key = if (cols_case) "moe_gate_up_geglu_cols" else "moe_gate_up_geglu",
+                .label = if (cols_case) "Gemma MoE fused gate+up Q4_K GeGLU route-packed cols" else "Gemma MoE fused gate+up Q4_K GeGLU",
                 .tensor0 = tensor,
                 .rows0 = inter_dim,
                 .cols = hidden_dim,
@@ -1502,12 +1538,14 @@ fn runMoeColsActiveBlocksDispatchBatch(
     dispatches: u32,
 ) !void {
     if (dispatches == 0 or active_block_upper_bound == 0) return;
-    const route_push = MoeRoutePackPush{
+    const route_push = MoeRoutePackBlocksPush{
         .n_tokens = n_tokens,
         .n_experts = n_experts,
         .k = k,
         .routing_stride = k * 2,
         .ids_stride = n_tokens,
+        .profile_index = 0,
+        .profile_slots = 0,
     };
     const dmmv_push = MoeColsDmmvPush{
         .M = rows,
@@ -1542,10 +1580,10 @@ fn runMoeColsActiveBlocksDispatchBatch(
         cmd.dispatchV2(
             route_pack_blocks_pipe,
             .{ 1, 1, 1 },
-            .{ 256, 1, 1 },
+            .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 },
             &route_bufs,
             &route_push,
-            @sizeOf(MoeRoutePackPush),
+            @sizeOf(MoeRoutePackBlocksPush),
             0,
         );
         cmd.barrier();
@@ -1557,6 +1595,93 @@ fn runMoeColsActiveBlocksDispatchBatch(
             &dmmv_push,
             @sizeOf(MoeColsDmmvPush),
             selection.push_idx,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn runMoeGateUpGegluColsActiveBlocksDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    route_pack_blocks_pipe: *const MetalPipeline,
+    geglu_cols_pipe: *const MetalPipeline,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    active_block_count_buf: *const MetalBuffer,
+    active_blocks_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    active_block_upper_bound: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0 or active_block_upper_bound == 0) return;
+    const gate_half_bytes: u32 = @intCast(weightBytesPerIter(tensor.info.type_, rows, cols));
+    const route_push = MoeRoutePackBlocksPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+        .profile_index = 0,
+        .profile_slots = 0,
+    };
+    const dmmv_push = MoeColsGateUpDmmvPush{
+        .M = rows,
+        .K = cols,
+        .a_offset = tensorPageOffset(model, tensor),
+        .expert_stride = @intCast(weightBytesPerIter(tensor.info.type_, rows * 2, cols)),
+        .gate_base_offset = 0,
+        .up_base_offset = gate_half_bytes,
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = n_tokens,
+        .x_route_divisor = k,
+        .use_active_blocks = 1,
+    };
+    const route_bufs = [_]*const MetalBuffer{
+        routing_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_block_count_buf,
+        active_blocks_buf,
+    };
+    const dmmv_bufs = [_]*const MetalBuffer{
+        &tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_blocks_buf,
+        active_block_count_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            route_pack_blocks_pipe,
+            .{ 1, 1, 1 },
+            .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 },
+            &route_bufs,
+            &route_push,
+            @sizeOf(MoeRoutePackBlocksPush),
+            0,
+        );
+        cmd.barrier();
+        cmd.dispatchV2(
+            geglu_cols_pipe,
+            .{ (rows + 7) / 8, active_block_upper_bound, 1 },
+            .{ 256, 1, 1 },
+            &dmmv_bufs,
+            &dmmv_push,
+            @sizeOf(MoeColsGateUpDmmvPush),
+            1,
         );
     }
     cmd.commitAndWait();
@@ -2744,6 +2869,90 @@ fn benchmarkMoeColsActiveBlocksVariant(
     };
 }
 
+fn benchmarkMoeGateUpGegluColsActiveBlocksVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    route_tokens: u32,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    if (hot_case.tensor0.info.type_ != .q4_k) return error.ExpectedExpertQuantTensor;
+    if (model.config.n_experts == 0 or model.config.n_experts_used == 0) return error.ExpectedMoeCase;
+
+    var route_pack_blocks_pipe = try loadShaderPipeline(device.ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&route_pack_blocks_pipe);
+    var geglu_cols_pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_moe_cols_geglu");
+    defer metal_pipeline.freePipeline(&geglu_cols_pipe);
+
+    const n_experts = model.config.n_experts;
+    const k = model.config.n_experts_used;
+    const route_slots = route_tokens * k;
+    const routing_stride = k * 2;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, n_experts);
+    const input_elems = @as(usize, route_tokens) * @as(usize, hot_case.cols);
+    const output_elems = @as(usize, route_slots) * @as(usize, hot_case.rows0);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, input_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, output_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, route_tokens) * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var packed_ids_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @as(usize, route_tokens) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&packed_ids_buf);
+    var active_block_count_buf = try metal_buffer.createBuffer(device.ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_block_count_buf);
+    var active_blocks_buf = try metal_buffer.createBuffer(device.ctx, @max(@as(usize, active_block_upper_bound) * @sizeOf(u32), 4));
+    defer metal_buffer.freeBuffer(&active_blocks_buf);
+
+    fillRouteColsInputBuffer(&input_buf, hot_case.cols, route_tokens);
+    fillRoutePackRoutingBuffer(&routing_buf, route_tokens, n_experts, k);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(packed_ids_buf.cpu_ptr.?[0..packed_ids_buf.size], 0);
+    @memset(active_block_count_buf.cpu_ptr.?[0..active_block_count_buf.size], 0);
+    @memset(active_blocks_buf.cpu_ptr.?[0..active_blocks_buf.size], 0);
+
+    try runMoeGateUpGegluColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &geglu_cols_pipe, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, warmup_iterations);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runMoeGateUpGegluColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &geglu_cols_pipe, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, iterations);
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const weight_bytes = weightBytesPerIter(.q4_k, hot_case.rows0 * 2, hot_case.cols) * active_block_upper_bound;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, @intCast(output_elems));
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "route-cols-active",
+        .shader_name = "dmmv_q4k_moe_cols_geglu",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = route_slots,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 256,
+        .rows_per_wg = 8,
+        .thread_execution_width = geglu_cols_pipe.thread_execution_width,
+        .static_threadgroup_memory_length = geglu_cols_pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn benchmarkSeparateDualVariant(
     allocator: std.mem.Allocator,
     device: *const metal_device.MetalDevice,
@@ -3090,7 +3299,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -3232,6 +3441,40 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, geglu_result.?);
+        } else if (case_id == .moe_gate_up_geglu_cols) {
+            const k = model.config.n_experts_used;
+            const route_slots = config.route_tokens * k;
+            const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, model.config.n_experts);
+            try stdout.interface.print(
+                "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} | tokens={d} k={d} routes={d} active_block_upper={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    config.route_tokens,
+                    k,
+                    route_slots,
+                    active_block_upper_bound,
+                    @as(f64, @floatFromInt(weightBytesPerIter(.q4_k, hot_case.rows0 * 2, hot_case.cols) * active_block_upper_bound)) / (1024.0 * 1024.0),
+                },
+            );
+
+            var geglu_cols_result: ?BenchResult = null;
+            defer if (geglu_cols_result) |*result| allocator.free(result.output);
+
+            geglu_cols_result = try benchmarkMoeGateUpGegluColsActiveBlocksVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.route_tokens,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, geglu_cols_result.?);
         } else if (case_id == .moe_gate_up_swiglu) {
             const up_tensor = hot_case.tensor1.?;
             const per_expert_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
