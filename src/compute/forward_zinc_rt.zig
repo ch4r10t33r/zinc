@@ -2284,26 +2284,23 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     const gpu_weight_bytes = gpu_rows_usize * row_bytes;
     if (q4_0_raw.len < gpu_weight_bytes) return null;
 
-    const gpu_logits = state.row_scratch[0..gpu_rows_usize];
-    tracking.boundary.dmmvQ4_0RowRange(
+    const prefix_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
         state.norm,
         q4_0_raw[0..gpu_weight_bytes],
         gpu_rows,
         cols,
-        gpu_logits,
     ) catch |err| {
         log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
         return null;
     };
 
     var selection: ArgmaxTop2Result = .{};
-    for (gpu_logits, 0..) |gpu_value, i| {
-        if (!std.math.isFinite(gpu_value)) {
-            log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix produced non-finite row {d}; selected token remains host-computed", .{i});
-            return null;
-        }
-        selection.offer(@intCast(i), gpu_value);
+    if (!std.math.isFinite(prefix_result.score)) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix produced non-finite row {d}; selected token remains host-computed", .{prefix_result.row});
+        return null;
     }
+    selection.best = .{ .index = prefix_result.row, .value = prefix_result.score };
+    selection.second = .{ .index = 0, .value = -std.math.inf(f32) };
     const gpu_prefix_best = selection.best;
 
     const cpu_gpu_best = try dotDirectTyped(.q4_0, q4_0_raw, selection.best.index, cols, state.norm, null);
@@ -2317,9 +2314,6 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         });
         return null;
     }
-    if (consumeDirectLogitsArgmaxRowRange(maybe_tracking, gpu_logits, 0, "lm_head_q4_0_prefix")) |direct_selection| {
-        selection = direct_selection;
-    }
 
     const window = directLmHeadQ4_0ArgmaxWindow(lm_head_rows, gpu_rows, max_rows_by_input, scratch_rows);
     var used_window = false;
@@ -2330,28 +2324,22 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         const window_off = @as(usize, window.start) * row_bytes;
         const window_bytes = window_rows_usize * row_bytes;
         if (window_off + window_bytes <= q4_0_raw.len) {
-            const window_logits = state.row_scratch[0..window_rows_usize];
-            tracking.boundary.dmmvQ4_0RowRange(
+            const window_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
                 state.norm,
                 q4_0_raw[window_off..][0..window_bytes],
                 window.rows,
                 cols,
-                window_logits,
             ) catch |err| {
                 log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window unavailable ({s}); selected token falls back to host rows for that window", .{@errorName(err)});
                 break :window_attempt;
             };
 
-            var window_selection: ArgmaxTop2Result = .{};
-            for (window_logits, 0..) |gpu_value, i| {
-                if (!std.math.isFinite(gpu_value)) {
-                    log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window produced non-finite row {d}; selected token falls back to host rows for that window", .{window.start + @as(u32, @intCast(i))});
-                    break :window_attempt;
-                }
-                window_selection.offer(@intCast(i), gpu_value);
+            if (!std.math.isFinite(window_result.score)) {
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window produced non-finite row {d}; selected token falls back to host rows for that window", .{window.start + window_result.row});
+                break :window_attempt;
             }
 
-            const absolute_best = offsetScoredToken(window_selection.best, window.start);
+            const absolute_best = ScoredToken{ .index = window.start + window_result.row, .value = window_result.score };
             const cpu_window_best = try dotDirectTyped(.q4_0, q4_0_raw, absolute_best.index, cols, state.norm, null);
             gpu_window_delta = @abs(cpu_window_best - absolute_best.value);
             if (gpu_window_delta > direct_lm_head_q4_0_best_row_tolerance) {
@@ -2365,13 +2353,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             }
 
             selection.offerToken(absolute_best);
-            selection.offerToken(offsetScoredToken(window_selection.second, window.start));
             gpu_window_best = absolute_best;
-            if (consumeDirectLogitsArgmaxRowRange(maybe_tracking, window_logits, window.start, "lm_head_q4_0_window")) |direct_window_selection| {
-                selection.offerToken(direct_window_selection.best);
-                selection.offerToken(direct_window_selection.second);
-                gpu_window_best = direct_window_selection.best;
-            }
             used_window = true;
         }
     }
