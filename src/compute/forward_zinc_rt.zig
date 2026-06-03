@@ -2397,9 +2397,11 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         selection.offerToken(offsetScoredToken(cpu_tail.second, cpu_tail_start));
     }
 
-    const selected_source = if (selection.best.index < gpu_rows)
+    const selected_from_gpu_prefix = selection.best.index < gpu_rows;
+    const selected_from_gpu_window = used_window and selection.best.index >= window.start and selection.best.index < window.start + window.rows;
+    const selected_source = if (selected_from_gpu_prefix)
         "gpu_prefix"
-    else if (used_window and selection.best.index >= window.start and selection.best.index < window.start + window.rows)
+    else if (selected_from_gpu_window)
         "gpu_window"
     else
         "cpu_rows";
@@ -2441,6 +2443,16 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             gpu_window_best.index,
             gpu_window_best.value,
             gpu_window_delta,
+        });
+    }
+    if (selected_from_gpu_prefix or selected_from_gpu_window) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row phase={s} source={s} row={d} cols={d} score={d:.6} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
+            selected_source,
+            selection.best.index,
+            cols,
+            selection.best.value,
         });
     }
     return selection;
