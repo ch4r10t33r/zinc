@@ -46,10 +46,6 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
-const moe_active_block_index_shift: u5 = 16;
-const moe_active_block_index_mask: u32 = 0x1FFF;
-const moe_active_block_routes_shift: u5 = 29;
-const moe_active_block_routes_mask: u32 = 0x7;
 const moe_route_pack_profile_stats_per_layer: usize = 4;
 
 fn moeRoutePackProfileWords(n_layers: usize) usize {
@@ -13680,7 +13676,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{&scratch.swiglu});
     dispatchGemmBatchedOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
-    profileGpuMoeResourceBarrierBuffers(cmd, profile, .down, &.{&scratch.moe_route_input});
+    profileGpuMoeBarrier(cmd, profile, .down);
     if (use_batched_weighted_post_norm) {
         var shared_gate_buf: *const MetalBuffer = &scratch.gate;
         if (lt.ffn_gate_inp_shexp) |gate_t| {
@@ -29137,13 +29133,9 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     for (0..active_count_ptr[0]) |i| {
         const entry = active_blocks_ptr[i];
         const expert = entry & 0xFFFF;
-        const block_idx = (entry >> moe_active_block_index_shift) & moe_active_block_index_mask;
-        const routes_in_block = ((entry >> moe_active_block_routes_shift) & moe_active_block_routes_mask) + 1;
+        const block_idx = entry >> 16;
         try std.testing.expect(expert < @as(u32, @intCast(n_experts)));
         try std.testing.expect(block_idx < 4);
-        try std.testing.expect(routes_in_block >= 1 and routes_in_block <= moe_route_block_cols);
-        const expected_remaining = counts_ptr[@intCast(expert)] - block_idx * moe_route_block_cols;
-        try std.testing.expectEqual(@min(expected_remaining, moe_route_block_cols), routes_in_block);
         try std.testing.expect(!seen_blocks[@intCast(expert)][@intCast(block_idx)]);
         seen_blocks[@intCast(expert)][@intCast(block_idx)] = true;
     }

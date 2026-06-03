@@ -15,9 +15,6 @@ struct Params {
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
 #define PROFILE_STATS_PER_LAYER 4u
-#define ACTIVE_BLOCK_INDEX_SHIFT 16u
-#define ACTIVE_BLOCK_INDEX_MASK 0x1FFFu
-#define ACTIVE_BLOCK_ROUTES_SHIFT 29u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -109,11 +106,7 @@ kernel void main0(
         // atomically instead of doing a per-expert prefix loop.
         const uint block_offset = atomic_fetch_add_explicit(active_block_count, block_count, memory_order_relaxed);
         for (uint block = 0u; block < block_count; block++) {
-            const uint remaining = route_counts[tid] - block * NUM_COLS;
-            const uint routes_in_block = min(remaining, NUM_COLS);
-            const uint packed_block = (block & ACTIVE_BLOCK_INDEX_MASK) << ACTIVE_BLOCK_INDEX_SHIFT;
-            const uint packed_routes = (routes_in_block - 1u) << ACTIVE_BLOCK_ROUTES_SHIFT;
-            active_blocks[block_offset + block] = tid | packed_block | packed_routes;
+            active_blocks[block_offset + block] = tid | (block << 16u);
         }
     }
 }

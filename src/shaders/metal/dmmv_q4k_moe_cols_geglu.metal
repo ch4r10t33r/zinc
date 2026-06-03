@@ -42,10 +42,6 @@ inline float geglu(float gate, float up) {
 
 #define NUM_COLS 8u
 #define ROWS_PER_TG 8u
-#define ACTIVE_BLOCK_INDEX_SHIFT 16u
-#define ACTIVE_BLOCK_INDEX_MASK 0x1FFFu
-#define ACTIVE_BLOCK_ROUTES_SHIFT 29u
-#define ACTIVE_BLOCK_ROUTES_MASK 0x7u
 
 kernel void main0(
     device const uchar* W                     [[buffer(0)]],
@@ -71,10 +67,8 @@ kernel void main0(
         return;
     }
 
-    const uint block_idx = (p.use_active_blocks != 0u) ? ((block_entry >> ACTIVE_BLOCK_INDEX_SHIFT) & ACTIVE_BLOCK_INDEX_MASK) : tg_pos.z;
-    const uint packed_base = block_idx * NUM_COLS;
-    const uint routes_in_block = ((block_entry >> ACTIVE_BLOCK_ROUTES_SHIFT) & ACTIVE_BLOCK_ROUTES_MASK) + 1u;
-    const uint count = (p.use_active_blocks != 0u) ? (packed_base + routes_in_block) : counts[expert_id];
+    const uint packed_base = (p.use_active_blocks != 0u) ? ((block_entry >> 16u) * NUM_COLS) : (tg_pos.z * NUM_COLS);
+    const uint count = counts[expert_id];
     if (packed_base >= count) {
         return;
     }
