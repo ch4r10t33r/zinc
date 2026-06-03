@@ -2515,6 +2515,75 @@ fn consumeDirectLmHeadQ4_0Top2Rows(
     const row_bytes = rowBytesForType(.q4_0, cols);
     if (row_bytes == 0) return null;
 
+    if (cpu_selection.second.index < lm_head_rows and
+        std.math.isFinite(cpu_selection.second.value) and
+        state.row_scratch.len >= 2)
+    packed_top2: {
+        const best_off = @as(usize, cpu_selection.best.index) * row_bytes;
+        const second_off = @as(usize, cpu_selection.second.index) * row_bytes;
+        if (best_off + row_bytes > q4_0_raw.len or second_off + row_bytes > q4_0_raw.len) break :packed_top2;
+
+        const gpu_logits = state.row_scratch[0..2];
+        tracking.boundary.dmmvQ4_0TwoRows(
+            state.norm,
+            q4_0_raw[best_off..][0..row_bytes],
+            q4_0_raw[second_off..][0..row_bytes],
+            cols,
+            gpu_logits,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 packed top2 rows unavailable ({s}); retrying individual rows", .{@errorName(err)});
+            break :packed_top2;
+        };
+
+        const gpu_best_value = gpu_logits[0];
+        const gpu_second_value = gpu_logits[1];
+        if (!std.math.isFinite(gpu_best_value) or !std.math.isFinite(gpu_second_value)) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 packed top2 rows produced non-finite values; retrying individual rows", .{});
+            break :packed_top2;
+        }
+
+        const best_delta = @abs(gpu_best_value - cpu_selection.best.value);
+        const second_delta = @abs(gpu_second_value - cpu_selection.second.value);
+        if (best_delta > direct_lm_head_q4_0_best_row_tolerance or second_delta > direct_lm_head_q4_0_best_row_tolerance) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 packed top2 rows mismatch: best row={d} cpu={d:.6} gpu={d:.6} delta={d:.6}; second row={d} cpu={d:.6} gpu={d:.6} delta={d:.6}; retrying individual rows", .{
+                cpu_selection.best.index,
+                cpu_selection.best.value,
+                gpu_best_value,
+                best_delta,
+                cpu_selection.second.index,
+                cpu_selection.second.value,
+                gpu_second_value,
+                second_delta,
+            });
+            break :packed_top2;
+        }
+
+        var gpu_selection: ArgmaxTop2Result = .{};
+        gpu_selection.offer(cpu_selection.best.index, gpu_best_value);
+        gpu_selection.offer(cpu_selection.second.index, gpu_second_value);
+
+        tracking.ops.* += 2;
+        mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+        tracking.consumed.* = true;
+        tracking.real_model_slice.* = true;
+        if (tracking.phase == .decode) {
+            if (tracking.decode_model_slices) |slices| slices.* += 2;
+        }
+        if (tracking.selected_token) |token| token.* = gpu_selection.best.index;
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_top2_rows_packed phase={s} rows=2 cols={d} token={d} gpu={d:.6} second=({d},{d:.6}) abs_delta_best={d:.6} abs_delta_second={d:.6} selected_source=gpu_top2_rows consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
+            cols,
+            gpu_selection.best.index,
+            gpu_selection.best.value,
+            gpu_selection.second.index,
+            gpu_selection.second.value,
+            best_delta,
+            second_delta,
+        });
+        return gpu_selection;
+    }
+
     const gpu_best = directLmHeadQ4_0GpuRow(
         state,
         tracking,

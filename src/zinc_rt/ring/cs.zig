@@ -1439,6 +1439,119 @@ pub const TokenBoundary = struct {
         for (0..rows) |i| output[i] = @bitCast(output_words[i]);
     }
 
+    /// Dispatch Q4_0 DMMV for two arbitrary model rows staged back-to-back.
+    ///
+    /// The caller supplies two individual source-format rows, which are packed
+    /// into the shared staging page as a compact two-row matrix. This lets the
+    /// current forward path consume both LM-head top-2 scores from one real
+    /// DMMV row-range submission even when the rows are not adjacent in vocab.
+    pub fn dmmvQ4_0TwoRows(
+        self: *TokenBoundary,
+        input: []const f32,
+        row_a_q4_0: []const u8,
+        row_b_q4_0: []const u8,
+        cols: u32,
+        output: []f32,
+    ) !void {
+        if (cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols or output.len < 2) return error.ShapeMismatch;
+        const rows: u32 = 2;
+        const row_bytes: usize = (@as(usize, cols) / 32) * 18;
+        if (row_a_q4_0.len < row_bytes or row_b_q4_0.len < row_bytes) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
+        const weights_bytes = @as(usize, rows) * row_bytes;
+        if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+        if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
+
+        @memcpy(self.input_map[0..input_bytes.len], input_bytes);
+        @memcpy(self.input_map[weight_off..][0..row_bytes], row_a_q4_0[0..row_bytes]);
+        @memcpy(self.input_map[weight_off + row_bytes ..][0..row_bytes], row_b_q4_0[0..row_bytes]);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (0..rows) |i| output_words[i] = 0x7fc0_0000;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_6100 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_range;
+        const pgm_lo: u32 = @truncate(pgm_va >> 8);
+        const pgm_hi: u32 = @truncate(pgm_va >> 40);
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_value,
+            compute_pgm_rsrc2_argmax_top2_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 1, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+        });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const out_lo: u32 = @truncate(self.output_va);
+        const out_hi: u32 = @truncate(self.output_va >> 32);
+        const weight_va = self.input_va + @as(u64, weight_off);
+        const weight_lo: u32 = @truncate(weight_va);
+        const weight_hi: u32 = @truncate(weight_va >> 32);
+        try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+            in_lo,
+            in_hi,
+            out_lo,
+            out_hi,
+            weight_lo,
+            weight_hi,
+            cols,
+            rows,
+        });
+        try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+        try self.builder.writeData64(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+        output[0] = @bitCast(output_words[0]);
+        output[1] = @bitCast(output_words[1]);
+    }
+
     /// Dispatch the gfx1201 Q4_0 row-range DMMV kernel that performs argmax in
     /// the same submission.
     ///
