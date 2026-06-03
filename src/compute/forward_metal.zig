@@ -13674,7 +13674,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (shexp_inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
-    profileGpuMoeBarrier(cmd, profile, .activation);
+    profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{&scratch.swiglu});
     dispatchGemmBatchedOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
     profileGpuMoeBarrier(cmd, profile, .down);
     if (use_batched_weighted_post_norm) {
