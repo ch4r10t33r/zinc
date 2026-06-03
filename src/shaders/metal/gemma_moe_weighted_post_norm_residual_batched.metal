@@ -54,11 +54,38 @@ kernel void main0(
     device float* hidden_row = hidden + token * p.hidden_dim;
     const float gate = p.has_gate != 0u ? 1.0f / (1.0f + exp(-gate_buf[token])) : 1.0f;
 
-    if (tid < p.k) {
-        const uint expert_id = route_row[tid];
-        route_weights[tid] = as_type<float>(route_row[p.k + tid]) * expert_scales[expert_id];
+    float w0 = 0.0f;
+    float w1 = 0.0f;
+    float w2 = 0.0f;
+    float w3 = 0.0f;
+    float w4 = 0.0f;
+    float w5 = 0.0f;
+    float w6 = 0.0f;
+    float w7 = 0.0f;
+    if (p.k == 8u) {
+        const float w0_lane = (simd_lane == 0u) ? as_type<float>(route_row[8u]) * expert_scales[route_row[0u]] : 0.0f;
+        const float w1_lane = (simd_lane == 0u) ? as_type<float>(route_row[9u]) * expert_scales[route_row[1u]] : 0.0f;
+        const float w2_lane = (simd_lane == 0u) ? as_type<float>(route_row[10u]) * expert_scales[route_row[2u]] : 0.0f;
+        const float w3_lane = (simd_lane == 0u) ? as_type<float>(route_row[11u]) * expert_scales[route_row[3u]] : 0.0f;
+        const float w4_lane = (simd_lane == 0u) ? as_type<float>(route_row[12u]) * expert_scales[route_row[4u]] : 0.0f;
+        const float w5_lane = (simd_lane == 0u) ? as_type<float>(route_row[13u]) * expert_scales[route_row[5u]] : 0.0f;
+        const float w6_lane = (simd_lane == 0u) ? as_type<float>(route_row[14u]) * expert_scales[route_row[6u]] : 0.0f;
+        const float w7_lane = (simd_lane == 0u) ? as_type<float>(route_row[15u]) * expert_scales[route_row[7u]] : 0.0f;
+        w0 = simd_broadcast(w0_lane, 0u);
+        w1 = simd_broadcast(w1_lane, 0u);
+        w2 = simd_broadcast(w2_lane, 0u);
+        w3 = simd_broadcast(w3_lane, 0u);
+        w4 = simd_broadcast(w4_lane, 0u);
+        w5 = simd_broadcast(w5_lane, 0u);
+        w6 = simd_broadcast(w6_lane, 0u);
+        w7 = simd_broadcast(w7_lane, 0u);
+    } else {
+        if (tid < p.k) {
+            const uint expert_id = route_row[tid];
+            route_weights[tid] = as_type<float>(route_row[p.k + tid]) * expert_scales[expert_id];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float expert_vals[MAX_PER_THREAD];
     float shared_vals[MAX_PER_THREAD];
@@ -70,14 +97,14 @@ kernel void main0(
     for (uint i = tid; i < p.hidden_dim; i += tg_size) {
         float e = 0.0f;
         if (p.k == 8u) {
-            e = fma(route_weights[0], expert_down[(token * p.k + 0u) * p.hidden_dim + i], e);
-            e = fma(route_weights[1], expert_down[(token * p.k + 1u) * p.hidden_dim + i], e);
-            e = fma(route_weights[2], expert_down[(token * p.k + 2u) * p.hidden_dim + i], e);
-            e = fma(route_weights[3], expert_down[(token * p.k + 3u) * p.hidden_dim + i], e);
-            e = fma(route_weights[4], expert_down[(token * p.k + 4u) * p.hidden_dim + i], e);
-            e = fma(route_weights[5], expert_down[(token * p.k + 5u) * p.hidden_dim + i], e);
-            e = fma(route_weights[6], expert_down[(token * p.k + 6u) * p.hidden_dim + i], e);
-            e = fma(route_weights[7], expert_down[(token * p.k + 7u) * p.hidden_dim + i], e);
+            e = fma(w0, expert_down[(token * p.k + 0u) * p.hidden_dim + i], e);
+            e = fma(w1, expert_down[(token * p.k + 1u) * p.hidden_dim + i], e);
+            e = fma(w2, expert_down[(token * p.k + 2u) * p.hidden_dim + i], e);
+            e = fma(w3, expert_down[(token * p.k + 3u) * p.hidden_dim + i], e);
+            e = fma(w4, expert_down[(token * p.k + 4u) * p.hidden_dim + i], e);
+            e = fma(w5, expert_down[(token * p.k + 5u) * p.hidden_dim + i], e);
+            e = fma(w6, expert_down[(token * p.k + 6u) * p.hidden_dim + i], e);
+            e = fma(w7, expert_down[(token * p.k + 7u) * p.hidden_dim + i], e);
         } else {
             for (uint slot = 0u; slot < p.k; slot++) {
                 e = fma(route_weights[slot], expert_down[(token * p.k + slot) * p.hidden_dim + i], e);
