@@ -1533,8 +1533,8 @@ const DirectComputeTracking = struct {
     selected_token: ?*u32 = null,
 };
 
-const direct_decode_model_slice_cadence_default: u32 = 16;
-const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
+const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_ssm_q8_0_row_range_max_successes_default: u32 = 0;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
@@ -2253,7 +2253,10 @@ fn consumeDirectLogitsArgmaxRowRange(
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 256;
+// Keep default M1 decode validation to GPU-recomputed selected rows. The
+// serial prefix/window scan remains available in code, but is too expensive to
+// pay on every benchmark run until row-parallel DMMV has a working TGID ABI.
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 0;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
 
@@ -7825,10 +7828,10 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
 }
 
 test "direct decode model slice cadence always covers first decode step" {
-    try std.testing.expectEqual(@as(u32, 16), directDecodeModelSliceCadenceForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
-    try std.testing.expectEqual(@as(u32, 16), directDecodeModelSliceCadenceForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("bad"));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 8));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 8));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(7, 8));
@@ -7837,7 +7840,7 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(15, direct_decode_model_slice_cadence_default));
-    try std.testing.expect(shouldTrackDirectDecodeModelSlice(16, direct_decode_model_slice_cadence_default));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(16, direct_decode_model_slice_cadence_default));
 }
 
 test "direct LM-head Q4_0 selected window covers sampled row" {
@@ -7866,10 +7869,10 @@ test "direct LM-head Q4_0 selected source identifies GPU scores" {
 }
 
 test "direct SSM Q8 row-range budget, trust and per-slice reset are bounded" {
-    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
     try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("0"));
     try std.testing.expectEqual(@as(u32, 5), directSsmQ8_0RowRangeMaxSuccessesForEnv("5"));
-    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
 
     try std.testing.expectEqual(@as(u32, 1), directSsmQ8_0TrustAfterSuccessesForEnv(null));
     try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0TrustAfterSuccessesForEnv("0"));

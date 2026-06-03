@@ -143,8 +143,8 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 | `ZINC_RT_FAST_POOL` | 1 | Set `0` to fall back to `std.Thread.Pool` (~2–5 tok/s worse) |
 | `ZINC_RT_LM_HEAD_ROWS` | 4096 | Cap LM-head rows scanned per step; 0 = full 248 320 vocab (~3.5–4.3 ms/token cost) |
 | `ZINC_RT_MAX_DECODE_TOKENS` | 8 | Per-step decode-token clamp; raise to 256+ for real coherence runs |
-| `ZINC_RT_DIRECT_DECODE_SLICE_CADENCE` | 16 | Direct LM-head/DMMV validation cadence during decode; 0 = first generated token only, N = first token plus every N generated tokens |
-| `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 2 | Per tracked decode slice cap on consumed direct Q8_0 SSM alpha/beta row-range successes |
+| `ZINC_RT_DIRECT_DECODE_SLICE_CADENCE` | 0 | Direct LM-head/DMMV validation cadence during decode; 0 = first generated token only, N = first token plus every N generated tokens |
+| `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 0 | Per tracked decode slice cap on consumed direct Q8_0 SSM alpha/beta row-range successes; opt in with a positive value for deeper SSM slice validation |
 | `ZINC_RT_DIRECT_SSM_Q8_TRUST_AFTER_SUCCESSES` | 1 | After this many validated alpha/beta pair successes, later paired direct Q8_0 SSM row ranges skip the CPU oracle and only finite-check GPU rows; 0 disables |
 | `ZINC_QWEN36_DECODE_TOPK` | metadata | Override MoE top-k after prefill; 0 is the current shortcut |
 | `ZINC_GEMMA4_ATTN_SCALE_DEFAULT` | model-dependent | Per-Gemma 4 attention scale override |
