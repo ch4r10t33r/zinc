@@ -2593,7 +2593,8 @@ fn runSsmLayer(
     // source-format Q8_0 alpha/beta projections from the host-produced fused
     // matvec and fill them from CS row-range kernels instead; CPU values are
     // still computed as oracles inside the direct consumers but no longer feed
-    // generation.
+    // generation. When both are eligible for the same layer, batch them into
+    // one CS row range because they share the same normalized activation.
     const direct_alpha = canAttemptDirectSsmAlphaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking);
     const direct_beta = canAttemptDirectSsmBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking);
     if (direct_alpha or direct_beta) {
@@ -2612,10 +2613,16 @@ fn runSsmLayer(
             part_count += 1;
         }
         try matvecFusedTensors(state.pool, model, parts_buf[0..part_count], state.norm, state.row_scratch);
-        if (direct_alpha and !consumeDirectSsmAlphaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
+        var consumed_alpha = false;
+        var consumed_beta = false;
+        if (direct_alpha and direct_beta and consumeDirectSsmAlphaBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
+            consumed_alpha = true;
+            consumed_beta = true;
+        }
+        if (direct_alpha and !consumed_alpha and !consumeDirectSsmAlphaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
             try matvecTensor(state.pool, model, lt.ssm_alpha.?, state.norm, dt_rank, state.row_scratch, state.alpha[0..dt_rank]);
         }
-        if (direct_beta and !consumeDirectSsmBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
+        if (direct_beta and !consumed_beta and !consumeDirectSsmBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
             try matvecTensor(state.pool, model, lt.ssm_beta.?, state.norm, dt_rank, state.row_scratch, state.beta[0..dt_rank]);
         }
     } else {
@@ -2883,6 +2890,141 @@ fn consumeDirectSsmAlphaQ8_0RowRange(
         rows,
         cols,
         max_abs_delta,
+        max_row,
+    });
+    return true;
+}
+
+fn consumeDirectSsmAlphaBetaQ8_0RowRange(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+    layer: u32,
+    maybe_tracking: ?DirectComputeTracking,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (state.direct_ssm_q8_row_range_max_successes == 0) return false;
+    if (state.direct_ssm_alpha_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (state.direct_ssm_beta_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_failed_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_failed_mask, layer)) return false;
+
+    const alpha_info = lt.ssm_alpha orelse return false;
+    const beta_info = lt.ssm_beta orelse return false;
+    const alpha_rows = directSsmAlphaQ8_0RowRangeRows(model.config, state, alpha_info);
+    const beta_rows = directSsmBetaQ8_0RowRangeRows(model.config, state, beta_info);
+    if (alpha_rows == 0 or beta_rows == 0) return false;
+    const cols: u32 = @intCast(state.norm.len);
+    const row_bytes = rowBytesForType(.q8_0, cols);
+    const alpha_bytes = @as(usize, alpha_rows) * row_bytes;
+    const beta_bytes = @as(usize, beta_rows) * row_bytes;
+    const alpha_raw = model.tensorData(alpha_info);
+    const beta_raw = model.tensorData(beta_info);
+    if (alpha_raw.len < alpha_bytes or beta_raw.len < beta_bytes) return false;
+
+    const total_rows = alpha_rows + beta_rows;
+    const total_rows_usize: usize = @intCast(total_rows);
+    const alpha_rows_usize: usize = @intCast(alpha_rows);
+    const beta_rows_usize: usize = @intCast(beta_rows);
+    if (state.row_scratch.len < total_rows_usize * 2) return false;
+    const gpu_out = state.row_scratch[0..total_rows_usize];
+    const cpu_out = state.row_scratch[total_rows_usize..][0..total_rows_usize];
+    const cpu_alpha = cpu_out[0..alpha_rows_usize];
+    const cpu_beta = cpu_out[alpha_rows_usize..][0..beta_rows_usize];
+    matvecRawDirectSerial(alpha_raw, .q8_0, state.norm, null, 0, alpha_rows, cpu_alpha) catch {
+        return false;
+    };
+    matvecRawDirectSerial(beta_raw, .q8_0, state.norm, null, 0, beta_rows, cpu_beta) catch {
+        return false;
+    };
+
+    tracking.boundary.dmmvQ8_0TwoRowRanges(
+        state.norm,
+        alpha_raw[0..alpha_bytes],
+        alpha_rows,
+        beta_raw[0..beta_bytes],
+        beta_rows,
+        cols,
+        gpu_out,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
+        return false;
+    };
+
+    var max_abs_delta: f32 = 0.0;
+    var max_row: u32 = 0;
+    var max_kind: enum { alpha, beta } = .alpha;
+    for (gpu_out[0..alpha_rows_usize], 0..) |gpu_value, i| {
+        if (!std.math.isFinite(gpu_value)) {
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha/beta remain host-computed", .{i});
+            state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+            state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+            return false;
+        }
+        const delta = @abs(gpu_value - cpu_alpha[i]);
+        if (delta > max_abs_delta) {
+            max_abs_delta = delta;
+            max_row = @intCast(i);
+            max_kind = .alpha;
+        }
+    }
+    for (gpu_out[alpha_rows_usize..][0..beta_rows_usize], 0..) |gpu_value, i| {
+        if (!std.math.isFinite(gpu_value)) {
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; alpha/beta remain host-computed", .{i});
+            state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+            state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+            return false;
+        }
+        const delta = @abs(gpu_value - cpu_beta[i]);
+        if (delta > max_abs_delta) {
+            max_abs_delta = delta;
+            max_row = @intCast(i);
+            max_kind = .beta;
+        }
+    }
+    const tolerance = @min(direct_ssm_alpha_q8_0_row_range_tolerance, direct_ssm_beta_q8_0_row_range_tolerance);
+    if (max_abs_delta > tolerance) {
+        const kind_name = switch (max_kind) {
+            .alpha => "alpha",
+            .beta => "beta",
+        };
+        log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range mismatch: layer={d} kind={s} rows={d} max_abs_delta={d:.6} row={d}; alpha/beta remain host-computed", .{
+            layer,
+            kind_name,
+            total_rows,
+            max_abs_delta,
+            max_row,
+        });
+        state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+        state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+        return false;
+    }
+
+    @memcpy(state.alpha[0..alpha_rows_usize], gpu_out[0..alpha_rows_usize]);
+    @memcpy(state.beta[0..beta_rows_usize], gpu_out[alpha_rows_usize..][0..beta_rows_usize]);
+    state.direct_ssm_alpha_q8_row_range_done_mask |= directSsmLayerBit(layer);
+    state.direct_ssm_beta_q8_row_range_done_mask |= directSsmLayerBit(layer);
+    state.direct_ssm_alpha_q8_row_range_successes += 1;
+    state.direct_ssm_beta_q8_row_range_successes += 1;
+    tracking.ops.* += 2;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 2;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_alpha_beta_q8_0_row_range phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} max_abs_delta={d:.6} max_kind={s} max_row={d}", .{
+        tracking.ops.*,
+        layer,
+        alpha_rows,
+        beta_rows,
+        cols,
+        max_abs_delta,
+        switch (max_kind) {
+            .alpha => "alpha",
+            .beta => "beta",
+        },
         max_row,
     });
     return true;
