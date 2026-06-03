@@ -2427,16 +2427,32 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             gpu_window_delta,
         });
     }
-    consumeDirectLmHeadQ4_0SelectedRow(
-        state,
-        tracking,
-        q4_0_raw,
-        lm_head_rows,
-        cols,
-        selected_source,
-        &selection.best,
-    );
+    if (directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source)) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
+            selected_source,
+            selection.best.index,
+            cols,
+            selection.best.value,
+        });
+    } else {
+        consumeDirectLmHeadQ4_0SelectedRow(
+            state,
+            tracking,
+            q4_0_raw,
+            lm_head_rows,
+            cols,
+            selected_source,
+            &selection.best,
+        );
+    }
     return selection;
+}
+
+fn directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source: []const u8) bool {
+    return std.mem.eql(u8, selected_source, "gpu_prefix") or
+        std.mem.eql(u8, selected_source, "gpu_window");
 }
 
 fn consumeDirectLmHeadQ4_0SelectedRow(
@@ -7611,6 +7627,12 @@ test "direct LM-head Q4_0 argmax window stays outside the prefix" {
 
     window = directLmHeadQ4_0ArgmaxWindow(4096, 256, 1024, 32);
     try std.testing.expectEqual(@as(u32, 32), window.rows);
+}
+
+test "direct LM-head Q4_0 selected source identifies GPU scores" {
+    try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_prefix"));
+    try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_window"));
+    try std.testing.expect(!directLmHeadQ4_0SelectedSourceHasGpuScore("cpu_rows"));
 }
 
 test "direct SSM Q8 row-range budget and masks are bounded" {
