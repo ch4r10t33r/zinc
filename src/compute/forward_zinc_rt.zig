@@ -2148,6 +2148,8 @@ fn directComputeArgmaxTop2(
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
 const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 256;
+const direct_lm_head_q4_0_argmax_window_start: u32 = 2048;
+const direct_lm_head_q4_0_argmax_window_rows: u32 = 256;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
 
 fn offsetScoredToken(token: ScoredToken, offset: u32) ScoredToken {
@@ -2155,6 +2157,28 @@ fn offsetScoredToken(token: ScoredToken, offset: u32) ScoredToken {
         .index = token.index + offset,
         .value = token.value,
     };
+}
+
+const DirectLmHeadWindow = struct {
+    start: u32 = 0,
+    rows: u32 = 0,
+};
+
+fn directLmHeadQ4_0ArgmaxWindow(
+    lm_head_rows: u32,
+    prefix_rows: u32,
+    max_rows_by_input: u32,
+    scratch_rows: u32,
+) DirectLmHeadWindow {
+    var start = direct_lm_head_q4_0_argmax_window_start;
+    if (start < prefix_rows) start = prefix_rows;
+    if (start >= lm_head_rows) return .{};
+
+    var rows = @min(lm_head_rows - start, direct_lm_head_q4_0_argmax_window_rows);
+    rows = @min(rows, max_rows_by_input);
+    rows = @min(rows, scratch_rows);
+    if (rows == 0) return .{};
+    return .{ .start = start, .rows = rows };
 }
 
 fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
@@ -2170,9 +2194,10 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     const row_bytes = rowBytesForType(.q4_0, cols);
     if (row_bytes == 0) return null;
     const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
+    const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
     var gpu_rows = @min(lm_head_rows, direct_lm_head_q4_0_argmax_prefix_rows);
     gpu_rows = @min(gpu_rows, max_rows_by_input);
-    gpu_rows = @min(gpu_rows, @as(u32, @intCast(state.row_scratch.len)));
+    gpu_rows = @min(gpu_rows, scratch_rows);
     if (gpu_rows == 0) return null;
 
     const gpu_rows_usize: usize = @intCast(gpu_rows);
@@ -2213,15 +2238,83 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         return null;
     }
 
-    if (gpu_rows < lm_head_rows) {
-        const suffix_raw = q4_0_raw[gpu_weight_bytes..];
-        const suffix_rows = lm_head_rows - gpu_rows;
-        const cpu_suffix = try argmaxMatvecRawTop2(state.pool, suffix_raw, .q4_0, state.norm, suffix_rows, state.row_scratch);
-        selection.offerToken(offsetScoredToken(cpu_suffix.best, gpu_rows));
-        selection.offerToken(offsetScoredToken(cpu_suffix.second, gpu_rows));
+    const window = directLmHeadQ4_0ArgmaxWindow(lm_head_rows, gpu_rows, max_rows_by_input, scratch_rows);
+    var used_window = false;
+    var gpu_window_best = ScoredToken{ .index = 0, .value = -std.math.inf(f32) };
+    var gpu_window_delta: f32 = 0.0;
+    if (window.rows > 0) window_attempt: {
+        const window_rows_usize: usize = @intCast(window.rows);
+        const window_off = @as(usize, window.start) * row_bytes;
+        const window_bytes = window_rows_usize * row_bytes;
+        if (window_off + window_bytes <= q4_0_raw.len) {
+            const window_logits = state.row_scratch[0..window_rows_usize];
+            tracking.boundary.dmmvQ4_0RowRange(
+                state.norm,
+                q4_0_raw[window_off..][0..window_bytes],
+                window.rows,
+                cols,
+                window_logits,
+            ) catch |err| {
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window unavailable ({s}); selected token falls back to host rows for that window", .{@errorName(err)});
+                break :window_attempt;
+            };
+
+            var window_selection: ArgmaxTop2Result = .{};
+            for (window_logits, 0..) |gpu_value, i| {
+                if (!std.math.isFinite(gpu_value)) {
+                    log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window produced non-finite row {d}; selected token falls back to host rows for that window", .{window.start + @as(u32, @intCast(i))});
+                    break :window_attempt;
+                }
+                window_selection.offer(@intCast(i), gpu_value);
+            }
+
+            const absolute_best = offsetScoredToken(window_selection.best, window.start);
+            const cpu_window_best = try dotDirectTyped(.q4_0, q4_0_raw, absolute_best.index, cols, state.norm, null);
+            gpu_window_delta = @abs(cpu_window_best - absolute_best.value);
+            if (gpu_window_delta > direct_lm_head_q4_0_best_row_tolerance) {
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-window mismatch: row={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}; selected token falls back to host rows for that window", .{
+                    absolute_best.index,
+                    cpu_window_best,
+                    absolute_best.value,
+                    gpu_window_delta,
+                });
+                break :window_attempt;
+            }
+
+            selection.offerToken(absolute_best);
+            selection.offerToken(offsetScoredToken(window_selection.second, window.start));
+            gpu_window_best = absolute_best;
+            used_window = true;
+        }
     }
 
-    const selected_source = if (selection.best.index < gpu_rows) "gpu_prefix" else "cpu_suffix";
+    const cpu_gap_end = if (used_window) window.start else lm_head_rows;
+    if (gpu_rows < cpu_gap_end) {
+        const gap_rows = cpu_gap_end - gpu_rows;
+        const gap_off = @as(usize, gpu_rows) * row_bytes;
+        const gap_bytes = @as(usize, gap_rows) * row_bytes;
+        if (gap_off + gap_bytes > q4_0_raw.len) return null;
+        const cpu_gap = try argmaxMatvecRawTop2(state.pool, q4_0_raw[gap_off..][0..gap_bytes], .q4_0, state.norm, gap_rows, state.row_scratch);
+        selection.offerToken(offsetScoredToken(cpu_gap.best, gpu_rows));
+        selection.offerToken(offsetScoredToken(cpu_gap.second, gpu_rows));
+    }
+    const cpu_tail_start = if (used_window) window.start + window.rows else cpu_gap_end;
+    if (cpu_tail_start < lm_head_rows) {
+        const tail_rows = lm_head_rows - cpu_tail_start;
+        const tail_off = @as(usize, cpu_tail_start) * row_bytes;
+        const tail_bytes = @as(usize, tail_rows) * row_bytes;
+        if (tail_off + tail_bytes > q4_0_raw.len) return null;
+        const cpu_tail = try argmaxMatvecRawTop2(state.pool, q4_0_raw[tail_off..][0..tail_bytes], .q4_0, state.norm, tail_rows, state.row_scratch);
+        selection.offerToken(offsetScoredToken(cpu_tail.best, cpu_tail_start));
+        selection.offerToken(offsetScoredToken(cpu_tail.second, cpu_tail_start));
+    }
+
+    const selected_source = if (selection.best.index < gpu_rows)
+        "gpu_prefix"
+    else if (used_window and selection.best.index >= window.start and selection.best.index < window.start + window.rows)
+        "gpu_window"
+    else
+        "cpu_rows";
     tracking.ops.* += 1;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -2242,6 +2335,26 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         gpu_prefix_best.value,
         gpu_best_delta,
     });
+    if (used_window) {
+        tracking.ops.* += 1;
+        mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+        if (tracking.phase == .decode) {
+            if (tracking.decode_model_slices) |slices| slices.* += 1;
+        }
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_argmax_window phase={s} start_row={d} gpu_rows={d} cols={d} selected_source={s} token={d} score={d:.6} gpu_window_best=({d},{d:.6}) abs_delta={d:.6}", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
+            window.start,
+            window.rows,
+            cols,
+            selected_source,
+            selection.best.index,
+            selection.best.value,
+            gpu_window_best.index,
+            gpu_window_best.value,
+            gpu_window_delta,
+        });
+    }
     return selection;
 }
 
@@ -7333,6 +7446,22 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 0));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
+}
+
+test "direct LM-head Q4_0 argmax window stays outside the prefix" {
+    var window = directLmHeadQ4_0ArgmaxWindow(4096, 256, 1024, 1024);
+    try std.testing.expectEqual(@as(u32, direct_lm_head_q4_0_argmax_window_start), window.start);
+    try std.testing.expectEqual(@as(u32, direct_lm_head_q4_0_argmax_window_rows), window.rows);
+
+    window = directLmHeadQ4_0ArgmaxWindow(2048, 256, 1024, 1024);
+    try std.testing.expectEqual(@as(u32, 0), window.rows);
+
+    window = directLmHeadQ4_0ArgmaxWindow(4096, 3072, 64, 1024);
+    try std.testing.expectEqual(@as(u32, 3072), window.start);
+    try std.testing.expectEqual(@as(u32, 64), window.rows);
+
+    window = directLmHeadQ4_0ArgmaxWindow(4096, 256, 1024, 32);
+    try std.testing.expectEqual(@as(u32, 32), window.rows);
 }
 
 test "direct SSM Q8 row-range budget and masks are bounded" {
