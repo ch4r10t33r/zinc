@@ -679,6 +679,9 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
     if (gemmaPrefillActualPathIsQueuedOffPath(state.lastProfileOutput)) {
       lines.push("- For Gemma26 M4 prefill, the latest profile says `queued-token-major default_batched=yes structural_batched=no route_layers=0`; full route-pack is off-path.");
       lines.push("- Productive directions are the exact `structural_batched=no` guard blocker, queued-prefill chunk/wait scheduling, or a measurement counter that names why the structural path is disabled.");
+    } else if (gemmaPrefillActualPathIsStructuralRoutePack(state.lastProfileOutput)) {
+      lines.push("- For Gemma26 M4 prefill, the structural route-packed path is live (`structural_batched=yes`, nonzero `route_layers`). Stop auditing old structural guards or queued-token-major scheduling unless the profile falls back.");
+      lines.push("- Productive directions are now on-path route-pack occupancy, q5_1/q4_k active-block tail kernels with fresh evidence, LM-head/Q8 hot shapes, or public-suite validation.");
     } else {
       lines.push("- For Gemma26 M4 prefill, stop spending cycles on another weighted-finalizer or narrow Q8 threadgroup retune unless the latest profile or `bench-metal-shapes` evidence names that exact shape as underperforming.");
       lines.push("- Productive directions so far are queued-prefill schedule changes and router/RMS fusion. Prefer consuming exact-shape evidence, auditing full batched-prefill guard blockers, or validating public-suite prompt lengths.");
@@ -717,6 +720,16 @@ export function gemmaPrefillActualPathIsQueuedOffPath(profile: string | null | u
     /route_layers=0/i.test(line);
 }
 
+export function gemmaPrefillActualPathIsStructuralRoutePack(profile: string | null | undefined): boolean {
+  const line = latestGemmaPrefillActualPathLine(profile);
+  if (!line) return false;
+  const layers = /route_layers=(\d+)/i.exec(line);
+  return /batched-route-pack/i.test(line) &&
+    /structural_batched=yes/i.test(line) &&
+    layers != null &&
+    Number.parseInt(layers[1], 10) > 0;
+}
+
 export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): string[] {
   if (!isGemmaPrefillPostBreakthrough(state)) return [];
 
@@ -735,16 +748,23 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
   const profile = state.lastProfileOutput ?? "";
   const actualPathLine = latestGemmaPrefillActualPathLine(profile);
   const routePackOffPath = gemmaPrefillActualPathIsQueuedOffPath(profile);
+  const routePackStructural = gemmaPrefillActualPathIsStructuralRoutePack(profile);
   const pathLine = profile.split("\n").find(line => /path bytes:/i.test(line));
   const prefillMoeLine = profile.split("\n").find(line => /prefill buckets: moe/i.test(line));
   const queuedLine = profile.split("\n").find(line => /prefill queued prefill:/i.test(line));
   const queueLine = profile.split("\n").find(line => /prefill queued prefill queue:/i.test(line));
+  const routePackLine = profile.split("\n").find(line => /prefill route pack:/i.test(line));
+  const routePackActualLine = profile.split("\n").find(line => /prefill route pack actual:/i.test(line));
+  const routePackOccupancyLine = profile.split("\n").find(line => /prefill route pack occupancy:/i.test(line));
   const q8Hot = profile.split("\n").filter(line => /q8 hot #/i.test(line)).slice(0, 4);
   const evidence = state.lastMetalShapesOutput ?? "";
+  const targetGap = TARGET_TOK_PER_SEC - best;
 
   const lines = [
     "## Gemma26 M4 Prefill Post-80 Focus",
-    `- Accepted best is ${best.toFixed(1)} prefill tok/s; current tree is ${current.toFixed(1)}; target is ${TARGET_TOK_PER_SEC.toFixed(1)}. Remaining gap is ${(TARGET_TOK_PER_SEC - best).toFixed(1)} tok/s (${(((TARGET_TOK_PER_SEC - best) / best) * 100).toFixed(1)}%).`,
+    targetGap > 0
+      ? `- Accepted best is ${best.toFixed(1)} prefill tok/s; current tree is ${current.toFixed(1)}; target is ${TARGET_TOK_PER_SEC.toFixed(1)}. Remaining gap is ${targetGap.toFixed(1)} tok/s (${((targetGap / best) * 100).toFixed(1)}%).`
+      : `- Accepted best is ${best.toFixed(1)} prefill tok/s; current tree is ${current.toFixed(1)}; configured target ${TARGET_TOK_PER_SEC.toFixed(1)} is already beaten by ${(-targetGap).toFixed(1)} tok/s. Use public-suite/llama.cpp parity and the latest profile as the next bar.`,
     `- Recent window: ${recentKept.length}/${recent.length} kept, ${recentReverted.length} reverted, ${cyclesSinceBest} cycles since best. Do not optimize from pre-80 or cycle-49 assumptions.`,
   ];
 
@@ -753,6 +773,9 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
   if (prefillMoeLine) lines.push(`- Latest MoE/shared buckets: ${prefillMoeLine.trim()}`);
   if (queuedLine) lines.push(`- Latest queued schedule: ${queuedLine.trim()}`);
   if (queueLine) lines.push(`- Latest queued waits: ${queueLine.trim()}`);
+  if (routePackLine) lines.push(`- Latest route-pack shape: ${routePackLine.trim()}`);
+  if (routePackActualLine) lines.push(`- Latest active-block count: ${routePackActualLine.trim()}`);
+  if (routePackOccupancyLine) lines.push(`- Latest route-pack occupancy: ${routePackOccupancyLine.trim()}`);
   if (q8Hot.length > 0) {
     lines.push(`- Latest Q8 hot shapes: ${q8Hot.map(line => line.trim().replace(/^info\(forward\):\s*/, "")).join(" | ")}`);
   }
@@ -767,6 +790,9 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
   if (routePackOffPath) {
     lines.push("- HARD PATH FACT: full batched route-pack is not executing in the production prefill profile (`structural_batched=no`, `route_layers=0`). Active-block/route-pack/gather kernel retunes are off-path until the outer profile flips to `structural_batched=yes` with nonzero route layers.");
     lines.push("- Valid next speed paths: emit the exact guard reason for `structural_batched=no` and fix it, or optimize the queued-token-major schedule/wait path that is actually running.");
+  } else if (routePackStructural) {
+    lines.push("- HARD PATH FACT: structural Gemma route-pack is live. The old `structural_batched=no` blocker is solved; do not spend another cycle on guard-audit, queued-token-major scheduling, or default-enable plumbing unless the latest profile falls back.");
+    lines.push("- Current on-path waste is route-pack occupancy/tails and hot Q8/LM-head traffic. Any tail-kernel change must cite the exact tail size and avoid known regressions: q5_1 exact-6, q4_k exact-4, and alt4 block-width/profile edits.");
   }
   if (evidence.trim().length > 0 && state.lastMetalShapesOk === false) {
     lines.push(`- Latest Metal-shapes evidence run failed at cycle ${state.lastMetalShapesCycle ?? "?"}. Fix that evidence path or choose a non-shape retune; do not keep adding benchmark-output changes that the harness cannot capture.`);
@@ -786,6 +812,12 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
     lines.push(
       "- Best next moves: audit the exact guard blocker for `structural_batched=no`; fix queued-token-major chunk sizing/wait behavior; or add a profile counter that names the guard without changing kernels.",
       "- Avoid: active-block/route-pack/gather/barrier retunes, weighted-finalizer sigmoid/cache/threadgroup micro-retunes, and broad Q8 repacks unless the production profile shows that path is actually executing.",
+      "",
+    );
+  } else if (routePackStructural) {
+    lines.push(
+      "- Best next moves: measure/optimize the active `batched-route-pack` path only; focus on route-pack occupancy, q5_1/q4_k tail sizes not already reverted, LM-head/Q8 hot shapes, or public-suite validation.",
+      "- Avoid: old structural guard work, queued-token-major schedule changes, q5_1 exact-6 tails, q4_k exact-4 tails, alt4 block-width changes, and broad finalizer/barrier retunes without a named profile bucket.",
       "",
     );
   } else {
@@ -3012,6 +3044,14 @@ async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
   }
 }
 
+export function applyBestTreeRestoreCommit(
+  state: Pick<RunState, "bestTree">,
+  commitHash: string | null | undefined,
+): void {
+  if (!state.bestTree?.commitHash || !commitHash) return;
+  state.bestTree = { ...state.bestTree, commitHash };
+}
+
 async function restoreBestTree(runDir: string, state: RunState, reason: string): Promise<void> {
   if (!state.bestTree?.commitHash) return;
 
@@ -3029,7 +3069,11 @@ async function restoreBestTree(runDir: string, state: RunState, reason: string):
   const status = await runCommand("git", ["status", "--porcelain", "--", ...restorePaths]);
   if (status.stdout.trim().length > 0) {
     await runCommand("git", ["add", "-A", ...restorePaths]).catch(() => {});
-    await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
+    const committed = await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => null);
+    if (committed) {
+      const head = await runCommand("git", ["rev-parse", "HEAD"]).catch(() => null);
+      applyBestTreeRestoreCommit(state, head?.stdout.trim());
+    }
   }
   state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };
   await saveState(runDir, state);

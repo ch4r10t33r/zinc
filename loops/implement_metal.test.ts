@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   aggregateTimedSamples,
+  applyBestTreeRestoreCommit,
   backfillNearMiss,
   bestKeptCorrectTokPerSec,
   bestTreeCandidateCycle,
@@ -24,6 +25,7 @@ import {
   decideKeep,
   detectPhase,
   evaluateOutputText,
+  gemmaPrefillActualPathIsStructuralRoutePack,
   gemmaPrefillActualPathIsQueuedOffPath,
   keepBaselinesForCycle,
   mergeUniqueEntries,
@@ -951,6 +953,42 @@ describe("buildPrompt", () => {
     expect(analysis).toContain("audit the exact guard blocker");
   });
 
+  test("Gemma post-370 focus pivots to on-path structural route-pack work", () => {
+    const profile = [
+      "info(forward):   prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0",
+      "info(forward):   path bytes: ssm 0.00 GiB attn 35.60 GiB dense 0.00 GiB moe-expert 44.91 GiB shared 16.95 GiB lm-head 23.38 GiB router 1.29 GiB",
+      "info(forward):   prefill route pack: layers 30 slots 16800 avg_slots/layer 560.0 active_block_upper 5460 dense_dispatch_blocks 34560 active/dense 15.8%",
+      "info(forward):   prefill route pack actual: samples 30 active_blocks 3400 avg/layer 113.3 min 102 max 128 actual/upper 62.3% saved_vs_upper 37.7%",
+      "info(forward):   prefill route pack occupancy: full 1356 tail 2044 singleton_tail 656 padding_slots 10400 util 61.8% tail_blocks 60.1% singleton_tail 32.1%",
+      "info(forward):   q8 hot #1: lm-head M=262144 K=2816 bytes=23.38 GiB calls=32",
+    ].join("\n");
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 370.1,
+      currentBest: { tokPerSec: 370.1, containsReference: true },
+      stalledCycles: 3,
+      lastProfileOutput: profile,
+      cycles: [
+        makeCycle({ cycle: 90, kept: true, containsReference: true, tokPerSec: 362.3, description: "Added exact q5_1 3-route tail" }),
+        makeCycle({ cycle: 97, kept: true, containsReference: true, tokPerSec: 368.4, description: "Added exact q4_k 2-route tail" }),
+        makeCycle({ cycle: 98, kept: true, containsReference: true, tokPerSec: 369.1, description: "Added exact q4_k 3-route tail" }),
+        makeCycle({ cycle: 99, kept: false, containsReference: true, tokPerSec: 362.9, description: "Added exact q4_k 4-route tail" }),
+        makeCycle({ cycle: 100, kept: true, containsReference: true, tokPerSec: 370.1, description: "Added full 8-route q4_k path" }),
+      ],
+    });
+
+    expect(gemmaPrefillActualPathIsStructuralRoutePack(profile)).toBe(true);
+    const analysis = buildGemmaPrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("structural Gemma route-pack is live");
+    expect(analysis).toContain("Latest route-pack occupancy");
+    expect(analysis).toContain("q5_1 exact-6");
+    expect(analysis).toContain("q4_k exact-4");
+    expect(analysis).toContain("old structural guard work");
+  });
+
   test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {
     const state = makeState({
       effortId: 11,
@@ -1746,6 +1784,16 @@ describe("plateau controls", () => {
       "best",
     );
     expect(decision.finalize).toBe(false);
+  });
+
+  test("best-tree restore updates promoted commit to the finalize commit", () => {
+    const state = makeState({
+      bestTree: { cycle: 83, tokPerSec: 82.1, commitHash: "cycle-83" },
+    });
+    applyBestTreeRestoreCommit(state, "finalize-83");
+    expect(state.bestTree?.cycle).toBe(83);
+    expect(state.bestTree?.tokPerSec).toBe(82.1);
+    expect(state.bestTree?.commitHash).toBe("finalize-83");
   });
 
   test("Gemma plateau restore fires when current accepted tree fell below promoted best", () => {

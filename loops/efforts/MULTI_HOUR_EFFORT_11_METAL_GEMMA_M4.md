@@ -135,6 +135,65 @@ Interpretation:
   `structural_batched=no`, or the queued-token-major chunk/wait schedule that
   is actually running.
 
+## Public-prompt resumed result - 2026-06-02 local M4 prefill loop
+
+The resumed run continued the same public-prompt state from cycle 31 to cycle
+100 after the harness learned to restore the real 90.8 tok/s best tree.
+
+Outcome:
+
+- Best kept-correct public-prompt prefill: **370.10 tok/s**.
+- Final tree: cycle 100, `batched-route-pack` active.
+- Kept/reverted: 74 kept, 26 reverted over the 100-cycle state.
+- Cross-effort decode ended healthy: **70.67 tok/s**, about **+0.9%** over the
+  decode guard baseline.
+
+Breakthrough:
+
+```text
+cycle 50: 90.8 -> 329.7 tok/s
+```
+
+Cycle 50 added Gemma `q8_0` MoE route-column prefill support and cleared the
+stale `layer_output_scale` structural guard. That moved the public prompt from
+queued token-major fallback into the production structural route-packed path:
+
+```text
+prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0
+```
+
+Post-unlock wins:
+
+- Cycle 84: route-packed gate/up reads token rows via `route / k` instead of
+  materializing duplicate route-slot rows.
+- Cycle 86: shrank Gemma structural prefill `moe_route_input` scratch from
+  route-slot rows to token rows.
+- Cycles 87-91: Q5_1 MoE-down route-tail specializations moved 340.3 -> 367.6.
+- Cycles 96-100: Q4_K route-packed GeGLU tail/full-block specializations moved
+  364.0 -> 370.1.
+
+Latest profile shape:
+
+```text
+prefill route pack: layers 30 slots 16800 active_block_upper 5460 dense_dispatch_blocks 34560 active/dense 15.8%
+prefill route pack actual: samples 30 active_blocks 3400 avg/layer 113.3 min 102 max 128 actual/upper 62.3%
+prefill route pack occupancy: full 1356 tail 2044 singleton_tail 656 padding_slots 10400 util 61.8% tail_blocks 60.1% singleton_tail 32.1%
+q8 hot #1: lm-head M=262144 K=2816 bytes=23.38 GiB calls=32
+q8 hot #2: shared M=2112 K=2816 bytes=11.30 GiB calls=1920
+```
+
+Interpretation:
+
+- The old `structural_batched=no` blocker is solved for this public prompt. Do
+  not spend more cycles on guard audits or queued-token-major scheduling unless
+  a fresh profile falls back.
+- Remaining room is on the active `batched-route-pack` path: occupancy/tail
+  waste, Q5_1/Q4_K tail kernels with exact evidence, LM-head/Q8 hot shapes, and
+  public-suite validation.
+- Known local dead ends: Q5_1 exact 6-route tail, Q4_K exact 4-route tail,
+  route-pack alt4/block-width profile changes, and broad finalizer/barrier
+  retunes without a named profile bucket.
+
 ## Loop recipes
 
 The default correctness oracle is still the Paris chat prompt. For public-suite
@@ -210,7 +269,7 @@ ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="$PROMPT" \
 ZINC_REFERENCE_TEXT=benchmark \
 ZINC_MAX_TOKENS=32 \
-ZINC_TARGET_TOK_PER_SEC=200 \
+ZINC_TARGET_TOK_PER_SEC=450 \
 ZINC_STOP_ON_TARGET=0 \
 ZINC_BENCHMARK_RUNS=5 \
 ZINC_BENCHMARK_WARMUPS=1 \
@@ -224,16 +283,17 @@ ZINC_CROSS_EFFORT_PROMPT_MODE=chat \
 ZINC_CROSS_EFFORT_MAX_TOKENS=96 \
 ZINC_CROSS_EFFORT_EVERY=3 \
 ZINC_GEMMA_PLATEAU_STALL_CYCLES=6 \
+ZINC_AUTO_STOP_NO_BEST_CYCLES=35 \
 ZINC_METAL_SHAPES_EVERY=0 \
 ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 70 --iterations 80 --warmup 10" \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
-bun loops/implement_metal.ts --resume --effort 11 --agent codex --model gpt-5.5 --cycles 100
+bun loops/implement_metal.ts --resume --effort 11 --agent codex --model gpt-5.5 --cycles 150
 ```
 
-Use `ZINC_METAL_SHAPES_EVERY=3` only after the profile shows
-`structural_batched=yes` and `route_layers>0`, or when the cycle explicitly
-adds measurement coverage. The last public-prompt run already captured enough
-off-path route-pack evidence.
+Use `ZINC_METAL_SHAPES_EVERY=3` only when the cycle explicitly needs outer
+exact-shape evidence. The current profile already proves
+`structural_batched=yes route_layers=30`; routine guard-audit and queued-path
+shape evidence is stale.
 
 ### Public-suite validation
 
@@ -533,17 +593,17 @@ surrounding path has changed substantially:
 - No-code study cycles are not useful unless they land measurement coverage or
   update this effort file with a concrete, current no-code conclusion.
 
-## Next best targets after public-prompt cycle 30
+## Next best targets after public-prompt cycle 100
 
-1. Audit and print the exact guard blocker that leaves the public-prompt profile
-   at `structural_batched=no route_layers=0`.
-2. If the structural path cannot be enabled cleanly, optimize the
-   queued-token-major path that is actually running: chunk sizing, async/final
-   split, or wait placement.
-3. Do not spend another cycle retuning active-block route-pack/gather/barrier
-   kernels unless a production profile first shows that path is executing.
-4. After a meaningful kept source change, validate on the public performance
-   suite before publishing site numbers.
+1. Validate the 370 tok/s tree on the public performance suite before
+   publishing site numbers.
+2. Stay on the active structural path:
+   `batched-route-pack structural_batched=yes route_layers=30`.
+3. Attack measured route-pack occupancy/tail waste only with exact evidence.
+   Avoid known-bad Q5_1 exact-6, Q4_K exact-4, and alt4 block-width changes.
+4. Inspect Q8/LM-head hot shapes (`lm-head M=262144 K=2816`, shared
+   `M=2112 K=2816`) for on-path wins.
+5. Keep decode cross-effort healthy. A -3% decode regression is a hard stop.
 
 ## Measurement gates
 
