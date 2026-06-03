@@ -2,7 +2,7 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 const DEFAULT_LISTEN = 9091;
@@ -174,6 +174,10 @@ export function syntheticCompletionForRequest(body) {
   if (isOpenCodeSuccessfulTestFinalRequest(body)) {
     return { kind: "tests_passed", content: "Done. All tests pass." };
   }
+  const prefetchReadCalls = syntheticPrefetchReadCalls(body);
+  if (prefetchReadCalls.length > 0) {
+    return { kind: "prefetch_reads", toolCalls: prefetchReadCalls };
+  }
   return null;
 }
 
@@ -211,6 +215,7 @@ function collectStrings(value, out = []) {
 }
 
 const absolutePathRe = /(?:\/private\/tmp|\/tmp|\/Users|\/root|\/Volumes|\/var)\/[^\s"'<>`{}]+/g;
+const relativeFilePathRe = /(?:^|[\s"'(:])((?:\.{1,2}\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9_+-]+)(?=$|[\s"',):.;])/g;
 
 export function extractKnownFilePaths(body) {
   const paths = new Set();
@@ -236,6 +241,74 @@ export function extractKnownFilePaths(body) {
   }
 
   return [...paths].sort();
+}
+
+export function extractRequestedFilePaths(body) {
+  const workingDir = extractWorkingDirectory(body);
+  const paths = new Set();
+  for (const message of body?.messages ?? []) {
+    if (message?.role !== "user") continue;
+    const text = messageText(message);
+    for (const match of text.matchAll(absolutePathRe)) {
+      const candidate = cleanPathCandidate(match[0]);
+      if (candidate && looksLikeFilePath(candidate)) paths.add(candidate);
+    }
+    if (!workingDir) continue;
+    for (const match of text.matchAll(relativeFilePathRe)) {
+      const raw = cleanPathCandidate(match[1]);
+      if (!raw || raw.startsWith("/") || !looksLikeFilePath(raw)) continue;
+      paths.add(path.posix.normalize(path.posix.join(workingDir, raw)));
+    }
+  }
+  return [...paths].filter((p) => {
+    try {
+      return existsSync(p) && statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  }).sort();
+}
+
+function hasToolResultMessages(body) {
+  return (body?.messages ?? []).some((m) => m?.role === "tool");
+}
+
+function hasReadTool(body) {
+  return (body?.tools ?? []).some((tool) => {
+    const name = tool?.function?.name ?? tool?.name ?? "";
+    return name === "read";
+  });
+}
+
+function syntheticToolCallId(prefix, value) {
+  return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 10)}`;
+}
+
+export function syntheticPrefetchReadCalls(body) {
+  if (!body || isOpenCodeTitleRequest(body) || isOpenCodeSuccessfulTestFinalRequest(body)) return [];
+  if (hasToolResultMessages(body) || !hasReadTool(body)) return [];
+  return extractRequestedFilePaths(body)
+    .slice(0, 8)
+    .map((filePath, index) => ({
+      index,
+      id: syntheticToolCallId("call_prefetch_read", filePath),
+      type: "function",
+      function: {
+        name: "read",
+        arguments: JSON.stringify({ filePath }),
+      },
+    }));
+}
+
+export function shouldSuppressAssistantContent(body) {
+  if (!body || isOpenCodeTitleRequest(body) || isOpenCodeSuccessfulTestFinalRequest(body)) return false;
+  const text = collectStrings(body).join("\n");
+  return hasReadTool(body) && /OpenCode continuation guard|stop after all tests pass|do not give the final response until the tests pass/i.test(text);
+}
+
+export function shouldRequireOpenCodeToolChoice(body) {
+  if (!body || isOpenCodeTitleRequest(body) || isOpenCodeSuccessfulTestFinalRequest(body)) return false;
+  return hasReadTool(body) && shouldSuppressAssistantContent(body);
 }
 
 function looksLikeFilePath(value) {
@@ -370,6 +443,10 @@ export function applyRequestOverrides(body, opts = {}) {
     if (!hasGuard(next.messages, "OpenCode continuation guard:")) {
       next.messages.push({ role: "system", content: buildCodingContinuationGuardMessage(next) });
     }
+  }
+
+  if (!opts.forceToolChoice && shouldRequireOpenCodeToolChoice(next)) {
+    next.tool_choice = "required";
   }
 
   return next;
@@ -594,19 +671,46 @@ export function repairOpenAiToolCalls(payload, requestBody, state = {}) {
 export function repairSseEvent(event, requestBody, state = {}) {
   const lines = event.split(/\n/);
   let changed = false;
+  let suppressedContentEvents = 0;
   const out = lines.map((line) => {
     if (!line.startsWith("data: ")) return line;
     const data = line.slice("data: ".length);
     if (!data.trim() || data.trim() === "[DONE]") return line;
     try {
       const payload = JSON.parse(data);
+      if (shouldSuppressAssistantContent(requestBody)) {
+        for (const choice of payload.choices ?? []) {
+          if (typeof choice.delta?.content === "string" && choice.delta.content.length > 0) {
+            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.delta.content.length;
+            const preview = state.suppressedContentPreview ?? "";
+            if (preview.length < 4096) {
+              state.suppressedContentPreview = preview + choice.delta.content.slice(0, 4096 - preview.length);
+            }
+            choice.delta = { ...choice.delta };
+            delete choice.delta.content;
+            suppressedContentEvents += 1;
+            changed = true;
+          }
+          if (typeof choice.message?.content === "string" && choice.message.content.length > 0 && choice.message.tool_calls?.length > 0) {
+            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.message.content.length;
+            const preview = state.suppressedContentPreview ?? "";
+            if (preview.length < 4096) {
+              state.suppressedContentPreview = preview + choice.message.content.slice(0, 4096 - preview.length);
+            }
+            choice.message = { ...choice.message, content: "" };
+            suppressedContentEvents += 1;
+            changed = true;
+          }
+        }
+      }
       if (repairOpenAiToolCalls(payload, requestBody, state)) changed = true;
       return `data: ${JSON.stringify(payload)}`;
     } catch {
       return line;
     }
   });
-  return { event: out.join("\n"), changed };
+  state.suppressedContentEvents = (state.suppressedContentEvents ?? 0) + suppressedContentEvents;
+  return { event: out.join("\n"), changed, suppressedContentEvents };
 }
 
 function upstreamUrlFor(incomingUrl, upstream) {
@@ -661,6 +765,22 @@ function openAiCompletion(body, content) {
   };
 }
 
+function openAiToolCallCompletion(body, toolCalls) {
+  return {
+    id: `chatcmpl-proxy-${Date.now().toString(36)}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: body?.model ?? "proxy",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: null, tool_calls: toolCalls },
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+}
+
 export function syntheticResponseText(body, content) {
   if (body?.stream) {
     return [
@@ -677,9 +797,30 @@ export function syntheticResponseText(body, content) {
   return JSON.stringify(openAiCompletion(body, content));
 }
 
+export function syntheticToolCallResponseText(body, toolCalls) {
+  if (body?.stream) {
+    return [
+      `data: ${JSON.stringify(openAiChunk(body, { role: "assistant" }))}`,
+      "",
+      ...toolCalls.flatMap((call, index) => [
+        `data: ${JSON.stringify(openAiChunk(body, { tool_calls: [{ ...call, index }] }))}`,
+        "",
+      ]),
+      `data: ${JSON.stringify(openAiChunk(body, {}, "tool_calls"))}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+  }
+  return JSON.stringify(openAiToolCallCompletion(body, toolCalls));
+}
+
 function writeSyntheticResponse(res, trace, body, shortcut) {
-  const text = syntheticResponseText(body, shortcut.content);
+  const text = shortcut.toolCalls
+    ? syntheticToolCallResponseText(body, shortcut.toolCalls)
+    : syntheticResponseText(body, shortcut.content);
   trace.shortcut = shortcut.kind;
+  if (shortcut.toolCalls) trace.synthetic_tool_calls = shortcut.toolCalls;
   trace.response_metrics.bytes = Buffer.byteLength(text);
   trace.response_preview = text.slice(0, TRACE_PREVIEW_LIMIT);
   if (body?.stream) {
@@ -741,7 +882,7 @@ async function handleProxyRequest(req, res, opts) {
       session_id: parsedBody?.session_id,
     },
     request_body: parsedBody,
-    response_metrics: { bytes: 0, repaired_events: 0 },
+    response_metrics: { bytes: 0, repaired_events: 0, suppressed_content_events: 0 },
     response_preview: "",
   };
 
@@ -775,6 +916,9 @@ async function handleProxyRequest(req, res, opts) {
           pending = pending.slice(idx + 2);
           const repaired = opts.repairToolPaths && parsedBody ? repairSseEvent(event, parsedBody, repairState) : { event, changed: false };
           if (repaired.changed) trace.response_metrics.repaired_events += 1;
+          if (repaired.suppressedContentEvents) {
+            trace.response_metrics.suppressed_content_events += repaired.suppressedContentEvents;
+          }
           trace.response_metrics.bytes += Buffer.byteLength(repaired.event);
           if (trace.response_preview.length < TRACE_PREVIEW_LIMIT) {
             trace.response_preview += repaired.event.slice(0, TRACE_PREVIEW_LIMIT - trace.response_preview.length);
@@ -783,6 +927,10 @@ async function handleProxyRequest(req, res, opts) {
         }
       }
       if (pending) res.write(pending);
+      if (repairState.suppressedContentChars) {
+        trace.response_metrics.suppressed_content_chars = repairState.suppressedContentChars;
+        trace.suppressed_content_preview = repairState.suppressedContentPreview ?? "";
+      }
       res.end();
     } else {
       let text = await upstreamResponse.text();

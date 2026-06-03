@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -10,6 +10,7 @@ import {
   editableRootDirs,
   deriveSessionId,
   extractKnownFilePaths,
+  extractRequestedFilePaths,
   extractWorkingDirectory,
   injectSessionId,
   isBenignPartialStreamClose,
@@ -23,9 +24,13 @@ import {
   repairOpenAiToolCalls,
   repairSseEvent,
   sendProxyErrorResponse,
+  shouldSuppressAssistantContent,
+  shouldRequireOpenCodeToolChoice,
   stripToolBoundaryTail,
   syntheticCompletionForRequest,
+  syntheticPrefetchReadCalls,
   syntheticResponseText,
+  syntheticToolCallResponseText,
   titleForOpenCodeRequest,
 } from "./opencode_trace_proxy.mjs";
 
@@ -35,6 +40,23 @@ function withTempFile(content, fn) {
   writeFileSync(file, content);
   try {
     return fn(file);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function withTempProject(files, fn) {
+  const dir = mkdtempSync(join(tmpdir(), "zinc-opencode-project-"));
+  for (const [name, content] of Object.entries(files)) {
+    const file = join(dir, name);
+    const parent = file.slice(0, file.lastIndexOf("/"));
+    if (parent) {
+      mkdirSync(parent, { recursive: true });
+    }
+    writeFileSync(file, content);
+  }
+  try {
+    return fn(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -203,6 +225,42 @@ describe("request shaping", () => {
     expect(out.messages.some((m) => String(m.content).startsWith("OpenCode continuation guard:"))).toBe(false);
   });
 
+  test("requires tool calls by default for OpenCode coding turns", () => {
+    const out = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix failing tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+
+    expect(shouldRequireOpenCodeToolChoice(out)).toBe(true);
+    expect(out.tool_choice).toBe("required");
+  });
+
+  test("respects an explicit tool_choice override", () => {
+    const out = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix failing tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true, forceToolChoice: "auto" },
+    );
+
+    expect(shouldRequireOpenCodeToolChoice(out)).toBe(true);
+    expect(out.tool_choice).toBe("auto");
+  });
+
   test("path guard extracts editable and read-only paths", () => {
     expect(extractWorkingDirectory(body)).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(preferredEditablePath(body)).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
@@ -280,6 +338,71 @@ describe("synthetic OpenCode responses", () => {
     const json = JSON.parse(syntheticResponseText({ ...titleBody, stream: false }, "Done."));
     expect(json.choices[0].message.content).toBe("Done.");
     expect(json.choices[0].finish_reason).toBe("stop");
+  });
+
+  test("prefetches exact user-named files as synthetic read tool calls", () => {
+    withTempProject(
+      {
+        "package.json": "{}\n",
+        "src/rate_limiter.mjs": "export const limit = 1;\n",
+        "test/rate_limiter.test.mjs": "test('x', () => {});\n",
+      },
+      (dir) => {
+        const request = applyRequestOverrides(
+          {
+            model: "zinc/qwen",
+            stream: true,
+            tools: [{ type: "function", function: { name: "read" } }],
+            messages: [
+              { role: "system", content: `Working directory: ${dir}` },
+              {
+                role: "user",
+                content:
+                  "Fix this. Read package.json, src/rate_limiter.mjs, and test/rate_limiter.test.mjs.",
+              },
+            ],
+          },
+          { injectPathGuard: true },
+        );
+
+        expect(extractRequestedFilePaths(request)).toEqual([
+          `${dir}/package.json`,
+          `${dir}/src/rate_limiter.mjs`,
+          `${dir}/test/rate_limiter.test.mjs`,
+        ]);
+
+        const calls = syntheticPrefetchReadCalls(request);
+        expect(calls.map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
+          `${dir}/package.json`,
+          `${dir}/src/rate_limiter.mjs`,
+          `${dir}/test/rate_limiter.test.mjs`,
+        ]);
+        expect(syntheticCompletionForRequest(request)).toEqual({
+          kind: "prefetch_reads",
+          toolCalls: calls,
+        });
+
+        const streamed = syntheticToolCallResponseText(request, calls);
+        expect(streamed).toContain('"tool_calls"');
+        expect(streamed).toContain('"name":"read"');
+        expect(streamed).toContain('"finish_reason":"tool_calls"');
+      },
+    );
+  });
+
+  test("does not prefetch once OpenCode has tool results", () => {
+    const request = {
+      model: "zinc/qwen",
+      tools: [{ type: "function", function: { name: "read" } }],
+      messages: [
+        { role: "system", content: "Working directory: /tmp/project" },
+        { role: "user", content: "Read package.json" },
+        { role: "tool", content: "<path>/tmp/project/package.json</path>" },
+      ],
+    };
+
+    expect(syntheticPrefetchReadCalls(request)).toEqual([]);
+    expect(syntheticCompletionForRequest(request)).toBe(null);
   });
 });
 
@@ -439,6 +562,56 @@ describe("tool argument repair", () => {
     expect(args.path).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(args.pattern).toBe("test/**/*");
     expect(repaired.event).not.toContain("<//parameter>");
+  });
+
+  test("suppresses visible assistant prose during OpenCode tool-call turns", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+    expect(shouldSuppressAssistantContent(request)).toBe(true);
+
+    const event =
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: "I can see the issue." }, finish_reason: null }],
+      })}\n\n`;
+    const repaired = repairSseEvent(event, request);
+    expect(repaired.changed).toBe(true);
+    expect(repaired.suppressedContentEvents).toBe(1);
+    const payload = JSON.parse(repaired.event.slice("data: ".length));
+    expect(payload.choices[0].delta.content).toBeUndefined();
+  });
+
+  test("records suppressed assistant prose for trace diagnostics", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+    const state = {};
+    const event =
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: "I should inspect the code first." }, finish_reason: null }],
+      })}\n\n`;
+
+    const repaired = repairSseEvent(event, request, state);
+
+    expect(repaired.changed).toBe(true);
+    expect(state.suppressedContentChars).toBe("I should inspect the code first.".length);
+    expect(state.suppressedContentPreview).toBe("I should inspect the code first.");
   });
 
   test("converts complete XML tool-call content into an OpenAI tool call", () => {
