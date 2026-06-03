@@ -1523,7 +1523,7 @@ const DirectComputeTracking = struct {
 };
 
 const direct_decode_model_slice_cadence_default: u32 = 0;
-const direct_ssm_q8_0_row_range_max_successes_default: u32 = 8;
+const direct_ssm_q8_0_row_range_max_successes_default: u32 = 1;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
     const raw = raw_override orelse return direct_decode_model_slice_cadence_default;
@@ -7556,10 +7556,10 @@ test "direct LM-head Q4_0 argmax window stays outside the prefix" {
 }
 
 test "direct SSM Q8 row-range budget and masks are bounded" {
-    try std.testing.expectEqual(@as(u32, 8), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
+    try std.testing.expectEqual(@as(u32, 1), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
     try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("0"));
     try std.testing.expectEqual(@as(u32, 5), directSsmQ8_0RowRangeMaxSuccessesForEnv("5"));
-    try std.testing.expectEqual(@as(u32, 8), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, 1), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
 
     var mask: u128 = 0;
     mask |= directSsmLayerBit(0);

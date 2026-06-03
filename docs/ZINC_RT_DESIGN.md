@@ -144,7 +144,7 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 | `ZINC_RT_LM_HEAD_ROWS` | 4096 | Cap LM-head rows scanned per step; 0 = full 248 320 vocab (~3.5–4.3 ms/token cost) |
 | `ZINC_RT_MAX_DECODE_TOKENS` | 8 | Per-step decode-token clamp; raise to 256+ for real coherence runs |
 | `ZINC_RT_DIRECT_DECODE_SLICE_CADENCE` | 0 | Direct LM-head/DMMV validation cadence during decode; 0 = first generated token only, N = first token plus every N generated tokens |
-| `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 8 | Per-run cap on consumed direct Q8_0 SSM alpha/beta row-range successes during decode |
+| `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 1 | Per-run cap on consumed direct Q8_0 SSM alpha/beta row-range successes during decode |
 | `ZINC_QWEN36_DECODE_TOPK` | metadata | Override MoE top-k after prefill; 0 is the current shortcut |
 | `ZINC_GEMMA4_ATTN_SCALE_DEFAULT` | model-dependent | Per-Gemma 4 attention scale override |
 
