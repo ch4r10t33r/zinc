@@ -426,6 +426,10 @@ export function applyRequestOverrides(body, opts = {}) {
   if (opts.model) next.model = opts.model;
   if (opts.forceEnableThinking !== null && opts.forceEnableThinking !== undefined) {
     next.enable_thinking = opts.forceEnableThinking;
+    next.chat_template_kwargs = {
+      ...(next.chat_template_kwargs && typeof next.chat_template_kwargs === "object" ? next.chat_template_kwargs : {}),
+      enable_thinking: opts.forceEnableThinking,
+    };
   }
   if (opts.forceToolChoice) next.tool_choice = opts.forceToolChoice;
   if (Number.isFinite(opts.maxTokensCap)) {
@@ -479,6 +483,12 @@ function normalizeCodeOperatorSpacing(value) {
     .replace(/!\s+=/g, "!=")
     .replace(/=\s+=/g, "==")
     .replace(/=\s+>/g, "=>");
+}
+
+function normalizeShellCommand(value) {
+  return String(value)
+    .replace(/\b((?:npm|bun|pnpm|yarn)\s+test)(?=(?:[12]?>&\d|[12]?>))/g, "$1 ")
+    .replace(/([^\s0-9])([12]?>&\d)/g, "$1 $2");
 }
 
 function editFilePathArg(args) {
@@ -567,15 +577,23 @@ export function repairArgumentsJson(argumentsText, requestBody, toolName = "") {
       return { text: stripped, changed: stripped !== argumentsText };
     }
   }
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { text: argumentsText, changed: false };
+  }
 
   const original = JSON.stringify(args);
   args = recursivelyNormalizeStrings(args);
   coerceNumericArgs(args);
 
   const workingDir = extractWorkingDirectory(requestBody);
+  const lowerToolName = toolName.toLowerCase();
   for (const [key, value] of Object.entries(args)) {
     if (typeof value !== "string") continue;
     const lower = key.toLowerCase();
+    if ((lowerToolName === "bash" || lowerToolName === "shell") && lower === "command") {
+      args[key] = normalizeShellCommand(value);
+      continue;
+    }
     if (toolName.toLowerCase() === "glob" && lower === "path" && looksLikeFilePath(value)) {
       args[key] = workingDir || path.posix.dirname(value);
       continue;
@@ -618,6 +636,35 @@ function repairToolCall(call, requestBody) {
   return changed;
 }
 
+function toolCallStreamKey(choice, call, fallbackIndex) {
+  return `${choice.index ?? 0}:${call.index ?? fallbackIndex ?? 0}`;
+}
+
+function repairStreamingToolCallFragment(choice, call, state = {}, fallbackIndex = 0) {
+  if (!call?.function || typeof call.function.arguments !== "string") return false;
+  const key = toolCallStreamKey(choice, call, fallbackIndex);
+  state.toolCallNames ??= {};
+  state.toolArgBuffers ??= {};
+  const name = call.function.name ?? state.toolCallNames[key] ?? call.name ?? "";
+  if (name) state.toolCallNames[key] = name;
+
+  const previous = state.toolArgBuffers[key] ?? "";
+  let fragment = call.function.arguments;
+  if (
+    (name.toLowerCase() === "bash" || name.toLowerCase() === "shell") &&
+    /\b(?:npm|bun|pnpm|yarn)\s+test$/.test(previous) &&
+    /^[12](?:$|>|>&)/.test(fragment)
+  ) {
+    fragment = ` ${fragment}`;
+  }
+  state.toolArgBuffers[key] = previous + fragment;
+  if (fragment !== call.function.arguments) {
+    call.function.arguments = fragment;
+    return true;
+  }
+  return false;
+}
+
 export function parseXmlToolCallContent(content) {
   if (typeof content !== "string") return null;
   const match = content.trim().match(/^<tool_call>\s*([\s\S]*?)\s*<\/tool_call>$/);
@@ -658,7 +705,8 @@ export function repairOpenAiToolCalls(payload, requestBody, state = {}) {
       choice.finish_reason = "tool_calls";
       changed = true;
     }
-    for (const call of choice.delta?.tool_calls ?? []) {
+    for (const [callIndex, call] of (choice.delta?.tool_calls ?? []).entries()) {
+      changed = repairStreamingToolCallFragment(choice, call, state, callIndex) || changed;
       changed = repairToolCall(call, requestBody) || changed;
     }
     for (const call of choice.message?.tool_calls ?? []) {
@@ -680,6 +728,17 @@ export function repairSseEvent(event, requestBody, state = {}) {
       const payload = JSON.parse(data);
       if (shouldSuppressAssistantContent(requestBody)) {
         for (const choice of payload.choices ?? []) {
+          if (typeof choice.delta?.reasoning_content === "string" && choice.delta.reasoning_content.length > 0) {
+            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.delta.reasoning_content.length;
+            const preview = state.suppressedContentPreview ?? "";
+            if (preview.length < 4096) {
+              state.suppressedContentPreview = preview + choice.delta.reasoning_content.slice(0, 4096 - preview.length);
+            }
+            choice.delta = { ...choice.delta };
+            delete choice.delta.reasoning_content;
+            suppressedContentEvents += 1;
+            changed = true;
+          }
           if (typeof choice.delta?.content === "string" && choice.delta.content.length > 0) {
             state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.delta.content.length;
             const preview = state.suppressedContentPreview ?? "";
@@ -688,6 +747,17 @@ export function repairSseEvent(event, requestBody, state = {}) {
             }
             choice.delta = { ...choice.delta };
             delete choice.delta.content;
+            suppressedContentEvents += 1;
+            changed = true;
+          }
+          if (typeof choice.message?.reasoning_content === "string" && choice.message.reasoning_content.length > 0) {
+            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.message.reasoning_content.length;
+            const preview = state.suppressedContentPreview ?? "";
+            if (preview.length < 4096) {
+              state.suppressedContentPreview = preview + choice.message.reasoning_content.slice(0, 4096 - preview.length);
+            }
+            choice.message = { ...choice.message };
+            delete choice.message.reasoning_content;
             suppressedContentEvents += 1;
             changed = true;
           }

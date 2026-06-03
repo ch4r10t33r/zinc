@@ -202,6 +202,7 @@ describe("request shaping", () => {
     );
     expect(out.model).toBe("qwen36-35b-a3b-q4k-xl");
     expect(out.enable_thinking).toBe(false);
+    expect(out.chat_template_kwargs?.enable_thinking).toBe(false);
     expect(out.tool_choice).toBe("auto");
     expect(out.max_tokens).toBe(768);
     expect(out.temperature).toBe(0);
@@ -491,6 +492,22 @@ describe("tool argument repair", () => {
     );
   });
 
+  test("repairs bash redirection stuck to package test commands", () => {
+    const repairedNpm = repairArgumentsJson(
+      JSON.stringify({ command: "npm test2>&1", description: "Run tests" }),
+      body,
+      "bash",
+    );
+    expect(JSON.parse(repairedNpm.text).command).toBe("npm test 2>&1");
+
+    const repairedBun = repairArgumentsJson(
+      JSON.stringify({ command: "bun test2>&1", description: "Run tests" }),
+      body,
+      "bash",
+    );
+    expect(JSON.parse(repairedBun.text).command).toBe("bun test 2>&1");
+  });
+
   test("repairs common operator spacing inside edit oldString before OpenCode applies it", () => {
     withTempFile("if (current - hit.time <= this.windowMs) {\n  keep();\n}\n", (filePath) => {
       const repaired = repairEditOldStringArgs({
@@ -564,6 +581,45 @@ describe("tool argument repair", () => {
     expect(repaired.event).not.toContain("<//parameter>");
   });
 
+  test("repairs llama.cpp split bash command argument streams", () => {
+    const state = {};
+    const fragments = [
+      { name: "bash", arguments: "{" },
+      { arguments: "\"command\":\"" },
+      { arguments: "npm" },
+      { arguments: " test" },
+      { arguments: "2" },
+      { arguments: ">&" },
+      { arguments: "1" },
+    ];
+    const repairedFragments = fragments.map((fragment, index) => {
+      const event =
+        `data: ${JSON.stringify({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    type: "function",
+                    function: fragment,
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        })}\n\n`;
+      const repaired = repairSseEvent(event, body, state);
+      const payload = JSON.parse(repaired.event.slice("data: ".length));
+      if (index === 4) expect(repaired.changed).toBe(true);
+      return payload.choices[0].delta.tool_calls[0].function.arguments;
+    });
+
+    expect(repairedFragments.join("")).toBe("{\"command\":\"npm test 2>&1");
+  });
+
   test("suppresses visible assistant prose during OpenCode tool-call turns", () => {
     const request = applyRequestOverrides(
       {
@@ -587,6 +643,33 @@ describe("tool argument repair", () => {
     expect(repaired.suppressedContentEvents).toBe(1);
     const payload = JSON.parse(repaired.event.slice("data: ".length));
     expect(payload.choices[0].delta.content).toBeUndefined();
+  });
+
+  test("suppresses llama.cpp reasoning_content during OpenCode tool-call turns", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true, forceEnableThinking: false },
+    );
+    const state = {};
+    const event =
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { reasoning_content: "Let me analyze." }, finish_reason: null }],
+      })}\n\n`;
+
+    const repaired = repairSseEvent(event, request, state);
+
+    expect(repaired.changed).toBe(true);
+    expect(repaired.suppressedContentEvents).toBe(1);
+    expect(state.suppressedContentPreview).toBe("Let me analyze.");
+    const payload = JSON.parse(repaired.event.slice("data: ".length));
+    expect(payload.choices[0].delta.reasoning_content).toBeUndefined();
   });
 
   test("records suppressed assistant prose for trace diagnostics", () => {
