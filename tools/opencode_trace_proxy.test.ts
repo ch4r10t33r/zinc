@@ -3,10 +3,13 @@ import {
   applyRequestOverrides,
   buildCodingContinuationGuardMessage,
   buildPathGuardMessage,
+  editableKnownFilePaths,
+  editableRootDirs,
   deriveSessionId,
   extractKnownFilePaths,
   extractWorkingDirectory,
   injectSessionId,
+  isBenignPartialStreamClose,
   parseArgs,
   preferredEditablePath,
   repairArgumentsJson,
@@ -32,6 +35,21 @@ const body = {
       role: "tool",
       content:
         "<path>/private/tmp/zinc-opencode-smoke4/test</path><type>directory</type><entries>cart.test.mjs\nhelpers.txt</entries>",
+    },
+  ],
+};
+
+const multiFileBody = {
+  model: "zinc/qwen",
+  messages: [
+    {
+      role: "system",
+      content: "Working directory: /private/tmp/zinc-opencode-smoke6",
+    },
+    {
+      role: "tool",
+      content:
+        "<path>/private/tmp/zinc-opencode-smoke6/src</path><type>directory</type><entries>cart.mjs\npricing.mjs</entries>\n<path>/private/tmp/zinc-opencode-smoke6/test</path><type>directory</type><entries>cart.test.mjs</entries>",
     },
   ],
 };
@@ -115,10 +133,24 @@ describe("request shaping", () => {
     expect(preferredEditablePath(body)).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
     const guard = buildPathGuardMessage(body);
     expect(guard).toContain("src/cart.mjs");
-    expect(guard).toContain("package and test files are read-only");
+    expect(guard).toContain("Package and test files are read-only");
     const continuation = buildCodingContinuationGuardMessage(body);
     expect(continuation).toContain("fix all known source bugs in one edit");
     expect(continuation).toContain("do not give the final response until the tests pass");
+  });
+
+  test("path guard allows multiple source files while keeping tests read-only", () => {
+    expect(editableKnownFilePaths(multiFileBody)).toEqual([
+      "/private/tmp/zinc-opencode-smoke6/src/cart.mjs",
+      "/private/tmp/zinc-opencode-smoke6/src/pricing.mjs",
+    ]);
+    expect(editableRootDirs(multiFileBody)).toEqual(["/private/tmp/zinc-opencode-smoke6/src"]);
+    const guard = buildPathGuardMessage(multiFileBody);
+    expect(guard).toContain("source files under: /private/tmp/zinc-opencode-smoke6/src");
+    expect(guard).toContain("Known editable files:");
+    expect(guard).toContain("src/pricing.mjs");
+    expect(guard).toContain("test/cart.test.mjs");
+    expect(guard).toContain("Package and test files are read-only");
   });
 
   test("extractKnownFilePaths promotes directory entries", () => {
@@ -158,6 +190,15 @@ describe("tool argument repair", () => {
   test("repairs bad private path to preferred editable source for edit/write", () => {
     const repaired = repairArgumentsJson(JSON.stringify({ filePath: "/private/" }), body, "edit");
     expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
+  });
+
+  test("preserves new source-file paths under known editable roots", () => {
+    const repaired = repairArgumentsJson(
+      JSON.stringify({ filePath: "/private/tmp/zinc-opencode-smoke6/src/discounts.mjs" }),
+      multiFileBody,
+      "write",
+    );
+    expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke6/src/discounts.mjs");
   });
 
   test("repairs glob file path root to working directory", () => {
@@ -251,5 +292,21 @@ describe("proxy error handling", () => {
 
     expect(calls).toEqual(["end"]);
     expect(res.writableEnded).toBe(true);
+  });
+
+  test("classifies socket close after streamed bytes as a warning", () => {
+    const res = { headersSent: true };
+    const trace = { response_metrics: { bytes: 1024 } };
+    const err = new Error("The socket connection was closed unexpectedly");
+
+    expect(isBenignPartialStreamClose(res, trace, err)).toBe(true);
+  });
+
+  test("does not classify pre-response socket close as benign", () => {
+    const res = { headersSent: false };
+    const trace = { response_metrics: { bytes: 0 } };
+    const err = new Error("The socket connection was closed unexpectedly");
+
+    expect(isBenignPartialStreamClose(res, trace, err)).toBe(false);
   });
 });

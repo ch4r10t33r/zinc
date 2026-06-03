@@ -179,6 +179,22 @@ function looksLikeDirectory(value) {
   return typeof value === "string" && value.length > 0 && !looksLikeFilePath(value);
 }
 
+function isReadOnlyProjectPath(value) {
+  return value.includes("/test/") || value.endsWith("/package.json") || value.includes("/node_modules/");
+}
+
+export function editableKnownFilePaths(body) {
+  return extractKnownFilePaths(body).filter((p) => !isReadOnlyProjectPath(p));
+}
+
+export function editableRootDirs(body) {
+  const dirs = new Set();
+  for (const file of editableKnownFilePaths(body)) {
+    dirs.add(path.posix.dirname(file));
+  }
+  return [...dirs].sort();
+}
+
 export function extractWorkingDirectory(body) {
   const strings = collectStrings(body);
   for (const text of strings) {
@@ -197,10 +213,9 @@ export function extractWorkingDirectory(body) {
 }
 
 export function preferredEditablePath(body) {
-  const known = extractKnownFilePaths(body);
+  const known = editableKnownFilePaths(body);
   return (
-    known.find((p) => p.includes("/src/") && !p.includes("/test/")) ??
-    known.find((p) => !p.includes("/test/") && !p.endsWith("/package.json")) ??
+    known.find((p) => p.includes("/src/")) ??
     known[0] ??
     ""
   );
@@ -222,11 +237,19 @@ export function injectSessionId(body) {
 export function buildPathGuardMessage(body) {
   const editable = preferredEditablePath(body);
   const known = extractKnownFilePaths(body);
+  const editableFiles = editableKnownFilePaths(body);
+  const editableRoots = editableRootDirs(body);
   const lines = [
     "Tool path guard: Use exact absolute paths from recent tool results.",
   ];
-  if (editable) {
-    lines.push(`For edit/write, use only ${editable}; package and test files are read-only unless the user explicitly asks to change tests.`);
+  if (editableRoots.length > 0) {
+    lines.push(`For edit/write, use source files under: ${editableRoots.slice(0, 8).join(", ")}.`);
+    lines.push("Package and test files are read-only unless the user explicitly asks to change them.");
+  } else if (editable) {
+    lines.push(`For edit/write, use ${editable}; package and test files are read-only unless the user explicitly asks to change tests.`);
+  }
+  if (editableFiles.length > 0) {
+    lines.push(`Known editable files: ${editableFiles.slice(0, 12).join(", ")}`);
   }
   if (known.length > 0) {
     lines.push(`Known file paths: ${known.slice(0, 12).join(", ")}`);
@@ -301,11 +324,15 @@ function nearestKnownPath(raw, body, toolName) {
   const value = cleanPathCandidate(raw);
   const known = extractKnownFilePaths(body);
   const editable = preferredEditablePath(body);
+  const editableRoots = editableRootDirs(body);
   if (!value || value === "/" || value === "/private" || value === "/private/") {
     return toolName && /edit|write/i.test(toolName) && editable ? editable : known[0] ?? value;
   }
 
   if (known.includes(value)) return value;
+  if (/edit|write/i.test(toolName ?? "") && editableRoots.some((root) => value === root || value.startsWith(`${root}/`))) {
+    return value;
+  }
   if (value.endsWith(".")) {
     const prefix = value.slice(0, -1);
     const byPrefix = known.find((p) => p.startsWith(prefix));
@@ -448,6 +475,15 @@ export function sendProxyErrorResponse(res, status, message, type = "proxy_error
   res.end(JSON.stringify({ error: { message, type } }));
 }
 
+export function isBenignPartialStreamClose(res, trace, err) {
+  const message = err?.message ?? String(err);
+  return (
+    res.headersSent &&
+    (trace.response_metrics?.bytes ?? 0) > 0 &&
+    /socket connection was closed unexpectedly|terminated|aborted/i.test(message)
+  );
+}
+
 async function handleProxyRequest(req, res, opts) {
   const rawBody = await readRequestBody(req);
   let requestBody = rawBody;
@@ -519,8 +555,13 @@ async function handleProxyRequest(req, res, opts) {
       res.end(text);
     }
   } catch (err) {
-    trace.error = { message: err?.message ?? String(err), stack: err?.stack };
-    sendProxyErrorResponse(res, 502, trace.error.message);
+    const message = err?.message ?? String(err);
+    if (isBenignPartialStreamClose(res, trace, err)) {
+      trace.warning = { message, type: "partial_stream_close_after_bytes" };
+    } else {
+      trace.error = { message, stack: err?.stack };
+    }
+    sendProxyErrorResponse(res, 502, message);
   } finally {
     try {
       trace.trace_file = await writeTrace(opts.traceDir, trace);
