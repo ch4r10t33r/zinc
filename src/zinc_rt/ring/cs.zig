@@ -213,6 +213,7 @@ const shader_offset_rms_norm_elem0: usize = 0x100;
 const shader_offset_dmmv_f32_row_range: usize = 0x200;
 const shader_offset_dmmv_q4_0_row_range: usize = 0x300;
 const shader_offset_dmmv_q8_0_row_range: usize = 0x500;
+const shader_offset_argmax_u32_range: usize = 0x600;
 const shader_page_bytes: usize = 4096;
 
 // gfx1201 one-wave kernel assembled with:
@@ -237,6 +238,53 @@ const argmax_top2_gfx1201 = [_]u32{
     0xbf800000, // s_nop 0
     0xbfb60003, // s_sendmsg(MSG_DEALLOC_VGPRS)
     0xbfb00000, // s_endpgm
+};
+
+// gfx1201 one-workitem ordered-u32 argmax row-range kernel assembled with:
+//   llvm-mc-20 -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj
+//
+// ABI:
+//   s[0:1] = ordered-score u32 input pointer
+//   s[2:3] = output pointer: u32 selected_token, u32 ordered_score
+//   s4     = rows
+//   s5     = start_row
+//
+// The host maps f32 scores into sortable u32 keys before dispatch. The kernel
+// does the row-range argmax and stores the absolute token id.
+const argmax_u32_range_gfx1201 = [_]u32{
+    0x7e000280,
+    0x7e060280,
+    0xbe890081,
+    0xee050000,
+    0x00000001,
+    0x00000000,
+    0xbf8903f7,
+    0xbf090409,
+    0xbfa2000c,
+    0x840a8209,
+    0x7e00020a,
+    0xee050000,
+    0x00000002,
+    0x00000000,
+    0xbf8903f7,
+    0x7e080209,
+    0x7c980302,
+    0x02020501,
+    0x02060903,
+    0x80098109,
+    0xbfa0fff2,
+    0x4a060605,
+    0x7e000280,
+    0xee068002,
+    0x01800000,
+    0x00000000,
+    0x7e000284,
+    0xee068002,
+    0x00800000,
+    0x00000000,
+    0xbf800000,
+    0xbfb60003,
+    0xbfb00000,
 };
 
 // gfx1201 one-wave kernel assembled with:
@@ -462,8 +510,15 @@ comptime {
     std.debug.assert(shader_offset_rms_norm_elem0 + rms_norm_elem0_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_f32_row_range);
     std.debug.assert(shader_offset_dmmv_f32_row_range + dmmv_f32_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range);
     std.debug.assert(shader_offset_dmmv_q4_0_row_range + dmmv_q4_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q8_0_row_range);
-    std.debug.assert(shader_offset_dmmv_q8_0_row_range + dmmv_q8_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+    std.debug.assert(shader_offset_dmmv_q8_0_row_range + dmmv_q8_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_argmax_u32_range);
+    std.debug.assert(shader_offset_argmax_u32_range + argmax_u32_range_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
 }
+
+/// Result produced by the ordered-score argmax row-range kernel.
+pub const ArgmaxRangeResult = struct {
+    token: u32,
+    ordered_score: u32,
+};
 
 /// Outcome classification for the CS bring-up smoke gate.
 /// Each variant maps to a specific failure point in the open → submit → wait
@@ -623,6 +678,7 @@ pub const TokenBoundary = struct {
         for (dmmv_f32_row_range_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_f32_row_range / @sizeOf(u32) + i] = word;
         for (dmmv_q4_0_row_range_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_range / @sizeOf(u32) + i] = word;
         for (dmmv_q8_0_row_range_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q8_0_row_range / @sizeOf(u32) + i] = word;
+        for (argmax_u32_range_gfx1201, 0..) |word, i| shader_words[shader_offset_argmax_u32_range / @sizeOf(u32) + i] = word;
         storeFence();
 
         var bo_entries = [_]DrmAmdgpuBoListEntry{
@@ -840,6 +896,110 @@ pub const TokenBoundary = struct {
         const selected = output_words[0];
         if (selected != token0 and selected != token1) return error.ArgmaxTop2InvalidToken;
         return selected;
+    }
+
+    /// Dispatch the gfx1201 ordered-score row-range argmax kernel.
+    ///
+    /// Converts `scores` into sortable u32 keys, copies them into the shared
+    /// input page, then lets the compute ring select the max row. The returned
+    /// token id is absolute: `start_row + local_best`.
+    /// @param scores F32 logit/score row range to select from.
+    /// @param start_row Absolute token row corresponding to `scores[0]`.
+    /// @returns The selected absolute token id and the ordered score key the GPU stored.
+    pub fn argmaxF32Range(
+        self: *TokenBoundary,
+        scores: []const f32,
+        start_row: u32,
+    ) !ArgmaxRangeResult {
+        if (scores.len == 0 or scores.len > std.math.maxInt(u32)) return error.ShapeMismatch;
+        const rows: u32 = @intCast(scores.len);
+        if (@as(usize, rows) * @sizeOf(u32) > self.input_map.len) return error.InputTooLarge;
+
+        const input_words: [*]volatile u32 = @ptrCast(@alignCast(self.input_map.ptr));
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (scores, 0..) |score, i| input_words[i] = orderedF32(score);
+        output_words[0] = 0xffff_ffff;
+        output_words[1] = 0;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_9000 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_argmax_u32_range;
+        const pgm_lo: u32 = @truncate(pgm_va >> 8);
+        const pgm_hi: u32 = @truncate(pgm_va >> 40);
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_value,
+            compute_pgm_rsrc2_argmax_top2_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 1, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+        });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const out_lo: u32 = @truncate(self.output_va);
+        const out_hi: u32 = @truncate(self.output_va >> 32);
+        try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+            in_lo,
+            in_hi,
+            out_lo,
+            out_hi,
+            rows,
+            start_row,
+            0,
+            0,
+        });
+        try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+        try self.builder.writeData64(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+        const token = output_words[0];
+        if (token < start_row or token >= start_row + rows) return error.ArgmaxRangeInvalidToken;
+        return .{
+            .token = token,
+            .ordered_score = output_words[1],
+        };
     }
 
     /// Dispatch the single-element gfx1201 final-RMS-norm kernel.

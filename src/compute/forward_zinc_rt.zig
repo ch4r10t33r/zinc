@@ -2061,7 +2061,11 @@ fn scalarEvalTokenDense(
             }
         } else {
             try matvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch, state.logits);
-            next_token.* = argmaxSlice(state.logits[0..lm_head_rows]);
+            if (consumeDirectLogitsArgmaxRowRange(direct_compute_tracking, state.logits[0..lm_head_rows], 0, "lm_head_logits")) |direct_selection| {
+                next_token.* = direct_selection.best.index;
+            } else {
+                next_token.* = argmaxSlice(state.logits[0..lm_head_rows]);
+            }
         }
     }
 }
@@ -2144,6 +2148,82 @@ fn directComputeArgmaxTop2(
     );
     if (selected != selection.best.index) return error.DirectArgmaxTop2Mismatch;
     return selected;
+}
+
+fn orderedF32ForDirectArgmax(value: f32) u32 {
+    const bits: u32 = @bitCast(value);
+    if ((bits & 0x8000_0000) != 0) return ~bits;
+    return bits ^ 0x8000_0000;
+}
+
+fn consumeDirectLogitsArgmaxRowRange(
+    maybe_tracking: ?DirectComputeTracking,
+    logits: []const f32,
+    start_row: u32,
+    source: []const u8,
+) ?ArgmaxTop2Result {
+    const tracking = maybe_tracking orelse return null;
+    if (logits.len == 0 or logits.len > std.math.maxInt(u32)) return null;
+
+    var cpu_selection: ArgmaxTop2Result = .{};
+    for (logits, 0..) |value, i| {
+        if (!std.math.isFinite(value)) {
+            log.warn("M1 AMDGPU CS direct logits argmax row-range saw non-finite {s} row {d}; selected token remains host-computed", .{
+                source,
+                start_row + @as(u32, @intCast(i)),
+            });
+            return null;
+        }
+        cpu_selection.offer(@intCast(i), value);
+    }
+
+    const gpu_result = tracking.boundary.argmaxF32Range(logits, start_row) catch |err| {
+        log.warn("M1 AMDGPU CS direct logits argmax row-range unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
+        return null;
+    };
+    const expected_token = start_row + cpu_selection.best.index;
+    if (gpu_result.token != expected_token) {
+        log.warn("M1 AMDGPU CS direct logits argmax row-range mismatch: source={s} start_row={d} rows={d} cpu_token={d} gpu_token={d}; selected token remains host-computed", .{
+            source,
+            start_row,
+            logits.len,
+            expected_token,
+            gpu_result.token,
+        });
+        return null;
+    }
+    const local_index: usize = @intCast(gpu_result.token - start_row);
+    const gpu_score = logits[local_index];
+    const expected_ordered = orderedF32ForDirectArgmax(gpu_score);
+    if (gpu_result.ordered_score != expected_ordered) {
+        log.warn("M1 AMDGPU CS direct logits argmax row-range score mismatch: source={s} token={d} expected_ordered=0x{x} gpu_ordered=0x{x}; selected token remains host-computed", .{
+            source,
+            gpu_result.token,
+            expected_ordered,
+            gpu_result.ordered_score,
+        });
+        return null;
+    }
+
+    var selection: ArgmaxTop2Result = .{};
+    selection.best = .{ .index = gpu_result.token, .value = gpu_score };
+    selection.second = offsetScoredToken(cpu_selection.second, start_row);
+
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .argmax);
+    tracking.consumed.* = true;
+    if (tracking.selected_token) |token| token.* = gpu_result.token;
+    log.info("M1 AMDGPU CS direct compute consumed: direct_compute_ops={d} direct_compute_kind=argmax op=lm_head_logits_argmax_row_range phase={s} source={s} start_row={d} rows={d} token={d} score={d:.6} cpu_token={d}", .{
+        tracking.ops.*,
+        directComputePhaseName(tracking.phase),
+        source,
+        start_row,
+        logits.len,
+        gpu_result.token,
+        gpu_score,
+        expected_token,
+    });
+    return selection;
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
@@ -2237,6 +2317,9 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         });
         return null;
     }
+    if (consumeDirectLogitsArgmaxRowRange(maybe_tracking, gpu_logits, 0, "lm_head_q4_0_prefix")) |direct_selection| {
+        selection = direct_selection;
+    }
 
     const window = directLmHeadQ4_0ArgmaxWindow(lm_head_rows, gpu_rows, max_rows_by_input, scratch_rows);
     var used_window = false;
@@ -2284,6 +2367,11 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             selection.offerToken(absolute_best);
             selection.offerToken(offsetScoredToken(window_selection.second, window.start));
             gpu_window_best = absolute_best;
+            if (consumeDirectLogitsArgmaxRowRange(maybe_tracking, window_logits, window.start, "lm_head_q4_0_window")) |direct_window_selection| {
+                selection.offerToken(direct_window_selection.best);
+                selection.offerToken(direct_window_selection.second);
+                gpu_window_best = direct_window_selection.best;
+            }
             used_window = true;
         }
     }
@@ -2572,7 +2660,10 @@ fn scalarEvalToken(
             }
         } else {
             try matvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch, state.logits);
-            if (need_top2) {
+            if (consumeDirectLogitsArgmaxRowRange(direct_compute_tracking, state.logits[0..lm_head_rows], 0, "lm_head_logits")) |direct_selection| {
+                selection = direct_selection;
+                next_token.* = selection.best.index;
+            } else if (need_top2) {
                 selection = argmaxTop2Slice(state.logits[0..lm_head_rows]);
                 next_token.* = selection.best.index;
             } else {
