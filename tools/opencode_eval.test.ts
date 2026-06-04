@@ -9,6 +9,7 @@ import {
   fixturesForOption,
   parseArgs,
   parseOpenCodeJsonl,
+  parsePortListenPids,
   parseTestSummary,
   readOnlyViolations,
   renderSummary,
@@ -51,6 +52,10 @@ describe("opencode eval args", () => {
       "rate-limiter-single",
     ]);
     expect(fixturesForOption(["all"]).length).toBe(FIXTURES.length);
+  });
+
+  test("parses listener pids from lsof output", () => {
+    expect(parsePortListenPids("61961\n75393\nnot-a-pid\n")).toEqual(["61961", "75393"]);
   });
 });
 

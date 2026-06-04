@@ -447,11 +447,51 @@ async function waitForHttp(url, timeoutMs = 10000) {
   return false;
 }
 
-async function killPort(port) {
-  await runCommand(`for pid in $(lsof -tiTCP:${Number(port)} -sTCP:LISTEN 2>/dev/null); do kill "$pid" 2>/dev/null || true; done`, {
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function parsePortListenPids(output) {
+  return String(output ?? "")
+    .split(/\s+/)
+    .map((value) => value.trim())
+    .filter((value) => /^\d+$/.test(value));
+}
+
+async function portListenPids(port) {
+  const result = await runCommand(`lsof -tiTCP:${Number(port)} -sTCP:LISTEN 2>/dev/null || true`, {
     cwd: REPO_ROOT,
     timeoutMs: 5000,
   });
+  return parsePortListenPids(result.output);
+}
+
+async function killPort(port) {
+  const numericPort = Number(port);
+  const initialPids = await portListenPids(numericPort);
+  if (initialPids.length === 0) return;
+
+  await runCommand(`for pid in $(lsof -tiTCP:${numericPort} -sTCP:LISTEN 2>/dev/null); do kill "$pid" 2>/dev/null || true; done`, {
+    cwd: REPO_ROOT,
+    timeoutMs: 5000,
+  });
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((await portListenPids(numericPort)).length === 0) return;
+    await sleep(100);
+  }
+
+  await runCommand(`for pid in $(lsof -tiTCP:${numericPort} -sTCP:LISTEN 2>/dev/null); do kill -9 "$pid" 2>/dev/null || true; done`, {
+    cwd: REPO_ROOT,
+    timeoutMs: 5000,
+  });
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((await portListenPids(numericPort)).length === 0) return;
+    await sleep(100);
+  }
+
+  throw new Error(`Port ${numericPort} is still in use after replace-proxy cleanup`);
 }
 
 async function startManagedProxy(provider, opts, traceDir, logFile) {
@@ -461,6 +501,9 @@ async function startManagedProxy(provider, opts, traceDir, logFile) {
       throw new Error(`Port ${opts.proxyPort} is already serving. Use --replace-proxy or --no-manage-proxy.`);
     }
     await killPort(opts.proxyPort);
+    if (await httpOk(modelsUrl, 300)) {
+      throw new Error(`Port ${opts.proxyPort} is still serving after --replace-proxy cleanup.`);
+    }
   }
 
   await ensureDir(path.dirname(logFile));
@@ -495,9 +538,13 @@ async function startManagedProxy(provider, opts, traceDir, logFile) {
   child.stderr.pipe(log);
 
   const ready = await waitForHttp(modelsUrl, 10000);
+  await sleep(50);
   if (!ready) {
     child.kill("SIGTERM");
     throw new Error(`Managed proxy for ${provider} did not become ready on ${modelsUrl}`);
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(`Managed proxy for ${provider} exited during startup; see ${logFile}`);
   }
 
   return {
