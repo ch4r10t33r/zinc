@@ -1534,11 +1534,11 @@ const DirectComputeTracking = struct {
     selected_token: ?*u32 = null,
 };
 
-// Keep M1 benchmark runs exercising consumed decode-phase model slices beyond
-// the first generated token. The cadence is intentionally sparse because the
-// current T1 DMMV row-range kernels are correctness-oriented serial kernels.
-const direct_decode_model_slice_cadence_default: u32 = 16;
-const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
+// Keep M1 benchmark runs exercising one consumed decode-phase model slice by
+// default. Repeated tracking is opt-in because the current T1 DMMV row-range
+// kernels are correctness-oriented serial kernels.
+const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_ssm_q8_0_row_range_max_successes_default: u32 = 0;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
@@ -8120,10 +8120,10 @@ test "direct LM-head Q4_0 selected source identifies GPU scores" {
 }
 
 test "direct SSM row-range budget, trust and per-slice reset are bounded" {
-    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
     try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("0"));
     try std.testing.expectEqual(@as(u32, 5), directSsmQ8_0RowRangeMaxSuccessesForEnv("5"));
-    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
 
     try std.testing.expectEqual(@as(u32, 1), directSsmQ8_0TrustAfterSuccessesForEnv(null));
     try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0TrustAfterSuccessesForEnv("0"));
