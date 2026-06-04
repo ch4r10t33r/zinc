@@ -19,6 +19,7 @@ layout(push_constant) uniform PushConstants {
     uint ids_stride;
     uint gate_up_workgroups_x;
     uint down_workgroups_x;
+    uint routing_token_base;
 } pc;
 
 layout(set = 0, binding = 0) readonly buffer Routing {
@@ -64,7 +65,7 @@ void main() {
         for (uint route = tid; route < total_routes; route += pc.n_experts) {
             const uint token = route / pc.k;
             const uint slot = route - token * pc.k;
-            const uint expert_id = routing[token * pc.routing_stride + slot];
+            const uint expert_id = routing[(pc.routing_token_base + token) * pc.routing_stride + slot];
             if (expert_id >= pc.n_experts) {
                 continue;
             }

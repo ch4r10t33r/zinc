@@ -195,6 +195,8 @@ pub fn build(b: *std.Build) void {
         "dmmv_q5k_moe_cols",
         "dmmv_q6k_moe",
         "moe_weighted_acc",
+        "moe_weighted_acc_batch",
+        "sigmoid_scale_acc_batch",
         "dmmv_q4k_batch",
         "dmmv_q4k_batch_kpar",
         "dmmv_q6k_batch",

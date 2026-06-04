@@ -203,6 +203,7 @@ pub const MoeRoutePackPush = extern struct {
     ids_stride: u32,
     gate_up_workgroups_x: u32,
     down_workgroups_x: u32,
+    routing_token_base: u32,
 };
 
 /// Push constants for `mul_mm_q4k.comp` (effort-6 Step 1 of 5 foundation:
@@ -1445,6 +1446,7 @@ pub const DmmvDispatch = struct {
         ids_stride: u32,
         gate_up_workgroups_x: u32,
         down_workgroups_x: u32,
+        routing_token_base: u32,
     ) !void {
         const pip = if (self.pipeline_moe_route_pack) |*p| p else return error.PipelineNotLoaded;
         if (n_tokens == 0 or n_experts == 0 or k == 0 or ids_stride == 0) return error.InvalidArgument;
@@ -1457,6 +1459,7 @@ pub const DmmvDispatch = struct {
             .ids_stride = ids_stride,
             .gate_up_workgroups_x = gate_up_workgroups_x,
             .down_workgroups_x = down_workgroups_x,
+            .routing_token_base = routing_token_base,
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = routing_buf, .offset = 0, .range = routing_size },

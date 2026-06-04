@@ -175,6 +175,21 @@ pub const MoeWeightedAccPush = extern struct {
     src_stride: u32,
 };
 
+pub const MoeWeightedAccBatchPush = extern struct {
+    hidden_dim: u32,
+    n_tokens: u32,
+    n_used: u32,
+    routing_stride: u32,
+    routing_token_base: u32,
+    accum_token_base: u32,
+};
+
+pub const SigmoidScaleAccBatchPush = extern struct {
+    hidden_dim: u32,
+    n_tokens: u32,
+    accum_token_base: u32,
+};
+
 /// Push constants for KV cache write compute shader.
 pub const KvCacheWritePush = extern struct {
     kv_dim: u32,
@@ -336,6 +351,10 @@ pub const ElementwiseDispatch = struct {
     pipeline_sigmoid_scale_acc: ?Pipeline,
     /// MOE WEIGHTED ACC pipeline: a[i] += routing_weight * b[i], 3 bindings (accum, src, routing).
     pipeline_moe_weighted_acc: ?Pipeline,
+    /// Batched route-major MoE weighted accumulate, 3 bindings.
+    pipeline_moe_weighted_acc_batch: ?Pipeline,
+    /// Batched per-token sigmoid-gated accumulate, 3 bindings.
+    pipeline_sigmoid_scale_acc_batch: ?Pipeline,
     /// KV CACHE WRITE pipeline: compute-based KV cache copy, 4 bindings (k_src, k_dst, v_src, v_dst).
     pipeline_kv_cache_write: ?Pipeline,
     /// Batched KV cache write for prefillBatched (5 bindings, page-aware).
@@ -632,6 +651,18 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const mwa_batch_path = std.fmt.bufPrint(&path_buf, "{s}/moe_weighted_acc_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_moe_weighted_acc_batch = pipeline_mod.createFromSpirvWithOptions(instance, mwa_batch_path, 3, @sizeOf(MoeWeightedAccBatchPush), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("moe_weighted_acc_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const ssa_batch_path = std.fmt.bufPrint(&path_buf, "{s}/sigmoid_scale_acc_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_sigmoid_scale_acc_batch = pipeline_mod.createFromSpirvWithOptions(instance, ssa_batch_path, 3, @sizeOf(SigmoidScaleAccBatchPush), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("sigmoid_scale_acc_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // kv_cache_write: 4 bindings (k_src, k_dst, v_src, v_dst)
         const kvcw_path = std.fmt.bufPrint(&path_buf, "{s}/kv_cache_write.spv", .{shader_dir}) catch unreachable;
         const pipeline_kv_cache_write = pipeline_mod.createFromSpirvWithOptions(instance, kvcw_path, 4, @sizeOf(KvCacheWritePush), &.{}, push_options, allocator) catch |err| blk: {
@@ -753,6 +784,8 @@ pub const ElementwiseDispatch = struct {
             .pipeline_softmax_topk_batch = pipeline_softmax_topk_batch,
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
             .pipeline_moe_weighted_acc = pipeline_moe_weighted_acc,
+            .pipeline_moe_weighted_acc_batch = pipeline_moe_weighted_acc_batch,
+            .pipeline_sigmoid_scale_acc_batch = pipeline_sigmoid_scale_acc_batch,
             .pipeline_kv_cache_write = pipeline_kv_cache_write,
             .pipeline_kv_cache_write_batched = pipeline_kv_cache_write_batched,
             .pipeline_residual_rms_norm = pipeline_residual_rms_norm,
@@ -1194,6 +1227,8 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_softmax_topk_batch) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
         if (self.pipeline_moe_weighted_acc) |*p| p.deinit();
+        if (self.pipeline_moe_weighted_acc_batch) |*p| p.deinit();
+        if (self.pipeline_sigmoid_scale_acc_batch) |*p| p.deinit();
         if (self.pipeline_kv_cache_write) |*p| p.deinit();
         if (self.pipeline_kv_cache_write_batched) |*p| p.deinit();
         if (self.pipeline_residual_rms_norm) |*p| p.deinit();
