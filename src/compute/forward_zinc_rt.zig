@@ -1534,13 +1534,14 @@ const DirectComputeTracking = struct {
     selected_token: ?*u32 = null,
 };
 
-// Keep M1 benchmark runs exercising one consumed decode-phase model slice by
+// Keep M1 benchmark runs exercising consumed decode-phase model slices by
 // default. Repeated tracking is opt-in because the current T1 DMMV row-range
-// kernels are correctness-oriented serial kernels. The tracked slice also
-// consumes one SSM alpha/beta row range so a GPU-produced internal activation,
-// not only the terminal LM-head score, feeds the live decode step.
+// kernels are correctness-oriented serial kernels. Each tracked slice consumes
+// the terminal LM-head score plus a small SSM alpha/beta budget. F32
+// projections validate each row range against the CPU oracle; paired Q8_0
+// projections can use trust-after-success after the first passing pair.
 const direct_decode_model_slice_cadence_default: u32 = 0;
-const direct_ssm_q8_0_row_range_max_successes_default: u32 = 1;
+const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
