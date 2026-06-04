@@ -151,25 +151,46 @@ pub const PacketBuilder = struct {
         self.publishPkt3Header(start, .dispatch_direct, 4);
     }
 
-    /// Emit a minimal `RELEASE_MEM` fence that writes `value` to `gpu_addr`.
+    /// Emit a GFX10+ `RELEASE_MEM` end-of-pipe fence that writes `value` to
+    /// `gpu_addr` after prior shader work and global-memory writes complete.
     /// @param self Builder to append to.
     /// @param gpu_addr 64-bit GPU virtual address to receive the fence value.
     /// @param value Fence payload (typically a monotonically increasing seqno).
-    /// @note The event/data selector fields are zeroed; this is only intended
-    ///     for the bring-up gate, with real kernel validation deferred to the
-    ///     UMQ smoke path.
+    /// @note This uses the GFX10+ release-mem packet layout used by amdgpu for
+    ///     compute-ring fences; older ASICs are not a ZINC_RT direct target.
     pub fn releaseMemSignal(self: *PacketBuilder, gpu_addr: u64, value: u64) Error!void {
-        // Minimal fence signal packet shape used by the bring-up gate. The
-        // event/data selectors are intentionally conservative placeholders;
-        // kernel validation of executable streams happens in the UMQ smoke path.
-        const start = try self.reservePacket(6);
-        self.words[start + 1] = 0;
-        self.words[start + 2] = 0;
+        const cache_flush_and_inv_ts_event: u32 = 0x14;
+        const event_index_end_of_pipe: u32 = 5;
+        const gcr_glm_wb: u32 = 1 << 12;
+        const gcr_glm_inv: u32 = 1 << 13;
+        const gcr_glv_inv: u32 = 1 << 14;
+        const gcr_gl1_inv: u32 = 1 << 15;
+        const gcr_gl2_inv: u32 = 1 << 20;
+        const gcr_gl2_wb: u32 = 1 << 21;
+        const gcr_seq: u32 = 1 << 22;
+        const cache_policy_bypass: u32 = 3 << 25;
+        const event_dw = cache_flush_and_inv_ts_event |
+            (event_index_end_of_pipe << 8) |
+            gcr_glm_wb |
+            gcr_glm_inv |
+            gcr_glv_inv |
+            gcr_gl1_inv |
+            gcr_gl2_inv |
+            gcr_gl2_wb |
+            gcr_seq |
+            cache_policy_bypass;
+        const data_sel_64: u32 = 2 << 29;
+        const int_sel_none: u32 = 0 << 24;
+        const dst_sel_mc: u32 = 0 << 16;
+        const start = try self.reservePacket(7);
+        self.words[start + 1] = event_dw;
+        self.words[start + 2] = data_sel_64 | int_sel_none | dst_sel_mc;
         self.words[start + 3] = lo32(gpu_addr);
         self.words[start + 4] = hi32(gpu_addr);
         self.words[start + 5] = lo32(value);
         self.words[start + 6] = hi32(value);
-        self.publishPkt3Header(start, .release_mem, 6);
+        self.words[start + 7] = 0;
+        self.publishPkt3Header(start, .release_mem, 7);
     }
 
     /// Emit `WRITE_DATA` that stores `value` (64 bits) at `gpu_addr` via the
@@ -308,6 +329,23 @@ test "packet builder emits write-data memory signal" {
     try std.testing.expectEqual(@as(u32, 0x11223344), out[3]);
     try std.testing.expectEqual(@as(u32, 0x05060708), out[4]);
     try std.testing.expectEqual(@as(u32, 0x01020304), out[5]);
+}
+
+test "packet builder emits release-mem eop signal" {
+    var words = [_]u32{0} ** 8;
+    var builder = PacketBuilder.init(&words);
+    try builder.releaseMemSignal(0x11223344_aabbccdd, 0x01020304_05060708);
+
+    const out = builder.written();
+    try std.testing.expectEqual(@as(usize, 8), out.len);
+    try std.testing.expectEqual((@as(u32, 3) << 30) | (@as(u32, 6) << 16) | (@as(u32, 0x49) << 8), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x0670f514), out[1]);
+    try std.testing.expectEqual(@as(u32, 2 << 29), out[2]);
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), out[3]);
+    try std.testing.expectEqual(@as(u32, 0x11223344), out[4]);
+    try std.testing.expectEqual(@as(u32, 0x05060708), out[5]);
+    try std.testing.expectEqual(@as(u32, 0x01020304), out[6]);
+    try std.testing.expectEqual(@as(u32, 0), out[7]);
 }
 
 test "packet builder emits copy-data memory to memory dword" {

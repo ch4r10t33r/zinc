@@ -2712,6 +2712,74 @@ fn consumeDirectLmHeadQ4_0SelectedWindow(
     const window_bytes = window_rows_usize * row_bytes;
     if (window_off + window_bytes > q4_0_raw.len) return false;
 
+    if (window.rows > 1) parallel_window: {
+        const gpu_logits = state.row_scratch[0..window_rows_usize];
+        tracking.boundary.dmmvQ4_0RowRangeParallel(
+            state.norm,
+            q4_0_raw[window_off..][0..window_bytes],
+            window.rows,
+            cols,
+            gpu_logits,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-window parallel unavailable ({s}); retrying serial argmax window", .{@errorName(err)});
+            break :parallel_window;
+        };
+
+        var gpu_window_selection: ArgmaxTop2Result = .{};
+        for (gpu_logits, 0..) |gpu_value, i| {
+            if (!std.math.isFinite(gpu_value)) {
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-window parallel produced non-finite row {d}; retrying serial argmax window", .{window.start + @as(u32, @intCast(i))});
+                break :parallel_window;
+            }
+            gpu_window_selection.offer(window.start + @as(u32, @intCast(i)), gpu_value);
+        }
+
+        const absolute_best = gpu_window_selection.best;
+        const cpu_window_best = dotDirectTyped(.q4_0, q4_0_raw, absolute_best.index, cols, state.norm, null) catch {
+            break :parallel_window;
+        };
+        const delta = @abs(cpu_window_best - absolute_best.value);
+        if (delta > direct_lm_head_q4_0_best_row_tolerance) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-window parallel mismatch: row={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}; retrying serial argmax window", .{
+                absolute_best.index,
+                cpu_window_best,
+                absolute_best.value,
+                delta,
+            });
+            break :parallel_window;
+        }
+        if (absolute_best.index != selected.index) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-window parallel best row changed: source={s} selected={d} gpu_window_best={d}; retrying serial argmax window", .{
+                selected_source,
+                selected.index,
+                absolute_best.index,
+            });
+            break :parallel_window;
+        }
+
+        selected.value = absolute_best.value;
+        tracking.ops.* += 1;
+        mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+        tracking.consumed.* = true;
+        tracking.real_model_slice.* = true;
+        if (tracking.phase == .decode) {
+            if (tracking.decode_model_slices) |slices| slices.* += 1;
+        }
+        if (tracking.selected_token) |token| token.* = selected.index;
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_window_parallel phase={s} source={s} start_row={d} gpu_rows={d} cols={d} row={d} gpu={d:.6} abs_delta={d:.6} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
+            selected_source,
+            window.start,
+            window.rows,
+            cols,
+            selected.index,
+            absolute_best.value,
+            delta,
+        });
+        return true;
+    }
+
     const window_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
         state.norm,
         q4_0_raw[window_off..][0..window_bytes],
