@@ -1384,6 +1384,13 @@ pub const InferenceEngine = struct {
     partial_decode_stop_after_ffn_norm: bool = false,
     partial_decode_ffn_norm_out: ?vk.c.VkBuffer = null,
     partial_decode_ffn_norm_out_offset: vk.c.VkDeviceSize = 0,
+    // A3b production enablement: after a layer-major SSM segment writes
+    // post-SSM hidden plus its FFN-entry RMS norm into strided scratch
+    // buffers, resume decodeStep at the MoE/dense FFN body for that layer
+    // without re-running attention/SSM or recomputing ffn_norm.
+    partial_decode_resume_from_ffn_norm: bool = false,
+    partial_decode_ffn_norm_in: ?vk.c.VkBuffer = null,
+    partial_decode_ffn_norm_in_offset: vk.c.VkDeviceSize = 0,
     partial_decode_stop_after_ssm_gnorm: bool = false,
     partial_decode_ssm_gnorm_out: ?vk.c.VkBuffer = null,
     partial_decode_ssm_gnorm_out_offset: vk.c.VkDeviceSize = 0,
@@ -5285,13 +5292,18 @@ pub const InferenceEngine = struct {
                 self.endProfilePhase(.embed_upload, embed_phase);
             }
 
-            // --- Input RMS norm: hidden_buf → norm_buf ---
-            const attn_norm = lt.attn_norm orelse {
-                log.err("Layer {d}: attn_norm.weight not found", .{layer});
-                return error.TensorNotFound;
-            };
             const is_full_attn = ((layer + 1) % full_attn_interval == 0);
             const diag_last_prompt_token = collect_output and state.generated_tokens.items.len == 0 and config.architecture == .gpt_oss;
+            const resume_from_ffn_norm = self.partial_decode_resume_from_ffn_norm and
+                self.prefill_active and
+                layer == layer_start and
+                self.partial_decode_ffn_norm_in != null;
+
+            // --- Input RMS norm: hidden_buf → norm_buf ---
+            const attn_norm = if (!resume_from_ffn_norm) lt.attn_norm orelse {
+                log.err("Layer {d}: attn_norm.weight not found", .{layer});
+                return error.TensorNotFound;
+            } else null;
 
             // Fused SSM pre-norm fast path: collapse the per-SSM-layer
             // (rms_norm_mul → alpha DMMV → beta DMMV) trio into a single
@@ -5301,11 +5313,12 @@ pub const InferenceEngine = struct {
             // amortizing the rms recompute across the alpha+beta matvec
             // (combined M=2*dt_rank, very small → trivial cache pressure).
             const use_fused_ssm_pre_norm = blk: {
+                if (resume_from_ffn_norm) break :blk false;
                 if (!self.use_fused_ssm_pre_norm) break :blk false; // env-gated kill switch
                 if (is_full_attn) break :blk false;
                 if (self.elementwise.pipeline_rms_norm_dmmv_q4k_alpha_beta == null) break :blk false;
                 if ((hidden_dim % 4) != 0) break :blk false; // shader reads as f32 vec4
-                if (attn_norm.info.type_ != .f32) break :blk false; // shader reads attn_norm as f32 vec4
+                if (attn_norm.?.info.type_ != .f32) break :blk false; // shader reads attn_norm as f32 vec4
                 const at = lt.ssm_alpha orelse break :blk false;
                 const bt = lt.ssm_beta orelse break :blk false;
                 // Qwen 3.6 35B-A3B Q4_K_XL ships these as f32 (see
@@ -5323,433 +5336,306 @@ pub const InferenceEngine = struct {
                 break :blk true;
             };
 
-            if (!use_fused_ssm_pre_norm) {
-                try self.dispatchRmsNorm(
-                    self.hidden_buf.handle,
-                    hidden_size,
-                    attn_norm.gpu_buffer.handle,
-                    attn_norm.gpu_buffer.size,
-                    self.norm_buf.handle,
-                    hidden_size,
-                    hidden_dim,
-                    1,
-                    rms_norm_eps,
-                );
-                self.decode_cmd.computeBarrier();
-            }
-
-            if (is_full_attn) {
-                const attention_phase = self.beginProfilePhase();
-                // === FULL ATTENTION LAYER ===
-                // Q/gate projection → Q/K norm → K/V proj → RoPE → KV cache → flash attention
-                // → sigmoid gate → output projection → residual
-
-                // Prefill last-layer dead-tail detector: for non-terminal prompt tokens
-                // on the final layer, only the KV cache write survives into the next
-                // token's forward pass. Q/gate/flash_attn/sigmoid_mul/O-proj/residual
-                // all feed hidden_buf, which the next prompt token overwrites via its
-                // layer-0 embed copy. Guard the Q path and the post-KV tail with this
-                // flag; K/V projection + K norm/RoPE + KV write still run so the next
-                // token's attention sees coherent KV state.
-                const is_dead_attn_tail = self.prefill_active and !collect_output and layer + 1 == config.n_layers;
-
-                const q_tensor = lt.attn_q orelse return error.TensorNotFound;
-                const k_tensor = lt.attn_k orelse return error.TensorNotFound;
-                // Gemma 4 global attention layers share K as V (no separate attn_v tensor).
-                const use_k_as_v = lt.attn_v == null and config.architecture == .gemma;
-                const v_tensor = lt.attn_v orelse if (use_k_as_v) k_tensor else return error.TensorNotFound;
-                const o_tensor = lt.attn_output orelse return error.TensorNotFound;
-                const attn_gate_tensor = lt.attn_gate;
-                const q_rows: u32 = @intCast(q_tensor.info.numElements() / hidden_dim);
-                const k_rows: u32 = @intCast(k_tensor.info.numElements() / hidden_dim);
-                const v_rows: u32 = @intCast(v_tensor.info.numElements() / hidden_dim);
-                const o_cols: u32 = @intCast(o_tensor.info.numElements() / hidden_dim);
-
-                // Derive per-layer head_dim from Q/K norm tensor or K tensor shape.
-                // Gemma 4 has mixed dimensions: SWA layers use head_dim=256, global use 512.
-                const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
-                    @intCast(qn.info.numElements())
-                else if (lt.attn_k_norm) |kn|
-                    @intCast(kn.info.numElements())
-                else
-                    config.head_dim;
-                const layer_kv_dim: u32 = k_rows;
-                const layer_n_kv_heads: u32 = if (layer_head_dim > 0) layer_kv_dim / layer_head_dim else config.n_kv_heads;
-                const layer_kv_vec_size = @as(vk.c.VkDeviceSize, layer_kv_dim) * @sizeOf(f32);
-                // Gemma 4 proportional RoPE: global attention layers (use_k_as_v) rotate
-                // the full head_dim using precomputed rope_freqs.weight frequencies.
-                const proportional_rope = config.architecture == .gemma and use_k_as_v;
-                const layer_rope_dim: u32 = if (proportional_rope)
-                    layer_head_dim
-                else
-                    @min(if (config.rope_dim > 0) config.rope_dim else layer_head_dim, layer_head_dim);
-
-                const packed_q_gate = q_rows == q_dim * 2;
-                const separate_attn_gate = q_rows == q_dim and attn_gate_tensor != null;
-                const apply_attn_gate = packed_q_gate or separate_attn_gate;
-                if (state.position == 0 and layer == full_attn_interval - 1) {
-                    log.debug("ATTN_Q layout L{d}: q_rows={d} k_rows={d} v_rows={d} o_cols={d} q_dim={d} kv_dim={d} packed_q_gate={} separate_gate={} gate_tensor={} apply_attn_gate={}", .{
-                        layer,
-                        q_rows,
-                        k_rows,
-                        v_rows,
-                        o_cols,
-                        q_dim,
-                        kv_dim,
-                        packed_q_gate,
-                        separate_attn_gate,
-                        attn_gate_tensor != null,
-                        apply_attn_gate,
-                    });
-                }
-
-                if (packed_q_gate) {
-                    // Qwen3Next packs per-head [Q(head_dim), gate(head_dim)] blocks.
-                    // Project into a temporary buffer and split each head block out.
-                    // Skip when the dead-tail guard is set: attn_out_buf is only read by
-                    // the subsequent deinterleave + flash_attn chain, all of which is
-                    // gated below.
-                    if (!is_dead_attn_tail) {
-                        try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.attn_out_buf, q_rows, hidden_dim);
-                    }
-                } else {
-                    // Dense qwen35 may store Q and gate as separate tensors.
-                    // Use q_rows (tensor shape) not q_dim (config) — Gemma 4 mixed head_dim.
-                    // Skip Q and gate DMMVs when the dead-tail guard is set: q_buf and
-                    // gate_buf only feed flash_attn / sigmoid_mul, which also get skipped.
-                    if (!is_dead_attn_tail) {
-                        try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.q_buf, q_rows, hidden_dim);
-                        if (attn_gate_tensor) |gate_tensor| {
-                            try self.dispatchDmmv(gate_tensor, self.norm_buf, hidden_size, self.gate_buf, q_rows, hidden_dim);
-                        }
-                    }
-                }
-                try self.dispatchDmmv(k_tensor, self.norm_buf, hidden_size, self.k_buf, k_rows, hidden_dim);
-                // Gemma full-attn layers (use_k_as_v) have v_tensor == k_tensor; the
-                // V projection would be a second DMMV reading the same Q4_K weights
-                // from DRAM. Skip it and let the Gemma V unit-norm below read from
-                // k_buf (raw K projection) and write into v_buf, fusing the K→V
-                // copy with the norm. Saves one DMMV per full-attn layer.
-                //
-                // Note: cycle 35 of effort-6 measured K+V fusion via the
-                // dmmv_q4k_fused_gate_up pipeline (single dispatch, two
-                // weight reads, one shared input read) at 8+8 interleaved
-                // samples on Qwen 3.6 35B-A3B Q4_K_XL: flag-on mean 82.55
-                // / median 82.92 vs flag-off mean 82.57 / median 82.84
-                // (delta within noise band on this hybrid SSM+attention
-                // model). The full-attention layers are a small fraction
-                // of total prefill time (attention bucket ≈ 21%), the K/V
-                // dispatches already overlap on RDNA4 within that bucket,
-                // and the norm_buf re-read amortizes through L2. Avoid
-                // re-attempting K+V fusion on this model class without
-                // first changing one of those three premises.
-                if (!use_k_as_v) {
-                    try self.dispatchDmmv(v_tensor, self.norm_buf, hidden_size, self.v_buf, v_rows, hidden_dim);
-                }
-                if (packed_q_gate) {
-                    // Wait for all DMMV outputs (Q+gate, K, V) before deinterleave
-                    self.decode_cmd.computeBarrier();
-                    // Deinterleave Q+gate using compute shader instead of per-head buffer copies.
-                    // Replaces computeToTransfer + n_heads*2 vkCmdCopyBuffer + transferToCompute
-                    // with a single compute dispatch, avoiding transfer stage overhead.
-                    {
-                        const pip = &(self.elementwise.pipeline_deinterleave orelse return error.ShaderNotLoaded);
-                        const total = layer_head_dim * config.n_heads;
-                        const q_full_size = @as(vk.c.VkDeviceSize, q_dim * 2) * @sizeOf(f32);
-                        const q_size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32);
-                        if (pip.uses_push_descriptors) {
-                            const push = DeinterleavePush{
-                                .head_dim = layer_head_dim,
-                                .n_heads = config.n_heads,
-                            };
-                            self.pushDispatch3(
-                                pip,
-                                std.mem.asBytes(&push),
-                                self.attn_out_buf.handle,
-                                q_full_size,
-                                self.q_buf.handle,
-                                q_size,
-                                self.gate_buf.handle,
-                                q_size,
-                                (total + 63) / 64,
-                                1,
-                                1,
-                            );
-                        } else {
-                            const ds = try self.allocDescSet(pip.descriptor_set_layout);
-                            self.writeDescSet3(ds, self.attn_out_buf.handle, q_full_size, self.q_buf.handle, q_size, self.gate_buf.handle, q_size);
-                            try self.elementwise.recordDeinterleave(&self.decode_cmd, ds, layer_head_dim, config.n_heads);
-                        }
-                    }
-                    self.decode_cmd.computeBarrier();
-                } else {
-                    self.decode_cmd.computeBarrier();
-                }
-
-                if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
-                    if (lt.attn_q_bias) |bias| {
-                        // Skip Q bias for dead-tail tokens: Q only feeds flash_attn
-                        // which is also skipped.
-                        if (!is_dead_attn_tail) {
-                            try self.dispatchBiasAdd(self.q_buf.handle, self.q_buf.size, bias, q_dim);
-                        }
-                    }
-                    if (lt.attn_k_bias) |bias| {
-                        try self.dispatchBiasAdd(self.k_buf.handle, self.k_buf.size, bias, kv_dim);
-                    }
-                    if (!use_k_as_v) {
-                        if (lt.attn_v_bias) |bias| {
-                            try self.dispatchBiasAdd(self.v_buf.handle, self.v_buf.size, bias, kv_dim);
-                        }
-                    }
-                    self.decode_cmd.computeBarrier();
-                }
-
-                // Bug fix #1: Q/K normalization (per-head RMS norm)
-                // attn_q_norm and attn_k_norm are per-head norms with head_dim weights
-                const q_norm_tensor = lt.attn_q_norm;
-                const k_norm_tensor = lt.attn_k_norm;
-                if (state.position == 0 and layer == full_attn_interval - 1) {
-                    log.debug("ATTN_NORM layout L{d}: q_norm_elems={d} k_norm_elems={d} q_norm_type={s} k_norm_type={s} head_dim={d} n_heads={d} n_kv_heads={d}", .{
-                        layer,
-                        if (q_norm_tensor) |qn| qn.info.numElements() else 0,
-                        if (k_norm_tensor) |kn| kn.info.numElements() else 0,
-                        if (q_norm_tensor) |qn| @tagName(qn.info.type_) else "none",
-                        if (k_norm_tensor) |kn| @tagName(kn.info.type_) else "none",
-                        config.head_dim,
-                        config.n_heads,
-                        config.n_kv_heads,
-                    });
-                    if (self.validation_diagnostics_enabled) {
-                        const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                        if (lt.attn_norm) |attn_norm_tensor| {
-                            var attn_norm_preview = [_]f32{0} ** 4;
-                            const n = @min(attn_norm_tensor.info.numElements(), attn_norm_preview.len);
-                            const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + attn_norm_tensor.info.offset);
-                            readMmapFloats(mmap, off, attn_norm_tensor.info.type_, attn_norm_preview[0..n]);
-                            log.info("ATTN_NORM_WEIGHTS L{d}: attn_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                                layer,
-                                attn_norm_preview[0],
-                                attn_norm_preview[1],
-                                attn_norm_preview[2],
-                                attn_norm_preview[3],
-                            });
-                        }
-                        if (q_norm_tensor) |qn| {
-                            var q_norm_preview = [_]f32{0} ** 4;
-                            const n = @min(qn.info.numElements(), q_norm_preview.len);
-                            const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + qn.info.offset);
-                            readMmapFloats(mmap, off, qn.info.type_, q_norm_preview[0..n]);
-                            log.info("ATTN_NORM_WEIGHTS L{d}: q_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                                layer,
-                                q_norm_preview[0],
-                                q_norm_preview[1],
-                                q_norm_preview[2],
-                                q_norm_preview[3],
-                            });
-                        }
-                        if (k_norm_tensor) |kn| {
-                            var k_norm_preview = [_]f32{0} ** 4;
-                            const n = @min(kn.info.numElements(), k_norm_preview.len);
-                            const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + kn.info.offset);
-                            readMmapFloats(mmap, off, kn.info.type_, k_norm_preview[0..n]);
-                            log.info("ATTN_NORM_WEIGHTS L{d}: k_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                                layer,
-                                k_norm_preview[0],
-                                k_norm_preview[1],
-                                k_norm_preview[2],
-                                k_norm_preview[3],
-                            });
-                        }
-                    }
-                }
-                // Bug fix #5+#6: IMRoPE — only rotate rope_dim of head_dim dimensions
-                // IMROPE: use precomputed per-pair frequencies when sections are present
-                const use_imrope = config.rope_sections[0] > 0 or config.rope_sections[1] > 0;
-                // Gemma 4 SWA layers use a different RoPE frequency base than global layers.
-                // Global layers use precomputed frequencies (with rope_freqs.weight factors).
-                const use_swa_rope = config.architecture == .gemma and config.rope_freq_base_swa > 0 and layer_head_dim < config.head_dim;
-                const use_yarn_rope = hasYarnScaling(config);
-                // Use precomputed frequency buffer when the host has already baked in
-                // per-dimension frequency corrections (IMROPE, Gemma proportional RoPE, YaRN).
-                const use_precomputed_freq = use_imrope or (proportional_rope and !use_swa_rope) or use_yarn_rope;
-                const rope_freq: f32 = if (use_precomputed_freq) 0.0 else if (use_swa_rope) config.rope_freq_base_swa else config.rope_freq_base;
-                const freq_buf_handle = if (use_precomputed_freq) self.rope_freq_buf.handle else null;
-                const rope_attn_scale = if (use_yarn_rope) effectiveRopeAttnScale(config) else 1.0;
-
-                // Fused norm+rope: when both norm and rope are needed, combine them into
-                // a single dispatch per head set, eliminating 1 barrier + 2 dispatches.
-                const use_fused_norm_rope = self.elementwise.pipeline_norm_rope != null;
-                // q_rope_done starts true for dead-tail tokens so the standalone Q RoPE
-                // dispatches below (both push-descriptor and transfer-fallback branches)
-                // are suppressed — q_buf only feeds flash_attn / sigmoid_mul / O_proj,
-                // all of which are also skipped by the dead-tail guard further down.
-                // Cycle 20 only handled the q_norm_tensor branch; models without a
-                // separate attn_q_norm tensor (e.g. Qwen3.5 mamba-hybrid) still ran
-                // Q RoPE for every non-terminal prompt token at the last full-attn layer.
-                var q_rope_done = is_dead_attn_tail;
-                var k_rope_done = false;
-
-                // Effort-11 cycle-12: fused Q+K norm+rope + KV cache write
-                // path. Single dispatch absorbs the (Q norm+rope → K norm+rope
-                // → kv_cache_write) trio when all per-call gates pass. Saves
-                // 2 dispatches + 1 global compute barrier per attention layer.
-                const physical_token_for_fused = if (self.use_fused_qk_kv)
-                    self.physicalTokenIndex(state.position) catch null
-                else
-                    null;
-                const fused_qk_kv_base_eligible = self.use_fused_qk_kv and
-                    self.elementwise.pipeline_qk_norm_rope_kv_write != null and
-                    q_norm_tensor != null and
-                    k_norm_tensor != null and
-                    !packed_q_gate and
-                    !is_dead_attn_tail and
-                    !(state.position == 0 and self.validation_diagnostics_enabled) and
-                    physical_token_for_fused != null;
-                const gemma_v_unit_norm_needed =
-                    config.architecture == .gemma and config.rope_freq_base_swa > 0;
-                const gemma_v_norm_in_fused =
-                    fused_qk_kv_base_eligible and gemma_v_unit_norm_needed;
-
-                // Gemma use_k_as_v optimization: V unit-norm reads the RAW K
-                // projection. If the fused Q/K/KV shader is active, it can
-                // normalize V directly while writing kv_v; otherwise this must
-                // run before K norm overwrites k_buf.
-                const apply_v_unit_norm_early = use_k_as_v and
-                    gemma_v_unit_norm_needed and
-                    !gemma_v_norm_in_fused;
-                if (apply_v_unit_norm_early) {
+            if (!resume_from_ffn_norm) {
+                if (!use_fused_ssm_pre_norm) {
                     try self.dispatchRmsNorm(
-                        self.k_buf.handle,
-                        self.k_buf.size,
-                        self.unit_norm_weights.handle,
-                        self.unit_norm_weights.size,
-                        self.v_buf.handle,
-                        self.v_buf.size,
-                        layer_head_dim,
-                        layer_n_kv_heads,
+                        self.hidden_buf.handle,
+                        hidden_size,
+                        attn_norm.?.gpu_buffer.handle,
+                        attn_norm.?.gpu_buffer.size,
+                        self.norm_buf.handle,
+                        hidden_size,
+                        hidden_dim,
+                        1,
                         rms_norm_eps,
                     );
                     self.decode_cmd.computeBarrier();
                 }
 
-                const fused_qk_kv_eligible = fused_qk_kv_base_eligible;
+                if (is_full_attn) {
+                    const attention_phase = self.beginProfilePhase();
+                    // === FULL ATTENTION LAYER ===
+                    // Q/gate projection → Q/K norm → K/V proj → RoPE → KV cache → flash attention
+                    // → sigmoid gate → output projection → residual
 
-                if (fused_qk_kv_eligible) {
-                    const qn = q_norm_tensor.?;
-                    const kn = k_norm_tensor.?;
-                    const dst_offset_floats: u32 = physical_token_for_fused.? * layer_kv_dim;
-                    const v_src_for_fused = if (gemma_v_norm_in_fused and use_k_as_v) self.k_buf else self.v_buf;
-                    self.dispatchQkNormRopeKvWrite(
-                        self.q_buf.handle,
-                        self.q_buf.size,
-                        qn.gpu_buffer.handle,
-                        qn.gpu_buffer.size,
-                        self.k_buf.handle,
-                        self.k_buf.size,
-                        kn.gpu_buffer.handle,
-                        kn.gpu_buffer.size,
-                        freq_buf_handle,
-                        self.rope_freq_buf.size,
-                        self.kv_k_cache[layer_idx].handle,
-                        self.kv_k_cache[layer_idx].size,
-                        v_src_for_fused.handle,
-                        v_src_for_fused.size,
-                        self.kv_v_cache[layer_idx].handle,
-                        self.kv_v_cache[layer_idx].size,
-                        layer_head_dim,
-                        layer_rope_dim,
-                        config.n_heads,
-                        layer_n_kv_heads,
-                        state.position,
-                        rope_freq,
-                        rope_attn_scale,
-                        rms_norm_eps,
-                        dst_offset_floats,
-                        gemma_v_norm_in_fused,
-                    );
-                    self.decode_cmd.computeBarrier();
-                    q_rope_done = true;
-                    k_rope_done = true;
-                } else if (q_norm_tensor) |qn| {
-                    // Skip Q norm/RoPE for dead-tail tokens: q_buf only feeds flash_attn.
-                    // Still mark q_rope_done=true so the fallback-path Q RoPE below is
-                    // also skipped (avoids reading stale q_buf).
-                    if (is_dead_attn_tail) {
-                        q_rope_done = true;
-                    } else if (use_fused_norm_rope) {
-                        // Fused Q norm + Q RoPE in a single dispatch
-                        self.dispatchNormRopeInPlace(
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            qn.gpu_buffer.handle,
-                            qn.gpu_buffer.size,
-                            freq_buf_handle,
-                            self.rope_freq_buf.size,
-                            layer_head_dim,
-                            layer_rope_dim,
-                            config.n_heads,
-                            state.position,
-                            rope_freq,
-                            rope_attn_scale,
-                            rms_norm_eps,
-                        );
-                        q_rope_done = true;
-                    } else {
-                        try self.dispatchRmsNorm(
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            qn.gpu_buffer.handle,
-                            qn.gpu_buffer.size,
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            layer_head_dim,
-                            config.n_heads,
-                            rms_norm_eps,
-                        );
+                    // Prefill last-layer dead-tail detector: for non-terminal prompt tokens
+                    // on the final layer, only the KV cache write survives into the next
+                    // token's forward pass. Q/gate/flash_attn/sigmoid_mul/O-proj/residual
+                    // all feed hidden_buf, which the next prompt token overwrites via its
+                    // layer-0 embed copy. Guard the Q path and the post-KV tail with this
+                    // flag; K/V projection + K norm/RoPE + KV write still run so the next
+                    // token's attention sees coherent KV state.
+                    const is_dead_attn_tail = self.prefill_active and !collect_output and layer + 1 == config.n_layers;
+
+                    const q_tensor = lt.attn_q orelse return error.TensorNotFound;
+                    const k_tensor = lt.attn_k orelse return error.TensorNotFound;
+                    // Gemma 4 global attention layers share K as V (no separate attn_v tensor).
+                    const use_k_as_v = lt.attn_v == null and config.architecture == .gemma;
+                    const v_tensor = lt.attn_v orelse if (use_k_as_v) k_tensor else return error.TensorNotFound;
+                    const o_tensor = lt.attn_output orelse return error.TensorNotFound;
+                    const attn_gate_tensor = lt.attn_gate;
+                    const q_rows: u32 = @intCast(q_tensor.info.numElements() / hidden_dim);
+                    const k_rows: u32 = @intCast(k_tensor.info.numElements() / hidden_dim);
+                    const v_rows: u32 = @intCast(v_tensor.info.numElements() / hidden_dim);
+                    const o_cols: u32 = @intCast(o_tensor.info.numElements() / hidden_dim);
+
+                    // Derive per-layer head_dim from Q/K norm tensor or K tensor shape.
+                    // Gemma 4 has mixed dimensions: SWA layers use head_dim=256, global use 512.
+                    const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+                        @intCast(qn.info.numElements())
+                    else if (lt.attn_k_norm) |kn|
+                        @intCast(kn.info.numElements())
+                    else
+                        config.head_dim;
+                    const layer_kv_dim: u32 = k_rows;
+                    const layer_n_kv_heads: u32 = if (layer_head_dim > 0) layer_kv_dim / layer_head_dim else config.n_kv_heads;
+                    const layer_kv_vec_size = @as(vk.c.VkDeviceSize, layer_kv_dim) * @sizeOf(f32);
+                    // Gemma 4 proportional RoPE: global attention layers (use_k_as_v) rotate
+                    // the full head_dim using precomputed rope_freqs.weight frequencies.
+                    const proportional_rope = config.architecture == .gemma and use_k_as_v;
+                    const layer_rope_dim: u32 = if (proportional_rope)
+                        layer_head_dim
+                    else
+                        @min(if (config.rope_dim > 0) config.rope_dim else layer_head_dim, layer_head_dim);
+
+                    const packed_q_gate = q_rows == q_dim * 2;
+                    const separate_attn_gate = q_rows == q_dim and attn_gate_tensor != null;
+                    const apply_attn_gate = packed_q_gate or separate_attn_gate;
+                    if (state.position == 0 and layer == full_attn_interval - 1) {
+                        log.debug("ATTN_Q layout L{d}: q_rows={d} k_rows={d} v_rows={d} o_cols={d} q_dim={d} kv_dim={d} packed_q_gate={} separate_gate={} gate_tensor={} apply_attn_gate={}", .{
+                            layer,
+                            q_rows,
+                            k_rows,
+                            v_rows,
+                            o_cols,
+                            q_dim,
+                            kv_dim,
+                            packed_q_gate,
+                            separate_attn_gate,
+                            attn_gate_tensor != null,
+                            apply_attn_gate,
+                        });
                     }
-                }
-                if (!fused_qk_kv_eligible) {
-                    if (k_norm_tensor) |kn| {
-                        if (use_fused_norm_rope) {
-                            // Fused K norm + K RoPE in a single dispatch
-                            self.dispatchNormRopeInPlace(
-                                self.k_buf.handle,
-                                self.k_buf.size,
-                                kn.gpu_buffer.handle,
-                                kn.gpu_buffer.size,
-                                freq_buf_handle,
-                                self.rope_freq_buf.size,
-                                layer_head_dim,
-                                layer_rope_dim,
-                                layer_n_kv_heads,
-                                state.position,
-                                rope_freq,
-                                rope_attn_scale,
-                                rms_norm_eps,
-                            );
-                            k_rope_done = true;
-                        } else {
-                            try self.dispatchRmsNorm(
-                                self.k_buf.handle,
-                                self.k_buf.size,
-                                kn.gpu_buffer.handle,
-                                kn.gpu_buffer.size,
-                                self.k_buf.handle,
-                                self.k_buf.size,
-                                layer_head_dim,
-                                layer_n_kv_heads,
-                                rms_norm_eps,
-                            );
+
+                    if (packed_q_gate) {
+                        // Qwen3Next packs per-head [Q(head_dim), gate(head_dim)] blocks.
+                        // Project into a temporary buffer and split each head block out.
+                        // Skip when the dead-tail guard is set: attn_out_buf is only read by
+                        // the subsequent deinterleave + flash_attn chain, all of which is
+                        // gated below.
+                        if (!is_dead_attn_tail) {
+                            try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.attn_out_buf, q_rows, hidden_dim);
+                        }
+                    } else {
+                        // Dense qwen35 may store Q and gate as separate tensors.
+                        // Use q_rows (tensor shape) not q_dim (config) — Gemma 4 mixed head_dim.
+                        // Skip Q and gate DMMVs when the dead-tail guard is set: q_buf and
+                        // gate_buf only feed flash_attn / sigmoid_mul, which also get skipped.
+                        if (!is_dead_attn_tail) {
+                            try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.q_buf, q_rows, hidden_dim);
+                            if (attn_gate_tensor) |gate_tensor| {
+                                try self.dispatchDmmv(gate_tensor, self.norm_buf, hidden_size, self.gate_buf, q_rows, hidden_dim);
+                            }
                         }
                     }
-                    // Gemma 4 applies plain RMS norm (unit weights) to V per-head.
-                    // Mirrors Metal forward_metal.zig:3460-3462. For use_k_as_v
-                    // layers this already ran ahead of Q/K norms above — skip here.
-                    if (config.architecture == .gemma and config.rope_freq_base_swa > 0 and !apply_v_unit_norm_early) {
+                    try self.dispatchDmmv(k_tensor, self.norm_buf, hidden_size, self.k_buf, k_rows, hidden_dim);
+                    // Gemma full-attn layers (use_k_as_v) have v_tensor == k_tensor; the
+                    // V projection would be a second DMMV reading the same Q4_K weights
+                    // from DRAM. Skip it and let the Gemma V unit-norm below read from
+                    // k_buf (raw K projection) and write into v_buf, fusing the K→V
+                    // copy with the norm. Saves one DMMV per full-attn layer.
+                    //
+                    // Note: cycle 35 of effort-6 measured K+V fusion via the
+                    // dmmv_q4k_fused_gate_up pipeline (single dispatch, two
+                    // weight reads, one shared input read) at 8+8 interleaved
+                    // samples on Qwen 3.6 35B-A3B Q4_K_XL: flag-on mean 82.55
+                    // / median 82.92 vs flag-off mean 82.57 / median 82.84
+                    // (delta within noise band on this hybrid SSM+attention
+                    // model). The full-attention layers are a small fraction
+                    // of total prefill time (attention bucket ≈ 21%), the K/V
+                    // dispatches already overlap on RDNA4 within that bucket,
+                    // and the norm_buf re-read amortizes through L2. Avoid
+                    // re-attempting K+V fusion on this model class without
+                    // first changing one of those three premises.
+                    if (!use_k_as_v) {
+                        try self.dispatchDmmv(v_tensor, self.norm_buf, hidden_size, self.v_buf, v_rows, hidden_dim);
+                    }
+                    if (packed_q_gate) {
+                        // Wait for all DMMV outputs (Q+gate, K, V) before deinterleave
+                        self.decode_cmd.computeBarrier();
+                        // Deinterleave Q+gate using compute shader instead of per-head buffer copies.
+                        // Replaces computeToTransfer + n_heads*2 vkCmdCopyBuffer + transferToCompute
+                        // with a single compute dispatch, avoiding transfer stage overhead.
+                        {
+                            const pip = &(self.elementwise.pipeline_deinterleave orelse return error.ShaderNotLoaded);
+                            const total = layer_head_dim * config.n_heads;
+                            const q_full_size = @as(vk.c.VkDeviceSize, q_dim * 2) * @sizeOf(f32);
+                            const q_size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32);
+                            if (pip.uses_push_descriptors) {
+                                const push = DeinterleavePush{
+                                    .head_dim = layer_head_dim,
+                                    .n_heads = config.n_heads,
+                                };
+                                self.pushDispatch3(
+                                    pip,
+                                    std.mem.asBytes(&push),
+                                    self.attn_out_buf.handle,
+                                    q_full_size,
+                                    self.q_buf.handle,
+                                    q_size,
+                                    self.gate_buf.handle,
+                                    q_size,
+                                    (total + 63) / 64,
+                                    1,
+                                    1,
+                                );
+                            } else {
+                                const ds = try self.allocDescSet(pip.descriptor_set_layout);
+                                self.writeDescSet3(ds, self.attn_out_buf.handle, q_full_size, self.q_buf.handle, q_size, self.gate_buf.handle, q_size);
+                                try self.elementwise.recordDeinterleave(&self.decode_cmd, ds, layer_head_dim, config.n_heads);
+                            }
+                        }
+                        self.decode_cmd.computeBarrier();
+                    } else {
+                        self.decode_cmd.computeBarrier();
+                    }
+
+                    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
+                        if (lt.attn_q_bias) |bias| {
+                            // Skip Q bias for dead-tail tokens: Q only feeds flash_attn
+                            // which is also skipped.
+                            if (!is_dead_attn_tail) {
+                                try self.dispatchBiasAdd(self.q_buf.handle, self.q_buf.size, bias, q_dim);
+                            }
+                        }
+                        if (lt.attn_k_bias) |bias| {
+                            try self.dispatchBiasAdd(self.k_buf.handle, self.k_buf.size, bias, kv_dim);
+                        }
+                        if (!use_k_as_v) {
+                            if (lt.attn_v_bias) |bias| {
+                                try self.dispatchBiasAdd(self.v_buf.handle, self.v_buf.size, bias, kv_dim);
+                            }
+                        }
+                        self.decode_cmd.computeBarrier();
+                    }
+
+                    // Bug fix #1: Q/K normalization (per-head RMS norm)
+                    // attn_q_norm and attn_k_norm are per-head norms with head_dim weights
+                    const q_norm_tensor = lt.attn_q_norm;
+                    const k_norm_tensor = lt.attn_k_norm;
+                    if (state.position == 0 and layer == full_attn_interval - 1) {
+                        log.debug("ATTN_NORM layout L{d}: q_norm_elems={d} k_norm_elems={d} q_norm_type={s} k_norm_type={s} head_dim={d} n_heads={d} n_kv_heads={d}", .{
+                            layer,
+                            if (q_norm_tensor) |qn| qn.info.numElements() else 0,
+                            if (k_norm_tensor) |kn| kn.info.numElements() else 0,
+                            if (q_norm_tensor) |qn| @tagName(qn.info.type_) else "none",
+                            if (k_norm_tensor) |kn| @tagName(kn.info.type_) else "none",
+                            config.head_dim,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        });
+                        if (self.validation_diagnostics_enabled) {
+                            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                            if (lt.attn_norm) |attn_norm_tensor| {
+                                var attn_norm_preview = [_]f32{0} ** 4;
+                                const n = @min(attn_norm_tensor.info.numElements(), attn_norm_preview.len);
+                                const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + attn_norm_tensor.info.offset);
+                                readMmapFloats(mmap, off, attn_norm_tensor.info.type_, attn_norm_preview[0..n]);
+                                log.info("ATTN_NORM_WEIGHTS L{d}: attn_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                                    layer,
+                                    attn_norm_preview[0],
+                                    attn_norm_preview[1],
+                                    attn_norm_preview[2],
+                                    attn_norm_preview[3],
+                                });
+                            }
+                            if (q_norm_tensor) |qn| {
+                                var q_norm_preview = [_]f32{0} ** 4;
+                                const n = @min(qn.info.numElements(), q_norm_preview.len);
+                                const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + qn.info.offset);
+                                readMmapFloats(mmap, off, qn.info.type_, q_norm_preview[0..n]);
+                                log.info("ATTN_NORM_WEIGHTS L{d}: q_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                                    layer,
+                                    q_norm_preview[0],
+                                    q_norm_preview[1],
+                                    q_norm_preview[2],
+                                    q_norm_preview[3],
+                                });
+                            }
+                            if (k_norm_tensor) |kn| {
+                                var k_norm_preview = [_]f32{0} ** 4;
+                                const n = @min(kn.info.numElements(), k_norm_preview.len);
+                                const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + kn.info.offset);
+                                readMmapFloats(mmap, off, kn.info.type_, k_norm_preview[0..n]);
+                                log.info("ATTN_NORM_WEIGHTS L{d}: k_norm[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                                    layer,
+                                    k_norm_preview[0],
+                                    k_norm_preview[1],
+                                    k_norm_preview[2],
+                                    k_norm_preview[3],
+                                });
+                            }
+                        }
+                    }
+                    // Bug fix #5+#6: IMRoPE — only rotate rope_dim of head_dim dimensions
+                    // IMROPE: use precomputed per-pair frequencies when sections are present
+                    const use_imrope = config.rope_sections[0] > 0 or config.rope_sections[1] > 0;
+                    // Gemma 4 SWA layers use a different RoPE frequency base than global layers.
+                    // Global layers use precomputed frequencies (with rope_freqs.weight factors).
+                    const use_swa_rope = config.architecture == .gemma and config.rope_freq_base_swa > 0 and layer_head_dim < config.head_dim;
+                    const use_yarn_rope = hasYarnScaling(config);
+                    // Use precomputed frequency buffer when the host has already baked in
+                    // per-dimension frequency corrections (IMROPE, Gemma proportional RoPE, YaRN).
+                    const use_precomputed_freq = use_imrope or (proportional_rope and !use_swa_rope) or use_yarn_rope;
+                    const rope_freq: f32 = if (use_precomputed_freq) 0.0 else if (use_swa_rope) config.rope_freq_base_swa else config.rope_freq_base;
+                    const freq_buf_handle = if (use_precomputed_freq) self.rope_freq_buf.handle else null;
+                    const rope_attn_scale = if (use_yarn_rope) effectiveRopeAttnScale(config) else 1.0;
+
+                    // Fused norm+rope: when both norm and rope are needed, combine them into
+                    // a single dispatch per head set, eliminating 1 barrier + 2 dispatches.
+                    const use_fused_norm_rope = self.elementwise.pipeline_norm_rope != null;
+                    // q_rope_done starts true for dead-tail tokens so the standalone Q RoPE
+                    // dispatches below (both push-descriptor and transfer-fallback branches)
+                    // are suppressed — q_buf only feeds flash_attn / sigmoid_mul / O_proj,
+                    // all of which are also skipped by the dead-tail guard further down.
+                    // Cycle 20 only handled the q_norm_tensor branch; models without a
+                    // separate attn_q_norm tensor (e.g. Qwen3.5 mamba-hybrid) still ran
+                    // Q RoPE for every non-terminal prompt token at the last full-attn layer.
+                    var q_rope_done = is_dead_attn_tail;
+                    var k_rope_done = false;
+
+                    // Effort-11 cycle-12: fused Q+K norm+rope + KV cache write
+                    // path. Single dispatch absorbs the (Q norm+rope → K norm+rope
+                    // → kv_cache_write) trio when all per-call gates pass. Saves
+                    // 2 dispatches + 1 global compute barrier per attention layer.
+                    const physical_token_for_fused = if (self.use_fused_qk_kv)
+                        self.physicalTokenIndex(state.position) catch null
+                    else
+                        null;
+                    const fused_qk_kv_base_eligible = self.use_fused_qk_kv and
+                        self.elementwise.pipeline_qk_norm_rope_kv_write != null and
+                        q_norm_tensor != null and
+                        k_norm_tensor != null and
+                        !packed_q_gate and
+                        !is_dead_attn_tail and
+                        !(state.position == 0 and self.validation_diagnostics_enabled) and
+                        physical_token_for_fused != null;
+                    const gemma_v_unit_norm_needed =
+                        config.architecture == .gemma and config.rope_freq_base_swa > 0;
+                    const gemma_v_norm_in_fused =
+                        fused_qk_kv_base_eligible and gemma_v_unit_norm_needed;
+
+                    // Gemma use_k_as_v optimization: V unit-norm reads the RAW K
+                    // projection. If the fused Q/K/KV shader is active, it can
+                    // normalize V directly while writing kv_v; otherwise this must
+                    // run before K norm overwrites k_buf.
+                    const apply_v_unit_norm_early = use_k_as_v and
+                        gemma_v_unit_norm_needed and
+                        !gemma_v_norm_in_fused;
+                    if (apply_v_unit_norm_early) {
                         try self.dispatchRmsNorm(
-                            self.v_buf.handle,
-                            self.v_buf.size,
+                            self.k_buf.handle,
+                            self.k_buf.size,
                             self.unit_norm_weights.handle,
                             self.unit_norm_weights.size,
                             self.v_buf.handle,
@@ -5758,228 +5644,404 @@ pub const InferenceEngine = struct {
                             layer_n_kv_heads,
                             rms_norm_eps,
                         );
+                        self.decode_cmd.computeBarrier();
                     }
-                    self.decode_cmd.computeBarrier();
 
-                    if (!k_rope_done) {
-                        // K RoPE first — KV cache write reads k_buf, so it must complete before the write.
-                        try self.dispatchRopeInPlace(
+                    const fused_qk_kv_eligible = fused_qk_kv_base_eligible;
+
+                    if (fused_qk_kv_eligible) {
+                        const qn = q_norm_tensor.?;
+                        const kn = k_norm_tensor.?;
+                        const dst_offset_floats: u32 = physical_token_for_fused.? * layer_kv_dim;
+                        const v_src_for_fused = if (gemma_v_norm_in_fused and use_k_as_v) self.k_buf else self.v_buf;
+                        self.dispatchQkNormRopeKvWrite(
+                            self.q_buf.handle,
+                            self.q_buf.size,
+                            qn.gpu_buffer.handle,
+                            qn.gpu_buffer.size,
                             self.k_buf.handle,
                             self.k_buf.size,
+                            kn.gpu_buffer.handle,
+                            kn.gpu_buffer.size,
                             freq_buf_handle,
                             self.rope_freq_buf.size,
+                            self.kv_k_cache[layer_idx].handle,
+                            self.kv_k_cache[layer_idx].size,
+                            v_src_for_fused.handle,
+                            v_src_for_fused.size,
+                            self.kv_v_cache[layer_idx].handle,
+                            self.kv_v_cache[layer_idx].size,
                             layer_head_dim,
                             layer_rope_dim,
+                            config.n_heads,
                             layer_n_kv_heads,
                             state.position,
                             rope_freq,
                             rope_attn_scale,
+                            rms_norm_eps,
+                            dst_offset_floats,
+                            gemma_v_norm_in_fused,
                         );
+                        self.decode_cmd.computeBarrier();
+                        q_rope_done = true;
+                        k_rope_done = true;
+                    } else if (q_norm_tensor) |qn| {
+                        // Skip Q norm/RoPE for dead-tail tokens: q_buf only feeds flash_attn.
+                        // Still mark q_rope_done=true so the fallback-path Q RoPE below is
+                        // also skipped (avoids reading stale q_buf).
+                        if (is_dead_attn_tail) {
+                            q_rope_done = true;
+                        } else if (use_fused_norm_rope) {
+                            // Fused Q norm + Q RoPE in a single dispatch
+                            self.dispatchNormRopeInPlace(
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                qn.gpu_buffer.handle,
+                                qn.gpu_buffer.size,
+                                freq_buf_handle,
+                                self.rope_freq_buf.size,
+                                layer_head_dim,
+                                layer_rope_dim,
+                                config.n_heads,
+                                state.position,
+                                rope_freq,
+                                rope_attn_scale,
+                                rms_norm_eps,
+                            );
+                            q_rope_done = true;
+                        } else {
+                            try self.dispatchRmsNorm(
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                qn.gpu_buffer.handle,
+                                qn.gpu_buffer.size,
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                layer_head_dim,
+                                config.n_heads,
+                                rms_norm_eps,
+                            );
+                        }
                     }
-                    // KV cache write: use compute shader to stay in compute pipeline,
-                    // avoiding compute→transfer + transfer→compute stage transitions.
-                    {
-                        const physical_token = try self.physicalTokenIndex(state.position);
-                        if (self.elementwise.pipeline_kv_cache_write) |*kv_pip| {
-                            if (!k_rope_done) self.decode_cmd.computeBarrier();
-                            const push = KvCacheWritePush{
-                                .kv_dim = layer_kv_dim,
-                                .dst_offset = physical_token * layer_kv_dim,
-                            };
-                            if (kv_pip.uses_push_descriptors) {
-                                self.pushDispatch4(
-                                    kv_pip,
-                                    std.mem.asBytes(&push),
+                    if (!fused_qk_kv_eligible) {
+                        if (k_norm_tensor) |kn| {
+                            if (use_fused_norm_rope) {
+                                // Fused K norm + K RoPE in a single dispatch
+                                self.dispatchNormRopeInPlace(
                                     self.k_buf.handle,
                                     self.k_buf.size,
-                                    self.kv_k_cache[layer_idx].handle,
-                                    self.kv_k_cache[layer_idx].size,
-                                    self.v_buf.handle,
-                                    self.v_buf.size,
-                                    self.kv_v_cache[layer_idx].handle,
-                                    self.kv_v_cache[layer_idx].size,
-                                    (layer_kv_dim + 63) / 64,
+                                    kn.gpu_buffer.handle,
+                                    kn.gpu_buffer.size,
+                                    freq_buf_handle,
+                                    self.rope_freq_buf.size,
+                                    layer_head_dim,
+                                    layer_rope_dim,
+                                    layer_n_kv_heads,
+                                    state.position,
+                                    rope_freq,
+                                    rope_attn_scale,
+                                    rms_norm_eps,
+                                );
+                                k_rope_done = true;
+                            } else {
+                                try self.dispatchRmsNorm(
+                                    self.k_buf.handle,
+                                    self.k_buf.size,
+                                    kn.gpu_buffer.handle,
+                                    kn.gpu_buffer.size,
+                                    self.k_buf.handle,
+                                    self.k_buf.size,
+                                    layer_head_dim,
+                                    layer_n_kv_heads,
+                                    rms_norm_eps,
+                                );
+                            }
+                        }
+                        // Gemma 4 applies plain RMS norm (unit weights) to V per-head.
+                        // Mirrors Metal forward_metal.zig:3460-3462. For use_k_as_v
+                        // layers this already ran ahead of Q/K norms above — skip here.
+                        if (config.architecture == .gemma and config.rope_freq_base_swa > 0 and !apply_v_unit_norm_early) {
+                            try self.dispatchRmsNorm(
+                                self.v_buf.handle,
+                                self.v_buf.size,
+                                self.unit_norm_weights.handle,
+                                self.unit_norm_weights.size,
+                                self.v_buf.handle,
+                                self.v_buf.size,
+                                layer_head_dim,
+                                layer_n_kv_heads,
+                                rms_norm_eps,
+                            );
+                        }
+                        self.decode_cmd.computeBarrier();
+
+                        if (!k_rope_done) {
+                            // K RoPE first — KV cache write reads k_buf, so it must complete before the write.
+                            try self.dispatchRopeInPlace(
+                                self.k_buf.handle,
+                                self.k_buf.size,
+                                freq_buf_handle,
+                                self.rope_freq_buf.size,
+                                layer_head_dim,
+                                layer_rope_dim,
+                                layer_n_kv_heads,
+                                state.position,
+                                rope_freq,
+                                rope_attn_scale,
+                            );
+                        }
+                        // KV cache write: use compute shader to stay in compute pipeline,
+                        // avoiding compute→transfer + transfer→compute stage transitions.
+                        {
+                            const physical_token = try self.physicalTokenIndex(state.position);
+                            if (self.elementwise.pipeline_kv_cache_write) |*kv_pip| {
+                                if (!k_rope_done) self.decode_cmd.computeBarrier();
+                                const push = KvCacheWritePush{
+                                    .kv_dim = layer_kv_dim,
+                                    .dst_offset = physical_token * layer_kv_dim,
+                                };
+                                if (kv_pip.uses_push_descriptors) {
+                                    self.pushDispatch4(
+                                        kv_pip,
+                                        std.mem.asBytes(&push),
+                                        self.k_buf.handle,
+                                        self.k_buf.size,
+                                        self.kv_k_cache[layer_idx].handle,
+                                        self.kv_k_cache[layer_idx].size,
+                                        self.v_buf.handle,
+                                        self.v_buf.size,
+                                        self.kv_v_cache[layer_idx].handle,
+                                        self.kv_v_cache[layer_idx].size,
+                                        (layer_kv_dim + 63) / 64,
+                                        1,
+                                        1,
+                                    );
+                                } else {
+                                    const ds = try self.allocDescSet(kv_pip.descriptor_set_layout);
+                                    self.writeDescSet4(ds, self.k_buf.handle, self.k_buf.size, self.kv_k_cache[layer_idx].handle, self.kv_k_cache[layer_idx].size, self.v_buf.handle, self.v_buf.size, self.kv_v_cache[layer_idx].handle, self.kv_v_cache[layer_idx].size);
+                                    self.decode_cmd.dispatchWithPush(kv_pip, ds, std.mem.asBytes(&push), (layer_kv_dim + 63) / 64, 1, 1);
+                                }
+                                if (!q_rope_done) {
+                                    // Q RoPE overlaps with KV write — no data dependency between them.
+                                    try self.dispatchRopeInPlace(
+                                        self.q_buf.handle,
+                                        self.q_buf.size,
+                                        freq_buf_handle,
+                                        self.rope_freq_buf.size,
+                                        layer_head_dim,
+                                        layer_rope_dim,
+                                        config.n_heads,
+                                        state.position,
+                                        rope_freq,
+                                        rope_attn_scale,
+                                    );
+                                }
+                                self.decode_cmd.computeBarrier();
+                            } else {
+                                if (!q_rope_done) {
+                                    try self.dispatchRopeInPlace(
+                                        self.q_buf.handle,
+                                        self.q_buf.size,
+                                        freq_buf_handle,
+                                        self.rope_freq_buf.size,
+                                        layer_head_dim,
+                                        layer_rope_dim,
+                                        config.n_heads,
+                                        state.position,
+                                        rope_freq,
+                                        rope_attn_scale,
+                                    );
+                                }
+                                // Transfer fallback: Q RoPE before barrier (original order preserved)
+                                self.decode_cmd.computeAndTransferBarrier();
+                                const kv_offset = @as(vk.c.VkDeviceSize, physical_token) * layer_kv_vec_size;
+                                const k_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = kv_offset, .size = layer_kv_vec_size };
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.k_buf.handle, self.kv_k_cache[layer_idx].handle, 1, &k_region);
+                                const v_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = kv_offset, .size = layer_kv_vec_size };
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.v_buf.handle, self.kv_v_cache[layer_idx].handle, 1, &v_region);
+                                self.decode_cmd.transferToComputeBarrier();
+                            }
+                        }
+                    }
+
+                    // Prefill last-layer shortcut: at the final layer of a non-terminal prefill
+                    // token, flash_attn + sigmoid_gate + O-proj + residual only feed into
+                    // hidden_buf, which the next prompt token overwrites via its layer-0 embed
+                    // copy. KV cache has already been committed just above, so next token's
+                    // attention still sees coherent state. Extends cycle 4's FFN/MoE-body skip
+                    // deeper into the attention block itself. Saves ~1 full-attn pass per
+                    // non-terminal prompt token.
+                    if (self.prefill_active and !collect_output and layer + 1 == config.n_layers) {
+                        self.endProfilePhase(.attention, attention_phase);
+                        continue;
+                    }
+
+                    // Flash attention. Sinks are pre-populated at init into a per-layer
+                    // slot of attn_sinks_buf (cycle 8); flash_attn reads via sink_offset.
+                    //
+                    // Batched-path foundation (ZINC_BATCH_ATTN=1): route through
+                    // the flash_attn_batched pipeline with n_queries=1 and
+                    // seq_start=state.position. Output is bit-equivalent to the
+                    // decode shader for n_queries=1. Speed cycle enables n>1 later.
+                    //
+                    // The flash_attn_kernel ProfilePhase wraps just the kernel
+                    // dispatch (and its computeBarrier) so --profile output
+                    // separates kernel time from QKV/RoPE/output-proj time
+                    // within the broader .attention phase. This is the
+                    // diagnostic the Effort 11 plan asks for in Step 2 to
+                    // attribute the L-dependent ms (~46 ms at L=1162) to the
+                    // flash_attn dispatch vs other dispatches before
+                    // committing to a shader rewrite.
+                    const flash_attn_kernel_phase = self.beginProfilePhase();
+                    const use_batched = self.use_batch_attn and self.attention.pipeline_batched != null;
+                    const attn_seq_len = state.position + 1;
+                    const split_k_min_seq_len: u32 = 128;
+                    const split_k_seq_ok = self.fa_split_k_forced or attn_seq_len >= split_k_min_seq_len;
+                    const use_split_k = !use_batched and split_k_seq_ok and self.fa_split_k > 1 and
+                        self.attention.pipeline_split != null and
+                        self.attention.pipeline_split_merge != null and
+                        self.partial_attn_out_buf.handle != null;
+                    // Effort-11 cycle-17: when ZINC_FUSED_OPROJ_MERGE=1 and split-K
+                    // is active, we replace the (merge → barrier → o_proj) pair
+                    // with a single dmmv_q4k_o_proj_merge dispatch. The flag is
+                    // off by default; when it engages, the merge dispatch below
+                    // is skipped and the o_proj site routes through
+                    // dispatchDmmvOprojMerge (which reads the partials directly
+                    // from partial_attn_out_buf).
+                    const o_tensor_for_merge = lt.attn_output;
+                    const o_proj_quant_ok = if (o_tensor_for_merge) |ot| ot.info.type_ == .q4_k else false;
+                    const apply_attn_gate_for_merge = lt.attn_gate != null;
+                    const post_attn_norm_for_merge = config.architecture == .gemma and lt.post_attention_norm != null;
+                    const fused_oproj_merge_active = self.use_fused_oproj_merge and
+                        use_split_k and
+                        self.dmmv.pipeline_q4k_o_proj_merge != null and
+                        o_proj_quant_ok and
+                        !apply_attn_gate_for_merge and
+                        !post_attn_norm_for_merge and
+                        !self.validation_diagnostics_enabled and
+                        hidden_dim <= 4096 and
+                        config.n_heads <= 64 and
+                        self.fa_split_k <= 8;
+                    if (use_split_k) {
+                        // Split-K dispatch (flash_attn writes per-chunk partials)
+                        // followed by the merge pass (combines partials, applies sinks,
+                        // writes final output). The split shader reuses flash_attn.spv
+                        // specialized with N_I_CHUNKS so binding 4 holds partials and
+                        // binding 5 (sinks) is unused — we still bind it for layout
+                        // compatibility with the original 6-binding pipeline.
+                        const split_pip = &self.attention.pipeline_split.?;
+                        const merge_pip = &self.attention.pipeline_split_merge.?;
+                        const sink_buf = self.attn_sinks_buf;
+                        const sink_offset: u32 = layer * config.n_heads;
+                        if (split_pip.uses_push_descriptors) {
+                            const split_push = FlashAttnPush{
+                                .head_dim = layer_head_dim,
+                                .n_heads = config.n_heads,
+                                .n_kv_heads = layer_n_kv_heads,
+                                .seq_len = attn_seq_len,
+                                .page_size = kv_page_size_tokens,
+                                .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
+                                .sink_offset = sink_offset,
+                            };
+                            self.pushDispatch6(
+                                split_pip,
+                                std.mem.asBytes(&split_push),
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
+                                self.partial_attn_out_buf.handle,
+                                self.partial_attn_out_buf.size,
+                                sink_buf.handle,
+                                sink_buf.size,
+                                config.n_heads,
+                                self.fa_split_k,
+                                1,
+                            );
+                        } else {
+                            const split_ds = try self.allocDescSet(split_pip.descriptor_set_layout);
+                            self.writeDescSet6(
+                                split_ds,
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
+                                self.partial_attn_out_buf.handle,
+                                self.partial_attn_out_buf.size,
+                                sink_buf.handle,
+                                sink_buf.size,
+                            );
+                            try self.attention.recordFlashAttnSplit(&self.decode_cmd, split_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
+                        }
+                        self.decode_cmd.computeBarrier();
+                        if (!fused_oproj_merge_active) {
+                            if (merge_pip.uses_push_descriptors) {
+                                const merge_push = FlashAttnSplitMergePush{
+                                    .head_dim = layer_head_dim,
+                                    .n_heads = config.n_heads,
+                                    .sink_offset = sink_offset,
+                                };
+                                self.pushDispatch3(
+                                    merge_pip,
+                                    std.mem.asBytes(&merge_push),
+                                    self.partial_attn_out_buf.handle,
+                                    self.partial_attn_out_buf.size,
+                                    self.attn_out_buf.handle,
+                                    self.attn_out_buf.size,
+                                    sink_buf.handle,
+                                    sink_buf.size,
+                                    config.n_heads,
                                     1,
                                     1,
                                 );
                             } else {
-                                const ds = try self.allocDescSet(kv_pip.descriptor_set_layout);
-                                self.writeDescSet4(ds, self.k_buf.handle, self.k_buf.size, self.kv_k_cache[layer_idx].handle, self.kv_k_cache[layer_idx].size, self.v_buf.handle, self.v_buf.size, self.kv_v_cache[layer_idx].handle, self.kv_v_cache[layer_idx].size);
-                                self.decode_cmd.dispatchWithPush(kv_pip, ds, std.mem.asBytes(&push), (layer_kv_dim + 63) / 64, 1, 1);
-                            }
-                            if (!q_rope_done) {
-                                // Q RoPE overlaps with KV write — no data dependency between them.
-                                try self.dispatchRopeInPlace(
-                                    self.q_buf.handle,
-                                    self.q_buf.size,
-                                    freq_buf_handle,
-                                    self.rope_freq_buf.size,
-                                    layer_head_dim,
-                                    layer_rope_dim,
-                                    config.n_heads,
-                                    state.position,
-                                    rope_freq,
-                                    rope_attn_scale,
+                                const merge_ds = try self.allocDescSet(merge_pip.descriptor_set_layout);
+                                self.writeDescSet3(
+                                    merge_ds,
+                                    self.partial_attn_out_buf.handle,
+                                    self.partial_attn_out_buf.size,
+                                    self.attn_out_buf.handle,
+                                    self.attn_out_buf.size,
+                                    sink_buf.handle,
+                                    sink_buf.size,
                                 );
+                                try self.attention.recordFlashAttnSplitMerge(&self.decode_cmd, merge_ds, layer_head_dim, config.n_heads, sink_offset);
                             }
-                            self.decode_cmd.computeBarrier();
-                        } else {
-                            // Transfer fallback: Q RoPE before barrier (original order preserved)
-                            if (!q_rope_done) {
-                                try self.dispatchRopeInPlace(
-                                    self.q_buf.handle,
-                                    self.q_buf.size,
-                                    freq_buf_handle,
-                                    self.rope_freq_buf.size,
-                                    layer_head_dim,
-                                    layer_rope_dim,
-                                    config.n_heads,
-                                    state.position,
-                                    rope_freq,
-                                    rope_attn_scale,
-                                );
-                            }
-                            self.decode_cmd.computeAndTransferBarrier();
-                            const kv_offset = @as(vk.c.VkDeviceSize, physical_token) * layer_kv_vec_size;
-                            const k_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = kv_offset, .size = layer_kv_vec_size };
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.k_buf.handle, self.kv_k_cache[layer_idx].handle, 1, &k_region);
-                            const v_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = kv_offset, .size = layer_kv_vec_size };
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.v_buf.handle, self.kv_v_cache[layer_idx].handle, 1, &v_region);
-                            self.decode_cmd.transferToComputeBarrier();
                         }
-                    }
-                }
-
-                // Prefill last-layer shortcut: at the final layer of a non-terminal prefill
-                // token, flash_attn + sigmoid_gate + O-proj + residual only feed into
-                // hidden_buf, which the next prompt token overwrites via its layer-0 embed
-                // copy. KV cache has already been committed just above, so next token's
-                // attention still sees coherent state. Extends cycle 4's FFN/MoE-body skip
-                // deeper into the attention block itself. Saves ~1 full-attn pass per
-                // non-terminal prompt token.
-                if (self.prefill_active and !collect_output and layer + 1 == config.n_layers) {
-                    self.endProfilePhase(.attention, attention_phase);
-                    continue;
-                }
-
-                // Flash attention. Sinks are pre-populated at init into a per-layer
-                // slot of attn_sinks_buf (cycle 8); flash_attn reads via sink_offset.
-                //
-                // Batched-path foundation (ZINC_BATCH_ATTN=1): route through
-                // the flash_attn_batched pipeline with n_queries=1 and
-                // seq_start=state.position. Output is bit-equivalent to the
-                // decode shader for n_queries=1. Speed cycle enables n>1 later.
-                //
-                // The flash_attn_kernel ProfilePhase wraps just the kernel
-                // dispatch (and its computeBarrier) so --profile output
-                // separates kernel time from QKV/RoPE/output-proj time
-                // within the broader .attention phase. This is the
-                // diagnostic the Effort 11 plan asks for in Step 2 to
-                // attribute the L-dependent ms (~46 ms at L=1162) to the
-                // flash_attn dispatch vs other dispatches before
-                // committing to a shader rewrite.
-                const flash_attn_kernel_phase = self.beginProfilePhase();
-                const use_batched = self.use_batch_attn and self.attention.pipeline_batched != null;
-                const attn_seq_len = state.position + 1;
-                const split_k_min_seq_len: u32 = 128;
-                const split_k_seq_ok = self.fa_split_k_forced or attn_seq_len >= split_k_min_seq_len;
-                const use_split_k = !use_batched and split_k_seq_ok and self.fa_split_k > 1 and
-                    self.attention.pipeline_split != null and
-                    self.attention.pipeline_split_merge != null and
-                    self.partial_attn_out_buf.handle != null;
-                // Effort-11 cycle-17: when ZINC_FUSED_OPROJ_MERGE=1 and split-K
-                // is active, we replace the (merge → barrier → o_proj) pair
-                // with a single dmmv_q4k_o_proj_merge dispatch. The flag is
-                // off by default; when it engages, the merge dispatch below
-                // is skipped and the o_proj site routes through
-                // dispatchDmmvOprojMerge (which reads the partials directly
-                // from partial_attn_out_buf).
-                const o_tensor_for_merge = lt.attn_output;
-                const o_proj_quant_ok = if (o_tensor_for_merge) |ot| ot.info.type_ == .q4_k else false;
-                const apply_attn_gate_for_merge = lt.attn_gate != null;
-                const post_attn_norm_for_merge = config.architecture == .gemma and lt.post_attention_norm != null;
-                const fused_oproj_merge_active = self.use_fused_oproj_merge and
-                    use_split_k and
-                    self.dmmv.pipeline_q4k_o_proj_merge != null and
-                    o_proj_quant_ok and
-                    !apply_attn_gate_for_merge and
-                    !post_attn_norm_for_merge and
-                    !self.validation_diagnostics_enabled and
-                    hidden_dim <= 4096 and
-                    config.n_heads <= 64 and
-                    self.fa_split_k <= 8;
-                if (use_split_k) {
-                    // Split-K dispatch (flash_attn writes per-chunk partials)
-                    // followed by the merge pass (combines partials, applies sinks,
-                    // writes final output). The split shader reuses flash_attn.spv
-                    // specialized with N_I_CHUNKS so binding 4 holds partials and
-                    // binding 5 (sinks) is unused — we still bind it for layout
-                    // compatibility with the original 6-binding pipeline.
-                    const split_pip = &self.attention.pipeline_split.?;
-                    const merge_pip = &self.attention.pipeline_split_merge.?;
-                    const sink_buf = self.attn_sinks_buf;
-                    const sink_offset: u32 = layer * config.n_heads;
-                    if (split_pip.uses_push_descriptors) {
-                        const split_push = FlashAttnPush{
-                            .head_dim = layer_head_dim,
-                            .n_heads = config.n_heads,
-                            .n_kv_heads = layer_n_kv_heads,
-                            .seq_len = attn_seq_len,
-                            .page_size = kv_page_size_tokens,
-                            .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
-                            .sink_offset = sink_offset,
-                        };
-                        self.pushDispatch6(
-                            split_pip,
-                            std.mem.asBytes(&split_push),
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.partial_attn_out_buf.handle,
-                            self.partial_attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                            config.n_heads,
-                            self.fa_split_k,
-                            1,
-                        );
-                    } else {
-                        const split_ds = try self.allocDescSet(split_pip.descriptor_set_layout);
-                        self.writeDescSet6(
-                            split_ds,
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.partial_attn_out_buf.handle,
-                            self.partial_attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                        );
-                        try self.attention.recordFlashAttnSplit(&self.decode_cmd, split_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
-                    }
-                    self.decode_cmd.computeBarrier();
-                    if (!fused_oproj_merge_active) {
-                        if (merge_pip.uses_push_descriptors) {
-                            const merge_push = FlashAttnSplitMergePush{
+                    } else if (use_batched) {
+                        const pip = &self.attention.pipeline_batched.?;
+                        const sink_buf = self.attn_sinks_buf;
+                        const sink_offset: u32 = layer * config.n_heads;
+                        if (pip.uses_push_descriptors) {
+                            const push = FlashAttnBatchedPush{
                                 .head_dim = layer_head_dim,
                                 .n_heads = config.n_heads,
+                                .n_kv_heads = layer_n_kv_heads,
+                                .seq_start = state.position,
+                                .n_queries = 1,
+                                .page_size = kv_page_size_tokens,
+                                .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
                                 .sink_offset = sink_offset,
                             };
-                            self.pushDispatch3(
-                                merge_pip,
-                                std.mem.asBytes(&merge_push),
-                                self.partial_attn_out_buf.handle,
-                                self.partial_attn_out_buf.size,
+                            self.pushDispatch6(
+                                pip,
+                                std.mem.asBytes(&push),
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
                                 self.attn_out_buf.handle,
                                 self.attn_out_buf.size,
                                 sink_buf.handle,
@@ -5989,434 +6051,586 @@ pub const InferenceEngine = struct {
                                 1,
                             );
                         } else {
-                            const merge_ds = try self.allocDescSet(merge_pip.descriptor_set_layout);
-                            self.writeDescSet3(
-                                merge_ds,
-                                self.partial_attn_out_buf.handle,
-                                self.partial_attn_out_buf.size,
+                            const attn_ds = try self.allocDescSet(pip.descriptor_set_layout);
+                            self.writeDescSet6(
+                                attn_ds,
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
                                 self.attn_out_buf.handle,
                                 self.attn_out_buf.size,
                                 sink_buf.handle,
                                 sink_buf.size,
                             );
-                            try self.attention.recordFlashAttnSplitMerge(&self.decode_cmd, merge_ds, layer_head_dim, config.n_heads, sink_offset);
+                            try self.attention.recordFlashAttnBatched(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, state.position, 1, kv_page_size_tokens, config.attn_scale, sink_offset);
                         }
-                    }
-                } else if (use_batched) {
-                    const pip = &self.attention.pipeline_batched.?;
-                    const sink_buf = self.attn_sinks_buf;
-                    const sink_offset: u32 = layer * config.n_heads;
-                    if (pip.uses_push_descriptors) {
-                        const push = FlashAttnBatchedPush{
-                            .head_dim = layer_head_dim,
-                            .n_heads = config.n_heads,
-                            .n_kv_heads = layer_n_kv_heads,
-                            .seq_start = state.position,
-                            .n_queries = 1,
-                            .page_size = kv_page_size_tokens,
-                            .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
-                            .sink_offset = sink_offset,
-                        };
-                        self.pushDispatch6(
-                            pip,
-                            std.mem.asBytes(&push),
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                            config.n_heads,
-                            1,
-                            1,
-                        );
-                    } else {
-                        const attn_ds = try self.allocDescSet(pip.descriptor_set_layout);
-                        self.writeDescSet6(
-                            attn_ds,
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                        );
-                        try self.attention.recordFlashAttnBatched(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, state.position, 1, kv_page_size_tokens, config.attn_scale, sink_offset);
-                    }
-                } else if (self.attention.pipeline) |*pip| {
-                    const sink_buf = self.attn_sinks_buf;
-                    const sink_offset: u32 = layer * config.n_heads;
-                    if (pip.uses_push_descriptors) {
-                        const push = FlashAttnPush{
-                            .head_dim = layer_head_dim,
-                            .n_heads = config.n_heads,
-                            .n_kv_heads = layer_n_kv_heads,
-                            .seq_len = state.position + 1,
-                            .page_size = kv_page_size_tokens,
-                            .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
-                            .sink_offset = sink_offset,
-                        };
-                        self.pushDispatch6(
-                            pip,
-                            std.mem.asBytes(&push),
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                            config.n_heads,
-                            1,
-                            1,
-                        );
-                    } else {
-                        const attn_ds = try self.allocDescSet(pip.descriptor_set_layout);
-                        self.writeDescSet6(
-                            attn_ds,
-                            self.q_buf.handle,
-                            self.q_buf.size,
-                            self.kv_k_cache[layer_idx].handle,
-                            self.kv_k_cache[layer_idx].size,
-                            self.kv_v_cache[layer_idx].handle,
-                            self.kv_v_cache[layer_idx].size,
-                            self.page_table_buf.handle,
-                            self.page_table_buf.size,
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            sink_buf.handle,
-                            sink_buf.size,
-                        );
-                        try self.attention.recordFlashAttn(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
-                    }
-                }
-                self.decode_cmd.computeBarrier();
-                self.endProfilePhase(.flash_attn_kernel, flash_attn_kernel_phase);
-
-                // Self-check the first attention layer at seq_len=1: with only one KV token,
-                // flash attention must reproduce the current V slice for each query head's KV group.
-                if (state.position == 0 and is_full_attn and self.validation_diagnostics_enabled) {
-                    const attn_q_dim_dbg = @as(u32, config.n_heads) * layer_head_dim;
-                    const attn_kv_dim_dbg = layer_n_kv_heads * layer_head_dim;
-                    const q_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
-                    const k_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
-                    const v_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
-                    const attn_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
-                    const k_off = q_bytes;
-                    const v_off = k_off + k_bytes;
-                    const attn_off = v_off + v_bytes;
-
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.q_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = 0,
-                        .size = q_bytes,
-                    });
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.k_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = k_off,
-                        .size = k_bytes,
-                    });
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.v_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = v_off,
-                        .size = v_bytes,
-                    });
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = attn_off,
-                        .size = attn_bytes,
-                    });
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                    const q_vals = dbg_ptr[0..attn_q_dim_dbg];
-                    const k_vals = dbg_ptr[@intCast(k_off / @sizeOf(f32))..][0..attn_kv_dim_dbg];
-                    const v_vals = dbg_ptr[@intCast(v_off / @sizeOf(f32))..][0..attn_kv_dim_dbg];
-                    const attn_vals = dbg_ptr[@intCast(attn_off / @sizeOf(f32))..][0..attn_q_dim_dbg];
-                    const sink_ptr: [*]const f32 = @ptrCast(@alignCast(self.attn_sinks_buf.mapped.?));
-                    const sink_vals = sink_ptr[layer * config.n_heads ..][0..config.n_heads];
-                    const scale = if (config.attn_scale != 0) config.attn_scale else 1.0 / @sqrt(@as(f32, @floatFromInt(layer_head_dim)));
-                    const q_per_kv = @max(config.n_heads / @max(layer_n_kv_heads, 1), 1);
-
-                    var attn_v_max_diff: f32 = 0;
-                    for (0..config.n_heads) |h| {
-                        const kv_head = h / q_per_kv;
-                        const q_head = q_vals[h * layer_head_dim ..][0..layer_head_dim];
-                        const k_head = k_vals[kv_head * layer_head_dim ..][0..layer_head_dim];
-                        const sink_val = sink_vals[h];
-
-                        var score: f32 = 0;
-                        for (0..layer_head_dim) |d| score += q_head[d] * k_head[d];
-                        score *= scale;
-
-                        var max_score = score;
-                        if (!std.math.isNan(sink_val) and sink_val > max_score) max_score = sink_val;
-                        var denom = @exp(score - max_score);
-                        if (!std.math.isNan(sink_val)) denom += @exp(sink_val - max_score);
-                        const weight = if (denom > 0) @exp(score - max_score) / denom else 0.0;
-
-                        for (0..layer_head_dim) |d| {
-                            const got = attn_vals[h * layer_head_dim + d];
-                            const want = v_vals[kv_head * layer_head_dim + d] * weight;
-                            const diff = @abs(got - want);
-                            if (diff > attn_v_max_diff) attn_v_max_diff = diff;
-                        }
-                    }
-                    log.info("ATTN_SELFTEST L{d}: seq_len=1 max_diff={d:.6} attn_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] v_kv0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] sink0={d:.6}", .{
-                        layer,
-                        attn_v_max_diff,
-                        attn_vals[0],
-                        attn_vals[1],
-                        attn_vals[2],
-                        attn_vals[3],
-                        v_vals[0],
-                        v_vals[1],
-                        v_vals[2],
-                        v_vals[3],
-                        sink_vals[0],
-                    });
-
-                    if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-                }
-
-                // Validate paged multi-token flash attention against a naive CPU reference on the
-                // last prompt token. This catches page-table / KV-layout bugs that token-0 checks miss.
-                if (diag_last_prompt_token and config.architecture == .gpt_oss and layer == full_attn_interval - 1 and self.validation_diagnostics_enabled) {
-                    const seq_len_dbg: u32 = state.position + 1;
-                    const attn_q_dim_dbg = @as(u32, config.n_heads) * layer_head_dim;
-                    const attn_kv_dim_dbg = layer_n_kv_heads * layer_head_dim;
-                    const q_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
-                    const kv_token_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
-                    const kv_dbg_bytes = @as(vk.c.VkDeviceSize, seq_len_dbg * attn_kv_dim_dbg) * @sizeOf(f32);
-                    const attn_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
-                    const k_off = q_bytes;
-                    const v_off = k_off + kv_dbg_bytes;
-                    const attn_off = v_off + kv_dbg_bytes;
-
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.q_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = 0,
-                        .size = q_bytes,
-                    });
-                    for (0..seq_len_dbg) |tok| {
-                        const physical_token = try self.physicalTokenIndex(@intCast(tok));
-                        const src_offset = @as(vk.c.VkDeviceSize, physical_token) * kv_token_bytes;
-                        const dst_offset = @as(vk.c.VkDeviceSize, tok) * kv_token_bytes;
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.kv_k_cache[layer_idx].handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = src_offset,
-                            .dstOffset = k_off + dst_offset,
-                            .size = kv_token_bytes,
-                        });
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.kv_v_cache[layer_idx].handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = src_offset,
-                            .dstOffset = v_off + dst_offset,
-                            .size = kv_token_bytes,
-                        });
-                    }
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = attn_off,
-                        .size = attn_bytes,
-                    });
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                    const q_vals = dbg_ptr[0..attn_q_dim_dbg];
-                    const k_vals = dbg_ptr[@intCast(k_off / @sizeOf(f32))..][0 .. seq_len_dbg * attn_kv_dim_dbg];
-                    const v_vals = dbg_ptr[@intCast(v_off / @sizeOf(f32))..][0 .. seq_len_dbg * attn_kv_dim_dbg];
-                    const attn_vals = dbg_ptr[@intCast(attn_off / @sizeOf(f32))..][0..attn_q_dim_dbg];
-                    const sink_ptr: [*]const f32 = @ptrCast(@alignCast(self.attn_sinks_buf.mapped.?));
-                    const sink_vals = sink_ptr[layer * config.n_heads ..][0..config.n_heads];
-
-                    const seq_len_usize: usize = @intCast(seq_len_dbg);
-                    const q_dim_usize: usize = @intCast(attn_q_dim_dbg);
-                    var cpu_attn = try self.allocator.alloc(f32, q_dim_usize);
-                    defer self.allocator.free(cpu_attn);
-                    var scores = try self.allocator.alloc(f32, seq_len_usize);
-                    defer self.allocator.free(scores);
-                    var probs = try self.allocator.alloc(f32, seq_len_usize);
-                    defer self.allocator.free(probs);
-
-                    const scale = if (config.attn_scale != 0) config.attn_scale else 1.0 / @sqrt(@as(f32, @floatFromInt(layer_head_dim)));
-                    const q_per_kv = @max(config.n_heads / @max(layer_n_kv_heads, 1), 1);
-                    for (0..config.n_heads) |h| {
-                        const kv_head = h / q_per_kv;
-                        const q_head = q_vals[h * layer_head_dim ..][0..layer_head_dim];
-                        const sink_val = sink_vals[h];
-
-                        var max_score: f32 = -std.math.inf(f32);
-                        for (0..seq_len_dbg) |tok| {
-                            const k_tok = k_vals[tok * attn_kv_dim_dbg + kv_head * layer_head_dim ..][0..layer_head_dim];
-                            var dot: f32 = 0;
-                            for (0..layer_head_dim) |d| dot += q_head[d] * k_tok[d];
-                            const s = dot * scale;
-                            scores[tok] = s;
-                            if (s > max_score) max_score = s;
-                        }
-                        if (!std.math.isNan(sink_val) and sink_val > max_score) max_score = sink_val;
-
-                        var sum_exp: f32 = 0;
-                        if (!std.math.isNan(sink_val)) {
-                            sum_exp += @exp(sink_val - max_score);
-                        }
-                        for (0..seq_len_dbg) |tok| {
-                            const p = @exp(scores[tok] - max_score);
-                            probs[tok] = p;
-                            sum_exp += p;
-                        }
-                        const inv_sum = if (sum_exp > 0) 1.0 / sum_exp else 0.0;
-
-                        const out_head = cpu_attn[h * layer_head_dim ..][0..layer_head_dim];
-                        @memset(out_head, 0);
-                        for (0..seq_len_dbg) |tok| {
-                            const weight = probs[tok] * inv_sum;
-                            const v_tok = v_vals[tok * attn_kv_dim_dbg + kv_head * layer_head_dim ..][0..layer_head_dim];
-                            for (0..layer_head_dim) |d| out_head[d] += weight * v_tok[d];
-                        }
-                    }
-
-                    var attn_ref_max_diff: f32 = 0;
-                    var q_nan_count: usize = 0;
-                    var k_nan_count: usize = 0;
-                    var attn_nan_count: usize = 0;
-                    var cpu_nan_count: usize = 0;
-                    for (q_vals) |v| {
-                        if (std.math.isNan(v)) q_nan_count += 1;
-                    }
-                    for (k_vals) |v| {
-                        if (std.math.isNan(v)) k_nan_count += 1;
-                    }
-                    for (0..attn_q_dim_dbg) |i| {
-                        if (std.math.isNan(attn_vals[i])) attn_nan_count += 1;
-                        if (std.math.isNan(cpu_attn[i])) cpu_nan_count += 1;
-                        if (std.math.isNan(attn_vals[i]) or std.math.isNan(cpu_attn[i])) continue;
-                        const diff = @abs(attn_vals[i] - cpu_attn[i]);
-                        if (diff > attn_ref_max_diff) attn_ref_max_diff = diff;
-                    }
-                    log.info("ATTN_REFTEST L{d} pos={d}: seq_len={d} max_diff={d:.6} q_nan={d} k_nan={d} attn_nan={d} cpu_nan={d} attn_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                        layer,
-                        state.position,
-                        seq_len_dbg,
-                        attn_ref_max_diff,
-                        q_nan_count,
-                        k_nan_count,
-                        attn_nan_count,
-                        cpu_nan_count,
-                        attn_vals[0],
-                        attn_vals[1],
-                        attn_vals[2],
-                        attn_vals[3],
-                        cpu_attn[0],
-                        cpu_attn[1],
-                        cpu_attn[2],
-                        cpu_attn[3],
-                    });
-
-                    if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-                }
-
-                if (apply_attn_gate) {
-                    if (self.elementwise.pipeline_sigmoid_mul) |*pip| {
-                        // Regression guard marker: self.writeDescSet3(gds, self.attn_out_buf.handle
-                        _ = pip;
-                        try self.dispatchSigmoidMul(
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            self.gate_buf.handle,
-                            self.gate_buf.size,
-                            self.attn_out_buf.handle,
-                            self.attn_out_buf.size,
-                            q_dim,
-                        );
-                        self.decode_cmd.computeBarrier();
-                    }
-                }
-
-                // Output projection + attention residual
-                const apply_post_attn_norm = config.architecture == .gemma and lt.post_attention_norm != null;
-                const has_post_attn_norm = apply_post_attn_norm;
-                const diag_attn_residual = diag_last_prompt_token and config.architecture == .gpt_oss and self.validation_diagnostics_enabled and q_dim <= 8192;
-                if (!has_post_attn_norm and !self.validation_diagnostics_enabled) {
-                    // Fused: O-proj DMMV accumulates directly into hidden_buf,
-                    // eliminating separate scale_acc dispatch + barrier
-                    // Use o_cols (from O weight tensor shape) — matches actual attention output dim.
-                    // Gemma 4 has mixed head_dim (256 SWA vs 512 global); o_cols is always correct
-                    // while q_dim (from config) uses the max head_dim.
-                    if (fused_oproj_merge_active and lt.attn_output_bias == null) {
-                        // Effort-11 cycle-17: replace (merge → barrier → o_proj DMMV-acc)
-                        // with a single dispatch that reads partials from
-                        // partial_attn_out_buf, computes per-head LSE merge weights
-                        // with sink fold-in, stages attn_out into LDS, and runs
-                        // the Q4_K matmul accumulating into hidden_buf. Bias path
-                        // falls through to the unfused dispatch (the post-bias
-                        // residual barrier is unchanged).
-                        const sink_offset_for_merge: u32 = layer * config.n_heads;
-                        try self.dispatchDmmvOprojMerge(
-                            o_tensor,
-                            self.partial_attn_out_buf,
-                            self.attn_sinks_buf,
-                            self.hidden_buf,
-                            hidden_dim,
-                            o_cols,
-                            config.n_heads,
-                            self.fa_split_k,
-                            sink_offset_for_merge,
-                            layer_head_dim,
-                        );
-                    } else {
-                        try self.dispatchDmmvAcc(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.hidden_buf, hidden_dim, o_cols);
-                        if (lt.attn_output_bias) |bias| {
-                            self.decode_cmd.computeBarrier();
-                            try self.dispatchBiasAdd(self.hidden_buf.handle, hidden_size, bias, hidden_dim);
+                    } else if (self.attention.pipeline) |*pip| {
+                        const sink_buf = self.attn_sinks_buf;
+                        const sink_offset: u32 = layer * config.n_heads;
+                        if (pip.uses_push_descriptors) {
+                            const push = FlashAttnPush{
+                                .head_dim = layer_head_dim,
+                                .n_heads = config.n_heads,
+                                .n_kv_heads = layer_n_kv_heads,
+                                .seq_len = state.position + 1,
+                                .page_size = kv_page_size_tokens,
+                                .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
+                                .sink_offset = sink_offset,
+                            };
+                            self.pushDispatch6(
+                                pip,
+                                std.mem.asBytes(&push),
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
+                                self.attn_out_buf.handle,
+                                self.attn_out_buf.size,
+                                sink_buf.handle,
+                                sink_buf.size,
+                                config.n_heads,
+                                1,
+                                1,
+                            );
+                        } else {
+                            const attn_ds = try self.allocDescSet(pip.descriptor_set_layout);
+                            self.writeDescSet6(
+                                attn_ds,
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                self.kv_k_cache[layer_idx].handle,
+                                self.kv_k_cache[layer_idx].size,
+                                self.kv_v_cache[layer_idx].handle,
+                                self.kv_v_cache[layer_idx].size,
+                                self.page_table_buf.handle,
+                                self.page_table_buf.size,
+                                self.attn_out_buf.handle,
+                                self.attn_out_buf.size,
+                                sink_buf.handle,
+                                sink_buf.size,
+                            );
+                            try self.attention.recordFlashAttn(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
                         }
                     }
                     self.decode_cmd.computeBarrier();
-                } else {
-                    // Unfused path: needed when post-attn norm exists (Gemma) or diagnostics enabled
-                    try self.dispatchDmmv(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.o_proj_buf, hidden_dim, o_cols);
-                    if (lt.attn_output_bias) |bias| {
-                        self.decode_cmd.computeBarrier();
-                        try self.dispatchBiasAdd(self.o_proj_buf.handle, hidden_size, bias, hidden_dim);
-                    }
-                    self.decode_cmd.computeBarrier();
+                    self.endProfilePhase(.flash_attn_kernel, flash_attn_kernel_phase);
 
-                    if ((state.position == 0 or (diag_last_prompt_token and config.architecture == .gpt_oss)) and is_full_attn and self.validation_diagnostics_enabled and q_dim <= 8192) {
+                    // Self-check the first attention layer at seq_len=1: with only one KV token,
+                    // flash attention must reproduce the current V slice for each query head's KV group.
+                    if (state.position == 0 and is_full_attn and self.validation_diagnostics_enabled) {
+                        const attn_q_dim_dbg = @as(u32, config.n_heads) * layer_head_dim;
+                        const attn_kv_dim_dbg = layer_n_kv_heads * layer_head_dim;
+                        const q_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
+                        const k_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
+                        const v_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
+                        const attn_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
+                        const k_off = q_bytes;
+                        const v_off = k_off + k_bytes;
+                        const attn_off = v_off + v_bytes;
+
                         try self.decode_cmd.end();
                         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
+                        try self.decode_cmd.reset();
+                        try self.decode_cmd.begin();
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.q_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = 0,
+                            .size = q_bytes,
+                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.k_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = k_off,
+                            .size = k_bytes,
+                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.v_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = v_off,
+                            .size = v_bytes,
+                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = attn_off,
+                            .size = attn_bytes,
+                        });
+                        try self.decode_cmd.end();
+                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                        const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                        const q_vals = dbg_ptr[0..attn_q_dim_dbg];
+                        const k_vals = dbg_ptr[@intCast(k_off / @sizeOf(f32))..][0..attn_kv_dim_dbg];
+                        const v_vals = dbg_ptr[@intCast(v_off / @sizeOf(f32))..][0..attn_kv_dim_dbg];
+                        const attn_vals = dbg_ptr[@intCast(attn_off / @sizeOf(f32))..][0..attn_q_dim_dbg];
+                        const sink_ptr: [*]const f32 = @ptrCast(@alignCast(self.attn_sinks_buf.mapped.?));
+                        const sink_vals = sink_ptr[layer * config.n_heads ..][0..config.n_heads];
+                        const scale = if (config.attn_scale != 0) config.attn_scale else 1.0 / @sqrt(@as(f32, @floatFromInt(layer_head_dim)));
+                        const q_per_kv = @max(config.n_heads / @max(layer_n_kv_heads, 1), 1);
+
+                        var attn_v_max_diff: f32 = 0;
+                        for (0..config.n_heads) |h| {
+                            const kv_head = h / q_per_kv;
+                            const q_head = q_vals[h * layer_head_dim ..][0..layer_head_dim];
+                            const k_head = k_vals[kv_head * layer_head_dim ..][0..layer_head_dim];
+                            const sink_val = sink_vals[h];
+
+                            var score: f32 = 0;
+                            for (0..layer_head_dim) |d| score += q_head[d] * k_head[d];
+                            score *= scale;
+
+                            var max_score = score;
+                            if (!std.math.isNan(sink_val) and sink_val > max_score) max_score = sink_val;
+                            var denom = @exp(score - max_score);
+                            if (!std.math.isNan(sink_val)) denom += @exp(sink_val - max_score);
+                            const weight = if (denom > 0) @exp(score - max_score) / denom else 0.0;
+
+                            for (0..layer_head_dim) |d| {
+                                const got = attn_vals[h * layer_head_dim + d];
+                                const want = v_vals[kv_head * layer_head_dim + d] * weight;
+                                const diff = @abs(got - want);
+                                if (diff > attn_v_max_diff) attn_v_max_diff = diff;
+                            }
+                        }
+                        log.info("ATTN_SELFTEST L{d}: seq_len=1 max_diff={d:.6} attn_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] v_kv0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] sink0={d:.6}", .{
+                            layer,
+                            attn_v_max_diff,
+                            attn_vals[0],
+                            attn_vals[1],
+                            attn_vals[2],
+                            attn_vals[3],
+                            v_vals[0],
+                            v_vals[1],
+                            v_vals[2],
+                            v_vals[3],
+                            sink_vals[0],
+                        });
+
+                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                        try self.decode_cmd.reset();
+                        try self.decode_cmd.begin();
+                    }
+
+                    // Validate paged multi-token flash attention against a naive CPU reference on the
+                    // last prompt token. This catches page-table / KV-layout bugs that token-0 checks miss.
+                    if (diag_last_prompt_token and config.architecture == .gpt_oss and layer == full_attn_interval - 1 and self.validation_diagnostics_enabled) {
+                        const seq_len_dbg: u32 = state.position + 1;
+                        const attn_q_dim_dbg = @as(u32, config.n_heads) * layer_head_dim;
+                        const attn_kv_dim_dbg = layer_n_kv_heads * layer_head_dim;
+                        const q_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
+                        const kv_token_bytes = @as(vk.c.VkDeviceSize, attn_kv_dim_dbg) * @sizeOf(f32);
+                        const kv_dbg_bytes = @as(vk.c.VkDeviceSize, seq_len_dbg * attn_kv_dim_dbg) * @sizeOf(f32);
+                        const attn_bytes = @as(vk.c.VkDeviceSize, attn_q_dim_dbg) * @sizeOf(f32);
+                        const k_off = q_bytes;
+                        const v_off = k_off + kv_dbg_bytes;
+                        const attn_off = v_off + kv_dbg_bytes;
+
+                        try self.decode_cmd.end();
+                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                        try self.decode_cmd.reset();
+                        try self.decode_cmd.begin();
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.q_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = 0,
+                            .size = q_bytes,
+                        });
+                        for (0..seq_len_dbg) |tok| {
+                            const physical_token = try self.physicalTokenIndex(@intCast(tok));
+                            const src_offset = @as(vk.c.VkDeviceSize, physical_token) * kv_token_bytes;
+                            const dst_offset = @as(vk.c.VkDeviceSize, tok) * kv_token_bytes;
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.kv_k_cache[layer_idx].handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = src_offset,
+                                .dstOffset = k_off + dst_offset,
+                                .size = kv_token_bytes,
+                            });
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.kv_v_cache[layer_idx].handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = src_offset,
+                                .dstOffset = v_off + dst_offset,
+                                .size = kv_token_bytes,
+                            });
+                        }
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = attn_off,
+                            .size = attn_bytes,
+                        });
+                        try self.decode_cmd.end();
+                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                        const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                        const q_vals = dbg_ptr[0..attn_q_dim_dbg];
+                        const k_vals = dbg_ptr[@intCast(k_off / @sizeOf(f32))..][0 .. seq_len_dbg * attn_kv_dim_dbg];
+                        const v_vals = dbg_ptr[@intCast(v_off / @sizeOf(f32))..][0 .. seq_len_dbg * attn_kv_dim_dbg];
+                        const attn_vals = dbg_ptr[@intCast(attn_off / @sizeOf(f32))..][0..attn_q_dim_dbg];
+                        const sink_ptr: [*]const f32 = @ptrCast(@alignCast(self.attn_sinks_buf.mapped.?));
+                        const sink_vals = sink_ptr[layer * config.n_heads ..][0..config.n_heads];
+
+                        const seq_len_usize: usize = @intCast(seq_len_dbg);
+                        const q_dim_usize: usize = @intCast(attn_q_dim_dbg);
+                        var cpu_attn = try self.allocator.alloc(f32, q_dim_usize);
+                        defer self.allocator.free(cpu_attn);
+                        var scores = try self.allocator.alloc(f32, seq_len_usize);
+                        defer self.allocator.free(scores);
+                        var probs = try self.allocator.alloc(f32, seq_len_usize);
+                        defer self.allocator.free(probs);
+
+                        const scale = if (config.attn_scale != 0) config.attn_scale else 1.0 / @sqrt(@as(f32, @floatFromInt(layer_head_dim)));
+                        const q_per_kv = @max(config.n_heads / @max(layer_n_kv_heads, 1), 1);
+                        for (0..config.n_heads) |h| {
+                            const kv_head = h / q_per_kv;
+                            const q_head = q_vals[h * layer_head_dim ..][0..layer_head_dim];
+                            const sink_val = sink_vals[h];
+
+                            var max_score: f32 = -std.math.inf(f32);
+                            for (0..seq_len_dbg) |tok| {
+                                const k_tok = k_vals[tok * attn_kv_dim_dbg + kv_head * layer_head_dim ..][0..layer_head_dim];
+                                var dot: f32 = 0;
+                                for (0..layer_head_dim) |d| dot += q_head[d] * k_tok[d];
+                                const s = dot * scale;
+                                scores[tok] = s;
+                                if (s > max_score) max_score = s;
+                            }
+                            if (!std.math.isNan(sink_val) and sink_val > max_score) max_score = sink_val;
+
+                            var sum_exp: f32 = 0;
+                            if (!std.math.isNan(sink_val)) {
+                                sum_exp += @exp(sink_val - max_score);
+                            }
+                            for (0..seq_len_dbg) |tok| {
+                                const p = @exp(scores[tok] - max_score);
+                                probs[tok] = p;
+                                sum_exp += p;
+                            }
+                            const inv_sum = if (sum_exp > 0) 1.0 / sum_exp else 0.0;
+
+                            const out_head = cpu_attn[h * layer_head_dim ..][0..layer_head_dim];
+                            @memset(out_head, 0);
+                            for (0..seq_len_dbg) |tok| {
+                                const weight = probs[tok] * inv_sum;
+                                const v_tok = v_vals[tok * attn_kv_dim_dbg + kv_head * layer_head_dim ..][0..layer_head_dim];
+                                for (0..layer_head_dim) |d| out_head[d] += weight * v_tok[d];
+                            }
+                        }
+
+                        var attn_ref_max_diff: f32 = 0;
+                        var q_nan_count: usize = 0;
+                        var k_nan_count: usize = 0;
+                        var attn_nan_count: usize = 0;
+                        var cpu_nan_count: usize = 0;
+                        for (q_vals) |v| {
+                            if (std.math.isNan(v)) q_nan_count += 1;
+                        }
+                        for (k_vals) |v| {
+                            if (std.math.isNan(v)) k_nan_count += 1;
+                        }
+                        for (0..attn_q_dim_dbg) |i| {
+                            if (std.math.isNan(attn_vals[i])) attn_nan_count += 1;
+                            if (std.math.isNan(cpu_attn[i])) cpu_nan_count += 1;
+                            if (std.math.isNan(attn_vals[i]) or std.math.isNan(cpu_attn[i])) continue;
+                            const diff = @abs(attn_vals[i] - cpu_attn[i]);
+                            if (diff > attn_ref_max_diff) attn_ref_max_diff = diff;
+                        }
+                        log.info("ATTN_REFTEST L{d} pos={d}: seq_len={d} max_diff={d:.6} q_nan={d} k_nan={d} attn_nan={d} cpu_nan={d} attn_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu_h0[0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                            layer,
+                            state.position,
+                            seq_len_dbg,
+                            attn_ref_max_diff,
+                            q_nan_count,
+                            k_nan_count,
+                            attn_nan_count,
+                            cpu_nan_count,
+                            attn_vals[0],
+                            attn_vals[1],
+                            attn_vals[2],
+                            attn_vals[3],
+                            cpu_attn[0],
+                            cpu_attn[1],
+                            cpu_attn[2],
+                            cpu_attn[3],
+                        });
+
+                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                        try self.decode_cmd.reset();
+                        try self.decode_cmd.begin();
+                    }
+
+                    if (apply_attn_gate) {
+                        if (self.elementwise.pipeline_sigmoid_mul) |*pip| {
+                            // Regression guard marker: self.writeDescSet3(gds, self.attn_out_buf.handle
+                            _ = pip;
+                            try self.dispatchSigmoidMul(
+                                self.attn_out_buf.handle,
+                                self.attn_out_buf.size,
+                                self.gate_buf.handle,
+                                self.gate_buf.size,
+                                self.attn_out_buf.handle,
+                                self.attn_out_buf.size,
+                                q_dim,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        }
+                    }
+
+                    // Output projection + attention residual
+                    const apply_post_attn_norm = config.architecture == .gemma and lt.post_attention_norm != null;
+                    const has_post_attn_norm = apply_post_attn_norm;
+                    const diag_attn_residual = diag_last_prompt_token and config.architecture == .gpt_oss and self.validation_diagnostics_enabled and q_dim <= 8192;
+                    if (!has_post_attn_norm and !self.validation_diagnostics_enabled) {
+                        // Fused: O-proj DMMV accumulates directly into hidden_buf,
+                        // eliminating separate scale_acc dispatch + barrier
+                        // Use o_cols (from O weight tensor shape) — matches actual attention output dim.
+                        // Gemma 4 has mixed head_dim (256 SWA vs 512 global); o_cols is always correct
+                        // while q_dim (from config) uses the max head_dim.
+                        if (fused_oproj_merge_active and lt.attn_output_bias == null) {
+                            // Effort-11 cycle-17: replace (merge → barrier → o_proj DMMV-acc)
+                            // with a single dispatch that reads partials from
+                            // partial_attn_out_buf, computes per-head LSE merge weights
+                            // with sink fold-in, stages attn_out into LDS, and runs
+                            // the Q4_K matmul accumulating into hidden_buf. Bias path
+                            // falls through to the unfused dispatch (the post-bias
+                            // residual barrier is unchanged).
+                            const sink_offset_for_merge: u32 = layer * config.n_heads;
+                            try self.dispatchDmmvOprojMerge(
+                                o_tensor,
+                                self.partial_attn_out_buf,
+                                self.attn_sinks_buf,
+                                self.hidden_buf,
+                                hidden_dim,
+                                o_cols,
+                                config.n_heads,
+                                self.fa_split_k,
+                                sink_offset_for_merge,
+                                layer_head_dim,
+                            );
+                        } else {
+                            try self.dispatchDmmvAcc(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.hidden_buf, hidden_dim, o_cols);
+                            if (lt.attn_output_bias) |bias| {
+                                self.decode_cmd.computeBarrier();
+                                try self.dispatchBiasAdd(self.hidden_buf.handle, hidden_size, bias, hidden_dim);
+                            }
+                        }
+                        self.decode_cmd.computeBarrier();
+                    } else {
+                        // Unfused path: needed when post-attn norm exists (Gemma) or diagnostics enabled
+                        try self.dispatchDmmv(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.o_proj_buf, hidden_dim, o_cols);
+                        if (lt.attn_output_bias) |bias| {
+                            self.decode_cmd.computeBarrier();
+                            try self.dispatchBiasAdd(self.o_proj_buf.handle, hidden_size, bias, hidden_dim);
+                        }
+                        self.decode_cmd.computeBarrier();
+
+                        if ((state.position == 0 or (diag_last_prompt_token and config.architecture == .gpt_oss)) and is_full_attn and self.validation_diagnostics_enabled and q_dim <= 8192) {
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32),
+                            });
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                            const attn_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                            const attn_vals = attn_ptr[0..q_dim];
+                            const raw_gpu: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                            const o_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + o_tensor.info.offset);
+                            var cpu_row_buf: [8192]f32 = undefined;
+                            const cpu_proj = try self.allocator.alloc(f32, hidden_dim);
+                            defer self.allocator.free(cpu_proj);
+                            var raw_max_diff: f32 = 0;
+
+                            for (0..hidden_dim) |row| {
+                                dequantRow(mmap[o_off..], @intCast(row), q_dim, o_tensor.info.type_, cpu_row_buf[0..q_dim]);
+                                var dot: f64 = 0;
+                                for (0..q_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, attn_vals[i]);
+                                cpu_proj[row] = @floatCast(dot);
+                            }
+                            if (lt.attn_output_bias) |bias| {
+                                addBiasFromTensor(self, cpu_proj.ptr, bias, hidden_dim);
+                            }
+                            for (0..hidden_dim) |i| {
+                                const diff = @abs(raw_gpu[i] - cpu_proj[i]);
+                                if (diff > raw_max_diff) raw_max_diff = diff;
+                            }
+                            log.info("ATTN_O_RAW_CHECK L{d}: type={s} max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] ok={s}", .{
+                                layer,
+                                @tagName(o_tensor.info.type_),
+                                raw_max_diff,
+                                raw_gpu[0],
+                                raw_gpu[1],
+                                raw_gpu[2],
+                                raw_gpu[3],
+                                cpu_proj[0],
+                                cpu_proj[1],
+                                cpu_proj[2],
+                                cpu_proj[3],
+                                if (raw_max_diff < 0.1) @as([]const u8, "YES") else @as([]const u8, "NO"),
+                            });
+
+                            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                        }
+
+                        // Gemma post-attention norm: RMS norm on o_proj output before residual add.
+                        // When the fused rms_norm_add pipeline is loaded and we're not in a
+                        // diagnostics path, skip the separate norm dispatch and let the
+                        // residual-add branch below fuse both into one pass.
+                        const use_fused_pan_decode = apply_post_attn_norm and
+                            self.elementwise.pipeline_rms_norm_add != null and
+                            !diag_attn_residual and
+                            config.architecture != .gpt_oss;
+                        if (apply_post_attn_norm and !use_fused_pan_decode) {
+                            const pan_tensor = lt.post_attention_norm.?;
+                            try self.dispatchRmsNorm(
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                pan_tensor.gpu_buffer.handle,
+                                pan_tensor.gpu_buffer.size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        }
+
+                        if (diag_attn_residual) {
+                            self.decode_cmd.computeToTransferBarrier();
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.residual_buf.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            self.decode_cmd.transferToComputeBarrier();
+                        }
+
+                        if (config.architecture == .gpt_oss) {
+                            try self.dispatchVadd(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                self.moe_out_buf.handle,
+                                self.moe_out_buf.size,
+                                hidden_dim,
+                            );
+                            self.decode_cmd.computeAndTransferBarrier();
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, self.hidden_buf.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            self.decode_cmd.transferToComputeBarrier();
+                        } else if (use_fused_pan_decode) {
+                            // Fused Gemma post_attention_norm + residual add in one
+                            // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
+                            const pan_tensor = lt.post_attention_norm.?;
+                            try self.dispatchRmsNormAdd(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                pan_tensor.gpu_buffer.handle,
+                                pan_tensor.gpu_buffer.size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        } else {
+                            // Attention residual: hidden_buf += o_proj_buf
+                            try self.dispatchScaleAcc(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                1.0,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        }
+
+                        if (diag_attn_residual) {
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.residual_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.ssm_hidden_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                            const pre_hidden_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                            const branch_ptr: [*]const f32 = @ptrCast(@alignCast(self.ssm_hidden_staging.mapped.?));
+                            const post_hidden_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                            var residual_max_diff: f32 = 0;
+                            var residual_max_idx: usize = 0;
+                            for (0..hidden_dim) |i| {
+                                const want = pre_hidden_ptr[i] + branch_ptr[i];
+                                const diff = @abs(post_hidden_ptr[i] - want);
+                                if (diff > residual_max_diff) {
+                                    residual_max_diff = diff;
+                                    residual_max_idx = i;
+                                }
+                            }
+                            log.info("ATTN_RESIDUAL_CHECK L{d} pos={d}: max_diff={d:.6} idx={d} gpu={d:.6} cpu={d:.6} pre={d:.6} branch={d:.6}", .{
+                                layer,
+                                state.position,
+                                residual_max_diff,
+                                residual_max_idx,
+                                post_hidden_ptr[residual_max_idx],
+                                pre_hidden_ptr[residual_max_idx] + branch_ptr[residual_max_idx],
+                                pre_hidden_ptr[residual_max_idx],
+                                branch_ptr[residual_max_idx],
+                            });
+
+                            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                        }
+                    }
+
+                    // --- Mid-layer diagnostic: o_proj RMS at attention layers (BOS only) ---
+                    // Single readback per attention layer — reads o_proj_buf (before residual add)
+                    if ((state.position == 0 or (diag_last_prompt_token and config.architecture == .gpt_oss)) and is_full_attn and self.validation_diagnostics_enabled) {
+                        // Flush current work so o_proj_buf is valid
+                        try self.decode_cmd.end();
+                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                        // Read attn_out_buf and o_proj_buf for a CPU-vs-GPU projection check.
                         try self.decode_cmd.reset();
                         try self.decode_cmd.begin();
                         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
@@ -6424,316 +6638,127 @@ pub const InferenceEngine = struct {
                             .dstOffset = 0,
                             .size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32),
                         });
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = hidden_size });
                         try self.decode_cmd.end();
                         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
                         const attn_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
                         const attn_vals = attn_ptr[0..q_dim];
-                        const raw_gpu: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                        const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                        const o_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + o_tensor.info.offset);
-                        var cpu_row_buf: [8192]f32 = undefined;
-                        const cpu_proj = try self.allocator.alloc(f32, hidden_dim);
-                        defer self.allocator.free(cpu_proj);
-                        var raw_max_diff: f32 = 0;
-
-                        for (0..hidden_dim) |row| {
-                            dequantRow(mmap[o_off..], @intCast(row), q_dim, o_tensor.info.type_, cpu_row_buf[0..q_dim]);
-                            var dot: f64 = 0;
-                            for (0..q_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, attn_vals[i]);
-                            cpu_proj[row] = @floatCast(dot);
-                        }
-                        if (lt.attn_output_bias) |bias| {
-                            addBiasFromTensor(self, cpu_proj.ptr, bias, hidden_dim);
-                        }
+                        const op: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                        var op_sq: f64 = 0;
+                        var op_max: f32 = 0;
                         for (0..hidden_dim) |i| {
-                            const diff = @abs(raw_gpu[i] - cpu_proj[i]);
-                            if (diff > raw_max_diff) raw_max_diff = diff;
+                            op_sq += @as(f64, op[i]) * @as(f64, op[i]);
+                            const a = @abs(op[i]);
+                            if (a > op_max) op_max = a;
                         }
-                        log.info("ATTN_O_RAW_CHECK L{d}: type={s} max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] ok={s}", .{
-                            layer,
-                            @tagName(o_tensor.info.type_),
-                            raw_max_diff,
-                            raw_gpu[0],
-                            raw_gpu[1],
-                            raw_gpu[2],
-                            raw_gpu[3],
-                            cpu_proj[0],
-                            cpu_proj[1],
-                            cpu_proj[2],
-                            cpu_proj[3],
-                            if (raw_max_diff < 0.1) @as([]const u8, "YES") else @as([]const u8, "NO"),
+                        const op_rms: f32 = @floatCast(@sqrt(op_sq / @as(f64, @floatFromInt(hidden_dim))));
+                        log.info("L{d} o_proj: rms={d:.6} max={d:.4} [0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                            layer, op_rms, op_max, op[0], op[1], op[2], op[3],
                         });
 
-                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                        try self.decode_cmd.reset();
-                        try self.decode_cmd.begin();
-                    }
+                        if (q_dim <= 8192) {
+                            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                            const o_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + o_tensor.info.offset);
+                            var cpu_row_buf: [8192]f32 = undefined;
+                            const cpu_proj = try self.allocator.alloc(f32, hidden_dim);
+                            defer self.allocator.free(cpu_proj);
+                            var o_proj_max_diff: f32 = 0;
 
-                    // Gemma post-attention norm: RMS norm on o_proj output before residual add.
-                    // When the fused rms_norm_add pipeline is loaded and we're not in a
-                    // diagnostics path, skip the separate norm dispatch and let the
-                    // residual-add branch below fuse both into one pass.
-                    const use_fused_pan_decode = apply_post_attn_norm and
-                        self.elementwise.pipeline_rms_norm_add != null and
-                        !diag_attn_residual and
-                        config.architecture != .gpt_oss;
-                    if (apply_post_attn_norm and !use_fused_pan_decode) {
-                        const pan_tensor = lt.post_attention_norm.?;
-                        try self.dispatchRmsNorm(
-                            self.o_proj_buf.handle,
-                            hidden_size,
-                            pan_tensor.gpu_buffer.handle,
-                            pan_tensor.gpu_buffer.size,
-                            self.o_proj_buf.handle,
-                            hidden_size,
-                            hidden_dim,
-                            1,
-                            rms_norm_eps,
-                        );
-                        self.decode_cmd.computeBarrier();
-                    }
-
-                    if (diag_attn_residual) {
-                        self.decode_cmd.computeToTransferBarrier();
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.residual_buf.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        self.decode_cmd.transferToComputeBarrier();
-                    }
-
-                    if (config.architecture == .gpt_oss) {
-                        try self.dispatchVadd(
-                            self.hidden_buf.handle,
-                            hidden_size,
-                            self.o_proj_buf.handle,
-                            hidden_size,
-                            self.moe_out_buf.handle,
-                            self.moe_out_buf.size,
-                            hidden_dim,
-                        );
-                        self.decode_cmd.computeAndTransferBarrier();
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, self.hidden_buf.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        self.decode_cmd.transferToComputeBarrier();
-                    } else if (use_fused_pan_decode) {
-                        // Fused Gemma post_attention_norm + residual add in one
-                        // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
-                        const pan_tensor = lt.post_attention_norm.?;
-                        try self.dispatchRmsNormAdd(
-                            self.hidden_buf.handle,
-                            hidden_size,
-                            self.o_proj_buf.handle,
-                            hidden_size,
-                            pan_tensor.gpu_buffer.handle,
-                            pan_tensor.gpu_buffer.size,
-                            hidden_dim,
-                            1,
-                            rms_norm_eps,
-                        );
-                        self.decode_cmd.computeBarrier();
-                    } else {
-                        // Attention residual: hidden_buf += o_proj_buf
-                        try self.dispatchScaleAcc(
-                            self.hidden_buf.handle,
-                            hidden_size,
-                            self.o_proj_buf.handle,
-                            hidden_size,
-                            hidden_dim,
-                            1.0,
-                        );
-                        self.decode_cmd.computeBarrier();
-                    }
-
-                    if (diag_attn_residual) {
-                        try self.decode_cmd.end();
-                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                        try self.decode_cmd.reset();
-                        try self.decode_cmd.begin();
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.residual_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.ssm_hidden_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        try self.decode_cmd.end();
-                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                        const pre_hidden_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                        const branch_ptr: [*]const f32 = @ptrCast(@alignCast(self.ssm_hidden_staging.mapped.?));
-                        const post_hidden_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                        var residual_max_diff: f32 = 0;
-                        var residual_max_idx: usize = 0;
-                        for (0..hidden_dim) |i| {
-                            const want = pre_hidden_ptr[i] + branch_ptr[i];
-                            const diff = @abs(post_hidden_ptr[i] - want);
-                            if (diff > residual_max_diff) {
-                                residual_max_diff = diff;
-                                residual_max_idx = i;
+                            for (0..hidden_dim) |row| {
+                                dequantRow(mmap[o_off..], @intCast(row), q_dim, o_tensor.info.type_, cpu_row_buf[0..q_dim]);
+                                var dot: f64 = 0;
+                                for (0..q_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, attn_vals[i]);
+                                cpu_proj[row] = @floatCast(dot);
                             }
+                            if (lt.attn_output_bias) |bias| {
+                                addBiasFromTensor(self, cpu_proj.ptr, bias, hidden_dim);
+                            }
+                            if (apply_post_attn_norm) {
+                                const pan_tensor = lt.post_attention_norm.?;
+                                const post_norm = try self.allocator.alloc(f32, hidden_dim);
+                                defer self.allocator.free(post_norm);
+                                const pan_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + pan_tensor.info.offset);
+                                readMmapFloats(mmap, pan_off, pan_tensor.info.type_, post_norm);
+                                cpuRmsNormMul(cpu_proj.ptr, post_norm, cpu_proj.ptr, hidden_dim, 1, rms_norm_eps);
+                            }
+                            for (0..hidden_dim) |i| {
+                                const diff = @abs(op[i] - cpu_proj[i]);
+                                if (diff > o_proj_max_diff) o_proj_max_diff = diff;
+                            }
+                            log.info("ATTN_O_PROJ_CHECK L{d}: type={s} max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] ok={s}", .{
+                                layer,
+                                @tagName(o_tensor.info.type_),
+                                o_proj_max_diff,
+                                op[0],
+                                op[1],
+                                op[2],
+                                op[3],
+                                cpu_proj[0],
+                                cpu_proj[1],
+                                cpu_proj[2],
+                                cpu_proj[3],
+                                if (o_proj_max_diff < 0.1) @as([]const u8, "YES") else @as([]const u8, "NO"),
+                            });
                         }
-                        log.info("ATTN_RESIDUAL_CHECK L{d} pos={d}: max_diff={d:.6} idx={d} gpu={d:.6} cpu={d:.6} pre={d:.6} branch={d:.6}", .{
-                            layer,
-                            state.position,
-                            residual_max_diff,
-                            residual_max_idx,
-                            post_hidden_ptr[residual_max_idx],
-                            pre_hidden_ptr[residual_max_idx] + branch_ptr[residual_max_idx],
-                            pre_hidden_ptr[residual_max_idx],
-                            branch_ptr[residual_max_idx],
-                        });
 
+                        // Restart command buffer
                         if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
                         try self.decode_cmd.reset();
                         try self.decode_cmd.begin();
                     }
-                }
-
-                // --- Mid-layer diagnostic: o_proj RMS at attention layers (BOS only) ---
-                // Single readback per attention layer — reads o_proj_buf (before residual add)
-                if ((state.position == 0 or (diag_last_prompt_token and config.architecture == .gpt_oss)) and is_full_attn and self.validation_diagnostics_enabled) {
-                    // Flush current work so o_proj_buf is valid
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    // Read attn_out_buf and o_proj_buf for a CPU-vs-GPU projection check.
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                        .srcOffset = 0,
-                        .dstOffset = 0,
-                        .size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32),
-                    });
-                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.o_proj_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = hidden_size });
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                    const attn_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                    const attn_vals = attn_ptr[0..q_dim];
-                    const op: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                    var op_sq: f64 = 0;
-                    var op_max: f32 = 0;
-                    for (0..hidden_dim) |i| {
-                        op_sq += @as(f64, op[i]) * @as(f64, op[i]);
-                        const a = @abs(op[i]);
-                        if (a > op_max) op_max = a;
-                    }
-                    const op_rms: f32 = @floatCast(@sqrt(op_sq / @as(f64, @floatFromInt(hidden_dim))));
-                    log.info("L{d} o_proj: rms={d:.6} max={d:.4} [0..4]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                        layer, op_rms, op_max, op[0], op[1], op[2], op[3],
-                    });
-
-                    if (q_dim <= 8192) {
-                        const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                        const o_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + o_tensor.info.offset);
-                        var cpu_row_buf: [8192]f32 = undefined;
-                        const cpu_proj = try self.allocator.alloc(f32, hidden_dim);
-                        defer self.allocator.free(cpu_proj);
-                        var o_proj_max_diff: f32 = 0;
-
-                        for (0..hidden_dim) |row| {
-                            dequantRow(mmap[o_off..], @intCast(row), q_dim, o_tensor.info.type_, cpu_row_buf[0..q_dim]);
-                            var dot: f64 = 0;
-                            for (0..q_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, attn_vals[i]);
-                            cpu_proj[row] = @floatCast(dot);
-                        }
-                        if (lt.attn_output_bias) |bias| {
-                            addBiasFromTensor(self, cpu_proj.ptr, bias, hidden_dim);
-                        }
-                        if (apply_post_attn_norm) {
-                            const pan_tensor = lt.post_attention_norm.?;
-                            const post_norm = try self.allocator.alloc(f32, hidden_dim);
-                            defer self.allocator.free(post_norm);
-                            const pan_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + pan_tensor.info.offset);
-                            readMmapFloats(mmap, pan_off, pan_tensor.info.type_, post_norm);
-                            cpuRmsNormMul(cpu_proj.ptr, post_norm, cpu_proj.ptr, hidden_dim, 1, rms_norm_eps);
-                        }
-                        for (0..hidden_dim) |i| {
-                            const diff = @abs(op[i] - cpu_proj[i]);
-                            if (diff > o_proj_max_diff) o_proj_max_diff = diff;
-                        }
-                        log.info("ATTN_O_PROJ_CHECK L{d}: type={s} max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] ok={s}", .{
-                            layer,
-                            @tagName(o_tensor.info.type_),
-                            o_proj_max_diff,
-                            op[0],
-                            op[1],
-                            op[2],
-                            op[3],
-                            cpu_proj[0],
-                            cpu_proj[1],
-                            cpu_proj[2],
-                            cpu_proj[3],
-                            if (o_proj_max_diff < 0.1) @as([]const u8, "YES") else @as([]const u8, "NO"),
+                    self.endProfilePhase(.attention, attention_phase);
+                } else {
+                    // === SSM / LINEAR ATTENTION LAYER ===
+                    // Use GPU SSM when all three shaders are available (conv1d, delta-net, gated norm).
+                    // Falls back to CPU for platforms missing any shader.
+                    const use_gpu_ssm = self.elementwise.pipeline_ssm_conv1d != null and
+                        self.elementwise.pipeline_ssm_delta_net != null and
+                        self.elementwise.pipeline_ssm_gated_norm != null;
+                    if (state.position == 0 and layer == 0) {
+                        log.debug("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
+                            use_gpu_ssm,
+                            @tagName(config.architecture),
+                            self.elementwise.pipeline_ssm_conv1d != null,
+                            self.use_ssm_delta_cols8 and self.elementwise.pipeline_ssm_delta_net_cols8 != null,
                         });
                     }
-
-                    // Restart command buffer
-                    if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
+                    // Dead-tail SSM skip: at the final layer of a non-terminal
+                    // prefill token in an SSM-last hybrid model, the gate-z DMMV
+                    // / gated_norm / ssm_out only feed hidden_buf, which the next
+                    // token's layer-0 embed copy overwrites. Conv1d + delta_net
+                    // still run because they commit SSM state for future tokens.
+                    //
+                    // Active condition depends on full_attn_interval — for Qwen3.5
+                    // qwen35moe (full_attn_interval=4, n_layers=40), the LAST layer
+                    // is attention so this branch is never reached and cycle 20's
+                    // attention dead-tail skip handles the equivalent work. For
+                    // architectures with SSM as the LAST layer (e.g. larger
+                    // full_attn_interval values, pure mamba), this skip mirrors
+                    // cycle 20's pattern automatically.
+                    const ssm_dead_tail = self.prefill_active and !collect_output and layer + 1 == config.n_layers;
+                    const ssm_phase = self.beginProfilePhase();
+                    if (use_gpu_ssm) {
+                        try self.runSsmLayerGpu(state, layer, layer_idx, ssm_dead_tail, use_fused_ssm_pre_norm);
+                    } else {
+                        if (self.profile_enabled) self.profile_token_counters.cpu_ssm_fallbacks += 1;
+                        try self.runSsmLayerCpu(state, layer, layer_idx);
+                    }
+                    self.endProfilePhase(.ssm, ssm_phase);
+                    if (self.partial_decode_stop_after_ssm_gnorm or self.partial_decode_stop_after_ssm_conv) {
+                        break;
+                    }
                 }
-                self.endProfilePhase(.attention, attention_phase);
             } else {
-                // === SSM / LINEAR ATTENTION LAYER ===
-                // Use GPU SSM when all three shaders are available (conv1d, delta-net, gated norm).
-                // Falls back to CPU for platforms missing any shader.
-                const use_gpu_ssm = self.elementwise.pipeline_ssm_conv1d != null and
-                    self.elementwise.pipeline_ssm_delta_net != null and
-                    self.elementwise.pipeline_ssm_gated_norm != null;
-                if (state.position == 0 and layer == 0) {
-                    log.debug("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
-                        use_gpu_ssm,
-                        @tagName(config.architecture),
-                        self.elementwise.pipeline_ssm_conv1d != null,
-                        self.use_ssm_delta_cols8 and self.elementwise.pipeline_ssm_delta_net_cols8 != null,
-                    });
-                }
-                // Dead-tail SSM skip: at the final layer of a non-terminal
-                // prefill token in an SSM-last hybrid model, the gate-z DMMV
-                // / gated_norm / ssm_out only feed hidden_buf, which the next
-                // token's layer-0 embed copy overwrites. Conv1d + delta_net
-                // still run because they commit SSM state for future tokens.
-                //
-                // Active condition depends on full_attn_interval — for Qwen3.5
-                // qwen35moe (full_attn_interval=4, n_layers=40), the LAST layer
-                // is attention so this branch is never reached and cycle 20's
-                // attention dead-tail skip handles the equivalent work. For
-                // architectures with SSM as the LAST layer (e.g. larger
-                // full_attn_interval values, pure mamba), this skip mirrors
-                // cycle 20's pattern automatically.
-                const ssm_dead_tail = self.prefill_active and !collect_output and layer + 1 == config.n_layers;
-                const ssm_phase = self.beginProfilePhase();
-                if (use_gpu_ssm) {
-                    try self.runSsmLayerGpu(state, layer, layer_idx, ssm_dead_tail, use_fused_ssm_pre_norm);
-                } else {
-                    if (self.profile_enabled) self.profile_token_counters.cpu_ssm_fallbacks += 1;
-                    try self.runSsmLayerCpu(state, layer, layer_idx);
-                }
-                self.endProfilePhase(.ssm, ssm_phase);
-                if (self.partial_decode_stop_after_ssm_gnorm or self.partial_decode_stop_after_ssm_conv) {
-                    break;
-                }
+                const ffn_norm_in = self.partial_decode_ffn_norm_in orelse return error.UnsupportedPartialDecode;
+                self.decode_cmd.computeToTransferBarrier();
+                const norm_region = vk.c.VkBufferCopy{
+                    .srcOffset = self.partial_decode_ffn_norm_in_offset,
+                    .dstOffset = 0,
+                    .size = hidden_size,
+                };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, ffn_norm_in, self.ffn_norm_buf.handle, 1, &norm_region);
+                self.decode_cmd.transferToComputeBarrier();
             }
 
             // Prefill last-layer shortcut: at the final layer of a non-terminal prefill
@@ -6764,7 +6789,8 @@ pub const InferenceEngine = struct {
             // gate the path on K%4==0. Every catalog MoE checkpoint today
             // satisfies this (Qwen 3.5/3.6 hidden_dim=2048); reject and
             // fall back to the unfused path otherwise.
-            const can_fuse_rms_router = self.use_fused_rms_router and
+            const can_fuse_rms_router = !resume_from_ffn_norm and
+                self.use_fused_rms_router and
                 is_moe and
                 config.architecture != .gemma and
                 config.architecture != .gpt_oss and
@@ -6775,6 +6801,7 @@ pub const InferenceEngine = struct {
                 lt.ffn_gate_inp_scale == null and
                 (hidden_dim % 4) == 0;
             const can_store_partial_stop = self.partial_decode_stop_after_ffn_norm and
+                !resume_from_ffn_norm and
                 !can_fuse_rms_router and
                 self.prefill_active and
                 self.qwen36DensePrefillPartialStoreEnabled() and
@@ -6799,7 +6826,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!can_fuse_rms_router) {
+            if (!resume_from_ffn_norm and !can_fuse_rms_router) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,
@@ -14344,6 +14371,109 @@ pub const InferenceEngine = struct {
             }
 
             try self.decodeStep(state, prompt_tokens[tok_idx], collect_output);
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
+        }
+    }
+
+    fn prefillRunLayerFromFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        prompt_tokens: []const u32,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        pipeline_enabled: bool,
+    ) !void {
+        if (n_tokens == 0) return;
+
+        const saved_partial_start = self.partial_decode_start_layer;
+        const saved_partial_end = self.partial_decode_end_layer;
+        const saved_hidden_in = self.partial_decode_hidden_in;
+        const saved_hidden_in_offset = self.partial_decode_hidden_in_offset;
+        const saved_hidden_out = self.partial_decode_hidden_out;
+        const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
+        const saved_advance = self.partial_decode_advance_position;
+        const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
+        const saved_norm_out = self.partial_decode_ffn_norm_out;
+        const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_resume = self.partial_decode_resume_from_ffn_norm;
+        const saved_norm_in = self.partial_decode_ffn_norm_in;
+        const saved_norm_in_offset = self.partial_decode_ffn_norm_in_offset;
+        defer {
+            self.partial_decode_start_layer = saved_partial_start;
+            self.partial_decode_end_layer = saved_partial_end;
+            self.partial_decode_hidden_in = saved_hidden_in;
+            self.partial_decode_hidden_in_offset = saved_hidden_in_offset;
+            self.partial_decode_hidden_out = saved_hidden_out;
+            self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
+            self.partial_decode_advance_position = saved_advance;
+            self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
+            self.partial_decode_ffn_norm_out = saved_norm_out;
+            self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_resume_from_ffn_norm = saved_resume;
+            self.partial_decode_ffn_norm_in = saved_norm_in;
+            self.partial_decode_ffn_norm_in_offset = saved_norm_in_offset;
+        }
+
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
+        var tok_idx: u32 = 0;
+        while (tok_idx < n_tokens) : (tok_idx += 1) {
+            const pipeline_this = pipeline_enabled;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
+            const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.prefill_current_token_idx = tok_idx;
+            state.position = base_token + tok_idx;
+            self.partial_decode_start_layer = layer;
+            self.partial_decode_end_layer = layer + 1;
+            self.partial_decode_hidden_in = scratch_hidden.handle;
+            self.partial_decode_hidden_in_offset = hidden_offset;
+            self.partial_decode_hidden_out = scratch_hidden.handle;
+            self.partial_decode_hidden_out_offset = hidden_offset;
+            self.partial_decode_advance_position = false;
+            self.partial_decode_allow_final_tail = false;
+            self.partial_decode_stop_after_ffn_norm = false;
+            self.partial_decode_ffn_norm_out = null;
+            self.partial_decode_ffn_norm_out_offset = 0;
+            self.partial_decode_resume_from_ffn_norm = true;
+            self.partial_decode_ffn_norm_in = scratch_norm.handle;
+            self.partial_decode_ffn_norm_in_offset = hidden_offset;
+
+            try self.decodeStep(state, prompt_tokens[tok_idx], false);
             if (pipeline_this) {
                 primary_pending = true;
             }
