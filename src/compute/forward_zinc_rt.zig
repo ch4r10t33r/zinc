@@ -3685,18 +3685,34 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         };
     }
 
-    tracking.boundary.dmmvQ8_0TwoRowRanges(
-        state.norm,
-        alpha_raw[0..alpha_bytes],
-        alpha_rows,
-        beta_raw[0..beta_bytes],
-        beta_rows,
-        cols,
-        gpu_out,
-    ) catch |err| {
-        log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
-        return false;
-    };
+    const used_parallel64 = total_rows == 64;
+    if (used_parallel64) {
+        tracking.boundary.dmmvQ8_0TwoRowRangesParallel64(
+            state.norm,
+            alpha_raw[0..alpha_bytes],
+            alpha_rows,
+            beta_raw[0..beta_bytes],
+            beta_rows,
+            cols,
+            gpu_out,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range parallel64 unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
+            return false;
+        };
+    } else {
+        tracking.boundary.dmmvQ8_0TwoRowRanges(
+            state.norm,
+            alpha_raw[0..alpha_bytes],
+            alpha_rows,
+            beta_raw[0..beta_bytes],
+            beta_rows,
+            cols,
+            gpu_out,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
+            return false;
+        };
+    }
 
     var max_abs_delta: f32 = 0.0;
     var max_row: u32 = 0;
@@ -3776,8 +3792,9 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
     tracking.real_model_slice.* = true;
     if (tracking.decode_model_slices) |slices| slices.* += 2;
     if (trusted_no_oracle) {
-        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_alpha_beta_q8_0_row_range_trusted phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} trust_after_successes={d} validation=finite_only", .{
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} trust_after_successes={d} validation=finite_only", .{
             tracking.ops.*,
+            if (used_parallel64) "ssm_alpha_beta_q8_0_row_range_parallel64_trusted" else "ssm_alpha_beta_q8_0_row_range_trusted",
             layer,
             alpha_rows,
             beta_rows,
@@ -3785,8 +3802,9 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
             state.direct_ssm_q8_row_range_trust_after_successes,
         });
     } else {
-        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_alpha_beta_q8_0_row_range phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} max_abs_delta={d:.6} max_kind={s} max_row={d}", .{
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} max_abs_delta={d:.6} max_kind={s} max_row={d}", .{
             tracking.ops.*,
+            if (used_parallel64) "ssm_alpha_beta_q8_0_row_range_parallel64" else "ssm_alpha_beta_q8_0_row_range",
             layer,
             alpha_rows,
             beta_rows,

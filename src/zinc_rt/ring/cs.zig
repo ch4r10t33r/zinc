@@ -219,6 +219,7 @@ const shader_offset_dmmv_q8_0_row_range: usize = 0x500;
 const shader_offset_argmax_u32_range: usize = 0x600;
 const shader_offset_dmmv_q4_0_argmax_row_range: usize = 0x700;
 const shader_offset_dmmv_q4_0_row_range_parallel: usize = 0x900;
+const shader_offset_dmmv_q8_0_row_range_parallel: usize = 0xb00;
 const shader_page_bytes: usize = 4096;
 
 // gfx1201 one-wave kernel assembled with:
@@ -682,6 +683,72 @@ const dmmv_q8_0_row_range_gfx1201 = [_]u32{
     0xbfb00000,
 };
 
+// gfx1201 wave64 Q8_0 DMMV row-range kernel assembled with:
+//   llvm-mc-20 -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj
+//
+// ABI:
+//   s[0:1] = input f32 vector pointer
+//   s[2:3] = output f32 row-result pointer
+//   s[4:5] = Q8_0 weight rows pointer
+//   s6     = cols, multiple of 32
+//   s7     = rows, currently must be 64
+//   v0     = workitem_id_x, row id
+//
+// One wave evaluates a 64-row Q8_0 range: each lane owns one row and walks K
+// serially. The current forward path uses this for the consumed SSM
+// alpha+beta row-range slice (32 alpha rows + 32 beta rows).
+const dmmv_q8_0_row_range_parallel_gfx1201 = [_]u32{
+    0xbf06c007,
+    0xbfa1002c,
+    0x7e100300,
+    0x7e020280,
+    0x850a8506,
+    0x1612100a,
+    0x161212a2,
+    0xbe8b0080,
+    0xbf090a0b,
+    0xbfa2001f,
+    0x960da20b,
+    0x4a14120d,
+    0xee048004,
+    0x00000002,
+    0x0000000a,
+    0x960ea00b,
+    0xbe8f0080,
+    0xbf8903f7,
+    0x7e041702,
+    0xbf09a00f,
+    0xbfa20012,
+    0x8010820d,
+    0x80100f10,
+    0x4a161210,
+    0xee044004,
+    0x00000003,
+    0x0000000b,
+    0x80110f0e,
+    0x84118211,
+    0x7e180211,
+    0xee050000,
+    0x00000006,
+    0x0000000c,
+    0xbf8903f7,
+    0x7e060b03,
+    0x10060702,
+    0x56020d03,
+    0x800f810f,
+    0xbfa0ffec,
+    0x800b810b,
+    0xbfa0ffdf,
+    0x301c1082,
+    0xee068002,
+    0x00800000,
+    0x0000000e,
+    0xbfa00000,
+    0xbf800000,
+    0xbfb60003,
+    0xbfb00000,
+};
+
 comptime {
     std.debug.assert(shader_offset_argmax_top2 + argmax_top2_gfx1201.len * @sizeOf(u32) <= shader_offset_rms_norm_elem0);
     std.debug.assert(shader_offset_rms_norm_elem0 + rms_norm_elem0_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_f32_row_range);
@@ -690,7 +757,8 @@ comptime {
     std.debug.assert(shader_offset_dmmv_q8_0_row_range + dmmv_q8_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_argmax_u32_range);
     std.debug.assert(shader_offset_argmax_u32_range + argmax_u32_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_argmax_row_range);
     std.debug.assert(shader_offset_dmmv_q4_0_argmax_row_range + dmmv_q4_0_argmax_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range_parallel);
-    std.debug.assert(shader_offset_dmmv_q4_0_row_range_parallel + dmmv_q4_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+    std.debug.assert(shader_offset_dmmv_q4_0_row_range_parallel + dmmv_q4_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q8_0_row_range_parallel);
+    std.debug.assert(shader_offset_dmmv_q8_0_row_range_parallel + dmmv_q8_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
 }
 
 /// Result produced by the ordered-score argmax row-range kernel.
@@ -867,6 +935,7 @@ pub const TokenBoundary = struct {
         for (argmax_u32_range_gfx1201, 0..) |word, i| shader_words[shader_offset_argmax_u32_range / @sizeOf(u32) + i] = word;
         for (dmmv_q4_0_argmax_row_range_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_argmax_row_range / @sizeOf(u32) + i] = word;
         for (dmmv_q4_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_range_parallel / @sizeOf(u32) + i] = word;
+        for (dmmv_q8_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q8_0_row_range_parallel / @sizeOf(u32) + i] = word;
         storeFence();
 
         var bo_entries = [_]DrmAmdgpuBoListEntry{
@@ -1997,9 +2066,43 @@ pub const TokenBoundary = struct {
         cols: u32,
         output: []f32,
     ) !void {
+        return self.dmmvQ8_0TwoRowRangesImpl(input, weights_a_q8_0, rows_a, weights_b_q8_0, rows_b, cols, output, false);
+    }
+
+    /// Dispatch one wave64 Q8_0 DMMV kernel over two packed row ranges.
+    ///
+    /// This is the row-parallel companion to `dmmvQ8_0TwoRowRanges` for the
+    /// current SSM alpha+beta shape: 32 alpha rows plus 32 beta rows. Each lane
+    /// computes one row from the packed staging block, so the consumed model
+    /// slice no longer runs all 64 rows through one serial GPU workitem.
+    pub fn dmmvQ8_0TwoRowRangesParallel64(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_a_q8_0: []const u8,
+        rows_a: u32,
+        weights_b_q8_0: []const u8,
+        rows_b: u32,
+        cols: u32,
+        output: []f32,
+    ) !void {
+        return self.dmmvQ8_0TwoRowRangesImpl(input, weights_a_q8_0, rows_a, weights_b_q8_0, rows_b, cols, output, true);
+    }
+
+    fn dmmvQ8_0TwoRowRangesImpl(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_a_q8_0: []const u8,
+        rows_a: u32,
+        weights_b_q8_0: []const u8,
+        rows_b: u32,
+        cols: u32,
+        output: []f32,
+        parallel64: bool,
+    ) !void {
         if (rows_a == 0 or rows_b == 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
         const rows = rows_a + rows_b;
         if (rows < rows_a or input.len < cols or output.len < rows) return error.ShapeMismatch;
+        if (parallel64 and rows != 64) return error.ShapeMismatch;
 
         const row_bytes: usize = (@as(usize, cols) / 32) * 34;
         const weights_a_bytes = @as(usize, rows_a) * row_bytes;
@@ -2024,20 +2127,25 @@ pub const TokenBoundary = struct {
         signal_words[1] = 0;
         storeFence();
 
-        const signal_expected: u64 = 0x5A494E435254_8000 | @as(u64, self.submit_count + 1);
+        const signal_base: u64 = if (parallel64) @as(u64, 0x5A494E435254_8100) else @as(u64, 0x5A494E435254_8000);
+        const signal_expected: u64 = signal_base | @as(u64, self.submit_count + 1);
         self.builder.reset();
         try self.builder.writeNop(1);
 
-        const pgm_va = self.shader_va + shader_offset_dmmv_q8_0_row_range;
+        const shader_offset: usize = if (parallel64) shader_offset_dmmv_q8_0_row_range_parallel else shader_offset_dmmv_q8_0_row_range;
+        const pgm_va = self.shader_va + shader_offset;
         const pgm_lo: u32 = @truncate(pgm_va >> 8);
         const pgm_hi: u32 = @truncate(pgm_va >> 40);
+        const pgm_rsrc1: u32 = if (parallel64) compute_pgm_rsrc1_vgpr16_value else compute_pgm_rsrc1_value;
+        const pgm_rsrc2: u32 = if (parallel64) compute_pgm_rsrc2_user8_vgpr_workitem_x_value else compute_pgm_rsrc2_argmax_top2_value;
         try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
         try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
-            compute_pgm_rsrc1_value,
-            compute_pgm_rsrc2_argmax_top2_value,
+            pgm_rsrc1,
+            pgm_rsrc2,
         });
         try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
-        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 1, 1, 1 });
+        const thread_x: u32 = if (parallel64) 64 else 1;
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ thread_x, 1, 1 });
         try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
             0,
             0xffff_ffff,
@@ -2062,7 +2170,11 @@ pub const TokenBoundary = struct {
             rows,
         });
         try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
-        try self.builder.writeData64(self.signal_va, signal_expected);
+        if (parallel64) {
+            try self.builder.releaseMemSignal(self.signal_va, signal_expected);
+        } else {
+            try self.builder.writeData64(self.signal_va, signal_expected);
+        }
         try self.builder.padToAlignment(64);
         storeFence();
 
