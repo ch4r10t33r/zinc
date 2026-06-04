@@ -3449,6 +3449,25 @@ fn runSsmLayer(
 
 const direct_ssm_alpha_q8_0_row_range_tolerance: f32 = 0.02;
 
+const DirectSsmProjectionKind = enum {
+    alpha,
+    beta,
+};
+
+fn directSsmProjectionKindName(kind: DirectSsmProjectionKind) []const u8 {
+    return switch (kind) {
+        .alpha => "alpha",
+        .beta => "beta",
+    };
+}
+
+fn markDirectSsmQ8_0RowRangeFailed(state: *ScalarDecodeState, layer: u32, kind: DirectSsmProjectionKind) void {
+    switch (kind) {
+        .alpha => state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer),
+        .beta => state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer),
+    }
+}
+
 fn directSsmRowRangeTypeName(tensor_type: gguf.GGMLType) []const u8 {
     return switch (tensor_type) {
         .f32 => "f32",
@@ -3681,21 +3700,19 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
 
     var max_abs_delta: f32 = 0.0;
     var max_row: u32 = 0;
-    var max_kind: enum { alpha, beta } = .alpha;
+    var max_kind: DirectSsmProjectionKind = .alpha;
     if (trusted_no_oracle) {
         for (gpu_out[0..alpha_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha/beta remain host-computed", .{i});
-                state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
-                state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{i});
+                markDirectSsmQ8_0RowRangeFailed(state, layer, .alpha);
                 return false;
             }
         }
         for (gpu_out[alpha_rows_usize..][0..beta_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; alpha/beta remain host-computed", .{i});
-                state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
-                state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{i});
+                markDirectSsmQ8_0RowRangeFailed(state, layer, .beta);
                 return false;
             }
         }
@@ -3705,9 +3722,8 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         const cpu_beta = cpu_out[alpha_rows_usize..][0..beta_rows_usize];
         for (gpu_out[0..alpha_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha/beta remain host-computed", .{i});
-                state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
-                state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{i});
+                markDirectSsmQ8_0RowRangeFailed(state, layer, .alpha);
                 return false;
             }
             const delta = @abs(gpu_value - cpu_alpha[i]);
@@ -3719,9 +3735,8 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         }
         for (gpu_out[alpha_rows_usize..][0..beta_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; alpha/beta remain host-computed", .{i});
-                state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
-                state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{i});
+                markDirectSsmQ8_0RowRangeFailed(state, layer, .beta);
                 return false;
             }
             const delta = @abs(gpu_value - cpu_beta[i]);
@@ -3733,19 +3748,16 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         }
         const tolerance = @min(direct_ssm_alpha_q8_0_row_range_tolerance, direct_ssm_beta_q8_0_row_range_tolerance);
         if (max_abs_delta > tolerance) {
-            const kind_name = switch (max_kind) {
-                .alpha => "alpha",
-                .beta => "beta",
-            };
-            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range mismatch: layer={d} kind={s} rows={d} max_abs_delta={d:.6} row={d}; alpha/beta remain host-computed", .{
+            const kind_name = directSsmProjectionKindName(max_kind);
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range mismatch: layer={d} kind={s} rows={d} max_abs_delta={d:.6} row={d}; {s} remains host-computed and the other projection may retry individually", .{
                 layer,
                 kind_name,
                 total_rows,
                 max_abs_delta,
                 max_row,
+                kind_name,
             });
-            state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
-            state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
+            markDirectSsmQ8_0RowRangeFailed(state, layer, max_kind);
             return false;
         }
     }
@@ -3780,10 +3792,7 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
             beta_rows,
             cols,
             max_abs_delta,
-            switch (max_kind) {
-                .alpha => "alpha",
-                .beta => "beta",
-            },
+            directSsmProjectionKindName(max_kind),
             max_row,
         });
     }
@@ -8257,6 +8266,15 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u32, 8), state.direct_ssm_beta_q8_row_range_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_alpha_q8_row_range_slice_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_beta_q8_row_range_slice_successes);
+
+    state.direct_ssm_alpha_q8_row_range_failed_mask = 0;
+    state.direct_ssm_beta_q8_row_range_failed_mask = 0;
+    markDirectSsmQ8_0RowRangeFailed(&state, 9, .alpha);
+    try std.testing.expectEqual(directSsmLayerBit(9), state.direct_ssm_alpha_q8_row_range_failed_mask);
+    try std.testing.expectEqual(@as(u128, 0), state.direct_ssm_beta_q8_row_range_failed_mask);
+    markDirectSsmQ8_0RowRangeFailed(&state, 10, .beta);
+    try std.testing.expectEqual(directSsmLayerBit(9), state.direct_ssm_alpha_q8_row_range_failed_mask);
+    try std.testing.expectEqual(directSsmLayerBit(10), state.direct_ssm_beta_q8_row_range_failed_mask);
 }
 
 test "direct SSM row-range accepts F32 and Q8_0 projection rows" {
