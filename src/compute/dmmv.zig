@@ -71,6 +71,7 @@ pub const MoeColsDmmvPushConstants = extern struct {
     y_offset: u32,
     ids_stride: u32,
     x_route_divisor: u32,
+    accumulate: u32 = 0,
 };
 
 /// Push constants for the fused MoE down + weighted_acc shader
@@ -1507,6 +1508,7 @@ pub const DmmvDispatch = struct {
         a_offset: u32,
         x_offset: u32,
         y_offset: u32,
+        accumulate: bool,
     ) !void {
         const pip = switch (quant_type) {
             .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
@@ -1524,6 +1526,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .accumulate = if (accumulate) 1 else 0,
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },
@@ -1586,6 +1589,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .accumulate = 0,
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },

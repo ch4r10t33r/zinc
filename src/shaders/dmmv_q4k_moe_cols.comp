@@ -21,11 +21,12 @@ layout(push_constant) uniform PushConstants {
     uint y_offset;
     uint ids_stride;
     uint x_route_divisor;
+    uint accumulate;
 };
 
 layout(set = 0, binding = 0) readonly buffer MatrixA { uint a_u32[]; };
 layout(set = 0, binding = 1) readonly buffer VectorX { vec4 x_v4[]; };
-layout(set = 0, binding = 2) writeonly buffer VectorY { float y_data[]; };
+layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 layout(set = 0, binding = 3) readonly buffer Counts { uint counts[]; };
 layout(set = 0, binding = 4) readonly buffer PackedIds { uint packed_ids[]; };
 layout(set = 0, binding = 5) readonly buffer ActiveBlocks { uint active_blocks[]; };
@@ -179,13 +180,24 @@ void main() {
 
     const uint y_base = y_offset / 4u;
     if (lane == 0u) {
-        if (active0) y_data[y_base + route0 * M + row] = out0;
-        if (active1) y_data[y_base + route1 * M + row] = out1;
-        if (active2) y_data[y_base + route2 * M + row] = out2;
-        if (active3) y_data[y_base + route3 * M + row] = out3;
-        if (active4) y_data[y_base + route4 * M + row] = out4;
-        if (active5) y_data[y_base + route5 * M + row] = out5;
-        if (active6) y_data[y_base + route6 * M + row] = out6;
-        if (active7) y_data[y_base + route7 * M + row] = out7;
+        if (accumulate != 0u) {
+            if (active0) y_data[y_base + route0 * M + row] += out0;
+            if (active1) y_data[y_base + route1 * M + row] += out1;
+            if (active2) y_data[y_base + route2 * M + row] += out2;
+            if (active3) y_data[y_base + route3 * M + row] += out3;
+            if (active4) y_data[y_base + route4 * M + row] += out4;
+            if (active5) y_data[y_base + route5 * M + row] += out5;
+            if (active6) y_data[y_base + route6 * M + row] += out6;
+            if (active7) y_data[y_base + route7 * M + row] += out7;
+        } else {
+            if (active0) y_data[y_base + route0 * M + row] = out0;
+            if (active1) y_data[y_base + route1 * M + row] = out1;
+            if (active2) y_data[y_base + route2 * M + row] = out2;
+            if (active3) y_data[y_base + route3 * M + row] = out3;
+            if (active4) y_data[y_base + route4 * M + row] = out4;
+            if (active5) y_data[y_base + route5 * M + row] = out5;
+            if (active6) y_data[y_base + route6 * M + row] = out6;
+            if (active7) y_data[y_base + route7 * M + row] = out7;
+        }
     }
 }

@@ -15511,6 +15511,7 @@ pub const InferenceEngine = struct {
             0,
             0,
             0,
+            false,
         );
         try self.dmmv.recordMoeColsDispatchIndirect(
             &self.decode_cmd,
@@ -15538,6 +15539,7 @@ pub const InferenceEngine = struct {
             0,
             0,
             0,
+            false,
         );
         self.endProfilePhase(.moe_gate_up, gate_up_phase);
 
@@ -15568,7 +15570,7 @@ pub const InferenceEngine = struct {
             down_exps.gpu_buffer.size,
             scratch_swiglu.handle,
             scratch_swiglu.size,
-            scratch_down.handle,
+            scratch_hidden.handle,
             prefix_hidden_bytes,
             counts.handle,
             counts_bytes,
@@ -15586,20 +15588,9 @@ pub const InferenceEngine = struct {
             0,
             0,
             0,
+            true,
         );
         self.endProfilePhase(.moe_down, down_phase);
-
-        self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
-        const acc_phase = self.beginProfilePhase();
-        try self.dispatchScaleAcc(
-            scratch_hidden.handle,
-            scratch_hidden.size,
-            scratch_down.handle,
-            scratch_down.size,
-            prefix_tokens * hidden_dim,
-            1.0,
-        );
-        self.endProfilePhase(.moe_weighted_acc, acc_phase);
 
         var grouped_total_tokens = prefix_tokens;
         if (can_group_suffix) {
@@ -15657,6 +15648,7 @@ pub const InferenceEngine = struct {
                 0,
                 0,
                 0,
+                false,
             );
             try self.dmmv.recordMoeColsDispatchIndirect(
                 &self.decode_cmd,
@@ -15684,6 +15676,7 @@ pub const InferenceEngine = struct {
                 0,
                 0,
                 0,
+                false,
             );
             self.endProfilePhase(.moe_gate_up, suffix_gate_up_phase);
 
@@ -15732,6 +15725,7 @@ pub const InferenceEngine = struct {
                 0,
                 0,
                 0,
+                false,
             );
             self.endProfilePhase(.moe_down, suffix_down_phase);
 
