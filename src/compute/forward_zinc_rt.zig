@@ -2257,10 +2257,10 @@ fn consumeDirectLogitsArgmaxRowRange(
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
-// Keep default M1 decode validation to GPU-recomputed selected rows. The
-// serial prefix/window scan remains available in code, but is too expensive to
-// pay on every benchmark run until row-parallel DMMV has a working TGID ABI.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 0;
+// Use one wave64 direct LM-head prefix by default so an exercised decode token
+// can be selected from GPU-produced Q4_0 row scores while the remaining rows
+// still use the host-assisted fallback.
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 64;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
 
@@ -2320,23 +2320,44 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     const gpu_weight_bytes = gpu_rows_usize * row_bytes;
     if (q4_0_raw.len < gpu_weight_bytes) return null;
 
-    const prefix_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
-        state.norm,
-        q4_0_raw[0..gpu_weight_bytes],
-        gpu_rows,
-        cols,
-    ) catch |err| {
-        log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
-        return null;
-    };
-
     var selection: ArgmaxTop2Result = .{};
-    if (!std.math.isFinite(prefix_result.score)) {
-        log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix produced non-finite row {d}; selected token remains host-computed", .{prefix_result.row});
-        return null;
+    if (gpu_rows % 64 == 0 and gpu_rows >= 64) {
+        const gpu_logits = state.row_scratch[0..gpu_rows_usize];
+        tracking.boundary.dmmvQ4_0RowRangeParallel(
+            state.norm,
+            q4_0_raw[0..gpu_weight_bytes],
+            gpu_rows,
+            cols,
+            gpu_logits,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
+            return null;
+        };
+        for (gpu_logits, 0..) |gpu_value, i| {
+            if (!std.math.isFinite(gpu_value)) {
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel produced non-finite row {d}; selected token remains host-computed", .{i});
+                return null;
+            }
+            selection.offer(@intCast(i), gpu_value);
+        }
+    } else {
+        const prefix_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
+            state.norm,
+            q4_0_raw[0..gpu_weight_bytes],
+            gpu_rows,
+            cols,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
+            return null;
+        };
+
+        if (!std.math.isFinite(prefix_result.score)) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix produced non-finite row {d}; selected token remains host-computed", .{prefix_result.row});
+            return null;
+        }
+        selection.best = .{ .index = prefix_result.row, .value = prefix_result.score };
+        selection.second = .{ .index = 0, .value = -std.math.inf(f32) };
     }
-    selection.best = .{ .index = prefix_result.row, .value = prefix_result.score };
-    selection.second = .{ .index = 0, .value = -std.math.inf(f32) };
     const gpu_prefix_best = selection.best;
 
     const cpu_gpu_best = try dotDirectTyped(.q4_0, q4_0_raw, selection.best.index, cols, state.norm, null);

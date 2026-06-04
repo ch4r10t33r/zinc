@@ -1528,8 +1528,8 @@ pub const TokenBoundary = struct {
     ///
     /// Stages the same source-format rows as `dmmvQ4_0RowRange`, but launches
     /// one wave64 workgroup where each lane computes one row. This is used for
-    /// consumed 64-row LM-head windows where the GPU row values participate in
-    /// choosing the sampled token.
+    /// consumed 64-row LM-head prefix/window ranges where the GPU row values
+    /// participate in choosing the sampled token.
     pub fn dmmvQ4_0RowRangeParallel(
         self: *TokenBoundary,
         input: []const f32,
