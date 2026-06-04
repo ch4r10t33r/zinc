@@ -889,20 +889,99 @@ const RequestTool = struct {
 };
 
 /// Resolution of the OpenAI `tool_choice` request field. `auto` lets the model
-/// decide whether to invoke a tool; `none` suppresses tool rendering even when
-/// `tools` is non-empty. Other OpenAI values (`required`, `{type:function,...}`)
-/// are not yet supported and downcast to `auto`.
-pub const ToolChoice = enum { auto, none };
+/// decide whether to invoke a tool; `required` renders the same tool surface
+/// but adds a native prompt-level requirement; `none` suppresses tool rendering
+/// even when `tools` is non-empty.
+pub const ToolChoice = enum { auto, required, none };
 
 fn parseToolChoice(value: ?std.json.Value) ToolChoice {
     const v = value orelse return .auto;
     switch (v) {
         .string => |s| {
             if (std.mem.eql(u8, s, "none")) return .none;
+            if (std.mem.eql(u8, s, "required")) return .required;
             return .auto;
         },
         else => return .auto,
     }
+}
+
+fn forcedSingleToolName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+    if (tool_choice != .required or tools.len != 1) return null;
+    return tools[0].name;
+}
+
+const JsonStringSlice = struct {
+    value: []const u8,
+    end: usize,
+};
+
+fn skipJsonWhitespace(json: []const u8, pos: *usize) void {
+    while (pos.* < json.len) : (pos.* += 1) {
+        switch (json[pos.*]) {
+            ' ', '\t', '\r', '\n' => {},
+            else => return,
+        }
+    }
+}
+
+fn isSafeJsonObjectKeyName(key: []const u8) bool {
+    if (key.len == 0) return false;
+    for (key) |c| {
+        if ((c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-' or c == '$')
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn parseSimpleJsonStringSlice(json: []const u8, quote_pos: usize) ?JsonStringSlice {
+    if (quote_pos >= json.len or json[quote_pos] != '"') return null;
+    var i = quote_pos + 1;
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (c == '\\' or c < 0x20) return null;
+        if (c == '"') return .{
+            .value = json[quote_pos + 1 .. i],
+            .end = i + 1,
+        };
+    }
+    return null;
+}
+
+fn firstStringInArrayAfterField(json: []const u8, field_literal: []const u8) ?[]const u8 {
+    const field_pos = std.mem.indexOf(u8, json, field_literal) orelse return null;
+    var pos = field_pos + field_literal.len;
+    const array_rel = std.mem.indexOfScalar(u8, json[pos..], '[') orelse return null;
+    pos += array_rel + 1;
+    skipJsonWhitespace(json, &pos);
+    const parsed = parseSimpleJsonStringSlice(json, pos) orelse return null;
+    return if (isSafeJsonObjectKeyName(parsed.value)) parsed.value else null;
+}
+
+fn firstObjectKeyAfterField(json: []const u8, field_literal: []const u8) ?[]const u8 {
+    const field_pos = std.mem.indexOf(u8, json, field_literal) orelse return null;
+    var pos = field_pos + field_literal.len;
+    const object_rel = std.mem.indexOfScalar(u8, json[pos..], '{') orelse return null;
+    pos += object_rel + 1;
+    skipJsonWhitespace(json, &pos);
+    const parsed = parseSimpleJsonStringSlice(json, pos) orelse return null;
+    return if (isSafeJsonObjectKeyName(parsed.value)) parsed.value else null;
+}
+
+fn firstToolArgumentName(parameters_json: []const u8) ?[]const u8 {
+    return firstStringInArrayAfterField(parameters_json, "\"required\"") orelse
+        firstObjectKeyAfterField(parameters_json, "\"properties\"");
+}
+
+fn forcedSingleToolFirstArgumentName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+    if (tool_choice != .required or tools.len != 1) return null;
+    return firstToolArgumentName(tools[0].parameters_json);
 }
 
 const ChatMessage = struct {
@@ -970,6 +1049,7 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
         for (tools) |t| {
             total += t.name.len + t.description.len + t.parameters_json.len + 64;
         }
+        total += 192;
     }
     return total;
 }
@@ -977,10 +1057,15 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
 fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
     const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
+    const forced_tool_name = forcedSingleToolName(tools_for_template, tool_choice);
+    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_template, tool_choice);
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .enable_thinking = enable_thinking,
         .skip_thinking_template = skip_thinking_template,
         .tools = tools_for_template,
+        .require_tool_call = tool_choice == .required,
+        .forced_tool_call_name = forced_tool_name,
+        .forced_tool_call_first_arg_name = forced_tool_first_arg_name,
         .tool_format = tf,
         .tool_render_allocator = allocator,
     }, buf);
@@ -1035,6 +1120,7 @@ fn buildChatTranscriptPrompt(
         .enable_thinking = enable_thinking,
         .skip_thinking_template = skip_thinking_template,
         .tools = tools_for_template,
+        .require_tool_call = tool_choice == .required,
         .tool_format = tf,
         .tool_render_allocator = allocator,
     }, buf);
@@ -1059,6 +1145,10 @@ fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, d
     if (comptime !runtime.supports_model_management) return false;
     const entry = catalog_mod.findForLoadedModel(managed_id, model_path, display_name) orelse return false;
     return !entry.thinking_stable;
+}
+
+fn shouldSkipThinkingTemplateForRequest(force_skip_by_model: bool, tools_len: usize, tool_choice: ToolChoice) bool {
+    return force_skip_by_model or (tools_len > 0 and tool_choice != .none);
 }
 
 fn warmChatReuseCache(
@@ -1951,9 +2041,11 @@ fn handleChatCompletions(
     const tokenizer = &resources.tokenizer;
     const model_name = resources.display_name;
 
-    // If the catalog marks this model's thinking as unstable, force-disable thinking
-    // and skip the thinking template entirely (no empty <think></think> block).
-    const skip_thinking_template = shouldForceDisableThinking(resources.managed_id, resources.model_path, resources.display_name);
+    // If the catalog marks this model's thinking as unstable, force-disable thinking.
+    // Tool-calling requests also skip the Qwen empty-thinking scaffold so the
+    // assistant can begin directly with a <tool_call> block.
+    const force_skip_thinking_template = shouldForceDisableThinking(resources.managed_id, resources.model_path, resources.display_name);
+    const skip_thinking_template = shouldSkipThinkingTemplateForRequest(force_skip_thinking_template, parsed.tools.len, parsed.tool_choice);
     if (skip_thinking_template) {
         parsed.enable_thinking = null;
     }
@@ -2022,6 +2114,9 @@ fn handleChatCompletions(
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "chatcmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "chatcmpl-0";
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
+    const tools_for_choice = if (parsed.tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else parsed.tools;
+    const forced_tool_name = forcedSingleToolName(tools_for_choice, parsed.tool_choice);
+    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
     const seed_bits: u128 = @bitCast(seed_ns);
     var prng = std.Random.DefaultPrng.init(@truncate(seed_bits));
     const random = prng.random();
@@ -2084,7 +2179,7 @@ fn handleChatCompletions(
             , .{ req_id, ts, model_name }) catch return;
             conn.writeSseEvent(chunk) catch return;
         }
-        if (thinking_enabled) {
+        if (thinking_enabled and forced_tool_name == null) {
             streamText(conn, thinking_prefix, req_id, ts, model_name) catch return;
         }
         if (conn.isPeerClosed()) return;
@@ -2237,7 +2332,7 @@ fn handleChatCompletions(
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     gen_text_len = sent_text_len + cleaned_pending.len;
-                    if (cleaned_pending.len > 0) {
+                    if (cleaned_pending.len > 0 and forced_tool_name == null) {
                         streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                     sent_text_len = gen_text_len;
@@ -2264,7 +2359,9 @@ fn handleChatCompletions(
                 }
 
                 if (!is_partial) {
-                    if (thinking_enabled) {
+                    if (forced_tool_name != null) {
+                        sent_text_len = gen_text_len;
+                    } else if (thinking_enabled) {
                         // Stream the accumulated bytes since the last safe send,
                         // trimmed to a UTF-8 codepoint boundary so partial multi-
                         // byte chars (emojis, CJK) carry into the next iteration.
@@ -2307,24 +2404,36 @@ fn handleChatCompletions(
                 if (thinking_enabled) {
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
-                    if (cleaned_pending.len > 0) {
+                    if (cleaned_pending.len > 0 and forced_tool_name == null) {
                         streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                 } else {
                     const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                     const cleaned_visible = trimTrailingChatArtifacts(visible);
-                    if (cleaned_visible.len > sent_visible_len) {
+                    if (cleaned_visible.len > sent_visible_len and forced_tool_name == null) {
                         streamTextViaDetector(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                 }
             }
             // Flush detector tail (bytes held while waiting for a potential tool call tag)
-            {
+            if (forced_tool_name == null) {
                 const tail = stream_detector.finalize();
                 if (tail.len > 0) {
                     streamText(conn, tail, req_id, ts, model_name) catch return;
                 }
             }
+        }
+
+        if (forced_tool_name) |tool_name| {
+            const args_json = try forcedToolArgumentsJsonAlloc(allocator, forced_tool_first_arg_name, gen_text_buf[0..gen_text_len]);
+            defer allocator.free(args_json);
+            var forced_id_buf: [64]u8 = undefined;
+            const forced_id = std.fmt.bufPrint(&forced_id_buf, "call_forced_{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "call_forced";
+            const ev = try formatStreamingToolCallChunk(allocator, req_id, ts, model_name, tool_call_index, forced_id, tool_name, args_json);
+            defer allocator.free(ev);
+            try conn.writeSseEvent(ev);
+            any_tool_call_emitted = true;
+            tool_call_index += 1;
         }
 
         // Final chunk with finish_reason
@@ -2340,7 +2449,7 @@ fn handleChatCompletions(
         }
 
         conn.writeSseDone() catch return;
-        if (cacheable_session) {
+        if (cacheable_session and forced_tool_name == null) {
             const trimmed_stream_text = sanitizeAssistantHistoryContent(gen_text_buf[0..gen_text_len]);
             var transport_buf: [32768]u8 = undefined;
             var tool_history_buf: std.ArrayList(u8) = .{};
@@ -3023,6 +3132,89 @@ fn formatStreamingToolCallChunk(
     return wb.toOwnedSlice(allocator);
 }
 
+fn forcedToolArgumentTail(generated_text: []const u8) []const u8 {
+    var out = trimTrailingChatArtifacts(generated_text);
+    if (std.mem.indexOf(u8, out, "</tool_call>")) |idx| {
+        out = out[0..idx];
+    }
+    if (std.mem.indexOf(u8, out, "<|im_end|>")) |idx| {
+        out = out[0..idx];
+    }
+    return std.mem.trim(u8, out, " \t\r\n");
+}
+
+fn firstCompleteJsonObjectSlice(text: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, text, '{') orelse return null;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var i = start;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        switch (c) {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return text[start .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn forcedToolArgumentsSlice(generated_text: []const u8) []const u8 {
+    var out = forcedToolArgumentTail(generated_text);
+    if (firstCompleteJsonObjectSlice(out)) |json_object| {
+        return json_object;
+    }
+
+    if (out.len >= 2 and
+        ((out[0] == '\'' and out[out.len - 1] == '\'') or
+            (out[0] == '"' and out[out.len - 1] == '"')))
+    {
+        out = std.mem.trim(u8, out[1 .. out.len - 1], " \t\r\n");
+        if (firstCompleteJsonObjectSlice(out)) |json_object| {
+            return json_object;
+        }
+    }
+    return "";
+}
+
+fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
+    var merged: std.ArrayList(u8) = .{};
+    defer merged.deinit(allocator);
+
+    if (first_arg_name) |arg_name| {
+        try merged.writer(allocator).print("{{\"{s}\":", .{arg_name});
+    }
+    try merged.appendSlice(allocator, forcedToolArgumentTail(generated_text));
+
+    const args = forcedToolArgumentsSlice(merged.items);
+    if (args.len == 0) return allocator.dupe(u8, "{}");
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch {
+        return allocator.dupe(u8, "{}");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, "{}");
+
+    return allocator.dupe(u8, args);
+}
+
 // ── Built-in Chat UI ─────────────────────────────────────────
 
 fn serveChatUi(conn: *http.Connection) !void {
@@ -3498,6 +3690,90 @@ test "buildChatPrompt enables thinking when requested" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "</think>") == null);
 }
 
+test "tool-calling requests skip qwen thinking scaffold" {
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(false, 1, .auto));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(false, 1, .required));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(false, 1, .none));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(true, 0, .auto));
+
+    var tok = makeTestTokenizer(
+        \\{%- if add_generation_prompt %}
+        \\  {{- '<|im_start|>assistant\n' }}
+        \\  {%- if enable_thinking is defined and enable_thinking is true %}
+        \\    {{- '<think>\n' }}
+        \\  {%- else %}
+        \\    {{- '<think>\n\n</think>\n\n' }}
+        \\  {%- endif %}
+        \\{%- endif %}
+    );
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"call a tool"};
+    const tools = [_]tool_format.ToolDefinition{.{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"}}}",
+    }};
+    var buf: [4096]u8 = undefined;
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, true, &tools, .auto, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<think>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_call>") != null);
+}
+
+test "required single-tool prompt prefills the tool call arguments slot" {
+    var tok = makeTestTokenizer(null);
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{ "system", "user" };
+    const contents = [_][]const u8{ "You are a coding agent.", "Write hello." };
+    const tools = [_]tool_format.ToolDefinition{.{
+        .name = "write",
+        .description = "Write a file.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}",
+    }};
+    var buf: [4096]u8 = undefined;
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, true, &tools, .required, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<tool_call>\n{\"name\":\"write\",\"arguments\":{\"filePath\":"));
+}
+
+test "firstToolArgumentName prefers required key then properties key" {
+    try std.testing.expectEqualStrings(
+        "content",
+        firstToolArgumentName("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"content\",\"filePath\"]}").?,
+    );
+    try std.testing.expectEqualStrings(
+        "filePath",
+        firstToolArgumentName("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}").?,
+    );
+}
+
+test "forcedToolArgumentsSlice extracts the generated JSON object" {
+    try std.testing.expectEqualStrings(
+        "{\"filePath\":\"/tmp/a\",\"content\":\"hello\"}",
+        forcedToolArgumentsSlice("  '{\"filePath\":\"/tmp/a\",\"content\":\"hello\"}'\n</tool_call>\n<|im_end|>"),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"/tmp/a\",\"content\":\"hello\"}",
+        forcedToolArgumentsSlice("{\"path\":\"/tmp/a\",\"content\":\"hello\"}</tool_call> trailing"),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"filePath\":\"/tmp/a\",\"content\":\"hello\"}",
+        forcedToolArgumentsSlice("{\"filePath\":\"/tmp/a\",\"content\":\"hello\"}}</tool_call> trailing"),
+    );
+}
+
+test "forcedToolArgumentsJsonAlloc rebuilds prefilled first argument" {
+    const args = try forcedToolArgumentsJsonAlloc(std.testing.allocator, "filePath", "\"/tmp/a\",\"content\":\"hello\"}}</tool_call>");
+    defer std.testing.allocator.free(args);
+    try std.testing.expectEqualStrings("{\"filePath\":\"/tmp/a\",\"content\":\"hello\"}", args);
+
+    const invalid = try forcedToolArgumentsJsonAlloc(std.testing.allocator, "filePath", "}</tool_call>");
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expectEqualStrings("{}", invalid);
+}
+
 test "buildChatPrompt succeeds for large Goose-style tool prompts" {
     var tok = makeTestTokenizer(null);
     defer tok.token_to_id.deinit();
@@ -3810,6 +4086,13 @@ test "parseChatRequest parses tools and tool_choice" {
     try std.testing.expectEqualStrings("get_time", parsed.tools[0].name);
     try std.testing.expectEqualStrings("Get current time", parsed.tools[0].description);
     try std.testing.expectEqual(ToolChoice.auto, parsed.tool_choice);
+
+    const required_body =
+        \\{"messages":[{"role":"user","content":"what time is it?"}],"tools":[{"type":"function","function":{"name":"get_time","description":"Get current time","parameters":{"type":"object"}}}],"tool_choice":"required"}
+    ;
+    var required = try parseChatRequest(std.testing.allocator, required_body);
+    defer required.deinit();
+    try std.testing.expectEqual(ToolChoice.required, required.tool_choice);
 }
 
 test "parseChatRequest tool_choice none suppresses tools" {

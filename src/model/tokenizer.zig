@@ -860,6 +860,16 @@ pub const Tokenizer = struct {
         skip_thinking_template: bool = false,
         /// Tool definitions to render into the system message. Empty slice = no tools.
         tools: []const tool_format_mod.ToolDefinition = &.{},
+        /// When true, add a native tool-template reminder that the next assistant
+        /// turn must contain tool calls instead of prose.
+        require_tool_call: bool = false,
+        /// When set, prefill the assistant turn as a single tool call for this
+        /// function name. The model then completes only the JSON arguments.
+        forced_tool_call_name: ?[]const u8 = null,
+        /// Optional first required argument key to prefill for single forced
+        /// tool calls. This starts generation inside the value slot instead of
+        /// letting the model choose an empty arguments object.
+        forced_tool_call_first_arg_name: ?[]const u8 = null,
         /// The format renderer to use for tool definitions and tool result messages.
         tool_format: ?tool_format_mod.ToolFormat = null,
         /// Allocator used for transient tool-rendering scratch buffers. Required
@@ -975,6 +985,12 @@ pub const Tokenizer = struct {
                         if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                         @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
                         pos += tool_buf.items.len;
+                        if (options.require_tool_call) {
+                            const required = "\nTool choice is required. The assistant response must contain one or more <tool_call>...</tool_call> blocks and no prose outside tool calls.\n";
+                            if (pos + required.len > buf.len) return error.BufferTooSmall;
+                            @memcpy(buf[pos .. pos + required.len], required);
+                            pos += required.len;
+                        }
                         tools_rendered = true;
                     }
 
@@ -991,11 +1007,22 @@ pub const Tokenizer = struct {
                     if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                     @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
                     pos += tool_buf.items.len;
+                    if (options.require_tool_call) {
+                        const required = "\nTool choice is required. The assistant response must contain one or more <tool_call>...</tool_call> blocks and no prose outside tool calls.\n";
+                        if (pos + required.len > buf.len) return error.BufferTooSmall;
+                        @memcpy(buf[pos .. pos + required.len], required);
+                        pos += required.len;
+                    }
                     const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
                     pos += close.len;
                 }
                 if (options.add_generation_prompt) {
-                    const suffix = if (supports_thinking and !options.skip_thinking_template) blk: {
+                    const suffix = if (options.forced_tool_call_name) |tool_name| blk: {
+                        if (options.forced_tool_call_first_arg_name) |arg_name| {
+                            break :blk std.fmt.bufPrint(buf[pos..], "<|im_start|>assistant\n<tool_call>\n{{\"name\":\"{s}\",\"arguments\":{{\"{s}\":", .{ tool_name, arg_name }) catch return error.BufferTooSmall;
+                        }
+                        break :blk std.fmt.bufPrint(buf[pos..], "<|im_start|>assistant\n<tool_call>\n{{\"name\":\"{s}\",\"arguments\":", .{tool_name}) catch return error.BufferTooSmall;
+                    } else if (supports_thinking and !options.skip_thinking_template) blk: {
                         if (options.enable_thinking orelse false) {
                             break :blk std.fmt.bufPrint(buf[pos..], "<|im_start|>assistant\n<think>\n", .{}) catch return error.BufferTooSmall;
                         }

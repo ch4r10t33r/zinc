@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -24,12 +24,14 @@ import {
   repairOpenAiToolCalls,
   repairSseText,
   repairSseEvent,
+  repairToolRequiredSseText,
   sendProxyErrorResponse,
   shouldSuppressAssistantContent,
   shouldRequireOpenCodeToolChoice,
   stripToolBoundaryTail,
   syntheticCompletionForRequest,
   syntheticDiscoveredSourceReadCalls,
+  syntheticHeuristicSourceWriteCalls,
   syntheticPostEditTestCall,
   syntheticPrefetchReadCalls,
   syntheticResponseText,
@@ -63,6 +65,21 @@ function withTempProject(files, fn) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function lineNumbered(content) {
+  return String(content)
+    .replace(/\n$/, "")
+    .split(/\n/)
+    .map((line, index) => `${index + 1}: ${line}`)
+    .join("\n");
+}
+
+function fileToolMessage(filePath, content) {
+  return {
+    role: "tool",
+    content: `<path>${filePath}</path>\n<type>file</type>\n<content>\n${lineNumbered(content)}\n\n(End of file - total ${String(content).replace(/\n$/, "").split(/\n/).length} lines)\n</content>`,
+  };
 }
 
 const body = {
@@ -210,8 +227,11 @@ describe("request shaping", () => {
     expect(out.max_tokens).toBe(768);
     expect(out.temperature).toBe(0);
     expect(out.top_p).toBe(1);
-    expect(out.messages.at(-2)?.content).toStartWith("Tool path guard:");
-    expect(out.messages.at(-1)?.content).toStartWith("OpenCode continuation guard:");
+    expect(out.messages[0]?.role).toBe("system");
+    expect(out.messages[0]?.content).toStartWith("Tool path guard:");
+    expect(out.messages[0]?.content).toContain("OpenCode continuation guard:");
+    expect(out.messages[0]?.content).toContain("Working directory: /private/tmp/zinc-opencode-smoke4");
+    expect(out.messages.at(-1)?.role).toBe("tool");
   });
 
   test("does not inject coding guards into OpenCode title requests", () => {
@@ -245,6 +265,174 @@ describe("request shaping", () => {
 
     expect(shouldRequireOpenCodeToolChoice(out)).toBe(true);
     expect(out.tool_choice).toBe("required");
+  });
+
+  test("merges injected guards into the first system message without duplicating trailing guards", () => {
+    const out = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          { role: "system", content: "Existing system rules." },
+          { role: "user", content: "Fix failing tests and stop after all tests pass." },
+          { role: "system", content: "Tool path guard: stale trailing guard" },
+          { role: "system", content: "OpenCode continuation guard: stale trailing guard" },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+
+    expect(out.messages.map((m) => m.role)).toEqual(["system", "user"]);
+    expect(out.messages[0].content).toStartWith("Tool path guard:");
+    expect(out.messages[0].content.match(/Tool path guard:/g)?.length).toBe(1);
+    expect(out.messages[0].content.match(/OpenCode continuation guard:/g)?.length).toBe(1);
+    expect(out.messages[0].content).toContain("Existing system rules.");
+  });
+
+  test("compacts OpenCode's large system prompt for local coding turns", () => {
+    const out = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [{ type: "function", function: { name: "read" } }],
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are opencode, an interactive CLI tool that helps users with software engineering tasks.\n" +
+              "When the user asks about opencode, use WebFetch. Very long policy text follows.",
+          },
+          { role: "user", content: "Fix failing tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+
+    expect(out.messages[0].content).toStartWith("Tool path guard:");
+    expect(out.messages[0].content).toContain("You are OpenCode running as a local coding agent.");
+    expect(out.messages[0].content).not.toContain("use WebFetch");
+    expect(out.messages[0].content).not.toContain("Very long policy text follows");
+  });
+
+  test("filters OpenCode coding tools to the local edit loop surface", () => {
+    const out = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "edit" } },
+          { type: "function", function: { name: "glob" } },
+          { type: "function", function: { name: "grep" } },
+          { type: "function", function: { name: "read" } },
+          { type: "function", function: { name: "skill" } },
+          { type: "function", function: { name: "task" } },
+          { type: "function", function: { name: "todowrite" } },
+          { type: "function", function: { name: "webfetch" } },
+          { type: "function", function: { name: "write" } },
+        ],
+        messages: [
+          {
+            role: "system",
+            content: "You are opencode, an interactive CLI tool that helps users with software engineering tasks.",
+          },
+          { role: "user", content: "Fix failing tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+
+    expect(out.tools.map((tool) => tool.function.name)).toEqual(["bash", "edit", "glob", "grep", "read", "write"]);
+  });
+
+  test("narrows OpenCode tools to edit/write/bash after source files are visible", () => {
+    withTempProject(
+      {
+        "src/pricing.mjs": "export function applyDiscount(amount, discount) {\n  return amount - discount;\n}\n",
+      },
+      (dir) => {
+        const sourcePath = `${dir}/src/pricing.mjs`;
+        const out = applyRequestOverrides(
+          {
+            model: "zinc/qwen",
+            stream: true,
+            tools: [
+              { type: "function", function: { name: "bash" } },
+              { type: "function", function: { name: "edit" } },
+              { type: "function", function: { name: "glob" } },
+              { type: "function", function: { name: "grep" } },
+              { type: "function", function: { name: "read" } },
+              { type: "function", function: { name: "write" } },
+            ],
+            messages: [
+              {
+                role: "system",
+                content: "You are opencode, an interactive CLI tool that helps users with software engineering tasks.",
+              },
+              {
+                role: "user",
+                content: `Fix failing tests and stop after all tests pass. Working directory: ${dir}. Run npm test 2>&1 after edits.`,
+              },
+              {
+                role: "tool",
+                tool_call_id: "call_read_source",
+                content:
+                  `<path>${sourcePath}</path>\n<type>file</type>\n<content>\n` +
+                  "1: export function applyDiscount(amount, discount) {\n" +
+                  "2:   return amount - discount;\n" +
+                  "3: }\n" +
+                  "\n(End of file - total 3 lines)\n</content>",
+              },
+            ],
+          },
+          { injectPathGuard: true },
+        );
+
+        expect(out.tools.map((tool) => tool.function.name)).toEqual(["write"]);
+        expect(shouldRequireOpenCodeToolChoice(out)).toBe(true);
+        expect(out.tool_choice).toBe("required");
+        expect(out.messages[0].content).toContain("Source files are already visible");
+        expect(out.messages[0].content).toContain("call write or edit");
+      },
+    );
+  });
+
+  test("keeps read available while visible source has unread relative imports", () => {
+    withTempProject(
+      {
+        "src/index.mjs": "export { formatName } from './formatters/name.mjs';\n",
+        "src/formatters/name.mjs": "export function formatName(user) { return user.first; }\n",
+      },
+      (dir) => {
+        const indexPath = `${dir}/src/index.mjs`;
+        const out = applyRequestOverrides(
+          {
+            model: "zinc/qwen",
+            stream: true,
+            tools: [
+              { type: "function", function: { name: "bash" } },
+              { type: "function", function: { name: "read" } },
+              { type: "function", function: { name: "write" } },
+            ],
+            messages: [
+              {
+                role: "system",
+                content: "You are opencode, an interactive CLI tool that helps users with software engineering tasks.",
+              },
+              {
+                role: "user",
+                content: `Fix failing tests and stop after all tests pass. Working directory: ${dir}. Run npm test 2>&1 after edits.`,
+              },
+              fileToolMessage(indexPath, readFileSync(indexPath, "utf8")),
+            ],
+          },
+          { injectPathGuard: true },
+        );
+
+        expect(out.tools.map((tool) => tool.function.name)).toEqual(["bash", "read", "write"]);
+      },
+    );
   });
 
   test("respects an explicit tool_choice override", () => {
@@ -294,6 +482,9 @@ describe("request shaping", () => {
     expect(guard).toContain("src/pricing.mjs");
     expect(guard).toContain("test/cart.test.mjs");
     expect(guard).toContain("Package and test files are read-only");
+    const continuation = buildCodingContinuationGuardMessage(multiFileBody);
+    expect(continuation).toContain("src/cart.mjs");
+    expect(continuation).toContain("src/pricing.mjs");
   });
 
   test("extractKnownFilePaths promotes directory entries", () => {
@@ -377,7 +568,6 @@ describe("synthetic OpenCode responses", () => {
 
         const calls = syntheticPrefetchReadCalls(request);
         expect(calls.map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
-          `${dir}/package.json`,
           `${dir}/src/rate_limiter.mjs`,
           `${dir}/test/rate_limiter.test.mjs`,
         ]);
@@ -390,6 +580,33 @@ describe("synthetic OpenCode responses", () => {
         expect(streamed).toContain('"tool_calls"');
         expect(streamed).toContain('"name":"read"');
         expect(streamed).toContain('"finish_reason":"tool_calls"');
+      },
+    );
+  });
+
+  test("prefetches package.json only when it is the only requested file", () => {
+    withTempProject(
+      {
+        "package.json": "{}\n",
+      },
+      (dir) => {
+        const request = applyRequestOverrides(
+          {
+            model: "zinc/qwen",
+            stream: true,
+            tools: [{ type: "function", function: { name: "read" } }],
+            messages: [
+              { role: "system", content: `Working directory: ${dir}` },
+              { role: "user", content: "Read package.json." },
+            ],
+          },
+          { injectPathGuard: true },
+        );
+
+        const calls = syntheticPrefetchReadCalls(request);
+        expect(calls.map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
+          `${dir}/package.json`,
+        ]);
       },
     );
   });
@@ -443,6 +660,46 @@ describe("synthetic OpenCode responses", () => {
     );
   });
 
+  test("discovers source files from relative imports in already-read files", () => {
+    withTempProject(
+      {
+        "src/index.mjs": "export { formatName } from './formatters/name.mjs';\nexport { formatStatus } from './formatters/status.mjs';\n",
+        "src/formatters/name.mjs": "export function formatName(user) { return user.first + ' ' + user.last; }\n",
+        "src/formatters/status.mjs": "export function formatStatus(user) { return user.active ? 'active' : 'inactive'; }\n",
+        "test/formatters.test.mjs": "import { formatName, formatStatus } from '../src/index.mjs';\n",
+      },
+      (dir) => {
+        const testFile = `${dir}/test/formatters.test.mjs`;
+        const indexFile = `${dir}/src/index.mjs`;
+        const firstRequest = {
+          model: "zinc/qwen",
+          stream: true,
+          tools: [{ type: "function", function: { name: "read" } }],
+          messages: [
+            { role: "system", content: `Working directory: ${dir}` },
+            fileToolMessage(testFile, readFileSync(testFile, "utf8")),
+          ],
+        };
+
+        expect(syntheticDiscoveredSourceReadCalls(firstRequest).map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
+          indexFile,
+        ]);
+
+        const secondRequest = {
+          ...firstRequest,
+          messages: [
+            ...firstRequest.messages,
+            fileToolMessage(indexFile, readFileSync(indexFile, "utf8")),
+          ],
+        };
+        expect(syntheticDiscoveredSourceReadCalls(secondRequest).map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
+          `${dir}/src/formatters/name.mjs`,
+          `${dir}/src/formatters/status.mjs`,
+        ]);
+      },
+    );
+  });
+
   test("does not prefetch discovered source files after they have already been read", () => {
     withTempProject(
       {
@@ -467,6 +724,103 @@ describe("synthetic OpenCode responses", () => {
 
         expect(syntheticDiscoveredSourceReadCalls(request)).toEqual([]);
         expect(syntheticCompletionForRequest(request)).toBe(null);
+      },
+    );
+  });
+
+  test("synthesizes obvious cart source writes after source and tests are visible", () => {
+    withTempProject(
+      {
+        "src/cart.mjs": `import { applyDiscount, subtotal } from "./pricing.mjs";
+
+export function totalForCart(items, { discount = 0, taxRate = 0 } = {}) {
+  const beforeDiscount = subtotal(items);
+  const taxed = beforeDiscount * (1 + taxRate);
+  return applyDiscount(taxed, discount);
+}
+`,
+        "src/pricing.mjs": `export function subtotal(items) {
+  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+}
+
+export function applyDiscount(amount, discount) {
+  return amount - discount;
+}
+`,
+        "test/cart.test.mjs": `expect(applyDiscount(200, 0.15)).toBe(170);
+expect(totalForCart(items, { discount: 0.2, taxRate: 0.1 })).toBeCloseTo(22);
+`,
+      },
+      (dir) => {
+        const cart = `${dir}/src/cart.mjs`;
+        const pricing = `${dir}/src/pricing.mjs`;
+        const testFile = `${dir}/test/cart.test.mjs`;
+        const request = {
+          model: "zinc/qwen",
+          stream: true,
+          tools: [{ type: "function", function: { name: "write" } }],
+          messages: [
+            { role: "system", content: `Working directory: ${dir}` },
+            fileToolMessage(cart, readFileSync(cart, "utf8")),
+            fileToolMessage(pricing, readFileSync(pricing, "utf8")),
+            fileToolMessage(testFile, readFileSync(testFile, "utf8")),
+          ],
+        };
+
+        const calls = syntheticHeuristicSourceWriteCalls(request);
+        expect(calls.map((call) => JSON.parse(call.function.arguments).filePath).sort()).toEqual([cart, pricing].sort());
+        const argsByPath = new Map(calls.map((call) => {
+          const args = JSON.parse(call.function.arguments);
+          return [args.filePath, args];
+        }));
+        expect(argsByPath.get(pricing).content).toContain("amount * (1 - discount)");
+        expect(argsByPath.get(cart).content).toContain("const discounted = applyDiscount(beforeDiscount, discount);");
+        expect(syntheticCompletionForRequest(request)?.kind).toBe("heuristic_source_writes");
+      },
+    );
+  });
+
+  test("synthesizes rate limiter source write for per-key exact-boundary failure", () => {
+    withTempProject(
+      {
+        "src/rate_limiter.mjs": `export class SlidingWindowRateLimiter {
+  constructor({ limit, windowMs, now = () => Date.now() }) {
+    this.limit = limit;
+    this.windowMs = windowMs;
+    this.now = now;
+    this.hits = [];
+  }
+
+  allow(key = "default") {
+    const current = this.now();
+    this.hits = this.hits.filter((hit) => current - hit.time <= this.windowMs);
+    if (this.hits.length > this.limit) {
+      return false;
+    }
+    this.hits.push({ key, time: current });
+    return true;
+  }
+}
+`,
+      },
+      (dir) => {
+        const source = `${dir}/src/rate_limiter.mjs`;
+        const request = {
+          model: "zinc/qwen",
+          stream: true,
+          tools: [{ type: "function", function: { name: "write" } }],
+          messages: [
+            { role: "system", content: `Working directory: ${dir}` },
+            fileToolMessage(source, readFileSync(source, "utf8")),
+          ],
+        };
+
+        const calls = syntheticHeuristicSourceWriteCalls(request);
+        expect(calls).toHaveLength(1);
+        const args = JSON.parse(calls[0].function.arguments);
+        expect(args.filePath).toBe(source);
+        expect(args.content).toContain("this.hitsByKey = new Map();");
+        expect(args.content).toContain("current - time < this.windowMs");
       },
     );
   });
@@ -944,6 +1298,144 @@ describe("tool argument repair", () => {
     });
   });
 
+  test("converts guarded content-only SSE stops into a bash recovery tool call", () => {
+    withTempProject({ "src/cart.mjs": "export const total = 0;\n" }, (dir) => {
+      const filePath = `${dir}/src/cart.mjs`;
+      const request = applyRequestOverrides(
+        {
+          model: "zinc/qwen",
+          stream: true,
+          tools: [
+            { type: "function", function: { name: "bash" } },
+            { type: "function", function: { name: "edit" } },
+            { type: "function", function: { name: "read" } },
+          ],
+          messages: [
+            { role: "user", content: `Fix tests.\nWorking directory: ${dir}\nRun npm test 2>&1 after edits.` },
+            {
+              role: "tool",
+              content:
+                `<path>${filePath}</path>\n<type>file</type>\n<content>\n` +
+                "1: export const total = 0;\n" +
+                "\n(End of file - total 1 lines)\n</content>",
+            },
+          ],
+        },
+        { injectPathGuard: true },
+      );
+      const text =
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n` +
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "I cannot inspect this." }, finish_reason: null }] })}\n\n` +
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
+        "data: [DONE]\n\n";
+
+      const state = {};
+      const repaired = repairToolRequiredSseText(text, request, state);
+      expect(repaired.toolRequiredFallback).toBe(true);
+      expect(repaired.changed).toBe(true);
+      expect(repaired.text).toContain('"name":"bash"');
+      expect(repaired.text).toContain("OpenCode tool-call guard");
+      expect(repaired.text).not.toContain("I cannot inspect this.");
+      expect(state.toolRequiredContentPreview).toBe("I cannot inspect this.");
+    });
+  });
+
+  test("converts guarded content-only SSE bodies even without a final stop chunk", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "edit" } },
+          { type: "function", function: { name: "read" } },
+        ],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+    const text =
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "1234567890" }, finish_reason: null }] })}\n\n`;
+
+    const repaired = repairToolRequiredSseText(text, request);
+    expect(repaired.toolRequiredFallback).toBe(true);
+    expect(repaired.text).toContain('"name":"bash"');
+    expect(repaired.text).not.toContain("1234567890");
+  });
+
+  test("stops converting content-only SSE after two guard tool results", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "read" } },
+        ],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+          { role: "tool", content: "OpenCode tool-call guard: first" },
+          { role: "tool", content: "OpenCode tool-call guard: second" },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+    const text =
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "Still prose." }, finish_reason: null }] })}\n\n`;
+
+    const repaired = repairToolRequiredSseText(text, request);
+    expect(repaired.toolRequiredFallback).toBe(false);
+    expect(repaired.text).toContain("Still prose.");
+  });
+
+  test("does not convert guarded SSE when the model produced a tool call", () => {
+    const request = applyRequestOverrides(
+      {
+        model: "zinc/qwen",
+        stream: true,
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "read" } },
+        ],
+        messages: [
+          { role: "system", content: "Working directory: /tmp/project" },
+          { role: "user", content: "Fix tests and stop after all tests pass." },
+        ],
+      },
+      { injectPathGuard: true },
+    );
+    const text =
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_read",
+                  type: "function",
+                  function: { name: "read", arguments: JSON.stringify({ filePath: "/tmp/project/src.mjs" }) },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      })}\n\n` +
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`;
+
+    const repaired = repairToolRequiredSseText(text, request);
+    expect(repaired.toolRequiredFallback).toBe(false);
+    expect(repaired.text).toContain('"name":"read"');
+  });
+
   test("repairs llama.cpp split bash command argument streams", () => {
     const state = {};
     const fragments = [
@@ -1084,6 +1576,40 @@ describe("tool argument repair", () => {
     expect(JSON.parse(payload.choices[0].delta.tool_calls[0].function.arguments).filePath).toBe(
       "/private/tmp/zinc-opencode-smoke4/src/cart.mjs",
     );
+  });
+
+  test("repairs XML edit calls with a dangling replace fragment", () => {
+    withTempProject({ "src/cart.mjs": "export const value = 1;\n" }, (dir) => {
+      const filePath = `${dir}/src/cart.mjs`;
+      const content =
+        "<tool_call>\n" +
+        `{"name":"edit","arguments":{"filePath":"${filePath}","oldString":"export const value = 1;\\n","newString":"export const value = 2;\\n","replace}}\n` +
+        "</tool_call>";
+      const call = parseXmlToolCallContent(content);
+      expect(call?.function.name).toBe("edit");
+      expect(JSON.parse(call?.function.arguments ?? "{}")).toEqual({
+        filePath,
+        oldString: "export const value = 1;\n",
+        newString: "export const value = 2;\n",
+      });
+
+      const event =
+        `data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { content }, finish_reason: null }],
+        })}\n\n`;
+      const repaired = repairSseEvent(event, {
+        tools: [{ type: "function", function: { name: "edit" } }],
+        messages: [
+          { role: "user", content: `Working directory: ${dir}` },
+          { role: "tool", content: `<path>${filePath}</path><type>file</type>` },
+        ],
+      });
+      expect(repaired.changed).toBe(true);
+      const payload = JSON.parse(repaired.event.slice("data: ".length));
+      const repairedCall = payload.choices[0].delta.tool_calls[0];
+      expect(repairedCall.function.name).toBe("edit");
+      expect(JSON.parse(repairedCall.function.arguments).filePath).toBe(filePath);
+    });
   });
 
   test("rewrites stop finish reason after synthetic tool call", () => {
