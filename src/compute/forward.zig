@@ -2692,7 +2692,16 @@ pub const InferenceEngine = struct {
         const a3b_validate_env = std.posix.getenv("ZINC_A3B_VALIDATE");
         const a3b_validate_flag = a3b_validate_env != null and std.mem.eql(u8, a3b_validate_env.?, "1");
         const a3b_production_env = std.posix.getenv("ZINC_A3B_PRODUCTION");
-        const a3b_production_flag = a3b_production_env != null and std.mem.eql(u8, a3b_production_env.?, "1");
+        const a3b_production_default_on =
+            config.architecture == .qwen2_moe and
+            config.n_experts > 0 and
+            config.ssm_d_inner > 0 and
+            config.ssm_dt_rank > 0 and
+            config.full_attn_interval == 4;
+        const a3b_production_flag = if (a3b_production_env) |raw|
+            raw.len > 0 and !std.mem.eql(u8, raw, "0")
+        else
+            a3b_production_default_on;
         // Cycle 127: capture buffers allocated only for validate. Cycle 125
         // tied production allocation to the same set, but the production
         // post-loop dispatch consumed corrupted captures (because cycle
@@ -2781,11 +2790,7 @@ pub const InferenceEngine = struct {
         } else if (a3b_validate_flag) {
             log.info("ZINC_A3B_VALIDATE requested but prerequisites missing (no SSM, missing pipeline, or no push descriptors); skipping", .{});
         } else if (a3b_production_flag) {
-            // Cycle 127: ZINC_A3B_PRODUCTION is currently dormant (cycle
-            // 125's broken implementation was rolled back). Setting the
-            // flag has no effect until cycle 128's layer-major restructure
-            // re-engages it.
-            log.info("ZINC_A3B_PRODUCTION=1 set but currently a no-op (cycle 125 wire-up reverted in cycle 127; layer-major restructure pending in cycle 128).", .{});
+            log.info("ZINC_A3B_PRODUCTION enabled: layer-major A3B SSM prefill will run without validate capture buffers", .{});
         }
 
         const dense_prefill_validate_env = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE");
@@ -3292,13 +3297,26 @@ pub const InferenceEngine = struct {
         const q_dim: u32 = cfg.n_heads * cfg.head_dim;
         const kv_dim: u32 = cfg.n_kv_heads * cfg.head_dim;
         const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const ssm_conv_dim: u32 = if (cfg.ssm_d_inner > 0)
+            cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state
+        else
+            0;
+        const q_scratch_dim = @max(q_dim, @max(cfg.ssm_d_inner, cfg.ssm_dt_rank));
+        const kv_scratch_dim = @max(kv_dim, cfg.ssm_dt_rank);
+        const attn_out_scratch_dim = @max(q_dim, cfg.ssm_d_inner);
+        const gate_scratch_dim = @max(inter_dim, ssm_conv_dim);
+        const up_scratch_dim = @max(inter_dim, cfg.ssm_d_inner);
+        const swiglu_scratch_dim = @max(inter_dim, cfg.ssm_d_inner);
 
         const n: u64 = n_tokens;
         const f32_sz: u64 = @sizeOf(f32);
         const hidden_bytes = n * hidden_dim * f32_sz;
-        const q_bytes = n * q_dim * f32_sz;
-        const kv_bytes = n * kv_dim * f32_sz;
-        const inter_bytes = n * inter_dim * f32_sz;
+        const q_bytes = n * q_scratch_dim * f32_sz;
+        const kv_bytes = n * kv_scratch_dim * f32_sz;
+        const attn_out_bytes = n * attn_out_scratch_dim * f32_sz;
+        const gate_bytes = n * gate_scratch_dim * f32_sz;
+        const up_bytes = n * up_scratch_dim * f32_sz;
+        const swiglu_bytes = n * swiglu_scratch_dim * f32_sz;
 
         const storage_xfer = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -3320,10 +3338,10 @@ pub const InferenceEngine = struct {
         try growSlot(self.instance, &self.batched_scratch_q, q_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_k, kv_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_v, kv_bytes, storage_xfer);
-        try growSlot(self.instance, &self.batched_scratch_attn_out, q_bytes, storage_xfer);
-        try growSlot(self.instance, &self.batched_scratch_gate, inter_bytes, storage_xfer);
-        try growSlot(self.instance, &self.batched_scratch_up, inter_bytes, storage_xfer);
-        try growSlot(self.instance, &self.batched_scratch_swiglu, inter_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_attn_out, attn_out_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_gate, gate_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_up, up_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_swiglu, swiglu_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_down, hidden_bytes, storage_xfer);
         // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
         // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
@@ -9999,6 +10017,24 @@ pub const InferenceEngine = struct {
             );
             return;
         }
+        if (tensor.info.type_ == .q8_0) {
+            var tok: u32 = 0;
+            while (tok < n_tokens) : (tok += 1) {
+                try self.dispatchDmmvInner(
+                    tensor,
+                    x_buf,
+                    x_buf.size,
+                    y_buf,
+                    M,
+                    K,
+                    0,
+                    tok * K * f32_bytes,
+                    tok * M * f32_bytes,
+                    0,
+                );
+            }
+            return;
+        }
         while (chunk_start < n_tokens) {
             const chunk: u32 = @min(max_cols, n_tokens - chunk_start);
             const x_offset: u32 = chunk_start * K * f32_bytes;
@@ -12731,8 +12767,26 @@ pub const InferenceEngine = struct {
             cfg.n_layers == 32;
     }
 
+    fn isQwen36A3bMoePrefillModel(self: *const InferenceEngine) bool {
+        const cfg = self.model.config;
+        return cfg.architecture == .qwen2_moe and
+            cfg.n_experts > 0 and
+            cfg.n_experts_used > 0 and
+            cfg.ssm_d_inner > 0 and
+            cfg.ssm_dt_rank > 0 and
+            cfg.ssm_d_state > 0 and
+            cfg.ssm_n_group > 0 and
+            cfg.full_attn_interval == 4 and
+            cfg.n_layers > 4;
+    }
+
     fn isQwenDenseHybridLayerMajorPrefillModel(self: *const InferenceEngine) bool {
         return self.isQwen36DenseHybrid27B() or self.isQwen35DenseHybrid9B();
+    }
+
+    fn isQwenLayerMajorSsmPrefillModel(self: *const InferenceEngine) bool {
+        return self.isQwenDenseHybridLayerMajorPrefillModel() or
+            (self.use_a3b_production and self.isQwen36A3bMoePrefillModel());
     }
 
     fn isAmdRdna(self: *const InferenceEngine) bool {
@@ -14132,7 +14186,7 @@ pub const InferenceEngine = struct {
         if (n_tokens < 16) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
-        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
+        if (!self.isQwenLayerMajorSsmPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.use_ssm_delta_normed_qk) return false;
@@ -16358,6 +16412,254 @@ pub const InferenceEngine = struct {
         self.recordProfilingSample();
     }
 
+    fn a3bProductionPrefillEnabled(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (!self.use_a3b_production) return false;
+        if (prompt_len < 16) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.use_ssm_delta_normed_qk) return false;
+        if (self.elementwise.pipeline_ssm_conv1d == null) return false;
+        if (self.elementwise.pipeline_ssm_delta_net == null and self.elementwise.pipeline_ssm_delta_net_cols8 == null) return false;
+        if (self.elementwise.pipeline_ssm_gated_norm == null) return false;
+        return true;
+    }
+
+    fn prefillA3bProduction(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        if (prompt_tokens.len == 0) return;
+
+        const cfg = self.model.config;
+        const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
+        const hidden_dim = cfg.hidden_dim;
+        const hidden_size = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+        const total_embed_bytes: u64 = @as(u64, hidden_dim) * @as(u64, n_tokens) * @sizeOf(f32);
+
+        const base_token: u32 = state.position;
+        const target_context_tokens = if (state.requested_context_tokens > 0)
+            @max(state.requested_context_tokens, base_token +| n_tokens)
+        else
+            base_token +| n_tokens;
+        if (base_token == 0 and state.generated_tokens.items.len == 0) {
+            try self.resetRequestState(target_context_tokens);
+        } else if (base_token > 0 and self.active_kv_page_ids == null) {
+            return error.KvStateNotAvailable;
+        } else {
+            try self.ensureKvPagesForContext(target_context_tokens);
+        }
+
+        try self.ensureBatchedScratchCapacity(n_tokens);
+        if (self.prefill_embed_big == null or self.prefill_embed_big_capacity_bytes < total_embed_bytes) {
+            if (self.prefill_embed_big) |*b| b.deinit();
+            self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
+            self.prefill_embed_big_capacity_bytes = total_embed_bytes;
+        }
+
+        const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
+        {
+            const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
+            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+            const data_start: usize = @intCast(self.model.gguf_file.tensor_data_offset + embd.info.offset);
+            const vocab_last = cfg.vocab_size -| 1;
+            for (prompt_tokens, 0..) |tok, i| {
+                const safe_id = @min(tok, vocab_last);
+                const dst = big_f32[i * hidden_dim ..][0..hidden_dim];
+                dequantRow(mmap[data_start..], safe_id, hidden_dim, embd.info.type_, dst);
+            }
+        }
+        self.prefill_embed_big_hidden = hidden_dim;
+        self.prefill_embed_big_token_count = n_tokens;
+        self.prefill_current_token_idx = 0;
+        defer {
+            self.prefill_embed_big_token_count = 0;
+            self.prefill_embed_big_hidden = 0;
+            self.prefill_current_token_idx = 0;
+        }
+
+        const scratch_hidden = self.batched_scratch_hidden.?;
+        const scratch_norm = self.batched_scratch_norm.?;
+        const scratch_gate = self.batched_scratch_gate.?;
+        const scratch_up = self.batched_scratch_up.?;
+        const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const scratch_down = self.batched_scratch_down.?;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_embed_bytes,
+        });
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        self.prefill_token_samples = 0;
+        self.prefill_cpu_embed_ns = 0;
+        self.prefill_cpu_record_ns = 0;
+        self.prefill_submit_wait_ns = 0;
+        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_total_ns = 0;
+        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
+        const profile_was_enabled = self.profile_enabled;
+        const enable_gpu_phase_timing = self.timestamp_query_pool != null and want_gpu_phases;
+        if (enable_gpu_phase_timing) self.profile_enabled = true;
+        defer {
+            if (enable_gpu_phase_timing) {
+                for (0..profile_phase_count) |p| {
+                    self.prefill_gpu_phase_ns[p] = self.profile_total_counters.gpu_phase_ns[p];
+                }
+                self.prefill_gpu_total_ns = @intFromFloat(@max(self.profile_total_gpu_ms * 1_000_000.0, 0.0));
+                self.resetProfilingSamples();
+                self.profile_enabled = profile_was_enabled;
+            }
+        }
+        self.prefill_active = true;
+        defer self.prefill_active = false;
+
+        const saved_partial_start = self.partial_decode_start_layer;
+        const saved_partial_end = self.partial_decode_end_layer;
+        const saved_hidden_in = self.partial_decode_hidden_in;
+        const saved_hidden_in_offset = self.partial_decode_hidden_in_offset;
+        const saved_hidden_out = self.partial_decode_hidden_out;
+        const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
+        const saved_advance = self.partial_decode_advance_position;
+        const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
+        const saved_norm_out = self.partial_decode_ffn_norm_out;
+        const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_resume = self.partial_decode_resume_from_ffn_norm;
+        const saved_norm_in = self.partial_decode_ffn_norm_in;
+        const saved_norm_in_offset = self.partial_decode_ffn_norm_in_offset;
+        const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
+        const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
+        const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
+        const saved_stop_after_ssm_conv = self.partial_decode_stop_after_ssm_conv;
+        const saved_ssm_conv_out = self.partial_decode_ssm_conv_out;
+        const saved_ssm_conv_out_offset = self.partial_decode_ssm_conv_out_offset;
+        const saved_ssm_z_out = self.partial_decode_ssm_z_out;
+        const saved_ssm_z_out_offset = self.partial_decode_ssm_z_out_offset;
+        const saved_ssm_alpha_out = self.partial_decode_ssm_alpha_out;
+        const saved_ssm_alpha_out_offset = self.partial_decode_ssm_alpha_out_offset;
+        const saved_ssm_beta_out = self.partial_decode_ssm_beta_out;
+        const saved_ssm_beta_out_offset = self.partial_decode_ssm_beta_out_offset;
+        defer {
+            self.partial_decode_start_layer = saved_partial_start;
+            self.partial_decode_end_layer = saved_partial_end;
+            self.partial_decode_hidden_in = saved_hidden_in;
+            self.partial_decode_hidden_in_offset = saved_hidden_in_offset;
+            self.partial_decode_hidden_out = saved_hidden_out;
+            self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
+            self.partial_decode_advance_position = saved_advance;
+            self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
+            self.partial_decode_ffn_norm_out = saved_norm_out;
+            self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_resume_from_ffn_norm = saved_resume;
+            self.partial_decode_ffn_norm_in = saved_norm_in;
+            self.partial_decode_ffn_norm_in_offset = saved_norm_in_offset;
+            self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
+            self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
+            self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
+            self.partial_decode_stop_after_ssm_conv = saved_stop_after_ssm_conv;
+            self.partial_decode_ssm_conv_out = saved_ssm_conv_out;
+            self.partial_decode_ssm_conv_out_offset = saved_ssm_conv_out_offset;
+            self.partial_decode_ssm_z_out = saved_ssm_z_out;
+            self.partial_decode_ssm_z_out_offset = saved_ssm_z_out_offset;
+            self.partial_decode_ssm_alpha_out = saved_ssm_alpha_out;
+            self.partial_decode_ssm_alpha_out_offset = saved_ssm_alpha_out_offset;
+            self.partial_decode_ssm_beta_out = saved_ssm_beta_out;
+            self.partial_decode_ssm_beta_out_offset = saved_ssm_beta_out_offset;
+        }
+
+        const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+        const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens) or
+            (n_tokens >= 16 and
+                !self.validation_diagnostics_enabled and
+                !self.profile_enabled and
+                self.instance.push_descriptor_fn != null and
+                self.isAmdRdna());
+        var layer: u32 = 0;
+        while (layer < cfg.n_layers) : (layer += 1) {
+            const is_final_layer = layer + 1 == cfg.n_layers;
+            if (is_final_layer) {
+                try self.prefillQwen36RunPartialTokenLoop(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    layer,
+                    layer + 1,
+                    scratch_hidden,
+                    null,
+                    false,
+                    false,
+                    true,
+                    true,
+                    pipeline_tail,
+                );
+                self.prefill_token_samples = n_tokens;
+                return;
+            }
+
+            const is_full_attn = ((layer + 1) % full_attn_interval) == 0;
+            if (is_full_attn) {
+                try self.prefillQwen36RunPartialTokenLoop(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    layer,
+                    layer + 1,
+                    scratch_hidden,
+                    null,
+                    true,
+                    false,
+                    false,
+                    false,
+                    pipeline_tail,
+                );
+                continue;
+            }
+
+            try self.prefillQwen36RunSsmLayerToFfnNorm(
+                state,
+                prompt_tokens,
+                base_token,
+                n_tokens,
+                hidden_dim,
+                cfg.ssm_d_inner,
+                hidden_size,
+                layer,
+                scratch_hidden,
+                scratch_gate,
+                scratch_up,
+                self.batched_scratch_q.?,
+                self.batched_scratch_k.?,
+                self.batched_scratch_attn_out.?,
+                scratch_swiglu,
+                scratch_norm,
+                scratch_down,
+                pipeline_tail,
+            );
+            try self.prefillRunLayerFromFfnNorm(
+                state,
+                prompt_tokens,
+                base_token,
+                n_tokens,
+                hidden_size,
+                layer,
+                scratch_hidden,
+                scratch_norm,
+                pipeline_tail,
+            );
+        }
+    }
+
     fn prefillQwen36DenseFfnPrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, prefix_layers: u32) !void {
         if (prompt_tokens.len == 0 or prefix_layers == 0) return;
 
@@ -16933,6 +17235,9 @@ pub const InferenceEngine = struct {
         const batched_disabled = std.mem.eql(u8, mode, "0");
         const validate_mode = std.mem.eql(u8, mode, "validate");
         if (!batched_disabled and !validate_mode) {
+            if (self.a3bProductionPrefillEnabled(prompt_tokens.len)) {
+                return self.prefillA3bProduction(state, prompt_tokens);
+            }
             const dense_prefix_layers = self.qwen36DensePrefillPrefixLayers(prompt_tokens.len);
             if (dense_prefix_layers > 0) {
                 return self.prefillQwen36DenseFfnPrefix(state, prompt_tokens, dense_prefix_layers);
