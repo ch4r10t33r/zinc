@@ -17292,6 +17292,71 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn a3bProductionFullAttnBatchedEligible(
+        self: *const InferenceEngine,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+        scratch_packed_qgate: Buffer,
+        scratch_gate_attn: Buffer,
+    ) bool {
+        if (n_tokens < 16) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.attention.pipeline_batched == null) return false;
+        if (self.elementwise.pipeline_rope_batched == null) return false;
+        if (self.elementwise.pipeline_kv_cache_write_batched == null) return false;
+        if (self.elementwise.pipeline_sigmoid_mul == null) return false;
+        if (self.elementwise.pipeline_residual_rms_norm == null) return false;
+        if (self.elementwise.pipeline_deinterleave_batched == null) return false;
+
+        const cfg = self.model.config;
+        const lt = self.layer_tensors[layer];
+        const q_t = lt.attn_q orelse return false;
+        const k_t = lt.attn_k orelse return false;
+        const v_t = lt.attn_v orelse return false;
+        const o_t = lt.attn_output orelse return false;
+        _ = lt.attn_norm orelse return false;
+        _ = lt.ffn_norm orelse lt.post_attention_norm orelse return false;
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+        if ((q_t.info.numElements() % hidden_dim) != 0) return false;
+        if ((k_t.info.numElements() % hidden_dim) != 0) return false;
+        if ((v_t.info.numElements() % hidden_dim) != 0) return false;
+        if ((o_t.info.numElements() % hidden_dim) != 0) return false;
+
+        const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+        const k_rows: u32 = @intCast(k_t.info.numElements() / hidden_dim);
+        const v_rows: u32 = @intCast(v_t.info.numElements() / hidden_dim);
+        if (v_rows != k_rows) return false;
+        const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+            @intCast(qn.info.numElements())
+        else if (lt.attn_k_norm) |kn|
+            @intCast(kn.info.numElements())
+        else
+            cfg.head_dim;
+        if (layer_head_dim == 0) return false;
+        if ((k_rows % layer_head_dim) != 0) return false;
+        const layer_q_dim: u32 = cfg.n_heads * layer_head_dim;
+        const packed_q_gate = q_rows == 2 * layer_q_dim;
+        if (!packed_q_gate and q_rows != layer_q_dim) return false;
+        const use_separate_gate = !packed_q_gate and lt.attn_gate != null;
+        const apply_attn_gate = packed_q_gate or use_separate_gate;
+
+        const q_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, layer_q_dim) *
+            @sizeOf(f32);
+        const packed_q_gate_total_bytes = q_total_bytes * 2;
+        if (q_total_bytes > self.batched_scratch_q.?.size) return false;
+        if (q_total_bytes > self.batched_scratch_attn_out.?.size) return false;
+        if (apply_attn_gate and q_total_bytes > scratch_gate_attn.size) return false;
+        if (packed_q_gate and packed_q_gate_total_bytes > scratch_packed_qgate.size) return false;
+        return true;
+    }
+
     fn prefillQwen36RunBatchedDenseFfnLayer(
         self: *InferenceEngine,
         layer: u32,
@@ -17712,22 +17777,57 @@ pub const InferenceEngine = struct {
 
             const is_full_attn = ((layer + 1) % full_attn_interval) == 0;
             if (is_full_attn) {
-                try self.prefillQwen36RunPartialTokenLoop(
-                    state,
-                    prompt_tokens,
-                    base_token,
-                    n_tokens,
-                    hidden_size,
-                    layer,
-                    layer + 1,
-                    scratch_hidden,
-                    null,
-                    true,
-                    false,
-                    false,
-                    false,
-                    pipeline_tail,
-                );
+                if (self.a3bProductionFullAttnBatchedEligible(n_tokens, hidden_dim, layer, scratch_gate, scratch_swiglu)) {
+                    try self.prefillQwen36RunFullAttnLayerToFfnNorm(
+                        state,
+                        base_token,
+                        n_tokens,
+                        hidden_dim,
+                        layer,
+                        scratch_hidden,
+                        scratch_norm,
+                        self.batched_scratch_q.?,
+                        self.batched_scratch_k.?,
+                        self.batched_scratch_v.?,
+                        self.batched_scratch_attn_out.?,
+                        scratch_gate,
+                        scratch_swiglu,
+                        scratch_down,
+                    );
+                    try self.prefillRunLayerFromFfnNorm(
+                        state,
+                        prompt_tokens,
+                        base_token,
+                        n_tokens,
+                        hidden_size,
+                        layer,
+                        scratch_hidden,
+                        scratch_norm,
+                        scratch_gate,
+                        scratch_up,
+                        self.batched_scratch_attn_out.?,
+                        scratch_swiglu,
+                        scratch_down,
+                        pipeline_tail,
+                    );
+                } else {
+                    try self.prefillQwen36RunPartialTokenLoop(
+                        state,
+                        prompt_tokens,
+                        base_token,
+                        n_tokens,
+                        hidden_size,
+                        layer,
+                        layer + 1,
+                        scratch_hidden,
+                        null,
+                        true,
+                        false,
+                        false,
+                        false,
+                        pipeline_tail,
+                    );
+                }
                 continue;
             }
 
