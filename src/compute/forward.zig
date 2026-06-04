@@ -3617,6 +3617,44 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn writeDescSet3LastOffset(
+        self: *InferenceEngine,
+        ds: vk.c.VkDescriptorSet,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        offset2: vk.c.VkDeviceSize,
+        size2: vk.c.VkDeviceSize,
+    ) void {
+        var buffer_infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = offset2, .range = size2 },
+        };
+        var writes: [3]vk.c.VkWriteDescriptorSet = undefined;
+        for (0..3) |i| {
+            writes[i] = .{
+                .sType = vk.c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = ds,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = &buffer_infos[i],
+                .pTexelBufferView = null,
+            };
+        }
+        vk.c.vkUpdateDescriptorSets(self.instance.device, 3, &writes, 0, null);
+        if (self.profile_enabled) {
+            self.profile_token_counters.descriptor_write_calls += 1;
+            self.profile_token_counters.descriptor_bindings += 3;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Layer tensor lookup
     // -----------------------------------------------------------------------
@@ -3856,6 +3894,47 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn writeDescSet4LastOffset(
+        self: *InferenceEngine,
+        ds: vk.c.VkDescriptorSet,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        size2: vk.c.VkDeviceSize,
+        buf3: vk.c.VkBuffer,
+        offset3: vk.c.VkDeviceSize,
+        size3: vk.c.VkDeviceSize,
+    ) void {
+        var buffer_infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = 0, .range = size2 },
+            .{ .buffer = buf3, .offset = offset3, .range = size3 },
+        };
+        var writes: [4]vk.c.VkWriteDescriptorSet = undefined;
+        for (0..4) |i| {
+            writes[i] = .{
+                .sType = vk.c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = ds,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = &buffer_infos[i],
+                .pTexelBufferView = null,
+            };
+        }
+        vk.c.vkUpdateDescriptorSets(self.instance.device, 4, &writes, 0, null);
+        if (self.profile_enabled) {
+            self.profile_token_counters.descriptor_write_calls += 1;
+            self.profile_token_counters.descriptor_bindings += 4;
+        }
+    }
+
     fn writeDescSet7(
         self: *InferenceEngine,
         ds: vk.c.VkDescriptorSet,
@@ -4015,6 +4094,37 @@ pub const InferenceEngine = struct {
         );
     }
 
+    fn pushDispatch3LastOffset(
+        self: *InferenceEngine,
+        pip: *const Pipeline,
+        push_data: []const u8,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        offset2: vk.c.VkDeviceSize,
+        size2: vk.c.VkDeviceSize,
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) void {
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = offset2, .range = size2 },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            push_data,
+            wg_x,
+            wg_y,
+            wg_z,
+        );
+    }
+
     fn pushDispatch4(
         self: *InferenceEngine,
         pip: *const Pipeline,
@@ -4036,6 +4146,40 @@ pub const InferenceEngine = struct {
             .{ .buffer = buf1, .offset = 0, .range = size1 },
             .{ .buffer = buf2, .offset = 0, .range = size2 },
             .{ .buffer = buf3, .offset = 0, .range = size3 },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            push_data,
+            wg_x,
+            wg_y,
+            wg_z,
+        );
+    }
+
+    fn pushDispatch4LastOffset(
+        self: *InferenceEngine,
+        pip: *const Pipeline,
+        push_data: []const u8,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        size2: vk.c.VkDeviceSize,
+        buf3: vk.c.VkBuffer,
+        offset3: vk.c.VkDeviceSize,
+        size3: vk.c.VkDeviceSize,
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) void {
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = 0, .range = size2 },
+            .{ .buffer = buf3, .offset = offset3, .range = size3 },
         };
         self.decode_cmd.pushDescAndDispatch(
             pip,
@@ -4084,6 +4228,43 @@ pub const InferenceEngine = struct {
         );
     }
 
+    fn pushDispatch5LastOffset(
+        self: *InferenceEngine,
+        pip: *const Pipeline,
+        push_data: []const u8,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        size2: vk.c.VkDeviceSize,
+        buf3: vk.c.VkBuffer,
+        size3: vk.c.VkDeviceSize,
+        buf4: vk.c.VkBuffer,
+        offset4: vk.c.VkDeviceSize,
+        size4: vk.c.VkDeviceSize,
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) void {
+        const infos = [5]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = 0, .range = size2 },
+            .{ .buffer = buf3, .offset = 0, .range = size3 },
+            .{ .buffer = buf4, .offset = offset4, .range = size4 },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            push_data,
+            wg_x,
+            wg_y,
+            wg_z,
+        );
+    }
+
     fn pushDispatch6(
         self: *InferenceEngine,
         pip: *const Pipeline,
@@ -4111,6 +4292,46 @@ pub const InferenceEngine = struct {
             .{ .buffer = buf3, .offset = 0, .range = size3 },
             .{ .buffer = buf4, .offset = 0, .range = size4 },
             .{ .buffer = buf5, .offset = 0, .range = size5 },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            push_data,
+            wg_x,
+            wg_y,
+            wg_z,
+        );
+    }
+
+    fn pushDispatch6LastOffset(
+        self: *InferenceEngine,
+        pip: *const Pipeline,
+        push_data: []const u8,
+        buf0: vk.c.VkBuffer,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        size2: vk.c.VkDeviceSize,
+        buf3: vk.c.VkBuffer,
+        size3: vk.c.VkDeviceSize,
+        buf4: vk.c.VkBuffer,
+        size4: vk.c.VkDeviceSize,
+        buf5: vk.c.VkBuffer,
+        offset5: vk.c.VkDeviceSize,
+        size5: vk.c.VkDeviceSize,
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) void {
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = 0, .range = size2 },
+            .{ .buffer = buf3, .offset = 0, .range = size3 },
+            .{ .buffer = buf4, .offset = 0, .range = size4 },
+            .{ .buffer = buf5, .offset = offset5, .range = size5 },
         };
         self.decode_cmd.pushDescAndDispatch(
             pip,
@@ -5139,6 +5360,7 @@ pub const InferenceEngine = struct {
         src_buf: vk.c.VkBuffer,
         src_size: vk.c.VkDeviceSize,
         routing_buf: vk.c.VkBuffer,
+        routing_offset: vk.c.VkDeviceSize,
         routing_size: vk.c.VkDeviceSize,
         n_elements: u32,
         n_used: u32,
@@ -5151,7 +5373,7 @@ pub const InferenceEngine = struct {
                 .n_used = n_used,
                 .src_stride = src_stride,
             };
-            self.pushDispatch3(
+            self.pushDispatch3LastOffset(
                 pip,
                 std.mem.asBytes(&push),
                 accum_buf,
@@ -5159,6 +5381,7 @@ pub const InferenceEngine = struct {
                 src_buf,
                 src_size,
                 routing_buf,
+                routing_offset,
                 routing_size,
                 (n_elements + 63) / 64,
                 1,
@@ -5168,7 +5391,7 @@ pub const InferenceEngine = struct {
         }
 
         const ds = try self.allocDescSet(pip.descriptor_set_layout);
-        self.writeDescSet3(ds, accum_buf, accum_size, src_buf, src_size, routing_buf, routing_size);
+        self.writeDescSet3LastOffset(ds, accum_buf, accum_size, src_buf, src_size, routing_buf, routing_offset, routing_size);
         try self.elementwise.recordMoeWeightedAcc(&self.decode_cmd, ds, n_elements, n_used, src_stride);
     }
 
@@ -7256,23 +7479,19 @@ pub const InferenceEngine = struct {
                     // This gives ~8× better GPU utilization vs serial per-expert dispatch.
                     // Reduces dispatches from 32 to 5, barriers from 32 to 4 per MoE layer.
 
-                    // softmax_topk writes expert_ids + weights to router_output_buf
+                    var moe_route_buf: vk.c.VkBuffer = self.router_output_buf.handle;
+                    var moe_route_offset: vk.c.VkDeviceSize = 0;
+                    var moe_route_size: vk.c.VkDeviceSize = self.router_output_buf.size;
+
+                    // softmax_topk writes expert_ids + weights to router_output_buf.
+                    // The A3B layer-major path already has the selected routes in
+                    // a token-strided cache, so bind that slot directly instead
+                    // of copying it back through router_output_buf per token.
                     const moe_topk_phase = self.beginProfilePhase();
                     if (use_precomputed_router) {
-                        self.decode_cmd.computeToTransferBarrier();
-                        const route_region = vk.c.VkBufferCopy{
-                            .srcOffset = self.partial_decode_router_output_in_offset,
-                            .dstOffset = 0,
-                            .size = precomputed_route_copy_size,
-                        };
-                        vk.c.vkCmdCopyBuffer(
-                            self.decode_cmd.handle,
-                            self.partial_decode_router_output_in.?,
-                            self.router_output_buf.handle,
-                            1,
-                            &route_region,
-                        );
-                        self.decode_cmd.transferToComputeBarrier();
+                        moe_route_buf = self.partial_decode_router_output_in.?;
+                        moe_route_offset = self.partial_decode_router_output_in_offset;
+                        moe_route_size = precomputed_route_copy_size;
                     } else {
                         try self.dispatchSoftmaxTopk(
                             self.router_logits_buf.handle,
@@ -7357,7 +7576,7 @@ pub const InferenceEngine = struct {
                         const pip = fused_gate_up_swiglu_pip.?;
                         const push = MoeDmmvPushConstants{ .M = inter_dim, .K = hidden_dim, .expert_stride = expert_gate_row_bytes, .x_expert_stride = 0, .x_offset = 0, .y_offset = 0 };
                         const wg_x: u32 = inter_dim;
-                        self.pushDispatch5(
+                        self.pushDispatch5LastOffset(
                             pip,
                             std.mem.asBytes(&push),
                             gate_exps.gpu_buffer.handle,
@@ -7368,8 +7587,9 @@ pub const InferenceEngine = struct {
                             hidden_size,
                             self.swiglu_buf.handle,
                             self.swiglu_buf.size,
-                            self.router_output_buf.handle,
-                            self.router_output_buf.size,
+                            moe_route_buf,
+                            moe_route_offset,
+                            moe_route_size,
                             wg_x,
                             n_used,
                             1,
@@ -7378,7 +7598,7 @@ pub const InferenceEngine = struct {
                         const pip = fused_gate_up_pip.?;
                         const push = MoeDmmvPushConstants{ .M = inter_dim, .K = hidden_dim, .expert_stride = expert_gate_row_bytes, .x_expert_stride = 0, .x_offset = 0, .y_offset = 0 };
                         const wg_x: u32 = (inter_dim + 1) / 2;
-                        self.pushDispatch6(
+                        self.pushDispatch6LastOffset(
                             pip,
                             std.mem.asBytes(&push),
                             gate_exps.gpu_buffer.handle,
@@ -7391,8 +7611,9 @@ pub const InferenceEngine = struct {
                             self.gate_buf.size,
                             self.up_buf.handle,
                             self.up_buf.size,
-                            self.router_output_buf.handle,
-                            self.router_output_buf.size,
+                            moe_route_buf,
+                            moe_route_offset,
+                            moe_route_size,
                             wg_x,
                             n_used,
                             1,
@@ -7408,10 +7629,10 @@ pub const InferenceEngine = struct {
                                     .mxfp4, .q8_0, .f16 => (inter_dim + 1) / 2,
                                     else => (inter_dim + 63) / 64,
                                 };
-                                self.pushDispatch4(pip, std.mem.asBytes(&push), gate_exps.gpu_buffer.handle, gate_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.gate_buf.handle, self.gate_buf.size, self.router_output_buf.handle, self.router_output_buf.size, wg_x, n_used, 1);
+                                self.pushDispatch4LastOffset(pip, std.mem.asBytes(&push), gate_exps.gpu_buffer.handle, gate_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.gate_buf.handle, self.gate_buf.size, moe_route_buf, moe_route_offset, moe_route_size, wg_x, n_used, 1);
                             } else {
                                 const ds = try self.allocDescSet(pip.descriptor_set_layout);
-                                self.writeDescSet4(ds, gate_exps.gpu_buffer.handle, gate_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.gate_buf.handle, self.gate_buf.size, self.router_output_buf.handle, self.router_output_buf.size);
+                                self.writeDescSet4LastOffset(ds, gate_exps.gpu_buffer.handle, gate_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.gate_buf.handle, self.gate_buf.size, moe_route_buf, moe_route_offset, moe_route_size);
                                 try self.dmmv.recordMoeDispatch(&self.decode_cmd, qt, ds, inter_dim, hidden_dim, expert_gate_row_bytes, n_used, 0, 0, 0);
                             }
                         }
@@ -7425,10 +7646,10 @@ pub const InferenceEngine = struct {
                                     .mxfp4, .q8_0, .f16 => (inter_dim + 1) / 2,
                                     else => (inter_dim + 63) / 64,
                                 };
-                                self.pushDispatch4(pip, std.mem.asBytes(&push), up_exps.gpu_buffer.handle, up_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.up_buf.handle, self.up_buf.size, self.router_output_buf.handle, self.router_output_buf.size, wg_x, n_used, 1);
+                                self.pushDispatch4LastOffset(pip, std.mem.asBytes(&push), up_exps.gpu_buffer.handle, up_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.up_buf.handle, self.up_buf.size, moe_route_buf, moe_route_offset, moe_route_size, wg_x, n_used, 1);
                             } else {
                                 const ds = try self.allocDescSet(pip.descriptor_set_layout);
-                                self.writeDescSet4(ds, up_exps.gpu_buffer.handle, up_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.up_buf.handle, self.up_buf.size, self.router_output_buf.handle, self.router_output_buf.size);
+                                self.writeDescSet4LastOffset(ds, up_exps.gpu_buffer.handle, up_exps.gpu_buffer.size, expert_input_buf.handle, hidden_size, self.up_buf.handle, self.up_buf.size, moe_route_buf, moe_route_offset, moe_route_size);
                                 try self.dmmv.recordMoeDispatch(&self.decode_cmd, qt, ds, inter_dim, hidden_dim, expert_gate_row_bytes, n_used, 0, 0, 0);
                             }
                         }
@@ -7569,7 +7790,7 @@ pub const InferenceEngine = struct {
                         // NUM_ROWS=2 and amortizes per-WG launch cost across
                         // 4 weighted-acc rows of the n_used-expert dot loop).
                         const wg_x: u32 = (hidden_dim + 3) / 4;
-                        self.pushDispatch4(
+                        self.pushDispatch4LastOffset(
                             pip,
                             std.mem.asBytes(&push),
                             down_exps.gpu_buffer.handle,
@@ -7578,8 +7799,9 @@ pub const InferenceEngine = struct {
                             self.swiglu_buf.size,
                             self.hidden_buf.handle,
                             hidden_size,
-                            self.router_output_buf.handle,
-                            self.router_output_buf.size,
+                            moe_route_buf,
+                            moe_route_offset,
+                            moe_route_size,
                             wg_x,
                             1,
                             1,
@@ -7596,10 +7818,10 @@ pub const InferenceEngine = struct {
                                 .mxfp4, .q8_0, .f16 => (hidden_dim + 1) / 2,
                                 else => (hidden_dim + 63) / 64,
                             };
-                            self.pushDispatch4(pip, std.mem.asBytes(&push), down_exps.gpu_buffer.handle, down_exps.gpu_buffer.size, self.swiglu_buf.handle, self.swiglu_buf.size, self.down_buf.handle, self.down_buf.size, self.router_output_buf.handle, self.router_output_buf.size, wg_x, n_used, 1);
+                            self.pushDispatch4LastOffset(pip, std.mem.asBytes(&push), down_exps.gpu_buffer.handle, down_exps.gpu_buffer.size, self.swiglu_buf.handle, self.swiglu_buf.size, self.down_buf.handle, self.down_buf.size, moe_route_buf, moe_route_offset, moe_route_size, wg_x, n_used, 1);
                         } else {
                             const ds = try self.allocDescSet(pip.descriptor_set_layout);
-                            self.writeDescSet4(ds, down_exps.gpu_buffer.handle, down_exps.gpu_buffer.size, self.swiglu_buf.handle, self.swiglu_buf.size, self.down_buf.handle, self.down_buf.size, self.router_output_buf.handle, self.router_output_buf.size);
+                            self.writeDescSet4LastOffset(ds, down_exps.gpu_buffer.handle, down_exps.gpu_buffer.size, self.swiglu_buf.handle, self.swiglu_buf.size, self.down_buf.handle, self.down_buf.size, moe_route_buf, moe_route_offset, moe_route_size);
                             try self.dmmv.recordMoeDispatch(&self.decode_cmd, qt, ds, hidden_dim, inter_dim, expert_down_row_bytes, n_used, inter_dim, 0, 0);
                         }
                     }
@@ -7683,8 +7905,9 @@ pub const InferenceEngine = struct {
                             moe_acc_target_size,
                             self.down_buf.handle,
                             self.down_buf.size,
-                            self.router_output_buf.handle,
-                            self.router_output_buf.size,
+                            moe_route_buf,
+                            moe_route_offset,
+                            moe_route_size,
                             hidden_dim,
                             n_used,
                             hidden_dim,
@@ -14663,7 +14886,7 @@ pub const InferenceEngine = struct {
         }
         self.endProfilePhase(.moe_topk, topk_phase);
         self.endProfilePhase(.moe_routed, moe_phase);
-        self.decode_cmd.computeToTransferBarrier();
+        self.decode_cmd.computeAndTransferBarrier();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
