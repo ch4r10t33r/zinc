@@ -463,6 +463,8 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q6k_full: ?Pipeline,
     /// Tiled Q5_K dense GEMM for Qwen3.6-27B batched SSM out projection prefill.
     pipeline_mul_mm_q5k: ?Pipeline,
+    /// Tiled Q8_0 dense GEMM for Qwen3.6 A3B batched SSM out projection prefill.
+    pipeline_mul_mm_q8_0: ?Pipeline,
     /// int8 DP4a full-tile Q6_K dense-down GEMM (Qwen3.6-27B prefill).
     pipeline_mul_mm_q6k_full_dp4a: ?Pipeline,
     /// Same Q6_K DP4a dense-down shader with K=12288 specialized for
@@ -994,6 +996,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q5k != null) {
             log.info("mul_mm_q5k pipeline loaded (Qwen3.6-27B batched Q5_K SSM-out prefill projection)", .{});
         }
+        const mul_mm_q8_0_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q8_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q8_0 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q8_0_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q8_0 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q8_0 != null) {
+            log.info("mul_mm_q8_0 pipeline loaded (Qwen3.6 A3B batched Q8_0 SSM-out prefill projection)", .{});
+        }
         // int8 DP4a dense-down: 4-binding GEMM (weights/packed-acts/scales/out) and
         // the 3-binding activation quantizer. Both only succeed when the device
         // enabled shaderIntegerDotProduct; otherwise the host path falls back to f32.
@@ -1214,6 +1224,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q5k_full_dp4a = pipeline_mul_mm_q5k_full_dp4a,
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
+            .pipeline_mul_mm_q8_0 = pipeline_mul_mm_q8_0,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -1856,6 +1867,56 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Tiled Q8_0 dense GEMM. Same push/layout as recordMulMmQ4K.
+    /// Used by Qwen3.6 A3B layer-major prefill for the SSM out projection.
+    pub fn recordMulMmQ8_0(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q8_0) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 31) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            (M + 31) / 32,
+            (N + 31) / 32,
+            1,
+        );
+    }
+
     /// Branchless full-tile Q6_K GEMM. Requires M and N to be multiples of 32.
     pub fn recordMulMmQ6KFull(
         self: *const DmmvDispatch,
@@ -2469,6 +2530,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q8_0) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k12288) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_q8_1) |*p| p.deinit();

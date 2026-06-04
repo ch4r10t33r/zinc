@@ -10197,6 +10197,11 @@ pub const InferenceEngine = struct {
             M == cfg.hidden_dim and
             K == cfg.ssm_d_inner and
             n_tokens >= 16;
+        const qwen_a3b_ssm_out_q8_shape = self.isQwen36A3bMoePrefillModel() and
+            tensor.info.type_ == .q8_0 and
+            M == cfg.hidden_dim and
+            K == cfg.ssm_d_inner and
+            n_tokens >= 16;
         const kpar_pipeline: ?*const Pipeline = blk: {
             if (!self.use_q4k_batch_kpar) break :blk null;
             if (prefer_serial_qwen_dense_down) break :blk null;
@@ -10342,6 +10347,31 @@ pub const InferenceEngine = struct {
                 0, // a_offset (bytes)
                 0, // b_offset (floats)
                 0, // d_offset (floats)
+            );
+            return;
+        }
+        if (qwen_a3b_ssm_out_q8_shape and
+            (K & 31) == 0 and
+            self.instance.push_descriptor_fn != null and
+            self.dmmv.pipeline_mul_mm_q8_0 != null)
+        {
+            try self.dmmv.recordMulMmQ8_0(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                x_buf.handle,
+                x_buf.size,
+                y_buf.handle,
+                y_buf.size,
+                M,
+                n_tokens,
+                K,
+                K,
+                M,
+                0,
+                0,
+                0,
             );
             return;
         }
@@ -15553,7 +15583,15 @@ pub const InferenceEngine = struct {
                 self.use_q4k_batch_kpar and
                 self.dmmv.pipeline_q5k != null and
                 n_tokens >= 2;
-            if (use_batched_q5k_ssm_out) {
+            const use_batched_q8_ssm_out = ssm_out_t.info.type_ == .q8_0 and
+                self.isQwen36A3bMoePrefillModel() and
+                self.dmmv.pipeline_mul_mm_q8_0 != null and
+                self.instance.push_descriptor_fn != null and
+                n_tokens >= 16 and
+                (d_inner & 31) == 0 and
+                (hidden_dim & 31) == 0;
+            const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
+            if (use_batched_ssm_out) {
                 // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
                 // K=d_inner) through the int8 DP4a tiled GEMM when the shape
                 // and runtime flags allow it; fall through to the f32
@@ -15561,15 +15599,19 @@ pub const InferenceEngine = struct {
                 // own ragged n_tokens&31 tail on f32 inputs, so the only
                 // caller-visible change is which kernel writes the full-cols
                 // block of scratch_down.
-                const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
-                    ssm_out_t,
-                    scratch_swiglu,
-                    scratch_down,
-                    hidden_dim,
-                    d_inner,
-                    n_tokens,
-                );
-                if (!wrote_ssm_out_dp4a) {
+                if (use_batched_q5k_ssm_out) {
+                    const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_down,
+                        hidden_dim,
+                        d_inner,
+                        n_tokens,
+                    );
+                    if (!wrote_ssm_out_dp4a) {
+                        try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    }
+                } else {
                     try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 }
                 self.decode_cmd.computeBarrier();
@@ -15637,7 +15679,7 @@ pub const InferenceEngine = struct {
             }
             self.endProfilePhase(.ssm_out, ssm_out_phase);
             self.endProfilePhase(.ssm, ssm_phase);
-            if (!use_batched_q5k_ssm_out) {
+            if (!use_batched_ssm_out) {
                 self.decode_cmd.computeBarrier();
                 try self.dispatchRmsNorm(
                     scratch_hidden.handle,
@@ -15860,7 +15902,15 @@ pub const InferenceEngine = struct {
                 self.use_q4k_batch_kpar and
                 self.dmmv.pipeline_q5k != null and
                 n_tokens >= 2;
-            if (use_batched_q5k_ssm_out) {
+            const use_batched_q8_ssm_out = ssm_out_t.info.type_ == .q8_0 and
+                self.isQwen36A3bMoePrefillModel() and
+                self.dmmv.pipeline_mul_mm_q8_0 != null and
+                self.instance.push_descriptor_fn != null and
+                n_tokens >= 16 and
+                (d_inner & 31) == 0 and
+                (hidden_dim & 31) == 0;
+            const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
+            if (use_batched_ssm_out) {
                 // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
                 // K=d_inner) through the int8 DP4a tiled GEMM when the shape
                 // and runtime flags allow it; fall through to the f32
@@ -15868,15 +15918,19 @@ pub const InferenceEngine = struct {
                 // own ragged n_tokens&31 tail on f32 inputs, so the only
                 // caller-visible change is which kernel writes the full-cols
                 // block of scratch_down.
-                const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
-                    ssm_out_t,
-                    scratch_swiglu,
-                    scratch_down,
-                    hidden_dim,
-                    d_inner,
-                    n_tokens,
-                );
-                if (!wrote_ssm_out_dp4a) {
+                if (use_batched_q5k_ssm_out) {
+                    const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_down,
+                        hidden_dim,
+                        d_inner,
+                        n_tokens,
+                    );
+                    if (!wrote_ssm_out_dp4a) {
+                        try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    }
+                } else {
                     try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 }
                 self.decode_cmd.computeBarrier();
@@ -15944,7 +15998,7 @@ pub const InferenceEngine = struct {
             }
             self.endProfilePhase(.ssm_out, ssm_out_phase);
             self.endProfilePhase(.ssm, ssm_phase);
-            if (!use_batched_q5k_ssm_out) {
+            if (!use_batched_ssm_out) {
                 self.decode_cmd.computeBarrier();
                 try self.dispatchRmsNorm(
                     scratch_hidden.handle,
@@ -16047,7 +16101,15 @@ pub const InferenceEngine = struct {
             self.use_q4k_batch_kpar and
             self.dmmv.pipeline_q5k != null and
             n_tokens >= 2;
-        if (use_batched_q5k_ssm_out) {
+        const use_batched_q8_ssm_out = ssm_out_t.info.type_ == .q8_0 and
+            self.isQwen36A3bMoePrefillModel() and
+            self.dmmv.pipeline_mul_mm_q8_0 != null and
+            self.instance.push_descriptor_fn != null and
+            n_tokens >= 16 and
+            (d_inner & 31) == 0 and
+            (hidden_dim & 31) == 0;
+        const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
+        if (use_batched_ssm_out) {
             // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
             // K=d_inner) through the int8 DP4a tiled GEMM when the shape and
             // runtime flags allow it; fall through to the f32 mul_mm_q5k
@@ -16055,15 +16117,19 @@ pub const InferenceEngine = struct {
             // n_tokens&31 tail on f32 inputs, so the only caller-visible
             // change is which kernel writes the full-cols block of
             // scratch_down.
-            const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
-                ssm_out_t,
-                scratch_swiglu,
-                scratch_down,
-                hidden_dim,
-                d_inner,
-                n_tokens,
-            );
-            if (!wrote_ssm_out_dp4a) {
+            if (use_batched_q5k_ssm_out) {
+                const wrote_ssm_out_dp4a = try self.dispatchQwen36SsmOutDp4a(
+                    ssm_out_t,
+                    scratch_swiglu,
+                    scratch_down,
+                    hidden_dim,
+                    d_inner,
+                    n_tokens,
+                );
+                if (!wrote_ssm_out_dp4a) {
+                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                }
+            } else {
                 try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
             }
             self.decode_cmd.computeBarrier();
@@ -16102,7 +16168,7 @@ pub const InferenceEngine = struct {
         }
         self.endProfilePhase(.ssm_out, ssm_out_phase);
         self.endProfilePhase(.ssm, ssm_phase);
-        if (!use_batched_q5k_ssm_out) {
+        if (!use_batched_ssm_out) {
             self.decode_cmd.computeBarrier();
             try self.dispatchRmsNorm(
                 scratch_hidden.handle,
