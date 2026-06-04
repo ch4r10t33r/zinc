@@ -41,6 +41,8 @@ const BiasAddPush = elementwise_mod.BiasAddPush;
 const RopePush = elementwise_mod.RopePush;
 const RopeBatchedPush = elementwise_mod.RopeBatchedPush;
 const SoftmaxTopkPush = elementwise_mod.SoftmaxTopkPush;
+const RouterF32BatchPush = elementwise_mod.RouterF32BatchPush;
+const SoftmaxTopkBatchPush = elementwise_mod.SoftmaxTopkBatchPush;
 const MoeWeightedAccPush = elementwise_mod.MoeWeightedAccPush;
 const SsmConv1dPush = elementwise_mod.SsmConv1dPush;
 const SsmConv1dBatchedPush = elementwise_mod.SsmConv1dBatchedPush;
@@ -1391,6 +1393,9 @@ pub const InferenceEngine = struct {
     partial_decode_resume_from_ffn_norm: bool = false,
     partial_decode_ffn_norm_in: ?vk.c.VkBuffer = null,
     partial_decode_ffn_norm_in_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_router_output_in: ?vk.c.VkBuffer = null,
+    partial_decode_router_output_in_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_router_output_in_size: vk.c.VkDeviceSize = 0,
     partial_decode_stop_after_ssm_gnorm: bool = false,
     partial_decode_ssm_gnorm_out: ?vk.c.VkBuffer = null,
     partial_decode_ssm_gnorm_out_offset: vk.c.VkDeviceSize = 0,
@@ -5054,6 +5059,79 @@ pub const InferenceEngine = struct {
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), 1, 1, 1);
     }
 
+    fn dispatchRouterF32Batch(
+        self: *InferenceEngine,
+        input_buf: vk.c.VkBuffer,
+        input_size: vk.c.VkDeviceSize,
+        weights_buf: vk.c.VkBuffer,
+        weights_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        n_tokens: u32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_router_f32_batch orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        const push = RouterF32BatchPush{
+            .M = M,
+            .K = K,
+            .n_tokens = n_tokens,
+            .stride_x = K,
+            .stride_y = M,
+        };
+        self.pushDispatch3(
+            pip,
+            std.mem.asBytes(&push),
+            input_buf,
+            input_size,
+            weights_buf,
+            weights_size,
+            output_buf,
+            output_size,
+            M,
+            n_tokens,
+            1,
+        );
+    }
+
+    fn dispatchSoftmaxTopkBatch(
+        self: *InferenceEngine,
+        logits_buf: vk.c.VkBuffer,
+        logits_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_size: vk.c.VkDeviceSize,
+        n_experts: u32,
+        k: u32,
+        token_base: u32,
+        n_tokens: u32,
+        output_stride: u32,
+    ) !void {
+        if (n_tokens == 0) return;
+        const pip = &(self.elementwise.pipeline_softmax_topk_batch orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        const push = SoftmaxTopkBatchPush{
+            .n_experts = n_experts,
+            .k = k,
+            .scale_bits = @bitCast(@as(f32, 1.0)),
+            .token_base = token_base,
+            .n_tokens = n_tokens,
+            .logits_stride = n_experts,
+            .output_stride = output_stride,
+        };
+        self.pushDispatch2(
+            pip,
+            std.mem.asBytes(&push),
+            logits_buf,
+            logits_size,
+            output_buf,
+            output_size,
+            n_tokens,
+            1,
+            1,
+        );
+    }
+
     fn dispatchMoeWeightedAcc(
         self: *InferenceEngine,
         accum_buf: vk.c.VkBuffer,
@@ -6939,106 +7017,129 @@ pub const InferenceEngine = struct {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
                 const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
+                const use_prefill_tail_topk = self.prefill_active and
+                    !collect_output and
+                    self.moe_prefill_tail_topk_limit > 0 and
+                    self.prefill_current_token_idx + self.moe_prefill_tail_topk_guard_tokens < self.prefill_embed_big_token_count;
+                const effective_moe_topk_limit = if (use_prefill_tail_topk)
+                    self.moe_prefill_tail_topk_limit
+                else
+                    self.moe_topk_limit;
+                const n_used = if (effective_moe_topk_limit > 0)
+                    @min(config.n_experts_used, effective_moe_topk_limit)
+                else
+                    config.n_experts_used;
+                const precomputed_route_copy_size: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, 2) * @as(vk.c.VkDeviceSize, n_used) * @sizeOf(u32);
+                const use_precomputed_router = resume_from_ffn_norm and
+                    config.architecture == .qwen2_moe and
+                    !self.use_capture_routing and
+                    self.partial_decode_router_output_in != null and
+                    precomputed_route_copy_size <= self.router_output_buf.size and
+                    self.partial_decode_router_output_in_offset + precomputed_route_copy_size <= self.partial_decode_router_output_in_size;
                 const moe_router_phase = self.beginProfilePhase();
+                var router_input_buf = self.ffn_norm_buf;
 
-                // Gemma MoE uses plain RMS-normalized hidden (unit weights) for the router input,
-                // while the FFN experts read the learned-weight ffn_norm output. Mirrors Metal
-                // forward_metal.zig:4636-4639.
-                const router_input_buf = if (config.architecture == .gemma) blk: {
-                    try self.dispatchRmsNorm(
-                        self.hidden_buf.handle,
-                        hidden_size,
-                        self.unit_norm_weights.handle,
-                        self.unit_norm_weights.size,
-                        self.residual_buf.handle,
-                        hidden_size,
-                        hidden_dim,
-                        1,
-                        rms_norm_eps,
-                    );
-                    self.decode_cmd.computeBarrier();
-                    // Gemma 4 MoE: apply ffn_gate_inp.scale elementwise to router input
-                    // before the router DMMV (matches Metal forward_metal.zig:4126-4129).
-                    if (lt.ffn_gate_inp_scale) |scale_t| {
-                        try self.dispatchMulElementwise(
+                if (!use_precomputed_router) {
+                    // Gemma MoE uses plain RMS-normalized hidden (unit weights) for the router input,
+                    // while the FFN experts read the learned-weight ffn_norm output. Mirrors Metal
+                    // forward_metal.zig:4636-4639.
+                    router_input_buf = if (config.architecture == .gemma) blk: {
+                        try self.dispatchRmsNorm(
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.unit_norm_weights.handle,
+                            self.unit_norm_weights.size,
                             self.residual_buf.handle,
                             hidden_size,
-                            scale_t.gpu_buffer.handle,
-                            scale_t.gpu_buffer.size,
                             hidden_dim,
+                            1,
+                            rms_norm_eps,
                         );
                         self.decode_cmd.computeBarrier();
-                    }
-                    break :blk self.residual_buf;
-                } else self.ffn_norm_buf;
-
-                if (can_fuse_rms_router) {
-                    // Fused path: one dispatch produces both ffn_norm_buf
-                    // (for downstream MoE gate/up + shared-expert reads) and
-                    // router_logits_buf in a single shader invocation. The
-                    // post-dispatch barrier covers BOTH outputs so the
-                    // downstream consumers see consistent state.
-                    try self.dispatchRmsNormDmmvF32(
-                        self.hidden_buf.handle,
-                        hidden_size,
-                        ffn_norm_tensor.gpu_buffer.handle,
-                        ffn_norm_tensor.gpu_buffer.size,
-                        router_tensor.gpu_buffer.handle,
-                        router_tensor.gpu_buffer.size,
-                        self.ffn_norm_buf.handle,
-                        hidden_size,
-                        self.router_logits_buf.handle,
-                        self.router_logits_buf.size,
-                        config.n_experts,
-                        hidden_dim,
-                        rms_norm_eps,
-                    );
-                    // Effort-6 Step 5 prerequisite (cycle 36): when the FFN
-                    // input capture flag is on AND this layer's MoE input is
-                    // ffn_norm_buf (not pre_ffw_norm_2), copy the ffn_norm
-                    // output into the per-(token, layer) capture slot.
-                    // Promote the buffer-scoped compute→compute barrier to a
-                    // global compute→compute+transfer barrier so the upcoming
-                    // vkCmdCopyBuffer reads ffn_norm_buf under visibility
-                    // guarantees. Downstream gate/up/router consumers still
-                    // see the same write visibility through the broader
-                    // memory barrier.
-                    const capture_active = self.use_capture_ffn_input and
-                        lt.pre_ffw_norm_2 == null and
-                        state.position < self.prefill_ffn_input_capture_max_tokens;
-                    if (capture_active) {
-                        self.decode_cmd.computeAndTransferBarrier();
-                        const slot_off: vk.c.VkDeviceSize =
-                            (@as(vk.c.VkDeviceSize, state.position) *
-                                @as(vk.c.VkDeviceSize, config.n_layers) +
-                                @as(vk.c.VkDeviceSize, layer)) *
-                            @as(vk.c.VkDeviceSize, hidden_dim) *
-                            @sizeOf(f32);
-                        const capture_size: vk.c.VkDeviceSize = hidden_size;
-                        if (slot_off + capture_size <= self.prefill_ffn_input_capture_buf.size) {
-                            const region = vk.c.VkBufferCopy{
-                                .srcOffset = 0,
-                                .dstOffset = slot_off,
-                                .size = capture_size,
-                            };
-                            vk.c.vkCmdCopyBuffer(
-                                self.decode_cmd.handle,
-                                self.ffn_norm_buf.handle,
-                                self.prefill_ffn_input_capture_buf.handle,
-                                1,
-                                &region,
+                        // Gemma 4 MoE: apply ffn_gate_inp.scale elementwise to router input
+                        // before the router DMMV (matches Metal forward_metal.zig:4126-4129).
+                        if (lt.ffn_gate_inp_scale) |scale_t| {
+                            try self.dispatchMulElementwise(
+                                self.residual_buf.handle,
+                                hidden_size,
+                                scale_t.gpu_buffer.handle,
+                                scale_t.gpu_buffer.size,
+                                hidden_dim,
                             );
+                            self.decode_cmd.computeBarrier();
+                        }
+                        break :blk self.residual_buf;
+                    } else self.ffn_norm_buf;
+
+                    if (can_fuse_rms_router) {
+                        // Fused path: one dispatch produces both ffn_norm_buf
+                        // (for downstream MoE gate/up + shared-expert reads) and
+                        // router_logits_buf in a single shader invocation. The
+                        // post-dispatch barrier covers BOTH outputs so the
+                        // downstream consumers see consistent state.
+                        try self.dispatchRmsNormDmmvF32(
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            ffn_norm_tensor.gpu_buffer.handle,
+                            ffn_norm_tensor.gpu_buffer.size,
+                            router_tensor.gpu_buffer.handle,
+                            router_tensor.gpu_buffer.size,
+                            self.ffn_norm_buf.handle,
+                            hidden_size,
+                            self.router_logits_buf.handle,
+                            self.router_logits_buf.size,
+                            config.n_experts,
+                            hidden_dim,
+                            rms_norm_eps,
+                        );
+                        // Effort-6 Step 5 prerequisite (cycle 36): when the FFN
+                        // input capture flag is on AND this layer's MoE input is
+                        // ffn_norm_buf (not pre_ffw_norm_2), copy the ffn_norm
+                        // output into the per-(token, layer) capture slot.
+                        // Promote the buffer-scoped compute→compute barrier to a
+                        // global compute→compute+transfer barrier so the upcoming
+                        // vkCmdCopyBuffer reads ffn_norm_buf under visibility
+                        // guarantees. Downstream gate/up/router consumers still
+                        // see the same write visibility through the broader
+                        // memory barrier.
+                        const capture_active = self.use_capture_ffn_input and
+                            lt.pre_ffw_norm_2 == null and
+                            state.position < self.prefill_ffn_input_capture_max_tokens;
+                        if (capture_active) {
+                            self.decode_cmd.computeAndTransferBarrier();
+                            const slot_off: vk.c.VkDeviceSize =
+                                (@as(vk.c.VkDeviceSize, state.position) *
+                                    @as(vk.c.VkDeviceSize, config.n_layers) +
+                                    @as(vk.c.VkDeviceSize, layer)) *
+                                @as(vk.c.VkDeviceSize, hidden_dim) *
+                                @sizeOf(f32);
+                            const capture_size: vk.c.VkDeviceSize = hidden_size;
+                            if (slot_off + capture_size <= self.prefill_ffn_input_capture_buf.size) {
+                                const region = vk.c.VkBufferCopy{
+                                    .srcOffset = 0,
+                                    .dstOffset = slot_off,
+                                    .size = capture_size,
+                                };
+                                vk.c.vkCmdCopyBuffer(
+                                    self.decode_cmd.handle,
+                                    self.ffn_norm_buf.handle,
+                                    self.prefill_ffn_input_capture_buf.handle,
+                                    1,
+                                    &region,
+                                );
+                            }
+                        } else {
+                            const fused_ranges = [_]CommandBuffer.BufferRange{
+                                .{ .buffer = self.ffn_norm_buf.handle, .size = hidden_size },
+                                .{ .buffer = self.router_logits_buf.handle, .size = self.router_logits_buf.size },
+                            };
+                            self.decode_cmd.computeBuffersBarrier(&fused_ranges);
                         }
                     } else {
-                        const fused_ranges = [_]CommandBuffer.BufferRange{
-                            .{ .buffer = self.ffn_norm_buf.handle, .size = hidden_size },
-                            .{ .buffer = self.router_logits_buf.handle, .size = self.router_logits_buf.size },
-                        };
-                        self.decode_cmd.computeBuffersBarrier(&fused_ranges);
+                        try self.dispatchDmmv(router_tensor, router_input_buf, hidden_size, self.router_logits_buf, config.n_experts, hidden_dim);
+                        self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                     }
-                } else {
-                    try self.dispatchDmmv(router_tensor, router_input_buf, hidden_size, self.router_logits_buf, config.n_experts, hidden_dim);
-                    self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                 }
 
                 // Dispatch each selected expert — handle both separate and fused gate+up layouts.
@@ -7102,19 +7203,6 @@ pub const InferenceEngine = struct {
                 }
                 self.endProfilePhase(.moe_router, moe_router_phase);
 
-                const use_prefill_tail_topk = self.prefill_active and
-                    !collect_output and
-                    self.moe_prefill_tail_topk_limit > 0 and
-                    self.prefill_current_token_idx + self.moe_prefill_tail_topk_guard_tokens < self.prefill_embed_big_token_count;
-                const effective_moe_topk_limit = if (use_prefill_tail_topk)
-                    self.moe_prefill_tail_topk_limit
-                else
-                    self.moe_topk_limit;
-                const n_used = if (effective_moe_topk_limit > 0)
-                    @min(config.n_experts_used, effective_moe_topk_limit)
-                else
-                    config.n_experts_used;
-
                 // Gemma 4 MoE uses pre_ffw_norm_2 for MoE expert input (vs ffn_norm_buf for shared).
                 // Available to both GPU-routed and CPU-routed MoE paths.
                 const defer_gemma_pre_ffw_norm_2 = gemma_gpu_topk_moe and lt.pre_ffw_norm_2 != null;
@@ -7170,15 +7258,32 @@ pub const InferenceEngine = struct {
 
                     // softmax_topk writes expert_ids + weights to router_output_buf
                     const moe_topk_phase = self.beginProfilePhase();
-                    try self.dispatchSoftmaxTopk(
-                        self.router_logits_buf.handle,
-                        @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
-                        self.router_output_buf.handle,
-                        self.router_output_buf.size,
-                        config.n_experts,
-                        n_used,
-                    );
-                    if (self.use_capture_routing and state.position < self.routing_capture_max_tokens) {
+                    if (use_precomputed_router) {
+                        self.decode_cmd.computeToTransferBarrier();
+                        const route_region = vk.c.VkBufferCopy{
+                            .srcOffset = self.partial_decode_router_output_in_offset,
+                            .dstOffset = 0,
+                            .size = precomputed_route_copy_size,
+                        };
+                        vk.c.vkCmdCopyBuffer(
+                            self.decode_cmd.handle,
+                            self.partial_decode_router_output_in.?,
+                            self.router_output_buf.handle,
+                            1,
+                            &route_region,
+                        );
+                        self.decode_cmd.transferToComputeBarrier();
+                    } else {
+                        try self.dispatchSoftmaxTopk(
+                            self.router_logits_buf.handle,
+                            @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
+                            self.router_output_buf.handle,
+                            self.router_output_buf.size,
+                            config.n_experts,
+                            n_used,
+                        );
+                    }
+                    if (!use_precomputed_router and self.use_capture_routing and state.position < self.routing_capture_max_tokens) {
                         // Step 11a: fan out the topk output to the per-(token, layer) capture
                         // slot. Broader compute→compute+transfer barrier replaces the narrow
                         // compute→compute one so the upcoming vkCmdCopyBuffer can read the
@@ -7208,7 +7313,7 @@ pub const InferenceEngine = struct {
                                 &region,
                             );
                         }
-                    } else {
+                    } else if (!use_precomputed_router) {
                         self.decode_cmd.computeBufferBarrier(self.router_output_buf.handle, self.router_output_buf.size);
                     }
                     self.endProfilePhase(.moe_topk, moe_topk_phase);
@@ -14439,6 +14544,133 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn prefillPrecomputeMoeRoutingFromFfnNorm(
+        self: *InferenceEngine,
+        n_tokens: u32,
+        layer: u32,
+        scratch_norm: Buffer,
+        scratch_router_logits: Buffer,
+        scratch_router_output: Buffer,
+        route_slot_bytes: vk.c.VkDeviceSize,
+    ) !bool {
+        if (n_tokens < 16) return false;
+        if (route_slot_bytes == 0 or (route_slot_bytes % @sizeOf(u32)) != 0) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.elementwise.pipeline_router_f32_batch == null) return false;
+        if (self.elementwise.pipeline_softmax_topk_batch == null) return false;
+
+        const cfg = self.model.config;
+        if (cfg.architecture != .qwen2_moe) return false;
+        if (cfg.n_experts == 0 or cfg.n_experts > 256) return false;
+        if (cfg.n_experts_used == 0 or cfg.n_experts_used > 16) return false;
+        const hidden_dim = cfg.hidden_dim;
+        if ((hidden_dim & 3) != 0) return false;
+
+        const lt = self.layer_tensors[layer];
+        const router_t = lt.ffn_gate_inp orelse return false;
+        if (router_t.info.type_ != .f32) return false;
+        if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_inp_scale != null) return false;
+        if (lt.pre_ffw_norm_2 != null or lt.ffn_gate_up_exps != null) return false;
+        const gate_exps = lt.ffn_gate_exps orelse return false;
+        const up_exps = lt.ffn_up_exps orelse return false;
+        const down_exps = lt.ffn_down_exps orelse return false;
+        if (self.dmmv.moePipelineForType(gate_exps.info.type_) == null) return false;
+        if (self.dmmv.moePipelineForType(up_exps.info.type_) == null) return false;
+        if (self.dmmv.moePipelineForType(down_exps.info.type_) == null) return false;
+        if (self.elementwise.pipeline_moe_weighted_acc == null) return false;
+
+        const hidden_total_bytes =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const logits_bytes =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, cfg.n_experts) *
+            @sizeOf(f32);
+        const route_bytes =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            route_slot_bytes;
+        if (scratch_norm.size < hidden_total_bytes) return false;
+        if (scratch_router_logits.size < logits_bytes) return false;
+        if (scratch_router_output.size < route_bytes) return false;
+
+        const route_stride_u32: u32 = @intCast(route_slot_bytes / @sizeOf(u32));
+        const suffix_limit = self.moe_topk_limit;
+        const suffix_k = if (suffix_limit > 0)
+            @min(cfg.n_experts_used, suffix_limit)
+        else
+            cfg.n_experts_used;
+        var prefix_tokens: u32 = 0;
+        var prefix_k: u32 = 0;
+        if (self.moe_prefill_tail_topk_limit > 0 and self.moe_prefill_tail_topk_guard_tokens < n_tokens) {
+            prefix_tokens = n_tokens - self.moe_prefill_tail_topk_guard_tokens;
+            prefix_k = @min(cfg.n_experts_used, self.moe_prefill_tail_topk_limit);
+        }
+        const suffix_tokens = n_tokens - prefix_tokens;
+        if ((prefix_tokens > 0 and prefix_k == 0) or suffix_k == 0) return false;
+
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.computeBarrier();
+
+        const moe_phase = self.beginProfilePhase();
+        const router_phase = self.beginProfilePhase();
+        try self.dispatchRouterF32Batch(
+            scratch_norm.handle,
+            scratch_norm.size,
+            router_t.gpu_buffer.handle,
+            router_t.gpu_buffer.size,
+            scratch_router_logits.handle,
+            scratch_router_logits.size,
+            cfg.n_experts,
+            hidden_dim,
+            n_tokens,
+        );
+        self.decode_cmd.computeBufferBarrier(scratch_router_logits.handle, logits_bytes);
+        self.endProfilePhase(.moe_router, router_phase);
+
+        const topk_phase = self.beginProfilePhase();
+        if (prefix_tokens > 0) {
+            try self.dispatchSoftmaxTopkBatch(
+                scratch_router_logits.handle,
+                scratch_router_logits.size,
+                scratch_router_output.handle,
+                scratch_router_output.size,
+                cfg.n_experts,
+                prefix_k,
+                0,
+                prefix_tokens,
+                route_stride_u32,
+            );
+        }
+        if (suffix_tokens > 0) {
+            try self.dispatchSoftmaxTopkBatch(
+                scratch_router_logits.handle,
+                scratch_router_logits.size,
+                scratch_router_output.handle,
+                scratch_router_output.size,
+                cfg.n_experts,
+                suffix_k,
+                prefix_tokens,
+                suffix_tokens,
+                route_stride_u32,
+            );
+        }
+        self.endProfilePhase(.moe_topk, topk_phase);
+        self.endProfilePhase(.moe_routed, moe_phase);
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+        return true;
+    }
+
     fn prefillRunLayerFromFfnNorm(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -14449,6 +14681,8 @@ pub const InferenceEngine = struct {
         layer: u32,
         scratch_hidden: Buffer,
         scratch_norm: Buffer,
+        scratch_router_logits: Buffer,
+        scratch_router_output: Buffer,
         pipeline_enabled: bool,
     ) !void {
         if (n_tokens == 0) return;
@@ -14467,6 +14701,9 @@ pub const InferenceEngine = struct {
         const saved_resume = self.partial_decode_resume_from_ffn_norm;
         const saved_norm_in = self.partial_decode_ffn_norm_in;
         const saved_norm_in_offset = self.partial_decode_ffn_norm_in_offset;
+        const saved_router_in = self.partial_decode_router_output_in;
+        const saved_router_in_offset = self.partial_decode_router_output_in_offset;
+        const saved_router_in_size = self.partial_decode_router_output_in_size;
         defer {
             self.partial_decode_start_layer = saved_partial_start;
             self.partial_decode_end_layer = saved_partial_end;
@@ -14482,7 +14719,23 @@ pub const InferenceEngine = struct {
             self.partial_decode_resume_from_ffn_norm = saved_resume;
             self.partial_decode_ffn_norm_in = saved_norm_in;
             self.partial_decode_ffn_norm_in_offset = saved_norm_in_offset;
+            self.partial_decode_router_output_in = saved_router_in;
+            self.partial_decode_router_output_in_offset = saved_router_in_offset;
+            self.partial_decode_router_output_in_size = saved_router_in_size;
         }
+
+        const route_slot_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, 2) *
+            @as(vk.c.VkDeviceSize, self.model.config.n_experts_used) *
+            @sizeOf(u32);
+        const route_cache_active = try self.prefillPrecomputeMoeRoutingFromFfnNorm(
+            n_tokens,
+            layer,
+            scratch_norm,
+            scratch_router_logits,
+            scratch_router_output,
+            route_slot_bytes,
+        );
 
         var primary_pending: bool = false;
         var alt_pending: bool = false;
@@ -14526,6 +14779,15 @@ pub const InferenceEngine = struct {
             self.partial_decode_resume_from_ffn_norm = true;
             self.partial_decode_ffn_norm_in = scratch_norm.handle;
             self.partial_decode_ffn_norm_in_offset = hidden_offset;
+            if (route_cache_active) {
+                self.partial_decode_router_output_in = scratch_router_output.handle;
+                self.partial_decode_router_output_in_offset = @as(vk.c.VkDeviceSize, tok_idx) * route_slot_bytes;
+                self.partial_decode_router_output_in_size = scratch_router_output.size;
+            } else {
+                self.partial_decode_router_output_in = null;
+                self.partial_decode_router_output_in_offset = 0;
+                self.partial_decode_router_output_in_size = 0;
+            }
 
             try self.decodeStep(state, prompt_tokens[tok_idx], false);
             if (pipeline_this) {
@@ -16655,6 +16917,8 @@ pub const InferenceEngine = struct {
                 layer,
                 scratch_hidden,
                 scratch_norm,
+                scratch_gate,
+                scratch_up,
                 pipeline_tail,
             );
         }

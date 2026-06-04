@@ -152,6 +152,8 @@ pub fn build(b: *std.Build) void {
         "rope_fused",
         "softmax_topk",
         "softmax_topk_v2",
+        "softmax_topk_batch",
+        "router_f32_batch",
         "flash_attn",
         "flash_attn_split_merge",
         "deinterleave",

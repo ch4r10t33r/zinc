@@ -147,6 +147,26 @@ pub const SoftmaxTopkPush = extern struct {
     scale_bits: u32 = @bitCast(@as(f32, 1.0)),
 };
 
+/// Push constants for token-batched f32 router matvec.
+pub const RouterF32BatchPush = extern struct {
+    M: u32,
+    K: u32,
+    n_tokens: u32,
+    stride_x: u32,
+    stride_y: u32,
+};
+
+/// Push constants for token-batched MoE top-k.
+pub const SoftmaxTopkBatchPush = extern struct {
+    n_experts: u32,
+    k: u32,
+    scale_bits: u32,
+    token_base: u32,
+    n_tokens: u32,
+    logits_stride: u32,
+    output_stride: u32,
+};
+
 /// Push constants for batched MoE weighted accumulate shader.
 /// Sums all expert outputs at once: a[i] = sum_j(weight_j * b[j*src_stride+i]).
 pub const MoeWeightedAccPush = extern struct {
@@ -308,6 +328,10 @@ pub const ElementwiseDispatch = struct {
     pipeline_softmax_topk: ?Pipeline,
     /// SOFTMAX TOPK v2 (subgroup-parallel reduction), or null.
     pipeline_softmax_topk_v2: ?Pipeline,
+    /// Token-batched f32 MoE router matvec, or null.
+    pipeline_router_f32_batch: ?Pipeline,
+    /// Token-batched MoE top-k, or null.
+    pipeline_softmax_topk_batch: ?Pipeline,
     /// SIGMOID SCALE ACC pipeline: a[i] += sigmoid(c[0]) * b[i], 3 bindings.
     pipeline_sigmoid_scale_acc: ?Pipeline,
     /// MOE WEIGHTED ACC pipeline: a[i] += routing_weight * b[i], 3 bindings (accum, src, routing).
@@ -582,6 +606,18 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const router_f32_batch_path = std.fmt.bufPrint(&path_buf, "{s}/router_f32_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_router_f32_batch = pipeline_mod.createFromSpirvWithOptions(instance, router_f32_batch_path, 3, @sizeOf(RouterF32BatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("router_f32_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const topk_batch_path = std.fmt.bufPrint(&path_buf, "{s}/softmax_topk_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_softmax_topk_batch = pipeline_mod.createFromSpirvWithOptions(instance, topk_batch_path, 2, @sizeOf(SoftmaxTopkBatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("softmax_topk_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // sigmoid_scale_acc: a[i] += sigmoid(c[0]) * b[i], 3 bindings (accum, src, gate)
         const ssa_path = std.fmt.bufPrint(&path_buf, "{s}/sigmoid_scale_acc.spv", .{shader_dir}) catch unreachable;
         const pipeline_sigmoid_scale_acc = pipeline_mod.createFromSpirvWithOptions(instance, ssa_path, 3, @sizeOf(ScaleAccPush), &.{}, push_options, allocator) catch |err| blk: {
@@ -713,6 +749,8 @@ pub const ElementwiseDispatch = struct {
             .pipeline_ssm_gated_norm_batch_tok = pipeline_ssm_gated_norm_batch_tok,
             .pipeline_softmax_topk = pipeline_softmax_topk,
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
+            .pipeline_router_f32_batch = pipeline_router_f32_batch,
+            .pipeline_softmax_topk_batch = pipeline_softmax_topk_batch,
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
             .pipeline_moe_weighted_acc = pipeline_moe_weighted_acc,
             .pipeline_kv_cache_write = pipeline_kv_cache_write,
@@ -1152,6 +1190,8 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_ssm_gated_norm_batch_tok) |*p| p.deinit();
         if (self.pipeline_softmax_topk) |*p| p.deinit();
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();
+        if (self.pipeline_router_f32_batch) |*p| p.deinit();
+        if (self.pipeline_softmax_topk_batch) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
         if (self.pipeline_moe_weighted_acc) |*p| p.deinit();
         if (self.pipeline_kv_cache_write) |*p| p.deinit();
