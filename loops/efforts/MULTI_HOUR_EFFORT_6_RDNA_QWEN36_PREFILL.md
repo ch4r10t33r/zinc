@@ -58,6 +58,14 @@ Cycles 44-50 are the current late-plateau dead-zone:
 | 49 | append grouped MoE into the SSM command | no improvement |
 | 50 | SSM-out DP4a with widened Q8 scale scratch | regression |
 
+2026-06-05 landing validation also rejected an exact-suffix scheduling
+overlap that recorded shared-expert gate/up while suffix MoE down was
+in flight and delayed the shared scalar gate until after route-cache
+reads. Fresh RDNA1 A/B against current `origin/main` was inconclusive
+to negative (`753.35` main, `696.67` candidate, `694.52` main rerun).
+Do not retry that scheduling shape unless the new evidence is a
+different mechanism and clears the material-improvement threshold.
+
 Two correctness traps are especially important:
 
 - Cycle 41 was faster (762.76) but broke Qwen3.6-35B coherence. The
