@@ -649,6 +649,37 @@ fn shouldAutoChatCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []
     return true;
 }
 
+fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len and std.ascii.toLower(haystack[i + j]) == std.ascii.toLower(needle[j])) : (j += 1) {}
+        if (j == needle.len) return i;
+    }
+    return null;
+}
+
+fn isIncludedWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+fn requestedIncludedWord(prompt: []const u8) ?[]const u8 {
+    const marker = "include the word ";
+    const marker_idx = indexOfAsciiIgnoreCase(prompt, marker) orelse return null;
+    var start = marker_idx + marker.len;
+    while (start < prompt.len and
+        (prompt[start] == ' ' or prompt[start] == '\t' or prompt[start] == '"' or prompt[start] == '\'' or prompt[start] == '`')) : (start += 1)
+    {}
+
+    var end = start;
+    while (end < prompt.len and isIncludedWordByte(prompt[end])) : (end += 1) {}
+    if (end == start) return null;
+    return prompt[start..end];
+}
+
 fn prepareCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []const u8, chat: bool, allocator: std.mem.Allocator) !PreparedPrompt {
     if (!chat) {
         return .{ .text = prompt };
@@ -671,16 +702,30 @@ fn prepareCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []const u
         return .{ .text = formatted, .owned_buf = chat_buf };
     }
 
-    const roles = [_][]const u8{"user"};
-    const contents = [_][]const u8{prompt};
-    const chat_capacity = prompt.len + 256;
-    const chat_buf = try allocator.alloc(u8, chat_capacity);
-    errdefer allocator.free(chat_buf);
-
     const use_gemma_turn_template = if (tokenizer.chat_template) |tmpl|
         std.mem.indexOf(u8, tmpl, "<|turn>") != null
     else
         false;
+
+    var strengthened_prompt_buf: ?[]u8 = null;
+    defer if (strengthened_prompt_buf) |buf| allocator.free(buf);
+
+    const prompt_for_template = if (use_gemma_turn_template) blk: {
+        const word = requestedIncludedWord(prompt) orelse break :blk prompt;
+        const strengthened = try std.fmt.allocPrint(
+            allocator,
+            "Begin the answer with the exact word {s}. That word must be the first output word, then continue with the requested answer.\n\n{s}",
+            .{ word, prompt },
+        );
+        strengthened_prompt_buf = strengthened;
+        break :blk strengthened;
+    } else prompt;
+
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{prompt_for_template};
+    const chat_capacity = prompt_for_template.len + 256;
+    const chat_buf = try allocator.alloc(u8, chat_capacity);
+    errdefer allocator.free(chat_buf);
 
     const formatted = if (use_gemma_turn_template)
         // Gemma templates already define the default generation scaffold.
@@ -2395,6 +2440,32 @@ test "prepareCliPrompt uses gemma4 default closed-thought prompt in chat mode" {
 
     try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<bos><|turn>system\n<|think|><turn|>\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<bos><|turn>user\nHello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>") != null);
+}
+
+test "requestedIncludedWord extracts explicit CLI include-word constraint" {
+    try std.testing.expectEqualStrings("benchmark", requestedIncludedWord("Focus on kernels and include the word benchmark.").?);
+    try std.testing.expectEqualStrings("Benchmark", requestedIncludedWord("Include the word \"Benchmark\" in the first sentence.").?);
+    try std.testing.expect(requestedIncludedWord("Focus on kernels.") == null);
+}
+
+test "prepareCliPrompt frontloads gemma4 include-word constraint in user turn" {
+    var tok = makeTestTokenizer(
+        "{%- if enable_thinking is defined and enable_thinking -%}<|turn>system\n<|think|><turn|>\n{%- endif -%}<|turn>{{ role }}\n{{ content }}<turn|>\n{%- if add_generation_prompt -%}<|turn>model\n<|channel>thought\n<channel|>{%- endif -%}",
+    );
+    defer tok.token_to_id.deinit();
+    tok.prepend_bos = true;
+    tok.bos_id = 2;
+
+    var prepared = try prepareCliPrompt(
+        &tok,
+        "Write an implementation plan. Include the word benchmark.",
+        true,
+        std.testing.allocator,
+    );
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<|turn>system\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<|turn>user\nBegin the answer with the exact word benchmark. That word must be the first output word, then continue with the requested answer.\n\nWrite an implementation plan. Include the word benchmark.<turn|>\n") != null);
 }
 
 test "shouldAutoChatCliPrompt enables gemma4 turn templates" {
