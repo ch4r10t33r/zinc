@@ -39,12 +39,12 @@ export type TopicHub = {
 export const topicHubs: TopicHub[] = [
   {
     slug: 'opencode-local-coding',
-    title: 'OpenCode with Local ZINC Models',
+    title: 'OpenCode Local Coding with Qwen and ZINC',
     shortTitle: 'OpenCode',
-    description: 'A practical guide to using OpenCode with ZINC as a local OpenAI-compatible coding backend: provider config, tool calls, thinking mode, context limits, SSH tunnels, and trace proxy debugging.',
-    keywords: 'OpenCode local LLM, OpenCode ZINC, local coding agent, OpenCode OpenAI compatible provider, Qwen coding model, ZINC tool calling, self-hosted coding assistant',
-    summary: 'OpenCode can use ZINC through the same OpenAI-compatible `/v1/chat/completions` API that powers the browser chat UI. The useful setup is local and boring: run ZINC, point OpenCode at localhost, keep tools enabled, set honest context limits, and use the trace proxy while testing coding workflows.',
-    practicalAnswer: 'For OpenCode, run ZINC on a localhost `/v1` endpoint and configure a custom `@ai-sdk/openai-compatible` provider. Use a Qwen-family model with stable thinking and tool behavior, keep `ZINC_TOOL_CALLING` enabled, and start with conservative context/output limits such as 4096/2048. If OpenCode runs on a laptop while ZINC runs on a GPU box, use an SSH tunnel so the OpenCode config still contains only `127.0.0.1`.',
+    description: 'A practical guide to OpenCode local coding with Qwen and ZINC: local LLM provider config, tool calls, thinking mode, context limits, SSH tunnels, and trace proxy debugging.',
+    keywords: 'OpenCode local coding, OpenCode local LLM, OpenCode Qwen, Qwen coding model, OpenCode ZINC, local coding agent, OpenCode OpenAI compatible provider, ZINC tool calling, self-hosted coding assistant',
+    summary: 'OpenCode can use ZINC and Qwen through the same OpenAI-compatible `/v1/chat/completions` API that powers the browser chat UI. The useful setup is local and boring: run ZINC, point OpenCode at localhost, keep tools enabled, set honest context limits, and use the trace proxy while testing coding workflows.',
+    practicalAnswer: 'For OpenCode local coding, run ZINC on a localhost `/v1` endpoint and configure a custom `@ai-sdk/openai-compatible` provider. Use a Qwen-family model with stable thinking and tool behavior, keep `ZINC_TOOL_CALLING` enabled, and start with conservative context/output limits such as 4096/2048. If OpenCode runs on a laptop while ZINC runs on a GPU box, use an SSH tunnel so the OpenCode config still contains only `127.0.0.1`.',
     bestUse: 'Use this page when you want a local coding assistant backed by ZINC rather than a hosted API. It is focused on operator setup, not benchmark marketing: provider config, local ports, tool calls, thinking, context budgets, and trace-based debugging.',
     status: [
       {
@@ -85,7 +85,7 @@ export const topicHubs: TopicHub[] = [
       },
       {
         label: 'Model shape',
-        detail: 'Use a Qwen/ChatML-family model when tool calling matters, and keep the `model` id consistent between ZINC and OpenCode.',
+        detail: 'Use a Qwen/ChatML-family coding model when tool calling matters, and keep the `model` id consistent between ZINC and OpenCode.',
       },
       {
         label: 'Context budget',
@@ -122,6 +122,10 @@ export const topicHubs: TopicHub[] = [
       {
         label: 'Tool calling on Qwen in practice',
         detail: 'Show the exact request, generated `<tool_call>`, structured OpenAI response, and follow-up tool-result prompt.',
+      },
+      {
+        label: 'Which Qwen model for local OpenCode',
+        detail: 'Compare Qwen3.6 35B-A3B, Qwen3.6 dense, and smaller Qwen targets for local coding latency, tool-call quality, and context headroom.',
       },
       {
         label: 'Remote GPU, local editor',
@@ -169,7 +173,7 @@ export const topicHubs: TopicHub[] = [
       {
         title: 'Configure OpenCode with ZINC',
         href: '/zinc/docs/opencode',
-        description: 'Step-by-step provider config, proxy setup, thinking, tool calling, context limits, and troubleshooting.',
+        description: 'Step-by-step OpenCode local LLM provider config for ZINC and Qwen, including proxy setup, thinking, tool calling, context limits, and troubleshooting.',
       },
       {
         title: 'Serving HTTP API',
@@ -187,6 +191,10 @@ export const topicHubs: TopicHub[] = [
       {
         question: 'Can OpenCode use ZINC as a local model backend?',
         answer: 'Yes. Configure OpenCode with an OpenAI-compatible provider whose base URL points at the ZINC `/v1` endpoint, usually `http://127.0.0.1:9090/v1` or a local trace proxy.',
+      },
+      {
+        question: 'Which Qwen model should I use for OpenCode local coding?',
+        answer: 'Start with a Qwen/ChatML-family model because ZINC validates thinking and tool calling on that template family. Use a smaller Qwen model for setup tests and a larger Qwen3.6 target when you have enough memory and want better coding behavior.',
       },
       {
         question: 'Should I expose the GPU server directly to OpenCode?',
@@ -517,6 +525,11 @@ export const topicHubs: TopicHub[] = [
         title: 'Running ZINC',
         href: '/zinc/docs/running-zinc',
         description: 'Model ids, CLI flags, chat mode, server mode, and KV quantization options.',
+      },
+      {
+        title: 'Configure OpenCode with ZINC',
+        href: '/zinc/docs/opencode',
+        description: 'Use Qwen through ZINC as a local OpenCode coding backend with tools, thinking, and context limits.',
       },
     ],
     related: ['amd-rdna4-llm-inference', 'kv-cache-quantization', 'gemma-local-inference'],

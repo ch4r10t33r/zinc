@@ -1,6 +1,6 @@
-# Configure OpenCode with ZINC
+# Configure OpenCode with ZINC and Qwen
 
-OpenCode can use ZINC as a local OpenAI-compatible coding backend. The practical setup is:
+OpenCode can use ZINC as a local OpenAI-compatible coding backend for Qwen-family models. This is the practical setup for running an OpenCode local LLM workflow with ZINC instead of a hosted coding model:
 
 1. run a ZINC server with a Qwen-family coding-capable model,
 2. point OpenCode at `http://127.0.0.1:<port>/v1`,
@@ -42,6 +42,23 @@ ZINC does not require an API key for local use. Some clients still expect one to
 
 ```bash
 export ZINC_API_KEY=local
+```
+
+## Pick A Qwen Coding Model
+
+For OpenCode, prefer a Qwen/ChatML-family model because ZINC's thinking and tool-call path is built around that template family.
+
+Good starting points:
+
+- `qwen36-35b-a3b-q4k-xl`: best fit for a large local coding assistant on a 32 GB-class GPU or enough unified memory.
+- `qwen35-9b-q4k-m`: smaller, easier to run, and useful for validating OpenCode tool calls before moving to a larger model.
+- `qwen36-27b-q4k-m`: experimental dense target; useful when you specifically want to compare dense Qwen behavior.
+
+The model you put in OpenCode's `model` field should match an installed ZINC managed model id. Check available and installed models with:
+
+```bash
+./zig-out/bin/zinc model list
+./zig-out/bin/zinc model active
 ```
 
 ## If OpenCode Runs On A Different Machine
