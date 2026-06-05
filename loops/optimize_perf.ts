@@ -422,14 +422,18 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Re-layering prefill embedding dequant (CPU f32 cache / staging-only / interleaved). Cycles 14, 15, 23 of the first run explored these; current upfront bulk dequant into host-mapped staging is the accepted equilibrium.",
       "Pair-dispatch via recordBatchDispatch(num_cols=2) through dmmv_q8_0_batch / dmmv_q4k_batch. Cycle 8 of the second run: -0.12 tok/s; cycle 9 rewrote with wave64 parallelism: -0.8 tok/s. K-parallel kpar shaders (commit bed8463 + e43da13) are now the canonical inner loop; specialized num_cols=2 variants on top haven't measured a win.",
       "Extending the prefill CB pipeline from 2-deep to 3-deep (cycle 2 of the second run): flat. Submit/wait is already saturated at 2-deep.",
+      "POST-759 PLATEAU: do not repeat cycles 44-50 without new evidence. These all failed the official 154-token gate after the 759.18 checkpoint: route-pack sentinel cleanup, terminal attn_norm reuse, grouped Q4_K MoE Q8_1/DP4a, SSM-out branchless full-tile GEMM, fused shared-expert suffix reuse, appending grouped MoE into the SSM command, and SSM-out DP4a with widened Q8 scale scratch.",
+      "Terminal full-attention K/V batching is coherence-sensitive. Cycle 41 was faster (762.76) but failed Qwen3.6-35B coherence with '!' and image-link garbage. Cycle 42/43 landed the safe variant. Any further terminal shortcut must run all 5 coherence models and must not bypass the final-token Q path.",
+      "Exact-MoE guard below 16 prompt tokens is unsafe on this target. Cycle 33 shortened the guard to 8, broke output ('A.'), and was reverted. Do not reduce ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD unless a validator proves top-k suffix equivalence on the benchmark prompt and the coherence sweep.",
+      "SSM-out quantized alternatives are currently negative. Cycle 29 int8 DP4a SSM-out, cycle 47 branchless full-tile SSM-out, and cycle 50 widened-scale DP4a SSM-out all measured below the 759.18 checkpoint. A new SSM-out attempt needs an L2/max_abs validator against the f32 batched path first, not another default-on quantization variant.",
     ],
     structuralSwingIdeas: [
-      "WIRE EXISTING mul_mm_q4k INTO SSM PROJ PREFILL (cycle 40's deferred work). The shader exists in tree (src/shaders/mul_mm_q4k.comp, currently used only for LM head where N=1 wastes BN tile). SSM proj fires 4 DMMVs × 30 layers × 154 tokens — perfect amortization shape. Concrete: in src/compute/forward.zig prefillBatched, replace the per-token loop over recordDmmv calls for SSM wqkv/z with a single mul_mm_q4k dispatch where N=batch_size_per_chunk. Buffer layout: gather norm_buf columns into a [N × K] activation tile; output [M × N] result; scatter back via the same pattern that recordBatchDispatch already uses. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3. Cycle 40 self-analysis flagged this as 'high-risk one-cycle refactor needed for buffer layout' — break it into 2 phases: (a) build the gather/scatter helper standalone with synthetic [M, K, N] data; (b) wire ONE projection (z is the simplest, single output M=d_inner) and measure SSM proj phase delta from ZINC_PREFILL_PROFILE=1.",
-      "ATTACK THE MoE BUCKET (884 ms, 24% of prefill, untouched since cycle 40). The mul_mm_id_q4k port was deleted as dormant — re-doing it the same way is the dead-end. Three viable paths: (a) extend the cycle-50 winning pattern (wider threads-per-row, halve register footprint, double WG count) to dmmv_q4k_moe_kpar.comp and dmmv_q4k_moe_fused_down_acc.comp — these are the inner loops of the MoE FFN. The pre-cycle-50 ssm_delta was 8t×8r; analogous shape transformation should land similar gains. (b) Apply vec4 reads/writes to moe_weighted_acc.comp accumulator (cycle 42 pattern on a different shader). (c) Use the in-tree count_experts.comp to add a per-expert dispatch wrapper that culls experts with zero routed tokens — the long tail of unselected experts is wasted dispatch work even before any GEMM port.",
-      "EXTEND CYCLE-50 PATTERN (wider threads-per-row + halved register footprint + doubled WG count) to remaining hot kernels. Cycle 50 found +2.76% on ssm_delta_net via 8t×8r → 16t×4r. The same shape transformation is untried on: dmmv_q4k_moe_kpar.comp (MoE expert FFN, currently NUM_ROWS=2 at expert M=1408 — try 32 threads-per-row × 1 row), dmmv_q4k_q8_1.comp (Q4_K weight × Q8_1 activation), dmmv_q4k_moe_fused_down_acc.comp (MoE down + accumulate). cycle-50 follow-up note: 32t×2r is the next step on ssm_delta itself.",
-      "PARALLEL-SCAN SSM PREFILL (the ssm_delta state recurrence). The 30 SSM layers in the Qwen 35B MoE family have token-recurrent state. Currently scanned token-by-token. Blelloch/Hillis-Steele scan over the N=154 token axis would parallelize this. Reference: llama.cpp mamba2 ggml_ssm_scan op + ggml-cuda/ssm-scan.cu. Risk: correctness blast radius is higher than dispatch-shape changes. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3 against the per-token reference. This is the single largest unattacked structural lever for the SSM bucket.",
-      "FLASH_ATTN Q PRE-LOAD INTO SHARED MEMORY (cycle 48 nextIdea). Currently Q[head_dim] is read repeatedly inside the Q.K dot loop across the K-tile axis. Pre-loading Q once per WG into shared/register memory eliminates head_dim × block_len redundant reads. Attention bucket is ~340 ms. Reference: ~/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_*.comp use the same pattern. Cycle 48 attempted vec4 alias bindings on the q.k dot and measured flat — the right intervention is the Q caching, not vec4 on the existing reads.",
-      "TOPK SHADER CROSS-WG PARALLELISM (cycle 49 nextIdea). topk fires once per token at the MoE entry, currently single-WG single-pass. 117 ms bucket. Two-pass topk (find threshold per-block, gather above threshold) parallelizes across WGs. Small absolute bucket but architecturally simple compared to grouped MoE.",
+      "POST-759 PROFILE-FIRST CYCLE. The final budget is balanced: ssm 83.8 ms, moe 73.9 ms, attn 58.3 ms, shared 14.9 ms. Before adding another kernel, run one bounded analysis cycle that emits coverage counters for A3B production: layer-major SSM eligibility, grouped prefix/suffix token counts, exact-suffix guard count, terminal KV-only eligibility, and per-sub-bucket timings on the canonical 154-token prompt. Keep only source-visible counters that make the next optimization more targeted; do not add another default-on path in the same cycle.",
+      "MoE gate_up/down is now the best structural target if the refreshed budget still shows moe near SSM. Current sub-buckets are gate_up 29.1 ms and down 25.6 ms. Avoid the reverted variants (Q8_1/DP4a grouped Q4_K gate/up, fused grouped Q4_K gate/up, shared-expert suffix reuse). Preferred next step: a route-density diagnostic plus a per-expert grouped exact-suffix plan that preserves top-k weights, or a small verified down-accumulator improvement that directly removes a measured MoE sub-bucket.",
+      "SSM remaining work must start with correctness instrumentation. Current sub-buckets are out 30.3 ms, qkv_z 25.9 ms, conv 17.8 ms, gnorm 17.1 ms, delta 13.1 ms. SSM-out DP4a/full-tile attempts regressed after cycle 29/47/50; alpha/beta batching and conv parallelization also regressed. The next SSM cycle should build an L2/max_abs validator for SSM-out or gnorm against the accepted f32 path, then use that evidence to decide between Q8_1 activation, fusing residual+ffn_norm after SSM-out, or leaving SSM alone.",
+      "Attention is no longer huge, but terminal-layer work still produced the last real keep. Current attn is 58.3 ms. Safe path: extend the cycle-42/43 terminal K/V reuse with a validator that compares last-token logits before/after any skipped terminal work. Unsafe path: do not repeat cycle-41's faster-but-incoherent final-layer shortcut. If attacking flash attention, use a bounded Q-cache or coopmat experiment behind a flag and validate all five coherence models.",
+      "Cross-scenario guard before another large default-on keep. This effort's canonical prompt now reports 759 tok/s, far above the old public 154 tok/s figure. A large new keep should include one extra bounded public-shape smoke (core or context-medium) so the loop does not overfit the Paris benchmark while hurting coding/review prompts.",
+      "If stuck for two more cycles, switch target instead of grinding SSM-out. The next high-value work is effort-15/17/18/19 cross-model prefill, not a tenth Qwen35 SSM micro-variant. Emit a measured-dead analysis and stop if no named sub-bucket plan can clear +3.8 tok/s over 759.18.",
     ],
     referenceImplementations: [
       {
@@ -1625,10 +1629,37 @@ function formatDominantBucketDirective(budget: PrefillPhaseBudget | null | undef
     `The current profile's largest top-level bucket is ${biggest.name} at ${biggest.totalMs.toFixed(1)} ms${runnerUpText}.`,
     `A cycle that targets another bucket must cite a fresh profile or a concrete dependency that unlocks ${biggest.name}.`,
   ];
+  const namedSubBuckets = collectNamedSubBuckets(budget)
+    .sort((a, b) => b.ms - a.ms)
+    .slice(0, 6);
+  if (namedSubBuckets.length > 0) {
+    lines.push(
+      `Largest named sub-buckets overall: ${namedSubBuckets.map((b) => `${b.bucket}.${b.name}=${b.ms.toFixed(1)} ms`).join(", ")}.`,
+    );
+  }
+  if (runnerUp && runnerUp[1] >= biggest.totalMs * 0.75) {
+    lines.push(
+      "The top-level buckets are close; prefer a named sub-bucket with fresh evidence over another broad bucket-level guess.",
+    );
+  }
   if (biggest.name === "dense_ffn") {
     lines.push("For effort 15, prefer dense layer-major segment work, dense gate/up/SwiGLU structural changes, or dense down+acc fusion. Avoid SSM-only work while dense_ffn remains largest.");
   }
   return lines.map((line) => `- ${line}`).join("\n");
+}
+
+function collectNamedSubBuckets(budget: PrefillPhaseBudget): Array<{ bucket: string; name: string; ms: number }> {
+  const out: Array<{ bucket: string; name: string; ms: number }> = [];
+  for (const [name, ms] of Object.entries(budget.moeTotalsMs)) {
+    if (ms > 0) out.push({ bucket: "moe", name, ms });
+  }
+  for (const [name, ms] of Object.entries(budget.ssmTotalsMs)) {
+    if (ms > 0) out.push({ bucket: "ssm", name, ms });
+  }
+  for (const [name, ms] of Object.entries(budget.denseTotalsMs ?? {})) {
+    if (ms > 0) out.push({ bucket: "dense_ffn", name, ms });
+  }
+  return out;
 }
 
 function tailHistory(history: string, maxLines = HISTORY_LINES_IN_PROMPT): string {

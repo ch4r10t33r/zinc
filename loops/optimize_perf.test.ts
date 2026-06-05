@@ -500,6 +500,10 @@ describe("controller helpers", () => {
     expect(spec?.primaryMetricLabel).toBe("prefill tok/s");
     expect(spec?.summary).toContain("RDNA Qwen36 prefill");
     expect(spec?.benchmarkMethod).toContain("Qwen3.6-35B flagship workload");
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("POST-759 PLATEAU");
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("SSM-out DP4a");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("POST-759 PROFILE-FIRST");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("Cross-scenario guard");
   });
 
   test("RDNA Qwen36 27B effort uses the site context-medium benchmark contract", () => {
@@ -1137,6 +1141,9 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     expect(prompt).toContain("Current Prefill Phase Budget");
     expect(prompt).toContain("Biggest top-level bucket: ssm");
     expect(prompt).toContain("Dominant Bucket Directive");
+    expect(prompt).toContain("Largest named sub-buckets overall");
+    expect(prompt).toContain("ssm.proj=1300.0 ms");
+    expect(prompt).toContain("dense_ffn.gateup=1200.0 ms");
     expect(prompt).toContain("Known Flat Territory");
     expect(prompt).toContain("narrowing compute→compute barriers is flat on RDNA4");
     expect(prompt).toContain("Structural Swing Ideas");
@@ -1192,8 +1199,8 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
         reviewSummary: null,
         bestPerf: null,
         phaseBudget: {
-          perTokenMs: { dense_ffn: 8.87, ssm: 6.54, attn: 1.11 },
-          totalsMs: { dense_ffn: 3087, ssm: 2274.5, attn: 387, tail: 1.9 },
+          perTokenMs: { dense_ffn: 8.87, ssm: 6.90, attn: 1.11 },
+          totalsMs: { dense_ffn: 3087, ssm: 2400.5, attn: 387, tail: 1.9 },
           moeTotalsMs: {},
           denseTotalsMs: { gateup: 1900, down: 1187 },
           ssmTotalsMs: { proj: 982.1, delta: 804.6 },
@@ -1211,6 +1218,9 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     expect(prompt).toContain("largest top-level bucket is dense_ffn");
     expect(prompt).toContain("Avoid SSM-only work");
     expect(prompt).toContain("Dense FFN sub-buckets");
+    expect(prompt).toContain("Largest named sub-buckets overall");
+    expect(prompt).toContain("dense_ffn.gateup=1900.0 ms");
+    expect(prompt).toContain("top-level buckets are close");
   });
 
   test("a freshly-banked foundation keep still demands a swing next cycle", () => {

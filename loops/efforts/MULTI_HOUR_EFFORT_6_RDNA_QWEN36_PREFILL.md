@@ -1,5 +1,104 @@
 # Optimization 6: RDNA Prefill Recovery for Qwen3.6-35B-A3B
 
+## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
+
+**Best 759.18 prefill tok/s at cycle 43.** The overnight RDNA1 run
+started at 149.95 tok/s and landed a 5.06x improvement on the
+canonical 154-token Qwen3.6-35B-A3B prefill harness.
+
+The original A3b problem is no longer open. The accepted production
+path is now layer-major A3B prefill:
+
+- SSM layers run via `prefillQwen36RunSsmLayerToFfnNorm`.
+- MoE resumes from precomputed FFN norm via `prefillRunLayerFromFfnNorm`.
+- Router/top-k are batched.
+- Top-1 prefix MoE is route-packed and grouped.
+- Exact suffix MoE is grouped with batched weighted/shared accumulation.
+- Non-final full-attention layers use layer-major batched attention.
+- SSM qkv/z uses Q8_0 DP4a tiled GEMM.
+- Terminal full-attention reuses preloaded K/V for the final-token fallback.
+
+Current refreshed phase budget at the plateau:
+
+| Bucket | ms |
+|---|---:|
+| SSM | 83.8 |
+| MoE | 73.9 |
+| attention | 58.3 |
+| shared expert | 14.9 |
+| tail | 1.0 |
+
+Named sub-buckets:
+
+| Sub-bucket | ms |
+|---|---:|
+| SSM out | 30.3 |
+| MoE gate_up | 29.1 |
+| SSM qkv_z | 25.9 |
+| MoE down | 25.6 |
+| SSM conv | 17.8 |
+| SSM gated norm | 17.1 |
+| SSM delta | 13.1 |
+
+The buckets are close now. Do not read "SSM is largest" as permission
+to try another broad SSM micro-variant. Pick a named sub-bucket with
+fresh evidence.
+
+### What not to repeat
+
+Cycles 44-50 are the current late-plateau dead-zone:
+
+| Cycle | Attempt | Outcome |
+|---|---|---|
+| 44 | remove route-pack sentinel writes/branches | no improvement |
+| 45 | reuse terminal batched `attn_norm` | no improvement |
+| 46 | grouped Q4_K MoE Q8_1/DP4a gate/up | no improvement |
+| 47 | branchless full-tile SSM-out GEMM | large regression |
+| 48 | fused shared-expert exact suffix reuse | below threshold |
+| 49 | append grouped MoE into the SSM command | no improvement |
+| 50 | SSM-out DP4a with widened Q8 scale scratch | regression |
+
+Two correctness traps are especially important:
+
+- Cycle 41 was faster (762.76) but broke Qwen3.6-35B coherence. The
+  safe terminal K/V path landed in cycles 42-43. Do not bypass the
+  final-token Q path or weaken the five-model coherence sweep.
+- Cycle 33 reduced the exact-MoE guard to 8 and produced wrong output.
+  The guard must stay conservative unless a validator proves equivalence
+  on the canonical prompt and the coherence sweep.
+
+### Next useful cycles
+
+1. **Profile/coverage cycle first.** Add source-visible counters for:
+   A3B production eligibility, grouped prefix/suffix token counts,
+   exact-suffix guard count, terminal KV-only eligibility, and named
+   sub-bucket timings on the canonical 154-token prompt. This is a
+   good analysis/foundation cycle if it directly tells the next cycle
+   which 20-30 ms sub-bucket is still real.
+2. **MoE gate_up/down.** If MoE stays near SSM, attack the 29.1 ms
+   gate_up or 25.6 ms down sub-bucket. Do not repeat Q8_1/DP4a
+   grouped Q4_K gate/up, fused grouped gate/up, or shared-expert suffix
+   reuse. Prefer route-density evidence and exact top-k weighted
+   grouping that preserves suffix correctness.
+3. **SSM with validator first.** SSM-out remains 30.3 ms, but all
+   recent SSM-out quantized/full-tile variants regressed. Build an
+   L2/max_abs validator against the accepted f32 path before trying
+   Q8_1 activation, residual+ffn_norm fusion after SSM-out, or another
+   SSM-out kernel route.
+4. **Attention only with logits/coherence validation.** The last real
+   keep was terminal K/V reuse. More terminal work needs a last-token
+   logits comparison before default-on, because the faster cycle-41
+   version was incoherent.
+5. **Cross-scenario guard.** The canonical prompt is now much faster
+   than the public page numbers. A large new default-on keep should
+   include one bounded public-shape smoke (core or context-medium) so
+   the loop does not overfit the Paris prompt while hurting coding or
+   review prompts.
+
+If the next two cycles cannot name a sub-bucket and evidence path that
+can plausibly clear +3.8 tok/s over 759.18, stop effort 6 and move the
+GPU to another prefill-gap effort.
+
 ## PIVOT 2026-05-06 — A3b INFRA IS DONE; FLIP THE PRODUCTION SWITCH
 
 **Best 127.16 tok/s. Stall 17.** Cycles 92-123: 32 cycles, 0 real perf
