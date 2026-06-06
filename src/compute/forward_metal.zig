@@ -1758,6 +1758,7 @@ const MoeColsGateUpDmmvPush = extern struct {
     ids_stride: u32,
     x_route_divisor: u32,
     use_active_blocks: u32,
+    enable_exact5: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -4147,6 +4148,7 @@ pub const InferenceEngine = struct {
     gemma_q8_moe_decode_enabled: bool,
     gemma_q8_moe_fallback_down_enabled: bool,
     gemma_moe_post_norm_residual_decode_enabled: bool,
+    gemma_q4k_geglu_exact5_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -4363,6 +4365,7 @@ pub const InferenceEngine = struct {
         self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
         self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
         self.gemma_moe_post_norm_residual_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_MOE_POST_NORM_DECODE") orelse defaultGemmaMoePostNormResidualDecodeEnabled(cfg);
+        self.gemma_q4k_geglu_exact5_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_EXACT5") orelse false;
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -10975,6 +10978,7 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
         .use_active_blocks = 1,
+        .enable_exact5 = if (engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &tensor.gpu_buffer,

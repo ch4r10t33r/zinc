@@ -20,6 +20,7 @@ struct MoeColsGateUpDmmvPush {
     uint ids_stride;
     uint x_route_divisor;
     uint use_active_blocks;
+    uint enable_exact5;
 };
 
 inline float2 get_scale_min_k4(uint j, device const uchar* sc) {
@@ -387,7 +388,7 @@ kernel void main0(
         return;
     }
 
-    if (remaining == 5u) {
+    if (p.enable_exact5 != 0u && remaining == 5u) {
         const uint route1 = expert_ids[packed_base + 1u];
         const uint route2 = expert_ids[packed_base + 2u];
         const uint route3 = expert_ids[packed_base + 3u];
