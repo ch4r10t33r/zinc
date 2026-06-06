@@ -905,6 +905,14 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    route_pack_gate_up_upper_threadgroups: u64 = 0,
+    route_pack_down_upper_threadgroups: u64 = 0,
+    route_pack_gate_up_q4k_layers: u32 = 0,
+    route_pack_down_q4k_layers: u32 = 0,
+    route_pack_down_q5_1_layers: u32 = 0,
+    route_pack_down_q5k_layers: u32 = 0,
+    route_pack_down_q6k_layers: u32 = 0,
+    route_pack_down_q8_0_layers: u32 = 0,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1321,6 +1329,14 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
+    delta.route_pack_gate_up_upper_threadgroups = total.route_pack_gate_up_upper_threadgroups -| prefix.route_pack_gate_up_upper_threadgroups;
+    delta.route_pack_down_upper_threadgroups = total.route_pack_down_upper_threadgroups -| prefix.route_pack_down_upper_threadgroups;
+    delta.route_pack_gate_up_q4k_layers = total.route_pack_gate_up_q4k_layers -| prefix.route_pack_gate_up_q4k_layers;
+    delta.route_pack_down_q4k_layers = total.route_pack_down_q4k_layers -| prefix.route_pack_down_q4k_layers;
+    delta.route_pack_down_q5_1_layers = total.route_pack_down_q5_1_layers -| prefix.route_pack_down_q5_1_layers;
+    delta.route_pack_down_q5k_layers = total.route_pack_down_q5k_layers -| prefix.route_pack_down_q5k_layers;
+    delta.route_pack_down_q6k_layers = total.route_pack_down_q6k_layers -| prefix.route_pack_down_q6k_layers;
+    delta.route_pack_down_q8_0_layers = total.route_pack_down_q8_0_layers -| prefix.route_pack_down_q8_0_layers;
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1454,6 +1470,31 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                         profile.route_pack_tail_size_blocks_actual[4],
                         profile.route_pack_tail_size_blocks_actual[5],
                         profile.route_pack_tail_size_blocks_actual[6],
+                    });
+                }
+                if (profile.route_pack_gate_up_upper_threadgroups > 0 or profile.route_pack_down_upper_threadgroups > 0) {
+                    const gate_up_active_tgs = projectedActiveThreadgroups(
+                        profile.route_pack_gate_up_upper_threadgroups,
+                        profile.route_pack_active_block_upper_bound,
+                        profile.route_pack_active_blocks_actual,
+                    );
+                    const down_active_tgs = projectedActiveThreadgroups(
+                        profile.route_pack_down_upper_threadgroups,
+                        profile.route_pack_active_block_upper_bound,
+                        profile.route_pack_active_blocks_actual,
+                    );
+                    log.info("  {s} route pack projected tgs: gate/up upper {d} active_est {d} q4_k_layers {d} | down upper {d} active_est {d} q4_k {d} q5_1 {d} q5_k {d} q6_k {d} q8_0 {d}", .{
+                        label,
+                        profile.route_pack_gate_up_upper_threadgroups,
+                        gate_up_active_tgs,
+                        profile.route_pack_gate_up_q4k_layers,
+                        profile.route_pack_down_upper_threadgroups,
+                        down_active_tgs,
+                        profile.route_pack_down_q4k_layers,
+                        profile.route_pack_down_q5_1_layers,
+                        profile.route_pack_down_q5k_layers,
+                        profile.route_pack_down_q6k_layers,
+                        profile.route_pack_down_q8_0_layers,
                     });
                 }
             }
@@ -2759,6 +2800,51 @@ fn recordRoutePackProfile(
     p.route_pack_slots += route_slots;
     p.route_pack_active_block_upper_bound += active_block_upper_bound;
     p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
+}
+
+fn projectedActiveThreadgroups(upper_threadgroups: u64, upper_blocks: u64, active_blocks: u64) u64 {
+    if (upper_threadgroups == 0 or upper_blocks == 0 or active_blocks == 0) return 0;
+    return (upper_threadgroups * active_blocks + upper_blocks - 1) / upper_blocks;
+}
+
+fn routePackRowsPerThreadgroup(quant_type: GGMLType) u32 {
+    return switch (quant_type) {
+        .q4_k, .q5_1, .q5_k, .q6_k, .q8_0 => 8,
+        else => 8,
+    };
+}
+
+fn recordRoutePackStageProfile(
+    profile: ?*RuntimeProfile,
+    gate_up_quant: GGMLType,
+    down_quant: GGMLType,
+    gate_up_rows: u32,
+    down_rows: u32,
+    active_block_upper_bound: u32,
+    gate_up_dispatches: u32,
+) void {
+    const p = profile orelse return;
+    if (active_block_upper_bound == 0) return;
+
+    const gate_up_row_groups = (gate_up_rows + routePackRowsPerThreadgroup(gate_up_quant) - 1) / routePackRowsPerThreadgroup(gate_up_quant);
+    const down_row_groups = (down_rows + routePackRowsPerThreadgroup(down_quant) - 1) / routePackRowsPerThreadgroup(down_quant);
+    p.route_pack_gate_up_upper_threadgroups += @as(u64, active_block_upper_bound) *
+        @as(u64, gate_up_row_groups) *
+        @as(u64, @max(gate_up_dispatches, 1));
+    p.route_pack_down_upper_threadgroups += @as(u64, active_block_upper_bound) * @as(u64, down_row_groups);
+
+    switch (gate_up_quant) {
+        .q4_k => p.route_pack_gate_up_q4k_layers += 1,
+        else => {},
+    }
+    switch (down_quant) {
+        .q4_k => p.route_pack_down_q4k_layers += 1,
+        .q5_1 => p.route_pack_down_q5_1_layers += 1,
+        .q5_k => p.route_pack_down_q5k_layers += 1,
+        .q6_k => p.route_pack_down_q6k_layers += 1,
+        .q8_0 => p.route_pack_down_q8_0_layers += 1,
+        else => {},
+    }
 }
 
 fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
@@ -13330,6 +13416,17 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         canUseGemmaBatchedWeightedPostNormResidual(engine, n_tokens, hidden_dim, cfg.n_experts_used);
     if (!use_route_slot_moe) {
         recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
+        if (use_active_blocks) {
+            recordRoutePackStageProfile(
+                profile,
+                gate_up_layout.gate_tensor.info.type_,
+                down_exps.info.type_,
+                inter_dim,
+                hidden_dim,
+                active_block_upper_bound,
+                if (use_fused_gate_up_geglu_cols) 1 else 2,
+            );
+        }
     }
 
     const router_logit_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
@@ -29952,6 +30049,19 @@ test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
     try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * 8, 256));
+}
+
+test "Gemma route-pack stage profile projects gate/up and down threadgroups" {
+    var profile: RuntimeProfile = .{};
+
+    recordRoutePackStageProfile(&profile, .q4_k, .q5_1, 704, 2816, 167, 1);
+
+    try std.testing.expectEqual(@as(u64, 167 * 88), profile.route_pack_gate_up_upper_threadgroups);
+    try std.testing.expectEqual(@as(u64, 167 * 352), profile.route_pack_down_upper_threadgroups);
+    try std.testing.expectEqual(@as(u32, 1), profile.route_pack_gate_up_q4k_layers);
+    try std.testing.expectEqual(@as(u32, 1), profile.route_pack_down_q5_1_layers);
+    try std.testing.expectEqual(@as(u64, 98 * 88), projectedActiveThreadgroups(profile.route_pack_gate_up_upper_threadgroups, 167, 98));
+    try std.testing.expectEqual(@as(u64, 98 * 352), projectedActiveThreadgroups(profile.route_pack_down_upper_threadgroups, 167, 98));
 }
 
 test "gemma batched prefill route mode names active-block selection" {
