@@ -905,18 +905,6 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
-    route_cols_gate_up_tgroups: u64 = 0,
-    route_cols_gate_up_tail_tgroups: u64 = 0,
-    route_cols_down_tgroups: u64 = 0,
-    route_cols_down_tail_tgroups: u64 = 0,
-    route_cols_q4k_geglu_tgroups: u64 = 0,
-    route_cols_q4k_geglu_tail_tgroups: u64 = 0,
-    route_cols_q5_1_tgroups: u64 = 0,
-    route_cols_q5_1_tail_tgroups: u64 = 0,
-    route_cols_q8_0_tgroups: u64 = 0,
-    route_cols_q8_0_tail_tgroups: u64 = 0,
-    route_cols_other_tgroups: u64 = 0,
-    route_cols_other_tail_tgroups: u64 = 0,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1333,18 +1321,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
-    delta.route_cols_gate_up_tgroups = total.route_cols_gate_up_tgroups -| prefix.route_cols_gate_up_tgroups;
-    delta.route_cols_gate_up_tail_tgroups = total.route_cols_gate_up_tail_tgroups -| prefix.route_cols_gate_up_tail_tgroups;
-    delta.route_cols_down_tgroups = total.route_cols_down_tgroups -| prefix.route_cols_down_tgroups;
-    delta.route_cols_down_tail_tgroups = total.route_cols_down_tail_tgroups -| prefix.route_cols_down_tail_tgroups;
-    delta.route_cols_q4k_geglu_tgroups = total.route_cols_q4k_geglu_tgroups -| prefix.route_cols_q4k_geglu_tgroups;
-    delta.route_cols_q4k_geglu_tail_tgroups = total.route_cols_q4k_geglu_tail_tgroups -| prefix.route_cols_q4k_geglu_tail_tgroups;
-    delta.route_cols_q5_1_tgroups = total.route_cols_q5_1_tgroups -| prefix.route_cols_q5_1_tgroups;
-    delta.route_cols_q5_1_tail_tgroups = total.route_cols_q5_1_tail_tgroups -| prefix.route_cols_q5_1_tail_tgroups;
-    delta.route_cols_q8_0_tgroups = total.route_cols_q8_0_tgroups -| prefix.route_cols_q8_0_tgroups;
-    delta.route_cols_q8_0_tail_tgroups = total.route_cols_q8_0_tail_tgroups -| prefix.route_cols_q8_0_tail_tgroups;
-    delta.route_cols_other_tgroups = total.route_cols_other_tgroups -| prefix.route_cols_other_tgroups;
-    delta.route_cols_other_tail_tgroups = total.route_cols_other_tail_tgroups -| prefix.route_cols_other_tail_tgroups;
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1481,26 +1457,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                     });
                 }
             }
-        }
-        const route_cols_total_tgroups = profile.route_cols_gate_up_tgroups + profile.route_cols_down_tgroups;
-        if (route_cols_total_tgroups > 0) {
-            log.info("  {s} route-cols tgroups: gate/up {d} tail {d} ({d:.1}%) q4k_geglu {d} tail {d} | down {d} tail {d} ({d:.1}%) q5_1 {d} tail {d} q8_0 {d} tail {d} other {d} tail {d}", .{
-                label,
-                profile.route_cols_gate_up_tgroups,
-                profile.route_cols_gate_up_tail_tgroups,
-                pctOf(profile.route_cols_gate_up_tgroups, profile.route_cols_gate_up_tail_tgroups),
-                profile.route_cols_q4k_geglu_tgroups,
-                profile.route_cols_q4k_geglu_tail_tgroups,
-                profile.route_cols_down_tgroups,
-                profile.route_cols_down_tail_tgroups,
-                pctOf(profile.route_cols_down_tgroups, profile.route_cols_down_tail_tgroups),
-                profile.route_cols_q5_1_tgroups,
-                profile.route_cols_q5_1_tail_tgroups,
-                profile.route_cols_q8_0_tgroups,
-                profile.route_cols_q8_0_tail_tgroups,
-                profile.route_cols_other_tgroups,
-                profile.route_cols_other_tail_tgroups,
-            });
         }
     }
     if (profile.queued_prefill_requests > 0) {
@@ -2805,83 +2761,7 @@ fn recordRoutePackProfile(
     p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
 }
 
-fn addRouteColsQuantTgroups(
-    profile: *RuntimeProfile,
-    quant_type: GGMLType,
-    total_tgroups: u64,
-    tail_tgroups: u64,
-    q4k_geglu: bool,
-) void {
-    if (q4k_geglu) {
-        profile.route_cols_q4k_geglu_tgroups += total_tgroups;
-        profile.route_cols_q4k_geglu_tail_tgroups += tail_tgroups;
-        return;
-    }
-    switch (quant_type) {
-        .q5_1 => {
-            profile.route_cols_q5_1_tgroups += total_tgroups;
-            profile.route_cols_q5_1_tail_tgroups += tail_tgroups;
-        },
-        .q8_0 => {
-            profile.route_cols_q8_0_tgroups += total_tgroups;
-            profile.route_cols_q8_0_tail_tgroups += tail_tgroups;
-        },
-        else => {
-            profile.route_cols_other_tgroups += total_tgroups;
-            profile.route_cols_other_tail_tgroups += tail_tgroups;
-        },
-    }
-}
-
-fn recordRouteColsTgroupsForLayer(
-    engine: *const InferenceEngine,
-    profile: *RuntimeProfile,
-    layer_idx: usize,
-    active_blocks: u32,
-    tail_blocks: u32,
-) void {
-    if (active_blocks == 0 or layer_idx >= engine.layer_tensors.len) return;
-
-    const cfg = engine.config;
-    const lt = engine.layer_tensors[layer_idx];
-    const hidden_dim = cfg.hidden_dim;
-    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
-    const row_groups_inter = @as(u64, (inter_dim + 7) / 8);
-    const row_groups_hidden = @as(u64, (hidden_dim + 7) / 8);
-    const active = @as(u64, active_blocks);
-    const tail = @as(u64, tail_blocks);
-
-    if (resolveMoeGateUpLayout(lt, inter_dim, hidden_dim)) |gate_up_layout| {
-        const use_fused_q4k_geglu =
-            gate_up_layout.gate_tensor == gate_up_layout.up_tensor and
-            gate_up_layout.gate_tensor.info.type_ == .q4_k and
-            gate_up_layout.gate_expert_stride == gate_up_layout.up_expert_stride;
-        const multiplier: u64 = if (use_fused_q4k_geglu) 1 else 2;
-        const total_tgroups = active * row_groups_inter * multiplier;
-        const tail_tgroups = tail * row_groups_inter * multiplier;
-
-        profile.route_cols_gate_up_tgroups += total_tgroups;
-        profile.route_cols_gate_up_tail_tgroups += tail_tgroups;
-        if (use_fused_q4k_geglu) {
-            addRouteColsQuantTgroups(profile, .q4_k, total_tgroups, tail_tgroups, true);
-        } else {
-            const one_total = active * row_groups_inter;
-            const one_tail = tail * row_groups_inter;
-            addRouteColsQuantTgroups(profile, gate_up_layout.gate_tensor.info.type_, one_total, one_tail, false);
-            addRouteColsQuantTgroups(profile, gate_up_layout.up_tensor.info.type_, one_total, one_tail, false);
-        }
-    } else |_| {}
-
-    if (lt.ffn_down_exps) |down_exps| {
-        const total_tgroups = active * row_groups_hidden;
-        const tail_tgroups = tail * row_groups_hidden;
-        profile.route_cols_down_tgroups += total_tgroups;
-        profile.route_cols_down_tail_tgroups += tail_tgroups;
-        addRouteColsQuantTgroups(profile, down_exps.info.type_, total_tgroups, tail_tgroups, false);
-    }
-}
-
-fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, engine: *const InferenceEngine, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
+fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
     const p = profile orelse return;
     if (scratch.moe_active_block_count.cpu_ptr == null) return;
 
@@ -2904,13 +2784,10 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, engine: *const Infere
     if (words >= moeRoutePackProfileWords(n_layers)) {
         for (0..n_layers) |i| {
             const base = moeRoutePackProfileStatsBase(n_layers, i);
-            const active_blocks = counts[1 + i];
-            const tail_blocks = counts[base + 1];
             p.route_pack_full_blocks_actual += counts[base + 0];
-            p.route_pack_tail_blocks_actual += tail_blocks;
+            p.route_pack_tail_blocks_actual += counts[base + 1];
             p.route_pack_single_tail_blocks_actual += counts[base + 2];
             p.route_pack_padding_slots_actual += counts[base + 3];
-            recordRouteColsTgroupsForLayer(engine, p, i, active_blocks, tail_blocks);
             for (0..moe_route_pack_profile_tail_bins) |tail_i| {
                 p.route_pack_tail_size_blocks_actual[tail_i] += counts[base + 4 + tail_i];
             }
@@ -7125,7 +7002,7 @@ pub const InferenceEngine = struct {
 
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, self, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -7143,7 +7020,7 @@ pub const InferenceEngine = struct {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, self, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             if (self.hidden_buf.cpu_ptr) |dst_bytes| {
                 const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
