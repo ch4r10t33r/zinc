@@ -489,10 +489,13 @@ fn isGemma26A4BMoeShape(cfg: ModelConfig) bool {
 }
 
 fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
-    // Keep Gemma26 Q8-down MoE on the routed device path by default. The
-    // explicit fallback path has to break the shared decode command so CPU
-    // routing/post-vector work can observe intermediate buffers; llama.cpp's
-    // `ggml_metal_op_mul_mat_id` keeps the selected-expert path device-side.
+    // llama.cpp's `ggml_metal_op_mul_mat_id` only switches to grouped
+    // matrix-matrix routing when the token row count reaches the prompt-sized
+    // break-even point (ne21 >= 32). Gemma26 decode is a single-token shape;
+    // leave its Q8 expert-down route behind the env flag until the decode guard
+    // proves the grouped path wins without hurting prefill, which is still
+    // allowed by `gemmaQ8RoutedMoeAllowed(..., in_prefill_phase=true, ...)`.
+    if (isGemma26A4BMoeShape(cfg)) return false;
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
@@ -27871,7 +27874,7 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
         .full_attn_interval = 0,
         .shared_expert_intermediate_dim = 0,
     };
-    try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
     try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
