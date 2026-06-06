@@ -364,6 +364,35 @@ export function parseLlamaCppVersionOutput(text) {
   };
 }
 
+export function parseZincVersionOutput(text) {
+  const lines = String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const versionLine = lines.find((line) => /^zinc\s+/i.test(line));
+  const field = (name) => {
+    const prefix = `${name}:`;
+    return lines.find((line) => line.toLowerCase().startsWith(prefix))?.slice(prefix.length).trim() ?? null;
+  };
+  return {
+    version: versionLine ? versionLine.replace(/^zinc\s+/i, "").trim() : null,
+    commit: field("commit"),
+    target: field("target"),
+    optimize: field("optimize"),
+    backend: field("backends") ?? field("backend"),
+  };
+}
+
+export function validateZincBackend(versionText, expectedBackend) {
+  if (!expectedBackend || expectedBackend === "auto") return parseZincVersionOutput(versionText);
+  const parsed = parseZincVersionOutput(versionText);
+  if (parsed.backend !== expectedBackend) {
+    const observed = parsed.backend ?? "unknown";
+    throw new Error(`RDNA ZINC binary backend mismatch: expected ${expectedBackend}, observed ${observed}. Rebuild or stop the process that overwrote zig-out/bin/zinc.`);
+  }
+  return parsed;
+}
+
 export function parseOpenAiCompletionOutput(text) {
   const body = JSON.parse(text);
   const content = body.choices?.[0]?.text ?? body.choices?.[0]?.message?.content ?? "";
@@ -1882,6 +1911,15 @@ async function prepareRdna(args, creds) {
   }
 }
 
+async function verifyRdnaZincBackend(args, creds, { quiet = false } = {}) {
+  if (args.rdnaBackend === "auto") return null;
+  const remote = `cd ${shellQuote(creds.workdir)} && ./zig-out/bin/zinc --version`;
+  const result = await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
+  const parsed = validateZincBackend(result.stdout, args.rdnaBackend);
+  if (!quiet) console.log(`[rdna] verified ZINC binary backend: ${parsed.backend}`);
+  return parsed;
+}
+
 async function prepareIntel(args, creds, remoteLibcConf) {
   if (args.intelSync) {
     console.log("Syncing current repo to Intel node...");
@@ -2286,6 +2324,7 @@ async function verifyRemoteVulkanDevice(creds, requireSubstring) {
 async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
+  await verifyRdnaZincBackend(args, creds);
   await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds);
@@ -2328,6 +2367,7 @@ async function runRdnaTarget(args) {
         if (phase.phase === "zinc") {
           let zinc = null;
           try {
+            await verifyRdnaZincBackend(args, creds, { quiet: true });
             const zincRows = await runSeries({
               label: `zinc ${entry.id} ${scenarioDef.id}`,
               warmupRuns: args.warmupRuns,

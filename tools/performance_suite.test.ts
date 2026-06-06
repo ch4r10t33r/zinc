@@ -25,6 +25,7 @@ import {
   parseLlamaCppVersionOutput,
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
+  parseZincVersionOutput,
   prefersChatPrompt,
   rdnaEnvValue,
   rdnaNodeEnvKey,
@@ -32,6 +33,7 @@ import {
   rdnaZincCommand,
   resolveLocalLlamaServer,
   summarizeValues,
+  validateZincBackend,
 } from "./performance_suite.mjs";
 
 test("parseArgs reads suite options", () => {
@@ -115,6 +117,32 @@ test("parseArgs rejects invalid RDNA backend", () => {
   expect(() => parseArgs(["--target", "rdna", "--rdna-backend", "metal"])).toThrow(
     "Invalid --rdna-backend 'metal'",
   );
+});
+
+test("parseZincVersionOutput extracts the compiled backend", () => {
+  const parsed = parseZincVersionOutput(`
+zinc 67cc418bf8f8
+commit: 67cc418bf8f8ce30ec82a6d9a599c3e90186904f
+target: x86_64-linux-gnu
+optimize: ReleaseFast
+backends: vulkan
+`);
+
+  expect(parsed.version).toBe("67cc418bf8f8");
+  expect(parsed.commit).toBe("67cc418bf8f8ce30ec82a6d9a599c3e90186904f");
+  expect(parsed.target).toBe("x86_64-linux-gnu");
+  expect(parsed.optimize).toBe("ReleaseFast");
+  expect(parsed.backend).toBe("vulkan");
+});
+
+test("validateZincBackend rejects stale or overwritten RDNA binaries", () => {
+  expect(() => validateZincBackend("info(zinc_rt): M0 runtime initialized", "vulkan")).toThrow(
+    "RDNA ZINC binary backend mismatch: expected vulkan, observed unknown",
+  );
+  expect(() => validateZincBackend("zinc dev\nbackends: zinc_rt\n", "vulkan")).toThrow(
+    "expected vulkan, observed zinc_rt",
+  );
+  expect(validateZincBackend("zinc dev\nbackends: vulkan\n", "vulkan").backend).toBe("vulkan");
 });
 
 test("parseArgs enables discovery mode", () => {
