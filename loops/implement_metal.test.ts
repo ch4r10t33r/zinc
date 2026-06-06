@@ -11,10 +11,12 @@ import {
   buildStepKindDiversityNudge,
   buildStructuralPivotDirective,
   classifyAttemptFamilies,
+  cooledFamilyRejectionReason,
   countNearMissFamilyReverts,
   detectAutoStopForPlateau,
   noiseAwareImproveBand,
   parseDiagnosticEnv,
+  parsePromptFingerprint,
   buildPrompt,
   buildGemmaPrefillPostBreakthroughAnalysis,
   buildQwen36PrefillPlateauAnalysis,
@@ -42,6 +44,7 @@ import {
   shouldRestorePromotedBestDuringPlateau,
   shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
+  workloadMismatchReason,
 } from "./implement_metal";
 import type { BuildRunResult, ControllerState, CycleResult, RunState } from "./implement_metal";
 
@@ -174,6 +177,36 @@ describe("parseTokPerSec", () => {
   test("computes prefill throughput when rate is not printed", () => {
     const output = "info(forward): Prefill complete: 50 tokens in 250 ms";
     expect(parseTokPerSec(output, "prefill")).toBe(200);
+  });
+});
+
+describe("workload fingerprinting", () => {
+  test("parses raw/prepared prompt hashes and prompt-token count from ZINC output", () => {
+    const parsed = parsePromptFingerprint(
+      'info(zinc): Prompt fingerprint: raw=abc123 prepared=def456 mode=chat prompt_tokens=82\ninfo(zinc): Prompt tokens (82): [1,2]',
+    );
+    expect(parsed).toEqual({
+      rawPromptHash: "abc123",
+      preparedPromptHash: "def456",
+      promptTokens: 82,
+    });
+  });
+
+  test("detects prepared-prompt and token-count workload drift", () => {
+    const base = {
+      model: "gemma4-26b-a4b-q4k-m",
+      metricMode: "prefill" as const,
+      promptMode: "chat",
+      maxTokens: 32,
+      referenceHash: "ref",
+      rawPromptHash: "raw",
+      preparedPromptHash: "prepared-a",
+      promptTokens: 70,
+    };
+    const drifted = { ...base, preparedPromptHash: "prepared-b", promptTokens: 82 };
+    const reason = workloadMismatchReason(base, drifted);
+    expect(reason).toContain("prepared prompt hash changed");
+    expect(reason).toContain("prompt tokens 70 -> 82");
   });
 });
 
@@ -1898,6 +1931,49 @@ describe("plateau controls", () => {
     expect(lines).toContain("FAMILY COOLDOWN");
     expect(lines).toContain("simd_sum/reduction packing");
     expect(lines).toContain("fresh profile");
+  });
+
+  test("hard cooldown rejects same-family optimization without fresh quantified evidence", () => {
+    const state = makeState({
+      cycles: [
+        makeCycle({ cycle: 1, kept: false, stepKind: "optimization", description: "exact q4_k route tail variant" }),
+        makeCycle({ cycle: 2, kept: false, stepKind: "optimization", description: "q4_k GeGLU singleton route-pack tail" }),
+        makeCycle({ cycle: 3, kept: false, stepKind: "optimization", description: "active-block q4_k gate/up exact route tail" }),
+      ],
+    });
+
+    const reason = cooledFamilyRejectionReason({
+      state,
+      stepKind: "optimization",
+      description: "Add another q4_k route-pack tail fast path",
+      selfAnalysis: "Same local retune without new measurements.",
+      ideas: [],
+      windowSize: 3,
+      threshold: 3,
+    });
+    expect(reason).toContain("cooled-down family");
+    expect(reason).toContain("Q4_K route-tail/GeGLU micro-variants");
+  });
+
+  test("hard cooldown allows same-family optimization with quantified candidate evidence", () => {
+    const state = makeState({
+      cycles: [
+        makeCycle({ cycle: 1, kept: false, stepKind: "optimization", description: "exact q4_k route tail variant" }),
+        makeCycle({ cycle: 2, kept: false, stepKind: "optimization", description: "q4_k GeGLU singleton route-pack tail" }),
+        makeCycle({ cycle: 3, kept: false, stepKind: "optimization", description: "active-block q4_k gate/up exact route tail" }),
+      ],
+    });
+
+    const reason = cooledFamilyRejectionReason({
+      state,
+      stepKind: "optimization",
+      description: "Add q4_k route-pack tail fast path",
+      selfAnalysis: "candidate_metal_shapes showed the exact-shape microbench improved 1.688 ms -> 1.521 ms (+9.9%).",
+      ideas: [],
+      windowSize: 3,
+      threshold: 3,
+    });
+    expect(reason).toBeNull();
   });
 
   test("structural pivot directive appears for Qwen36 decode plateau", () => {

@@ -23,6 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
@@ -157,6 +158,8 @@ const STRUCTURAL_PIVOT_REVERT_STREAK = parsePositiveIntEnv("ZINC_STRUCTURAL_PIVO
 const STRUCTURAL_PIVOT_NO_BEST_CYCLES = parsePositiveIntEnv("ZINC_STRUCTURAL_PIVOT_NO_BEST_CYCLES", 12);
 const FAMILY_COOLDOWN_WINDOW = parsePositiveIntEnv("ZINC_FAMILY_COOLDOWN_WINDOW", 12);
 const FAMILY_COOLDOWN_THRESHOLD = parsePositiveIntEnv("ZINC_FAMILY_COOLDOWN_THRESHOLD", 3);
+const HARD_FAMILY_COOLDOWN = parseBoolEnv("ZINC_HARD_FAMILY_COOLDOWN", true);
+const WORKLOAD_RESET_ON_CHANGE = parseBoolEnv("ZINC_WORKLOAD_RESET_ON_CHANGE", true);
 const FINALIZE_BEST_TREE = parseBoolEnv("ZINC_FINALIZE_BEST_TREE", true);
 const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
 const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
@@ -248,6 +251,69 @@ function zincPromptArgs(): string[] {
   return args;
 }
 
+function shortHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+export type WorkloadContract = {
+  model: string;
+  metricMode: MetricMode;
+  promptMode: string;
+  maxTokens: number;
+  referenceHash: string;
+  rawPromptHash: string;
+  preparedPromptHash: string | null;
+  promptTokens: number | null;
+};
+
+export function parsePromptFingerprint(output: string): { rawPromptHash: string | null; preparedPromptHash: string | null; promptTokens: number | null } {
+  const fp = output.match(/Prompt fingerprint:\s*raw=([0-9a-f]+)\s+prepared=([0-9a-f]+)\s+mode=\S+\s+prompt_tokens=(\d+)/i);
+  if (fp) {
+    return {
+      rawPromptHash: fp[1],
+      preparedPromptHash: fp[2],
+      promptTokens: Number.parseInt(fp[3], 10),
+    };
+  }
+  return {
+    rawPromptHash: null,
+    preparedPromptHash: null,
+    promptTokens: parsePrefillTokenCount(output),
+  };
+}
+
+function workloadFromMeasurement(result: Pick<BuildRunResult, "runOutput" | "promptTokens">): WorkloadContract {
+  const parsed = parsePromptFingerprint(result.runOutput);
+  return {
+    model: displayModelLabel(),
+    metricMode: METRIC_MODE,
+    promptMode: PROMPT_MODE,
+    maxTokens: MAX_TOKENS,
+    referenceHash: shortHash(REFERENCE_TEXT),
+    rawPromptHash: parsed.rawPromptHash ?? shortHash(TEST_PROMPT),
+    preparedPromptHash: parsed.preparedPromptHash,
+    promptTokens: parsed.promptTokens ?? result.promptTokens ?? null,
+  };
+}
+
+export function workloadMismatchReason(expected: WorkloadContract | null | undefined, actual: WorkloadContract | null | undefined): string | null {
+  if (!expected || !actual) return null;
+  const mismatches: string[] = [];
+  if (expected.model !== actual.model) mismatches.push(`model ${expected.model} -> ${actual.model}`);
+  if (expected.metricMode !== actual.metricMode) mismatches.push(`metric ${expected.metricMode} -> ${actual.metricMode}`);
+  if (expected.promptMode !== actual.promptMode) mismatches.push(`prompt mode ${expected.promptMode} -> ${actual.promptMode}`);
+  if (expected.maxTokens !== actual.maxTokens) mismatches.push(`max tokens ${expected.maxTokens} -> ${actual.maxTokens}`);
+  if (expected.referenceHash !== actual.referenceHash) mismatches.push("reference text hash changed");
+  if (expected.rawPromptHash !== actual.rawPromptHash) mismatches.push("raw prompt hash changed");
+  if (expected.preparedPromptHash && actual.preparedPromptHash && expected.preparedPromptHash !== actual.preparedPromptHash) {
+    mismatches.push("prepared prompt hash changed");
+  }
+  if (expected.promptTokens != null && actual.promptTokens != null && expected.promptTokens !== actual.promptTokens) {
+    mismatches.push(`prompt tokens ${expected.promptTokens} -> ${actual.promptTokens}`);
+  }
+  return mismatches.length > 0 ? mismatches.join("; ") : null;
+}
+
 function displayModelLabel(): string {
   return MODEL_PATH ? basename(MODEL_PATH) : MODEL_ID;
 }
@@ -300,6 +366,15 @@ function promptTrunc(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
+function cycleMatchesWorkload(
+  state: Pick<RunState, "workload">,
+  cycle: Pick<CycleResult, "workload">,
+): boolean {
+  if (!state.workload) return true;
+  if (!cycle.workload) return false;
+  return workloadMismatchReason(state.workload, cycle.workload) == null;
+}
+
 function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): number | null {
   const candidates: number[] = [];
   if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
@@ -309,6 +384,7 @@ function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): num
     candidates.push(lastResult.tokPerSec);
   }
   for (const c of state.cycles) {
+    if (!cycleMatchesWorkload(state, c)) continue;
     if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
       candidates.push(c.tokPerSec);
     }
@@ -321,7 +397,7 @@ function smallAcceptedProgressBand(anchorTokPerSec: number): number {
 }
 
 export function bestKeptCorrectTokPerSec(
-  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest" | "workload">,
 ): number {
   const candidates: number[] = [];
   if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
@@ -335,6 +411,7 @@ export function bestKeptCorrectTokPerSec(
     candidates.push(state.currentBest.tokPerSec);
   }
   for (const c of state.cycles) {
+    if (!cycleMatchesWorkload(state, c)) continue;
     if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
       candidates.push(c.tokPerSec);
     }
@@ -342,7 +419,7 @@ export function bestKeptCorrectTokPerSec(
   return candidates.length > 0 ? Math.max(...candidates) : 0;
 }
 
-export function currentAcceptedTokPerSec(state: Pick<RunState, "cycles" | "currentBest" | "bestTokPerSec">): number {
+export function currentAcceptedTokPerSec(state: Pick<RunState, "cycles" | "currentBest" | "bestTokPerSec" | "workload">): number {
   if (
     state.currentBest?.containsReference &&
     state.currentBest.tokPerSec != null &&
@@ -352,6 +429,7 @@ export function currentAcceptedTokPerSec(state: Pick<RunState, "cycles" | "curre
   }
   for (let idx = state.cycles.length - 1; idx >= 0; idx--) {
     const cycle = state.cycles[idx];
+    if (!cycleMatchesWorkload(state, cycle)) continue;
     if (cycle.kept && cycle.containsReference && cycle.tokPerSec != null && cycle.tokPerSec > 0) {
       return cycle.tokPerSec;
     }
@@ -364,7 +442,7 @@ function correctResultTokPerSec(result: Pick<BuildRunResult, "containsReference"
 }
 
 export function keepBaselinesForCycle(
-  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest" | "workload">,
   cycleBaseline: Pick<BuildRunResult, "containsReference" | "tokPerSec">,
 ): { bestTokPerSec: number; acceptedTokPerSec: number } {
   const measuredBaseline = correctResultTokPerSec(cycleBaseline);
@@ -378,7 +456,7 @@ function normalizeStateBestTokPerSec(state: RunState): void {
 }
 
 export function recentAcceptedProgress(
-  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest" | "workload">,
   window = RECENT_PROGRESS_WINDOW,
 ): { start: number; end: number; delta: number; threshold: number; hasProgress: boolean } {
   const recent = state.cycles.slice(-window);
@@ -390,9 +468,11 @@ export function recentAcceptedProgress(
 
   const priorKept = state.cycles
     .slice(0, -recent.length)
+    .filter(c => cycleMatchesWorkload(state, c))
     .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
     .map(c => c.tokPerSec!);
   const recentKept = recent
+    .filter(c => cycleMatchesWorkload(state, c))
     .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
     .map(c => c.tokPerSec!);
 
@@ -512,9 +592,10 @@ function recentRoutePackCooldown(state: RunState): { active: boolean; count: num
   return { active: count >= 2, count, window };
 }
 
-function bestKeptCorrectCycle(state: Pick<RunState, "cycles">): CycleResult | null {
+function bestKeptCorrectCycle(state: Pick<RunState, "cycles" | "workload">): CycleResult | null {
   let best: CycleResult | null = null;
   for (const cycle of state.cycles) {
+    if (!cycleMatchesWorkload(state, cycle)) continue;
     if (!cycle.kept || !cycle.containsReference || cycle.tokPerSec == null) continue;
     if (best == null || cycle.tokPerSec > (best.tokPerSec ?? 0)) {
       best = cycle;
@@ -523,15 +604,17 @@ function bestKeptCorrectCycle(state: Pick<RunState, "cycles">): CycleResult | nu
   return best;
 }
 
-export function bestTreeCandidateCycle(state: Pick<RunState, "cycles" | "bestTokPerSec">): CycleResult | null {
+export function bestTreeCandidateCycle(state: Pick<RunState, "cycles" | "bestTokPerSec" | "workload">): CycleResult | null {
   let bestTokPerSec = Number.isFinite(state.bestTokPerSec) ? state.bestTokPerSec : 0;
   for (const cycle of state.cycles) {
+    if (!cycleMatchesWorkload(state, cycle)) continue;
     if (!cycle.kept || !cycle.containsReference || cycle.tokPerSec == null || cycle.tokPerSec <= 0) continue;
     bestTokPerSec = Math.max(bestTokPerSec, cycle.tokPerSec);
   }
 
   let candidate: CycleResult | null = null;
   for (const cycle of state.cycles) {
+    if (!cycleMatchesWorkload(state, cycle)) continue;
     if (!cycle.kept || !cycle.containsReference || cycle.tokPerSec == null || cycle.tokPerSec <= 0) continue;
     if (cycle.tokPerSec < bestTokPerSec - 0.05) continue;
     if (candidate == null || cycle.cycle > candidate.cycle) {
@@ -559,7 +642,7 @@ export type PlateauStopDecision = {
 };
 
 export function detectAutoStopForPlateau(
-  state: Pick<RunState, "cycles">,
+  state: Pick<RunState, "cycles" | "workload">,
   opts: { revertStreak?: number; noBestCycles?: number } = {},
 ): PlateauStopDecision {
   const revertStreak = opts.revertStreak ?? AUTO_STOP_REVERT_STREAK;
@@ -651,6 +734,71 @@ export function buildFamilyCooldownDirective(
   lines.push("- Do not try another member of a cooled-down family unless the cycle first adds or cites fresh profile/microbench/validator evidence naming the exact shader, shape, or barrier bucket.");
   lines.push("- A valid next cycle can be `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement` if it builds the missing evidence; a same-family optimization without new evidence should be reverted by the harness.");
   return lines;
+}
+
+function hasFreshQuantifiedEvidence(text: string): boolean {
+  const namesEvidence = /\b(candidate[_-]?(profile|metal[_-]?shapes)|metal-shapes|bench-metal-shapes|microbench|profile|validator|exact-shape)\b/i.test(text);
+  const hasNumber = /(?:[+-]?\d+(?:\.\d+)?\s*(?:tok\/s|ms|gb\/s|%))|(?:\b\d+(?:\.\d+)?\s*x\b)/i.test(text);
+  return namesEvidence && hasNumber;
+}
+
+export function cooledFamilyRejectionReason(args: {
+  state: Pick<RunState, "cycles">;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  ideas: string[];
+  windowSize?: number;
+  threshold?: number;
+}): string | null {
+  if (!HARD_FAMILY_COOLDOWN) return null;
+  if (args.stepKind !== "optimization") return null;
+
+  const recent = args.state.cycles.slice(-(args.windowSize ?? FAMILY_COOLDOWN_WINDOW));
+  if (recent.length < (args.threshold ?? FAMILY_COOLDOWN_THRESHOLD)) return null;
+
+  const stats = new Map<string, { kept: number; reverted: number }>();
+  for (const cycle of recent) {
+    for (const family of classifyAttemptFamilies(cycle)) {
+      const entry = stats.get(family) ?? { kept: 0, reverted: 0 };
+      if (cycle.kept) entry.kept++;
+      else entry.reverted++;
+      stats.set(family, entry);
+    }
+  }
+  const activeFamilies = new Set(
+    [...stats.entries()]
+      .filter(([, s]) => s.reverted >= (args.threshold ?? FAMILY_COOLDOWN_THRESHOLD) && s.kept === 0)
+      .map(([family]) => family),
+  );
+  if (activeFamilies.size === 0) return null;
+
+  const text = [
+    args.description,
+    args.selfAnalysis,
+    ...args.ideas,
+  ].join("\n");
+  if (hasFreshQuantifiedEvidence(text)) return null;
+
+  const attemptedFamilies = classifyAttemptFamilies({
+    cycle: 0,
+    timestamp: "",
+    phase: "optimize",
+    description: args.description,
+    kept: false,
+    tokPerSec: null,
+    tokensGenerated: 0,
+    containsReference: true,
+    buildExitCode: 0,
+    testExitCode: 0,
+    runExitCode: 0,
+    outputText: "",
+    selfAnalysis: args.selfAnalysis,
+    nextIdeas: args.ideas,
+  });
+  const blocked = attemptedFamilies.filter((family) => activeFamilies.has(family));
+  if (blocked.length === 0) return null;
+  return `cooled-down family without fresh quantified evidence: ${blocked.join(", ")}`;
 }
 
 export function buildStructuralPivotDirective(state: RunState): string[] {
@@ -1157,6 +1305,7 @@ export type BuildRunResult = {
   tokPerSecSamples: number[];
   promptTokens?: number | null;
   promptTokenSamples?: number[];
+  workload?: WorkloadContract | null;
   tokensGenerated: number;
   outputText: string;
   containsReference: boolean;
@@ -1174,6 +1323,7 @@ export type ResultSnapshot = {
   tokPerSecSamples: number[];
   promptTokens?: number | null;
   promptTokenSamples?: number[];
+  workload?: WorkloadContract | null;
   tokensGenerated: number;
   outputText: string;
   containsReference: boolean;
@@ -1334,6 +1484,7 @@ export function snapshotFromResult(cycle: number, result: BuildRunResult): Resul
     tokPerSecSamples: result.tokPerSecSamples,
     promptTokens: result.promptTokens ?? null,
     promptTokenSamples: result.promptTokenSamples ?? [],
+    workload: result.workload ?? null,
     tokensGenerated: result.tokensGenerated,
     outputText: result.outputText,
     containsReference: result.containsReference,
@@ -1819,6 +1970,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   const tokensGenerated = parseTokensGenerated(lastCombined);
   const outputText = parseOutputText(lastCombined);
   const evaluation = evaluateOutputText(outputText);
+  const workload = workloadFromMeasurement({ runOutput: lastCombined, promptTokens });
 
   if (tokPerSec != null && tokPerSecSamples.length > 1) {
     const aggLabel = agg.trimmed
@@ -1840,6 +1992,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     tokPerSecSamples,
     promptTokens,
     promptTokenSamples,
+    workload,
     tokensGenerated,
     outputText,
     containsReference: evaluation.containsReference,
@@ -2519,6 +2672,12 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     if (lastResult.promptTokens != null) {
       diagnosis.push(`Benchmark prompt shape: ${lastResult.promptTokens} prompt tokens${lastResult.promptTokenSamples?.length ? ` [${lastResult.promptTokenSamples.join(", ")}]` : ""}. Treat this as part of the workload contract; do not overfit one exact boundary without checking nearby public prompt lengths.`);
     }
+    if (state.workload) {
+      diagnosis.push(
+        `Locked workload: model=${state.workload.model}, mode=${state.workload.promptMode}, metric=${state.workload.metricMode}, max_tokens=${state.workload.maxTokens}, prompt_tokens=${state.workload.promptTokens ?? "?"}, raw_prompt_hash=${state.workload.rawPromptHash}, prepared_prompt_hash=${state.workload.preparedPromptHash ?? "unknown"}, reference_hash=${state.workload.referenceHash}.`,
+      );
+      diagnosis.push("Do not change prompt preparation, chat-template behavior, correctness oracle text, or prompt token count as a performance optimization. Such changes are workload changes, not kernel throughput wins, and the harness will reject them as incomparable.");
+    }
     diagnosis.push(`Gap: ${gap.toFixed(1)} ${METRIC_LABEL} (need ${pctNeeded}% improvement)`);
     if (currentAccepted > 0 || bestKept > 0) {
       diagnosis.push(`Accepted baseline: current tree ${currentAccepted.toFixed(2)} ${METRIC_LABEL}; highest kept-correct ${bestKept.toFixed(2)} ${METRIC_LABEL}.`);
@@ -2902,6 +3061,9 @@ export type CycleResult = {
   kept: boolean;
   tokPerSec: number | null;
   tokensGenerated: number;
+  promptTokens?: number | null;
+  promptTokenSamples?: number[];
+  workload?: WorkloadContract | null;
   containsReference: boolean;
   buildExitCode: number;
   testExitCode: number;
@@ -2948,6 +3110,11 @@ export type RunState = {
   ideas: string[];
   phase: Phase;
   metricMode?: MetricMode | null;
+  /// Locked measurement workload contract. A run's accepted performance
+  /// baselines are comparable only while model, prompt mode, raw/prepared
+  /// prompt hashes, prompt token count, max tokens, metric, and correctness
+  /// reference remain stable.
+  workload?: WorkloadContract | null;
   currentBest: { tokPerSec: number | null; containsReference: boolean } | null;
   stalledCycles: number;
   bestTokPerSec: number;
@@ -3017,6 +3184,54 @@ async function loadEffortPlan(effort: number): Promise<{ file: string; plan: str
 
 async function saveState(runDir: string, state: RunState): Promise<void> {
   await writeFile(join(runDir, "state.json"), JSON.stringify(state, null, 2));
+}
+
+function measuredWorkload(result: BuildRunResult): WorkloadContract | null {
+  if (result.buildExitCode !== 0 || result.testExitCode !== 0) return null;
+  if (result.runExitCode !== 0) return null;
+  return result.workload ?? null;
+}
+
+function resetPerformanceBaselinesToMeasurement(state: RunState, result: BuildRunResult): void {
+  state.currentBest = result.containsReference && result.tokPerSec != null
+    ? { tokPerSec: result.tokPerSec, containsReference: true }
+    : null;
+  state.bestTokPerSec = result.containsReference && result.tokPerSec != null ? result.tokPerSec : 0;
+  state.bestTree = null;
+  state.bestIncorrect = null;
+  state.stalledCycles = 0;
+  state.crossEffortBaseline = null;
+  state.lastCrossEffort = null;
+}
+
+async function syncWorkloadBeforeCycle(runDir: string, state: RunState, result: BuildRunResult): Promise<void> {
+  const workload = measuredWorkload(result);
+  if (!workload) return;
+
+  if (!state.workload) {
+    state.workload = workload;
+    if (state.cycles.length > 0 && WORKLOAD_RESET_ON_CHANGE) {
+      resetPerformanceBaselinesToMeasurement(state, result);
+      console.log(clr("1;33", `  ◎ Workload contract locked for legacy state; reset performance baselines to ${result.tokPerSec?.toFixed(2) ?? "n/a"} ${METRIC_LABEL}`));
+    } else {
+      console.log(clr("1;36", `  ◎ Workload contract locked: prompt=${workload.promptTokens ?? "?"} tokens raw=${workload.rawPromptHash} prepared=${workload.preparedPromptHash ?? "unknown"}`));
+    }
+    await saveState(runDir, state);
+    return;
+  }
+
+  const mismatch = workloadMismatchReason(state.workload, workload);
+  if (!mismatch) return;
+
+  if (!WORKLOAD_RESET_ON_CHANGE) {
+    console.log(clr("1;31", `  ⚠ Workload changed but reset is disabled: ${mismatch}`));
+    return;
+  }
+
+  state.workload = workload;
+  resetPerformanceBaselinesToMeasurement(state, result);
+  console.log(clr("1;33", `  ◎ Workload changed (${mismatch}); reset performance baselines to current measurement ${result.tokPerSec?.toFixed(2) ?? "n/a"} ${METRIC_LABEL}`));
+  await saveState(runDir, state);
 }
 
 export function shouldFinalizeBestTree(
@@ -3745,6 +3960,7 @@ async function main() {
     // Backfill fields that may not exist in older state files
     state.reviewSummaries ??= [];
     state.metricMode ??= METRIC_MODE;
+    state.workload ??= null;
     state.stalledCycles ??= 0;
     state.bestTokPerSec ??= 0;
     state.lastProfileOutput ??= null;
@@ -3808,6 +4024,7 @@ async function main() {
       ideas: [],
       phase: "optimize",
       metricMode: METRIC_MODE,
+      workload: null,
       currentBest: null,
       stalledCycles: 0,
       bestTokPerSec: 0,
@@ -3863,6 +4080,7 @@ async function main() {
 
     // Step 1: Build + Test + Run
     const result = await buildTestRun(currentMaxTokens);
+    await syncWorkloadBeforeCycle(runDir, state, result);
     state.phase = result.phase;
 
     await writeFile(join(cycleDir, "build.log"), result.buildOutput);
@@ -3955,7 +4173,9 @@ async function main() {
     // throughput estimate is refined — the correctness verdict from the cycle
     // run stands.
     const preConfirmAgg = aggregateTimedSamples(verify.tokPerSecSamples);
+    const preConfirmWorkloadMismatch = workloadMismatchReason(state.workload, measuredWorkload(verify));
     if (
+      !preConfirmWorkloadMismatch &&
       shouldConfirmCandidate({
         containsReference: verify.containsReference,
         ranOk: verify.runExitCode === 0,
@@ -3978,16 +4198,25 @@ async function main() {
           const flag = merged.bimodal ? " ⚠ STILL BIMODAL" : "";
           console.log(clr("1;36", `    confirmed: ${(verify.tokPerSec ?? 0).toFixed(2)} → ${merged.tokPerSec.toFixed(2)} ${METRIC_LABEL} over ${verify.tokPerSecSamples.length} samples [${verify.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}]${flag}`));
           verify.tokPerSec = merged.tokPerSec;
+          verify.workload = workloadFromMeasurement(verify);
           await writeFile(join(cycleDir, "verify.log"), JSON.stringify(verify, null, 2));
         }
       }
     }
     const verifyTps = verify.tokPerSec ?? 0;
+    const verifyWorkloadMismatch = workloadMismatchReason(state.workload, measuredWorkload(verify));
+    const cooldownRejectReason = cooledFamilyRejectionReason({
+      state,
+      stepKind,
+      description,
+      selfAnalysis,
+      ideas: newIdeas,
+    });
 
     let candidateProfileCaptured = false;
     let candidateMetalShapesCaptured = false;
     let candidateMetalShapesAttempted = false;
-    const candidateEvidence = shouldRunCandidateEvidence({
+    const candidateEvidence = !verifyWorkloadMismatch ? shouldRunCandidateEvidence({
       state,
       cycle,
       containsReference: verify.containsReference,
@@ -3998,7 +4227,7 @@ async function main() {
       description,
       selfAnalysis,
       ideas: newIdeas,
-    });
+    }) : { profile: false, metalShapes: false };
     if (candidateEvidence.profile || candidateEvidence.metalShapes) {
       const header = [
         `CANDIDATE EVIDENCE cycle ${cycle} (${stepKind})`,
@@ -4038,7 +4267,12 @@ async function main() {
       }
     }
 
-    if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
+    if (verifyWorkloadMismatch) {
+      console.log(clr("1;31", `  ↩ REVERTING — workload changed (${verifyWorkloadMismatch})`));
+      await resetCycleToPreHash(preHash);
+      state.failedApproaches.push(`${description} — changed benchmark workload: ${verifyWorkloadMismatch}`);
+      state.stalledCycles++;
+    } else if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
       console.log(clr("1;31", `  ↩ REVERTING — ${verify.buildExitCode !== 0 ? "build" : "tests"} broken`));
       await resetCycleToPreHash(preHash);
@@ -4055,6 +4289,11 @@ async function main() {
       console.log(clr("1;31", `  ↩ REVERTING — lost correctness (output: "${verify.outputText.slice(0, 60)}")`));
       await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — broke correctness`);
+      state.stalledCycles++;
+    } else if (cooldownRejectReason) {
+      console.log(clr("1;31", `  ↩ REVERTING — ${cooldownRejectReason}`));
+      await resetCycleToPreHash(preHash);
+      state.failedApproaches.push(`${description} — ${cooldownRejectReason}`);
       state.stalledCycles++;
     } else if (verify.containsReference && verifyTps > bestTps + improveBand) {
       // Meaningful speed improvement with correct output
@@ -4249,6 +4488,9 @@ async function main() {
       kept,
       tokPerSec: verify.tokPerSec,
       tokensGenerated: verify.tokensGenerated,
+      promptTokens: verify.promptTokens ?? null,
+      promptTokenSamples: verify.promptTokenSamples ?? [],
+      workload: verify.workload ?? null,
       containsReference: verify.containsReference,
       buildExitCode: verify.buildExitCode,
       testExitCode: verify.testExitCode,

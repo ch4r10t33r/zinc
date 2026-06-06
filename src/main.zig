@@ -680,6 +680,10 @@ fn requestedIncludedWord(prompt: []const u8) ?[]const u8 {
     return prompt[start..end];
 }
 
+fn promptFingerprint(text: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, text);
+}
+
 fn prepareCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []const u8, chat: bool, allocator: std.mem.Allocator) !PreparedPrompt {
     if (!chat) {
         return .{ .text = prompt };
@@ -1783,6 +1787,12 @@ pub fn main() !void {
             const prompt_tokens = try tokenizer.encodePrompt(prepared_prompt.text, allocator);
             defer allocator.free(prompt_tokens);
 
+            log.info("Prompt fingerprint: raw={x} prepared={x} mode={s} prompt_tokens={d}", .{
+                promptFingerprint(prompt),
+                promptFingerprint(prepared_prompt.text),
+                if (use_chat_prompt) "chat" else "raw",
+                prompt_tokens.len,
+            });
             log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 30)] });
 
             // Initialize inference engine
@@ -1966,6 +1976,12 @@ pub fn main() !void {
         const prompt_tokens = try tokenizer.encodePrompt(prepared_prompt.text, allocator);
         defer allocator.free(prompt_tokens);
 
+        log.info("Prompt fingerprint: raw={x} prepared={x} mode={s} prompt_tokens={d}", .{
+            promptFingerprint(prompt),
+            promptFingerprint(prepared_prompt.text),
+            if (use_chat_prompt) "chat" else "raw",
+            prompt_tokens.len,
+        });
         log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 30)] });
         // Decode prompt tokens for verification
         {
