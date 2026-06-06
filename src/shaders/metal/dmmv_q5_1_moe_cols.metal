@@ -340,16 +340,16 @@ kernel void main0(
                 const uint q1 = hi | (((qh >> (j + 16u)) & 1u) << 4);
 
                 const float4 x_lo0 = float4(
-                    active0 ? x0[base + j] : 0.0f,
-                    active1 ? x1[base + j] : 0.0f,
-                    active2 ? x2[base + j] : 0.0f,
-                    active3 ? x3[base + j] : 0.0f
+                    x0[base + j],
+                    x1[base + j],
+                    x2[base + j],
+                    x3[base + j]
                 );
                 const float4 x_hi0 = float4(
-                    active0 ? x0[base + 16u + j] : 0.0f,
-                    active1 ? x1[base + 16u + j] : 0.0f,
-                    active2 ? x2[base + 16u + j] : 0.0f,
-                    active3 ? x3[base + 16u + j] : 0.0f
+                    x0[base + 16u + j],
+                    x1[base + 16u + j],
+                    x2[base + 16u + j],
+                    x3[base + 16u + j]
                 );
 
                 sum_qx0 += float(q0) * x_lo0 + float(q1) * x_hi0;
@@ -366,10 +366,10 @@ kernel void main0(
 
         device float* y_base = Y + (p.y_offset / 4u);
         if (tid == 0u) {
-            if (active0) y_base[route0 * p.M + row] = out0;
-            if (active1) y_base[route1 * p.M + row] = out1;
-            if (active2) y_base[route2 * p.M + row] = out2;
-            if (active3) y_base[route3 * p.M + row] = out3;
+            y_base[route0 * p.M + row] = out0;
+            y_base[route1 * p.M + row] = out1;
+            y_base[route2 * p.M + row] = out2;
+            y_base[route3 * p.M + row] = out3;
         }
         return;
     }
