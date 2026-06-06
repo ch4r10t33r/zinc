@@ -10978,7 +10978,7 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
         .use_active_blocks = 1,
-        .enable_exact5 = if (engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
+        .enable_exact5 = if (engine.in_prefill_phase and engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &tensor.gpu_buffer,
