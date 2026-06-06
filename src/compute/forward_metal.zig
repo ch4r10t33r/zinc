@@ -20013,6 +20013,25 @@ fn runDecodeStep(
         shared_cmd_storage = try beginProfiledCommand(engine, profile);
         break :blk &shared_cmd_storage;
     } else null;
+    // Hybrid SSM dense models (e.g. Qwen3.5-2B) are not MoE and carry SSM
+    // layers, so neither use_single_gpu_cmd (MoE) nor use_dense_layer_cmd
+    // (non-SSM dense) fires. They otherwise fall back to a per-layer local
+    // command buffer that commitAndWaits twice per layer (attn/ssm, then FFN)
+    // and finishes the FFN residual on the CPU — ~48 CPU↔GPU round trips per
+    // token on the 24-layer 2B, leaving standalone decode ~20× off the
+    // memory-bandwidth floor. Mirror the proven use_dense_layer_cmd path:
+    // submit each layer command buffer asynchronously, do the FFN residual on
+    // the GPU (scale_accumulate), and wait once at the token boundary. Scoped
+    // to standalone decode (no external/queued prompt command, no MoE, no
+    // validation) so prefill and every other architecture are untouched.
+    const use_async_local_decode = !using_external_shared_cmd and
+        async_out == null and
+        shared_cmd == null and
+        !is_moe and
+        cfg.ssm_d_inner != 0 and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled;
     const qwen_branch_hidden_seed: ?QwenMoeHiddenSeed = blk: {
         if (start_layer != 0) break :blk null;
         if (!canUseQwenLayer0SeededBranchMoe(engine)) break :blk null;
@@ -20077,7 +20096,12 @@ fn runDecodeStep(
         .barrier_count = 0,
         .barrier_enabled = false,
     };
-    var dense_pending_cmds: [64]MetalCommand = undefined;
+    // Sized to hold one token's worth of async layer command buffers. The
+    // use_dense_layer_cmd path submits a few grouped chunks, but the
+    // use_async_local_decode path (hybrid SSM dense decode) submits two per
+    // layer (attn/ssm + FFN), so a 64-layer model (qwen36-27b) needs 128 slots;
+    // 256 keeps a token's commands in flight without a forced mid-token flush.
+    var dense_pending_cmds: [256]MetalCommand = undefined;
     var dense_pending_count: usize = 0;
     errdefer waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
     const layer_count: usize = @intCast(cfg.n_layers);
@@ -20548,7 +20572,12 @@ fn runDecodeStep(
             } else if (profile) |p| {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
-            if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (using_local_cmd) {
+                if (use_async_local_decode)
+                    submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile)
+                else
+                    commitAndWaitProfiled(cmd, profile);
+            }
             if (qwen_moe_validation_ref) |*validation| {
                 const validation_start = profileStart(profile != null);
                 try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
@@ -21344,7 +21373,12 @@ fn runDecodeStep(
             } else if (profile) |p| {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
-            if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (using_local_cmd) {
+                if (use_async_local_decode)
+                    submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile)
+                else
+                    commitAndWaitProfiled(cmd, profile);
+            }
             if (qwen_moe_validation_ref) |*validation| {
                 const validation_start = profileStart(profile != null);
                 try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
@@ -21809,11 +21843,21 @@ fn runDecodeStep(
                 }
                 if (profile) |p| p.dense_ffn_record_ns += profileElapsedNs(dense_record_start);
                 if (using_local_cmd) {
-                    commitAndWaitProfiled(cmd, profile);
+                    if (use_async_local_decode) {
+                        // GPU-side residual (hidden += down) so this layer command
+                        // buffer needs no CPU readback and can be committed async,
+                        // mirroring the use_dense_layer_cmd scale_accumulate path.
+                        const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+                        const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
+                        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+                        submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile);
+                    } else {
+                        commitAndWaitProfiled(cmd, profile);
 
-                    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
-                    const down_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
-                    for (0..hidden_dim) |i| hidden_ptr[i] += down_ptr[i];
+                        const hidden_ptr: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+                        const down_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+                        for (0..hidden_dim) |i| hidden_ptr[i] += down_ptr[i];
+                    }
                 }
             }
         }
