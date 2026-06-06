@@ -15,10 +15,7 @@ struct Params {
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
 #define PROFILE_TAIL_BINS 7u
-#define PROFILE_BASE_STATS_WORDS (4u + PROFILE_TAIL_BINS)
-#define PROFILE_ALT_BLOCK_COLS 3u
-#define PROFILE_ALT_STATS_PER_COL 4u
-#define PROFILE_STATS_PER_LAYER (PROFILE_BASE_STATS_WORDS + PROFILE_ALT_BLOCK_COLS * PROFILE_ALT_STATS_PER_COL)
+#define PROFILE_STATS_PER_LAYER (4u + PROFILE_TAIL_BINS)
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -104,38 +101,6 @@ kernel void main0(
             atomic_store_explicit(layer_stats + 3u, padding_slots, memory_order_relaxed);
             for (uint i = 0u; i < PROFILE_TAIL_BINS; i++) {
                 atomic_store_explicit(layer_stats + 4u + i, tail_size_blocks[i], memory_order_relaxed);
-            }
-
-            const uint alt_cols[PROFILE_ALT_BLOCK_COLS] = { 4u, 16u, 32u };
-            for (uint alt = 0u; alt < PROFILE_ALT_BLOCK_COLS; alt++) {
-                const uint cols = alt_cols[alt];
-                uint alt_blocks = 0u;
-                uint alt_tail_blocks = 0u;
-                uint alt_single_tail_blocks = 0u;
-                uint alt_padding_slots = 0u;
-
-                for (uint expert = 0u; expert < p.n_experts; expert++) {
-                    const uint stored_count = route_counts[expert];
-                    if (stored_count == 0u) {
-                        continue;
-                    }
-                    const uint blocks = (stored_count + cols - 1u) / cols;
-                    const uint tail_routes = stored_count % cols;
-                    alt_blocks += blocks;
-                    if (tail_routes != 0u) {
-                        alt_tail_blocks += 1u;
-                        alt_padding_slots += cols - tail_routes;
-                        if (tail_routes == 1u) {
-                            alt_single_tail_blocks += 1u;
-                        }
-                    }
-                }
-
-                device atomic_uint* alt_stats = layer_stats + PROFILE_BASE_STATS_WORDS + alt * PROFILE_ALT_STATS_PER_COL;
-                atomic_store_explicit(alt_stats + 0u, alt_blocks, memory_order_relaxed);
-                atomic_store_explicit(alt_stats + 1u, alt_tail_blocks, memory_order_relaxed);
-                atomic_store_explicit(alt_stats + 2u, alt_single_tail_blocks, memory_order_relaxed);
-                atomic_store_explicit(alt_stats + 3u, alt_padding_slots, memory_order_relaxed);
             }
         }
     }
