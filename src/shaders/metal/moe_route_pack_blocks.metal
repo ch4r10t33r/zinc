@@ -14,7 +14,7 @@ struct Params {
 
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
-#define PROFILE_STATS_PER_LAYER 11u
+#define PROFILE_STATS_PER_LAYER 4u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -73,13 +73,6 @@ kernel void main0(
         uint tail_blocks = 0u;
         uint singleton_tail_blocks = 0u;
         uint padding_slots = 0u;
-        uint tail_r1 = 0u;
-        uint tail_r2 = 0u;
-        uint tail_r3 = 0u;
-        uint tail_r4 = 0u;
-        uint tail_r5 = 0u;
-        uint tail_r6 = 0u;
-        uint tail_r7 = 0u;
         for (uint expert = 0u; expert < p.n_experts; expert++) {
             total_blocks += block_counts[expert];
             const uint stored_count = route_counts[expert];
@@ -94,16 +87,6 @@ kernel void main0(
                 if (tail_routes == 1u) {
                     singleton_tail_blocks += 1u;
                 }
-                switch (tail_routes) {
-                    case 1u: tail_r1 += 1u; break;
-                    case 2u: tail_r2 += 1u; break;
-                    case 3u: tail_r3 += 1u; break;
-                    case 4u: tail_r4 += 1u; break;
-                    case 5u: tail_r5 += 1u; break;
-                    case 6u: tail_r6 += 1u; break;
-                    case 7u: tail_r7 += 1u; break;
-                    default: break;
-                }
             }
         }
         if (p.profile_index < p.profile_slots) {
@@ -113,13 +96,6 @@ kernel void main0(
             atomic_store_explicit(layer_stats + 1u, tail_blocks, memory_order_relaxed);
             atomic_store_explicit(layer_stats + 2u, singleton_tail_blocks, memory_order_relaxed);
             atomic_store_explicit(layer_stats + 3u, padding_slots, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 4u, tail_r1, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 5u, tail_r2, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 6u, tail_r3, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 7u, tail_r4, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 8u, tail_r5, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 9u, tail_r6, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + 10u, tail_r7, memory_order_relaxed);
         }
     }
 

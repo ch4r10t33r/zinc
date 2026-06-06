@@ -46,8 +46,7 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
-const moe_route_pack_tail_size_buckets: usize = 7;
-const moe_route_pack_profile_stats_per_layer: usize = 4 + moe_route_pack_tail_size_buckets;
+const moe_route_pack_profile_stats_per_layer: usize = 4;
 
 fn moeRoutePackProfileWords(n_layers: usize) usize {
     return 1 + n_layers + n_layers * moe_route_pack_profile_stats_per_layer;
@@ -904,7 +903,6 @@ pub const RuntimeProfile = struct {
     route_pack_tail_blocks_actual: u64 = 0,
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
-    route_pack_tail_size_blocks_actual: [moe_route_pack_tail_size_buckets]u64 = [_]u64{0} ** moe_route_pack_tail_size_buckets,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1318,9 +1316,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.route_pack_tail_blocks_actual = total.route_pack_tail_blocks_actual -| prefix.route_pack_tail_blocks_actual;
     delta.route_pack_single_tail_blocks_actual = total.route_pack_single_tail_blocks_actual -| prefix.route_pack_single_tail_blocks_actual;
     delta.route_pack_padding_slots_actual = total.route_pack_padding_slots_actual -| prefix.route_pack_padding_slots_actual;
-    for (&delta.route_pack_tail_size_blocks_actual, total.route_pack_tail_size_blocks_actual, prefix.route_pack_tail_size_blocks_actual) |*out, total_count, prefix_count| {
-        out.* = total_count -| prefix_count;
-    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1444,7 +1439,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                     pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                     pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                 });
-                logRoutePackTailSizes(label, profile);
             }
         }
     }
@@ -1495,37 +1489,6 @@ fn gemmaMoePrefillPathName(profile: RuntimeProfile) []const u8 {
     if (profile.queued_prefill_requests > 0) return "queued-token-major";
     if (profile.decode_steps > 0) return "per-token";
     return "none";
-}
-
-fn logRoutePackTailSizes(label: []const u8, profile: RuntimeProfile) void {
-    var total: u64 = 0;
-    for (profile.route_pack_tail_size_blocks_actual) |count| {
-        total += count;
-    }
-    if (total == 0) return;
-
-    if (label.len > 0) {
-        log.info("  {s} route pack tail sizes: r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
-            label,
-            profile.route_pack_tail_size_blocks_actual[0],
-            profile.route_pack_tail_size_blocks_actual[1],
-            profile.route_pack_tail_size_blocks_actual[2],
-            profile.route_pack_tail_size_blocks_actual[3],
-            profile.route_pack_tail_size_blocks_actual[4],
-            profile.route_pack_tail_size_blocks_actual[5],
-            profile.route_pack_tail_size_blocks_actual[6],
-        });
-    } else {
-        log.info("  route-pack tail sizes: r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
-            profile.route_pack_tail_size_blocks_actual[0],
-            profile.route_pack_tail_size_blocks_actual[1],
-            profile.route_pack_tail_size_blocks_actual[2],
-            profile.route_pack_tail_size_blocks_actual[3],
-            profile.route_pack_tail_size_blocks_actual[4],
-            profile.route_pack_tail_size_blocks_actual[5],
-            profile.route_pack_tail_size_blocks_actual[6],
-        });
-    }
 }
 
 fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
@@ -2808,9 +2771,6 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
             p.route_pack_tail_blocks_actual += counts[base + 1];
             p.route_pack_single_tail_blocks_actual += counts[base + 2];
             p.route_pack_padding_slots_actual += counts[base + 3];
-            for (&p.route_pack_tail_size_blocks_actual, 0..) |*bucket, bucket_idx| {
-                bucket.* += counts[base + 4 + bucket_idx];
-            }
         }
     }
 }
@@ -7337,7 +7297,6 @@ pub const InferenceEngine = struct {
                             pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                             pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                         });
-                        logRoutePackTailSizes("", profile);
                     }
                 }
             }
@@ -29159,13 +29118,6 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 1]);
         try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 2]);
         try std.testing.expectEqual(@as(u32, 33), active_count_ptr[stats_base + 3]);
-        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 4]);
-        try std.testing.expectEqual(@as(u32, 3), active_count_ptr[stats_base + 5]);
-        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 6]);
-        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 7]);
-        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 8]);
-        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 9]);
-        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 10]);
     }
 
     var seen_routes = [_]bool{false} ** route_slots;
