@@ -773,6 +773,23 @@ const Q8RepackedDispatchStat = struct {
     calls: u32 = 0,
 };
 
+const MoeRouteColsActiveKind = enum(u8) {
+    q4k,
+    q4k_geglu,
+    q5_1,
+    q5k,
+    q6k,
+    q8_0,
+};
+
+const moe_route_cols_active_kind_count = 6;
+
+const MoeRouteColsActiveStat = struct {
+    calls: u32 = 0,
+    upper_blocks: u64 = 0,
+    threadgroups: u64 = 0,
+};
+
 const BarrierClass = enum(u8) {
     embed,
     full_attn,
@@ -905,6 +922,7 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    route_cols_active_stats: [moe_route_cols_active_kind_count]MoeRouteColsActiveStat = [_]MoeRouteColsActiveStat{.{}} ** moe_route_cols_active_kind_count,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1321,6 +1339,13 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
+    for (0..moe_route_cols_active_kind_count) |i| {
+        delta.route_cols_active_stats[i] = .{
+            .calls = total.route_cols_active_stats[i].calls -| prefix.route_cols_active_stats[i].calls,
+            .upper_blocks = total.route_cols_active_stats[i].upper_blocks -| prefix.route_cols_active_stats[i].upper_blocks,
+            .threadgroups = total.route_cols_active_stats[i].threadgroups -| prefix.route_cols_active_stats[i].threadgroups,
+        };
+    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1358,6 +1383,81 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.q8_repacked_dispatch_stats[idx] = q8RepackedDispatchStatMinusPrefix(slot, prefix);
     }
     return delta;
+}
+
+fn moeRouteColsActiveThreadgroups(rows: u32, rows_per_wg: u32, upper_blocks: u32) u64 {
+    if (rows == 0 or rows_per_wg == 0 or upper_blocks == 0) return 0;
+    const row_groups = (rows + rows_per_wg - 1) / rows_per_wg;
+    return @as(u64, row_groups) * @as(u64, upper_blocks);
+}
+
+fn recordMoeRouteColsActiveProfile(
+    engine: *InferenceEngine,
+    kind: MoeRouteColsActiveKind,
+    rows: u32,
+    rows_per_wg: u32,
+    upper_blocks: u32,
+) void {
+    if (!engine.profile_enabled) return;
+
+    const idx: usize = @intFromEnum(kind);
+    var stat = &engine.request_profile.route_cols_active_stats[idx];
+    stat.calls += 1;
+    stat.upper_blocks += upper_blocks;
+    stat.threadgroups += moeRouteColsActiveThreadgroups(rows, rows_per_wg, upper_blocks);
+}
+
+fn moeRouteColsActiveKindForQuant(quant: GGMLType) ?MoeRouteColsActiveKind {
+    return switch (quant) {
+        .q4_k => .q4k,
+        .q5_1 => .q5_1,
+        .q5_k => .q5k,
+        .q6_k => .q6k,
+        .q8_0 => .q8_0,
+        else => null,
+    };
+}
+
+fn routeColsActiveStat(profile: RuntimeProfile, kind: MoeRouteColsActiveKind) MoeRouteColsActiveStat {
+    return profile.route_cols_active_stats[@intFromEnum(kind)];
+}
+
+fn routeColsActiveTotalCalls(profile: RuntimeProfile) u32 {
+    var calls: u32 = 0;
+    for (profile.route_cols_active_stats) |stat| calls += stat.calls;
+    return calls;
+}
+
+fn logMoeRouteColsActiveStats(label: []const u8, profile: RuntimeProfile) void {
+    if (routeColsActiveTotalCalls(profile) == 0) return;
+
+    const q4k = routeColsActiveStat(profile, .q4k);
+    const q4k_geglu = routeColsActiveStat(profile, .q4k_geglu);
+    const q5_1 = routeColsActiveStat(profile, .q5_1);
+    const q5k = routeColsActiveStat(profile, .q5k);
+    const q6k = routeColsActiveStat(profile, .q6k);
+    const q8_0 = routeColsActiveStat(profile, .q8_0);
+    log.info("  {s} route cols active: q4k {d}/{d}/{d} q4k-geglu {d}/{d}/{d} q5_1 {d}/{d}/{d} q5k {d}/{d}/{d} q6k {d}/{d}/{d} q8_0 {d}/{d}/{d} (calls/upper-blocks/tgs)", .{
+        label,
+        q4k.calls,
+        q4k.upper_blocks,
+        q4k.threadgroups,
+        q4k_geglu.calls,
+        q4k_geglu.upper_blocks,
+        q4k_geglu.threadgroups,
+        q5_1.calls,
+        q5_1.upper_blocks,
+        q5_1.threadgroups,
+        q5k.calls,
+        q5k.upper_blocks,
+        q5k.threadgroups,
+        q6k.calls,
+        q6k.upper_blocks,
+        q6k.threadgroups,
+        q8_0.calls,
+        q8_0.upper_blocks,
+        q8_0.threadgroups,
+    });
 }
 
 fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
@@ -1459,6 +1559,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             }
         }
     }
+    logMoeRouteColsActiveStats(label, profile);
     if (profile.queued_prefill_requests > 0) {
         log.info("  {s} queued prefill: requests {d} prompt_tokens {d} chunks {d} async {d} chunk_base {d} requested {d} min {d} max {d} final {d} first_chunks [{d},{d},{d},{d},{d},{d},{d},{d}] total_listed {d}", .{
             label,
@@ -10930,6 +11031,10 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
 ) !void {
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
+    const rows_per_wg: u32 = 8;
+    if (moeRouteColsActiveKindForQuant(tensor.info.type_)) |kind| {
+        recordMoeRouteColsActiveProfile(engine, kind, M, rows_per_wg, route_blocks);
+    }
 
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
@@ -10961,7 +11066,6 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
         active_blocks_buf,
         active_block_count_buf,
     };
-    const rows_per_wg: u32 = 8;
     cmd.dispatchV2(
         pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
@@ -10999,6 +11103,8 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
 
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks * 2);
+    const rows_per_wg: u32 = 8;
+    recordMoeRouteColsActiveProfile(engine, .q4k_geglu, M, rows_per_wg, route_blocks);
 
     const push = MoeColsGateUpDmmvPush{
         .M = M,
@@ -11023,7 +11129,6 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         active_blocks_buf,
         active_block_count_buf,
     };
-    const rows_per_wg: u32 = 8;
     cmd.dispatchV2(
         &engine.dmmv_q4k_moe_cols_geglu_pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
@@ -29952,6 +30057,13 @@ test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
     try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * 8, 256));
+}
+
+test "moe route cols active profile counts launched row-block threadgroups" {
+    try std.testing.expectEqual(@as(u64, 0), moeRouteColsActiveThreadgroups(2816, 8, 0));
+    try std.testing.expectEqual(@as(u64, 352), moeRouteColsActiveThreadgroups(2816, 8, 1));
+    try std.testing.expectEqual(@as(u64, 440_880), moeRouteColsActiveThreadgroups(704, 8, 5010));
+    try std.testing.expectEqual(@as(u64, 1_704_736), moeRouteColsActiveThreadgroups(2816, 8, 4843));
 }
 
 test "gemma batched prefill route mode names active-block selection" {
