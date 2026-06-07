@@ -84,6 +84,7 @@ const GatedNormPush = extern struct {
 };
 const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
+const DeintPush = extern struct { head_dim: u32, n_head: u32 };
 const ArgmaxPush = extern struct { N: u32 };
 
 /// Map a GGUF quant type to its DMMV kernel pipeline (indexes ForwardCuda.dmmv).
@@ -165,6 +166,7 @@ const Pipelines = struct {
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
     sigmoid_mul: CudaPipeline,
+    deinterleave: CudaPipeline,
     ssm_conv1d: CudaPipeline,
     ssm_delta_net: CudaPipeline,
     ssm_gated_norm: CudaPipeline,
@@ -185,6 +187,7 @@ pub const ForwardCuda = struct {
     // activation scratch (device, f32)
     hidden: CudaBuffer,
     norm_buf: CudaBuffer,
+    qfull_buf: CudaBuffer, // [2*q_dim] packed [Q|gate] interleaved per head (attn)
     q_buf: CudaBuffer,
     k_buf: CudaBuffer,
     v_buf: CudaBuffer,
@@ -231,12 +234,13 @@ pub const ForwardCuda = struct {
         pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
         pipes.sigmoid_mul = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_mul");
+        pipes.deinterleave = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate");
         pipes.ssm_conv1d = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d");
         pipes.ssm_delta_net = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net");
         pipes.ssm_gated_norm = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm");
         pipes.swiglu = try pipeline.createPipeline(ctx, src.ptr, "swiglu");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{15});
+        log.info("nvrtc: compiled {d} kernel pipelines", .{16});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -249,6 +253,7 @@ pub const ForwardCuda = struct {
             .pipes = pipes,
             .hidden = try buffer.createBuffer(ctx, d.n_embd * f4),
             .norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
+            .qfull_buf = try buffer.createBuffer(ctx, 2 * d.q_dim * f4),
             .q_buf = try buffer.createBuffer(ctx, d.q_dim * f4),
             .k_buf = try buffer.createBuffer(ctx, d.kv_dim * f4),
             .v_buf = try buffer.createBuffer(ctx, d.kv_dim * f4),
@@ -318,7 +323,7 @@ pub const ForwardCuda = struct {
 
     pub fn deinit(self: *ForwardCuda) void {
         const a = self.allocator;
-        inline for (.{ &self.hidden, &self.norm_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.inv_freq, &self.sinks }) |b| {
+        inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
         for (self.kv_k) |*b| buffer.freeBuffer(b);
@@ -398,13 +403,14 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        // Q, gate, K, V projections from norm_buf
-        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.q_buf, d.q_dim, d.n_embd, 0);
-        // qwen35 attention gate is packed into attn_q's upper half (rows q_dim..2*q_dim),
-        // reached via the DMMV byte a_offset — there is no separate attn_gate tensor.
-        const q_row_bytes = (d.n_embd / wq.info.type_.blockSize()) * wq.info.type_.bytesPerBlock();
-        const gate_push = DmmvPush{ .M = d.q_dim, .K = d.n_embd, .a_offset = d.q_dim * q_row_bytes };
-        cmd.dispatch(&self.pipes.dmmv[dmmvIdx(wq.info.type_)], .{ d.q_dim, 1, 1 }, .{ 256, 1, 1 }, &.{ &wq.gpu_buffer, &self.norm_buf, &self.gate_buf }, &gate_push, @sizeOf(DmmvPush), 0);
+        // Q+gate, K, V projections from norm_buf.
+        // qwen35 packs the attention gate INTO attn_q: wq outputs 2*q_dim, laid out
+        // per head as [Q(head_dim) | gate(head_dim)] interleaved across heads
+        // ([Q0,g0,Q1,g1,...]). Project the full 2*q_dim, then deinterleave into
+        // contiguous q_buf (the Q halves) and gate_buf (the gate halves).
+        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.qfull_buf, 2 * d.q_dim, d.n_embd, 0);
+        const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
+        cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &self.qfull_buf, &self.q_buf, &self.gate_buf }, &deint, @sizeOf(DeintPush), 0);
         self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, d.kv_dim, d.n_embd, 0);
         self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, d.kv_dim, d.n_embd, 0);
         // per-head q/k rms norm

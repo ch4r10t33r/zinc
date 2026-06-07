@@ -460,6 +460,22 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_cuda_run.addArgs(args);
         const cuda_run_step = b.step("cuda-run", "Build & run the CUDA greedy-decode driver (Linux/NVIDIA)");
         cuda_run_step.dependOn(&run_cuda_run.step);
+
+        // CUDA per-layer debug dump — drives forward_cuda layer-by-layer via the
+        // public hooks, printing the residual-stream norm after each layer, to
+        // diff against a llama.cpp per-layer reference and pinpoint divergence.
+        const cuda_dbg_mod = b.createModule(.{
+            .root_source_file = b.path("src/dbg_cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureCudaModule(b, target, cuda_dbg_mod);
+        const cuda_dbg_exe = b.addExecutable(.{ .name = "cuda-dbg", .root_module = cuda_dbg_mod });
+        const run_cuda_dbg = b.addRunArtifact(cuda_dbg_exe);
+        if (b.args) |args| run_cuda_dbg.addArgs(args);
+        const cuda_dbg_step = b.step("cuda-dbg", "Build & run the CUDA per-layer debug dump (Linux/NVIDIA)");
+        cuda_dbg_step.dependOn(&run_cuda_dbg.step);
     }
 
     // --- Documentation ---

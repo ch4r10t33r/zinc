@@ -43,6 +43,9 @@ const forward_mod = if (gpu.is_vulkan) @import("compute/forward.zig") else struc
 // Backend-specific imports (only one branch compiles per platform)
 const instance_mod = if (gpu.is_vulkan) @import("vulkan/instance.zig") else gpu.backend;
 const gpu_detect = if (gpu.is_vulkan) @import("vulkan/gpu_detect.zig") else struct {};
+// CUDA: backend modules (only resolve under -Dbackend=cuda; stubbed elsewhere)
+const cuda_device_mod = if (gpu.is_cuda) @import("cuda/device.zig") else struct {};
+const loader_cuda_mod = if (gpu.is_cuda) @import("model/loader_cuda.zig") else struct {};
 const forward_cuda_mod = if (gpu.is_cuda) @import("compute/forward_cuda.zig") else struct {};
 const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
@@ -116,6 +119,18 @@ comptime {
         _ = @import("server/model_manager_metal.zig");
         _ = @import("server/model_manager_runtime.zig");
         _ = @import("server/routes.zig");
+    }
+    if (gpu.is_cuda) {
+        // CUDA: force-compile the CUDA backend modules + the shared catalog/
+        // managed-model code the CUDA CLI path reuses.
+        _ = @import("cuda/device.zig");
+        _ = @import("cuda/buffer.zig");
+        _ = @import("cuda/pipeline.zig");
+        _ = @import("cuda/command.zig");
+        _ = @import("model/loader_cuda.zig");
+        _ = @import("compute/forward_cuda.zig");
+        _ = @import("model/catalog.zig");
+        _ = @import("model/managed.zig");
     }
     // Platform-independent modules
     _ = @import("model/config.zig");
@@ -924,6 +939,31 @@ fn resolveManagedGpuSupport(device_index: u32, allocator: std.mem.Allocator) !Ma
         };
     }
 
+    if (gpu.is_cuda) {
+        // CUDA: probe the best NVIDIA device, derive the catalog profile from
+        // the device name, and use free VRAM as the fit budget (mirrors the
+        // Metal branch's working-set budget). device_index is ignored here —
+        // initBest picks the highest-CC device (5090 over 4090).
+        var device = try cuda_device_mod.CudaDevice.initBest(allocator);
+        defer device.deinit();
+
+        const profile = catalog_mod.profileForCuda();
+        const vram_budget_bytes = blk: {
+            const free = device.freeMemory();
+            break :blk if (free > 0) free else device.totalMemory();
+        };
+        var name_buf: [256]u8 = undefined;
+        const device_name = device.name(&name_buf);
+
+        try managed_mod.writeCachedGpuProfile(device_index, profile, device_name, vram_budget_bytes, allocator);
+
+        return .{
+            .profile = try allocator.dupe(u8, profile),
+            .vram_budget_bytes = vram_budget_bytes,
+            .from_cache = false,
+        };
+    }
+
     return error.GpuDetectionUnavailable;
 }
 
@@ -1596,6 +1636,196 @@ fn writeDecodeGraphArtifacts(
     }
 }
 
+// CUDA: prompt-mode entrypoint for the NVIDIA backend. Only referenced (and
+// therefore only analyzed) under -Dbackend=cuda. Does a real greedy decode:
+// load → forward init → tokenize → prefill (one decodeStep per prompt token) →
+// greedy generate (feed argmax back) → detokenize → print. Server mode is not
+// yet supported on CUDA.
+fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
+    const model_path = config.model_path orelse {
+        // model_id resolution flows through resolveStartupModel in main(); on
+        // the CUDA path we only support an explicit -m/--model for now.
+        log.err("CUDA backend requires an explicit model path: zinc -m <model.gguf> --prompt \"...\"", .{});
+        return error.NoModelSpecified;
+    };
+
+    var device = try cuda_device_mod.CudaDevice.initBest(allocator);
+    defer device.deinit();
+    var name_buf: [256]u8 = undefined;
+    log.info("ZINC CUDA backend — {s} (sm_{d}, {d} SMs)", .{
+        device.name(&name_buf), device.computeCapability(), device.smCount(),
+    });
+
+    if (config.prompt == null) {
+        log.err("CUDA backend currently supports prompt mode only. Pass --prompt \"...\" (server mode is not yet wired on CUDA).", .{});
+        return error.ServerModeUnavailableOnThisBackend;
+    }
+    const prompt = config.prompt.?;
+
+    // Load the model onto the GPU (weights uploaded verbatim-quantized).
+    var model = loader_cuda_mod.Model.load(allocator, device.ctx, model_path) catch |err| {
+        log.err("Failed to load model: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer model.deinit();
+
+    // Build the forward state. max_ctx must cover prompt + generated tokens.
+    const max_ctx: u32 = if (config.context_length) |c| c else 2048;
+    var fwd = forward_cuda_mod.ForwardCuda.init(allocator, &model, max_ctx) catch |err| {
+        log.err("Failed to init CUDA forward pass: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer fwd.deinit();
+    log.info("CUDA forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
+        fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
+    });
+
+    // Tokenizer is backend-agnostic — built from the GGUF metadata.
+    var tokenizer = tokenizer_mod.Tokenizer.initFromGGUF(&model.gguf_file, allocator) catch |err| {
+        log.err("Failed to init tokenizer from GGUF: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer tokenizer.deinit();
+
+    const auto_chat = !config.chat and !config.raw_prompt and shouldAutoChatCliPrompt(&tokenizer, prompt);
+    const use_chat_prompt = config.chat or auto_chat;
+    var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, allocator);
+    defer prepared_prompt.deinit(allocator);
+
+    const prompt_tokens = try tokenizer.encodePrompt(prepared_prompt.text, allocator);
+    defer allocator.free(prompt_tokens);
+    if (prompt_tokens.len == 0) {
+        log.err("Prompt tokenized to zero tokens.", .{});
+        return error.EmptyPrompt;
+    }
+
+    log.info("Prompt: {s}", .{prompt});
+    log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 30)] });
+
+    const eos_id = tokenizer.eosId();
+    const max_new: u32 = config.max_tokens;
+
+    // Clamp generation so prompt + generated never exceeds the KV/SSM context.
+    if (prompt_tokens.len >= max_ctx) {
+        log.err("Prompt ({d} tokens) does not fit in context ({d}); pass -c <larger>.", .{ prompt_tokens.len, max_ctx });
+        return error.ContextTooSmall;
+    }
+
+    var generated: std.ArrayList(u32) = .{};
+    defer generated.deinit(allocator);
+
+    // PREFILL: run one decodeStep per prompt token (pos 0..T-1). The prediction
+    // returned for the last prompt token is the first generated token.
+    var pos: u32 = 0;
+    var next_tok: u32 = 0;
+    while (pos < prompt_tokens.len) : (pos += 1) {
+        next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
+    }
+
+    // GENERATE: greedily feed the argmax back until EOS or the token budget /
+    // context limit is reached.
+    var produced: u32 = 0;
+    while (produced < max_new and pos < max_ctx) {
+        if (next_tok == eos_id) break;
+        try generated.append(allocator, next_tok);
+        produced += 1;
+        if (produced >= max_new or pos >= max_ctx) break;
+        const fed = next_tok;
+        next_tok = try fwd.decodeStep(fed, pos, true);
+        pos += 1;
+    }
+
+    if (config.debug) {
+        log.debug("Generated tokens ({d}): {any}", .{
+            generated.items.len, generated.items[0..@min(generated.items.len, 20)],
+        });
+    }
+
+    // Detokenize → text.
+    var text_buf: std.ArrayList(u8) = .{};
+    defer text_buf.deinit(allocator);
+    for (generated.items) |tid| {
+        var dec_buf: [256]u8 = undefined;
+        const decoded = tokenizer.decodeToken(tid, &dec_buf);
+        if (decoded.len > 0) {
+            try text_buf.appendSlice(allocator, decoded);
+        } else {
+            try text_buf.appendSlice(allocator, "<?>");
+        }
+    }
+    const output_text = trimCliOutputText(text_buf.items, use_chat_prompt);
+    log.info("Output ({d} tokens): {s}", .{ generated.items.len, output_text });
+}
+
+// CUDA: `zinc --check` for NVIDIA. Detects the best CUDA device and prints a
+// diagnostics report (device name, compute capability, SMs, VRAM, backend),
+// then OK. diagnostics_mod is a no-op stub on the CUDA backend, so this is the
+// operator-facing preflight on this platform.
+fn runCudaCheck(config: Config, check_target: ResolvedCheckTarget, allocator: std.mem.Allocator) !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    const w = &stdout_writer.interface;
+
+    try w.print("\n=== ZINC System Diagnostics ===\n", .{});
+    try w.print("\n[1/2] Host Environment\n", .{});
+    try w.print("  OS: {s} [OK]\n", .{@tagName(builtin.os.tag)});
+    try w.print("  CPU arch: {s} [OK]\n", .{@tagName(builtin.cpu.arch)});
+    try w.print("  Backend: cuda [OK]\n", .{});
+
+    try w.print("\n[2/2] CUDA Device\n", .{});
+    var device = cuda_device_mod.CudaDevice.initBest(allocator) catch |err| {
+        try w.print("  CUDA init: FAILED ({s}) [FAIL]\n", .{@errorName(err)});
+        try w.print("\nVerdict: NOT READY [FAIL]\n", .{});
+        try w.flush();
+        return error.DiagnosticsFailed;
+    };
+    defer device.deinit();
+
+    var name_buf: [256]u8 = undefined;
+    const name = device.name(&name_buf);
+    const cc = device.computeCapability();
+    const total = device.totalMemory();
+    const free = device.freeMemory();
+    try w.print("  CUDA init: Initialized best device (index {d}) [OK]\n", .{device.device_index});
+    try w.print("  Device: {s} [OK]\n", .{name});
+    try w.print("  Compute capability: sm_{d} [OK]\n", .{cc});
+    try w.print("  SM count: {d} [OK]\n", .{device.smCount()});
+    try w.print("  Warp size: {d}\n", .{device.warpSize()});
+    try w.print("  Total VRAM: {d:.2} GiB [OK]\n", .{bytesToGiBf(total)});
+    try w.print("  Free VRAM: {d:.2} GiB [OK]\n", .{bytesToGiBf(free)});
+
+    // Optional model-fit note (catalog size vs free VRAM); GGUF inspection of an
+    // installed model when a managed id / path was supplied.
+    if (check_target.managed_model) |managed| {
+        try w.print("  Managed model: {s} ({s})\n", .{ managed.id, managed.status_label });
+        const status = if (managed.size_bytes <= free) "[OK]" else "[WARN]";
+        try w.print("  Catalog size: {d:.2} GiB of weights vs {d:.2} GiB free VRAM {s}\n", .{
+            bytesToGiBf(managed.size_bytes), bytesToGiBf(free), status,
+        });
+    }
+    if (check_target.model_path) |path| {
+        const cfg = loader_cuda_mod.inspectConfig(path, allocator) catch |err| blk: {
+            try w.print("  GGUF: inspection failed for {s}: {s} [WARN]\n", .{ path, @errorName(err) });
+            break :blk null;
+        };
+        if (cfg) |c| {
+            try w.print("  GGUF: {s} [OK]\n", .{path});
+            try w.print("  architecture: {s} | {d} layers | {d} heads ({d} KV) | dim {d} | vocab {d}\n", .{
+                @tagName(c.architecture), c.n_layers, c.n_heads, c.n_kv_heads, c.hidden_dim, c.vocab_size,
+            });
+        }
+    }
+
+    _ = config;
+    try w.print("\nVerdict: READY [OK]\n", .{});
+    try w.flush();
+}
+
+/// Bytes → GiB as f64 for diagnostics formatting.
+fn bytesToGiBf(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
+
 /// Parse arguments, dispatch model-management commands, run diagnostics, or start inference.
 /// In prompt mode the engine runs up to `max_tokens` forward passes and prints the decoded output.
 /// In server mode an HTTP listener is started and requests are handled until SIGINT/SIGTERM.
@@ -1643,6 +1873,16 @@ pub fn main() !void {
             "src/shaders/metal"
         else
             "zig-out/share/zinc/shaders";
+
+        if (comptime gpu.is_cuda) {
+            // CUDA: diagnostics_mod is the no-op stub on this backend, so run a
+            // dedicated NVIDIA preflight (detect device + report + OK).
+            runCudaCheck(config, check_target, allocator) catch |err| {
+                log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            return;
+        }
 
         diagnostics_mod.run(.{
             .device_index = config.device_index,
@@ -1898,12 +2138,12 @@ pub fn main() !void {
         return;
     }
 
-    if (gpu.is_cuda) {
-        // CUDA backend (Linux/WSL2 + NVIDIA). forward_cuda owns device init +
-        // weight load + the forward pass. Mirrors the Metal branch above: this
-        // returns, so the Vulkan tail below is comptime-dead here.
-        forward_cuda_mod.run(allocator, config) catch |err| {
-            log.err("CUDA forward failed: {s}", .{@errorName(err)});
+    // CUDA: NVIDIA / WSL2 backend. Placed before the Vulkan tail; the
+    // `return` makes the Vulkan code below comptime-unreachable on CUDA (same
+    // pattern as the Metal block above), so it is never analyzed here.
+    if (comptime gpu.is_cuda) {
+        runCuda(config, allocator) catch |err| {
+            log.err("CUDA run failed: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
         return;

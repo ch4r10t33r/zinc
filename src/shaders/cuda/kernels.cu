@@ -1149,3 +1149,19 @@ extern "C" __global__ void sigmoid_mul(const float* a, const float* gate, float*
     float g = gate[idx];
     out[idx] = a[idx] * (1.0f / (1.0f + expf(-g)));
 }
+
+// ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
+// wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
+// interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and
+// gate_out (each [n_head*head_dim]). One thread per (head,dim) element.
+struct DeintPush { unsigned head_dim, n_head; };
+extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, float* gate_out, DeintPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = pc.n_head * pc.head_dim;
+    if (i >= total) return;
+    unsigned h = i / pc.head_dim;
+    unsigned d = i % pc.head_dim;
+    unsigned src = h * 2u * pc.head_dim + d;
+    q_out[i]    = qfull[src];
+    gate_out[i] = qfull[src + pc.head_dim];
+}
