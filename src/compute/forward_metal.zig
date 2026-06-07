@@ -12199,7 +12199,8 @@ fn dispatchScaleInPlaceOnCmd(
     const push = ScaleAccPush{ .n = n, .scale_bits = @as(u32, @bitCast(scale)) };
     const bufs = [_]*const MetalBuffer{buf};
     cmd.dispatchV2(&engine.scale_in_place_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
-    profileBarrier(cmd, profile, barrier_class);
+    // scale_in_place publishes only `buf`; keep unrelated queued writes free to overlap.
+    profileResourceBarrierBuffers(cmd, profile, barrier_class, &.{buf});
 }
 
 fn dispatchAddBiasOnCmd(
