@@ -183,10 +183,22 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
 });
 
-test("default RDNA cases include Qwen 3.5 9B and Qwen 3.6 27B dense", () => {
+test("default RDNA cases include Gemma and current Qwen rows", () => {
   const cases = defaultRdnaCases("/root/models");
+  const gemma26 = cases.find((entry) => entry.id === "gemma4-26b-a4b-q4k-m");
+  const gemma31 = cases.find((entry) => entry.id === "gemma4-31b-q4k-m");
   const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
   const qwen35 = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
+
+  expect(gemma26?.model_path).toBe("/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf");
+  expect(gemma26?.prompt_mode).toBe("chat");
+  expect(gemma26?.prompt).toContain("benchmark screenshots");
+  expect(gemma26?.max_tokens).toBe(96);
+
+  expect(gemma31?.model_path).toBe("/root/models/gemma-4-31B-it-Q4_K_M.gguf");
+  expect(gemma31?.prompt_mode).toBe("chat");
+  expect(gemma31?.prompt).toContain("benchmark screenshots");
+  expect(gemma31?.max_tokens).toBe(96);
 
   expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
   expect(qwen36Dense?.prompt_mode).toBe("raw");

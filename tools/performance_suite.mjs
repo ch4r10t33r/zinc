@@ -1734,6 +1734,28 @@ async function discoverMetalCases(modelRoot) {
 export function defaultRdnaCases(modelRoot) {
   return [
     {
+      id: "gemma4-26b-a4b-q4k-m",
+      label: "Gemma 4 26B-A4B MoE Q4_K_M",
+      family: "Gemma 4",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("gemma4-26b-a4b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m"),
+      notes: ["RDNA4 Gemma MoE comparison against llama.cpp server"],
+    },
+    {
+      id: "gemma4-31b-q4k-m",
+      label: "Gemma 4 31B Q4_K_M",
+      family: "Gemma 4",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "gemma-4-31B-it-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("gemma4-31b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("gemma4-31b-q4k-m"),
+      notes: ["RDNA4 dense Gemma comparison against llama.cpp server"],
+    },
+    {
       id: "qwen36-35b-a3b-q4k-xl",
       label: "Qwen 3.6 35B A3B UD Q4_K_XL",
       family: "Qwen 3.6",
