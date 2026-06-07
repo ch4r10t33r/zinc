@@ -344,7 +344,9 @@ kernel void main0(
 
     device float* dst_f32 = Y + (p.y_offset / 4);
 
-    for (int row = 0; row < NR0 && first_row + row < (int)p.M; ++row) {
+    // The Zig dispatcher only routes vocab-size multiples of 4 here, so the
+    // NR0=2 rows in both simdgroups are always in bounds.
+    FOR_UNROLL (int row = 0; row < NR0; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             const uint idx = uint(first_row + row);
