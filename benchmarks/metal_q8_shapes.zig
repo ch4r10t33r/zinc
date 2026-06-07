@@ -26,6 +26,8 @@ const DmmvPush = extern struct {
     y_offset: u32,
 };
 
+const skip_logits_y_offset: u32 = std.math.maxInt(u32);
+
 const DualQ8DmmvPush = extern struct {
     M0: u32,
     M1: u32,
@@ -176,6 +178,7 @@ fn moeRoutePackThreadgroupSize(n_experts: u32) u32 {
 const CaseId = enum {
     all,
     lm_head,
+    lm_head_q4k_argmax,
     attn_q,
     attn_k,
     attn_v,
@@ -326,7 +329,7 @@ fn helpText() []const u8 {
     \\Options:
     \\  -m, --model <path>         GGUF model path (required)
     \\  -d, --device <index>       Metal device index (default: 0)
-    \\  --case <name>              all | lm_head | attn_q | attn_k | attn_v | attn_out
+    \\  --case <name>              all | lm_head | lm_head_q4k_argmax | attn_q | attn_k | attn_v | attn_out
     \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
     \\                            | router | router_f32_fused
     \\                            | shared_gate | shared_up | shared_down | shared_dual
@@ -361,6 +364,7 @@ fn parseU32(arg: []const u8) !u32 {
 fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "all")) return .all;
     if (std.mem.eql(u8, arg, "lm_head")) return .lm_head;
+    if (std.mem.eql(u8, arg, "lm_head_q4k_argmax")) return .lm_head_q4k_argmax;
     if (std.mem.eql(u8, arg, "attn_q")) return .attn_q;
     if (std.mem.eql(u8, arg, "attn_k")) return .attn_k;
     if (std.mem.eql(u8, arg, "attn_v")) return .attn_v;
@@ -404,6 +408,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .shared_down_gemm,
             .dense_gate_up_geglu,
             .post_norm_residual_wide,
+            .lm_head_q4k_argmax,
             => false,
             else => true,
         },
@@ -575,6 +580,21 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .tensor0 = tensor,
                 .rows0 = try tensorRows(tensor),
                 .cols = try tensorCols(tensor),
+            };
+        },
+        .lm_head_q4k_argmax => blk: {
+            const tensor = findTensorByName(model, "output.weight") orelse
+                findTensorByName(model, "token_embd.weight") orelse return error.MissingLmHeadTensor;
+            if (tensor.info.type_ != .q4_k) return error.ExpectedQ4KTensor;
+            const rows = try tensorRows(tensor);
+            const cols = try tensorCols(tensor);
+            if (rows < 65536 or rows % 4 != 0 or cols % 256 != 0) return error.InvalidTensorShape;
+            break :blk .{
+                .key = "lm_head_q4k_argmax",
+                .label = "Q4_K LM head + argmax partials",
+                .tensor0 = tensor,
+                .rows0 = rows,
+                .cols = cols,
             };
         },
         .attn_q => blk: {
@@ -1396,6 +1416,46 @@ fn runDispatchBatch(
             &push,
             @sizeOf(DmmvPush),
             selection.push_idx,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn runLmHeadQ4KArgmaxDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    logits_buf: *const MetalBuffer,
+    partials_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    write_logits: bool,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = DmmvPush{
+        .M = rows,
+        .K = cols,
+        .a_offset = tensorPageOffset(model, tensor),
+        .x_offset = 0,
+        .y_offset = if (write_logits) 0 else skip_logits_y_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, logits_buf, partials_buf };
+    const rows_per_wg: u32 = 4;
+    const workgroups = (rows + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, 1, 1 },
+            .{ 64, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(DmmvPush),
+            1,
         );
     }
     cmd.commitAndWait();
@@ -2800,6 +2860,17 @@ fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows
     return try allocator.dupe(f32, ptr[0..rows]);
 }
 
+fn copyArgmaxPartialsAsF32(allocator: std.mem.Allocator, partials_buf: *const MetalBuffer, n_pairs: u32) ![]f32 {
+    const words: [*]const u32 = @ptrCast(@alignCast(partials_buf.cpu_ptr.?));
+    const out = try allocator.alloc(f32, @as(usize, n_pairs) * 2);
+    for (0..n_pairs) |i| {
+        const word_idx = i * 2;
+        out[word_idx + 0] = @floatFromInt(words[word_idx + 0]);
+        out[word_idx + 1] = @bitCast(words[word_idx + 1]);
+    }
+    return out;
+}
+
 fn checksumOutput(output: []const f32) f64 {
     if (output.len == 0) return 0.0;
     const probe = @min(output.len, 32);
@@ -2876,6 +2947,93 @@ fn benchmarkVariant(
         .rows_per_wg = selection.rows_per_wg,
         .thread_execution_width = selection.pipe.thread_execution_width,
         .static_threadgroup_memory_length = selection.pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
+fn benchmarkLmHeadQ4KArgmaxVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+    write_logits: bool,
+) !BenchResult {
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_lmhead_argmax");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 64) return error.InvalidThreadgroupSize;
+
+    const rows_per_wg: u32 = 4;
+    const n_pairs = (hot_case.rows0 + rows_per_wg - 1) / rows_per_wg;
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var logits_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&logits_buf);
+    var partials_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_pairs) * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&partials_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    @memset(logits_buf.cpu_ptr.?[0..logits_buf.size], 0);
+    @memset(partials_buf.cpu_ptr.?[0..partials_buf.size], 0);
+
+    try runLmHeadQ4KArgmaxDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        model,
+        &input_buf,
+        &logits_buf,
+        &partials_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        write_logits,
+        warmup_iterations,
+    );
+    @memset(logits_buf.cpu_ptr.?[0..logits_buf.size], 0);
+    @memset(partials_buf.cpu_ptr.?[0..partials_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runLmHeadQ4KArgmaxDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        model,
+        &input_buf,
+        &logits_buf,
+        &partials_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        write_logits,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const weight_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyArgmaxPartialsAsF32(allocator, &partials_buf, n_pairs);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = if (write_logits) "write-logits" else "skip-logits",
+        .shader_name = "dmmv_q4k_lmhead_argmax",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = 1,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 64,
+        .rows_per_wg = rows_per_wg,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
         .weight_bytes_per_iter = weight_bytes,
         .total_ms = elapsed_ms,
         .ms_per_iter = ms_per_iter,
@@ -3609,7 +3767,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -3693,7 +3851,58 @@ pub fn main() !void {
         }
 
         const hot_case = try resolveHotCase(&model, case_id);
-        if (hot_case.is_batched_gemm) {
+        if (case_id == .lm_head_q4k_argmax) {
+            try stdout.interface.print(
+                "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} | partial_pairs={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    (hot_case.rows0 + 3) / 4,
+                    @as(f64, @floatFromInt(weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var write_result: ?BenchResult = null;
+            defer if (write_result) |*result| allocator.free(result.output);
+            var skip_result: ?BenchResult = null;
+            defer if (skip_result) |*result| allocator.free(result.output);
+
+            write_result = try benchmarkLmHeadQ4KArgmaxVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+                true,
+            );
+            try printBenchResult(&stdout, write_result.?);
+
+            skip_result = try benchmarkLmHeadQ4KArgmaxVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+                false,
+            );
+            try printBenchResult(&stdout, skip_result.?);
+
+            const diff = compareOutputs(write_result.?.output, skip_result.?.output);
+            const delta_pct = if (write_result.?.ms_per_iter > 0.0)
+                ((write_result.?.ms_per_iter - skip_result.?.ms_per_iter) / write_result.?.ms_per_iter) * 100.0
+            else
+                0.0;
+            try stdout.interface.print(
+                "  skip-logits vs write-logits: {d:.2}% ms/iter | max_abs {d:.6} | mean_abs {d:.6}\n",
+                .{ delta_pct, diff.max_abs, diff.mean_abs },
+            );
+        } else if (hot_case.is_batched_gemm) {
             try stdout.interface.print(
                 "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} N={d} | weight {d:.2} MiB/iter\n",
                 .{
