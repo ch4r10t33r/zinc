@@ -116,7 +116,6 @@ kernel void main0(
         device const uchar* src = is_k ? (W_k + p.a_k_offset) : (W_q + p.a_q_offset);
         device float* out = is_k ? (Y_k + (p.y_k_offset / 4)) : (Y_q + (p.y_q_offset / 4));
         const int dst_row_base = is_k ? (first_linear_row - int(p.M_q)) : first_linear_row;
-        const int M = is_k ? int(p.M_k) : int(p.M_q);
 
         device const float* x = X + (p.x_offset / 4);
         float sumf[NR0] = {0.f, 0.f};
@@ -243,7 +242,7 @@ kernel void main0(
         for (short row = 0; row < NR0; ++row) {
             const int dst_row = dst_row_base + row;
             const float total = simd_sum(sumf[row]);
-            if (tiisg == 0 && dst_row < M) out[dst_row] = total;
+            if (tiisg == 0) out[dst_row] = total;
         }
         return;
     }
@@ -329,7 +328,6 @@ kernel void main0(
     device float* out = Y_v + (p.y_v_offset / 4u);
     FOR_UNROLL (ushort row = 0u; row < NR0; ++row) {
         const uint dst_row = first_v_row + uint(row);
-        if (dst_row >= p.M_v) continue;
         const float total = simd_sum(sumf[row]);
         if (tiisg == 0u) out[dst_row] = total;
     }
