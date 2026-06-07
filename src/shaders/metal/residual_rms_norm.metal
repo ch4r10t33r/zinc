@@ -8,6 +8,7 @@ struct Params {
     float eps;
     float scale;
     uint residual_offset;
+    float hidden_scale;
 };
 
 // Fused residual-add + RMS norm: hidden += scale * residual; norm = weights * normalize(hidden)
@@ -36,6 +37,8 @@ kernel void main0(
 
     const uint base = group_id * p.n;
     const float scale = p.scale;
+    const float hidden_scale = p.hidden_scale;
+    const bool apply_hidden_scale = hidden_scale != 1.0f;
 
     // Pass 1: residual add + accumulate sum of squares.
     // Store residual-added values in register array to avoid re-reading hidden in pass 2.
@@ -44,7 +47,7 @@ kernel void main0(
     uint count = 0;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
         const float h = fma(scale, residual[p.residual_offset + base + i], hidden[base + i]);
-        hidden[base + i] = h;
+        hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;
         vals[count++] = h;
         sum_sq += h * h;
     }
