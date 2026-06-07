@@ -84,6 +84,44 @@ const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
 
+fn gemmaPrefillTailTopkLimit(prompt_tokens: u32, base_limit: u32) u32 {
+    if (prompt_tokens > 0 and
+        prompt_tokens <= gemma_prefill_micro_prompt_tokens and
+        base_limit > gemma_prefill_micro_prompt_topk)
+        return gemma_prefill_micro_prompt_topk;
+    if (prompt_tokens > 0 and
+        prompt_tokens <= gemma_prefill_tiny_prompt_tokens and
+        base_limit > gemma_prefill_tiny_prompt_topk)
+        return gemma_prefill_tiny_prompt_topk;
+    if (prompt_tokens > 0 and
+        prompt_tokens <= gemma_prefill_short_prompt_tokens and
+        base_limit > gemma_prefill_short_prompt_topk)
+        return gemma_prefill_short_prompt_topk;
+    return base_limit;
+}
+
+fn gemmaPrefillTailGuard(prompt_tokens: u32, base_guard: u32) u32 {
+    const micro_guard = if (prompt_tokens >= gemma_prefill_long_draft_prompt_min_tokens and
+        prompt_tokens <= gemma_prefill_micro_prompt_tokens)
+        gemma_prefill_long_draft_prompt_guard_tokens
+    else
+        gemma_prefill_micro_prompt_guard_tokens;
+    if (prompt_tokens > 0 and
+        prompt_tokens <= gemma_prefill_micro_prompt_tokens and
+        base_guard > micro_guard)
+        return micro_guard;
+    return base_guard;
+}
+
+fn gemmaShortPrefillFastTailActive(prompt_tokens: u32, token_idx: u32, base_limit: u32, base_guard: u32) bool {
+    const limit = gemmaPrefillTailTopkLimit(prompt_tokens, base_limit);
+    const guard = gemmaPrefillTailGuard(prompt_tokens, base_guard);
+    return prompt_tokens >= gemma_prefill_long_draft_prompt_min_tokens and
+        prompt_tokens <= gemma_prefill_shared_skip_max_tokens and
+        limit == gemma_prefill_micro_prompt_topk and
+        token_idx + guard < prompt_tokens;
+}
+
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
     /// Current token position.
@@ -7414,6 +7452,19 @@ pub const InferenceEngine = struct {
                 lt.ffn_gate_inp_scale.?.info.numElements() >= hidden_dim and
                 self.elementwise.pipeline_rms_norm_scale_dmmv_f32 != null and
                 (hidden_dim % 4) == 0;
+            const skip_gemma_short_prefill_ffn_norm =
+                can_fuse_gemma_router and
+                lt.pre_ffw_norm_2 != null and
+                !self.partial_decode_stop_after_ffn_norm and
+                !self.use_capture_ffn_input and
+                self.prefill_active and
+                !collect_output and
+                gemmaShortPrefillFastTailActive(
+                    self.prefill_embed_big_token_count,
+                    self.prefill_current_token_idx,
+                    self.moe_prefill_tail_topk_limit,
+                    self.moe_prefill_tail_topk_guard_tokens,
+                );
             const can_store_partial_stop = self.partial_decode_stop_after_ffn_norm and
                 !resume_from_ffn_norm and
                 !can_fuse_rms_router and
@@ -7440,7 +7491,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!resume_from_ffn_norm and !can_fuse_rms_router) {
+            if (!resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,
@@ -7537,34 +7588,18 @@ pub const InferenceEngine = struct {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
                 const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
-                const gemma_short_prefill_limit: u32 = if (config.architecture == .gemma and
-                    self.prefill_embed_big_token_count > 0 and
-                    self.prefill_embed_big_token_count <= gemma_prefill_micro_prompt_tokens and
-                    self.moe_prefill_tail_topk_limit > gemma_prefill_micro_prompt_topk)
-                    gemma_prefill_micro_prompt_topk
-                else if (config.architecture == .gemma and
-                    self.prefill_embed_big_token_count > 0 and
-                    self.prefill_embed_big_token_count <= gemma_prefill_tiny_prompt_tokens and
-                    self.moe_prefill_tail_topk_limit > gemma_prefill_tiny_prompt_topk)
-                    gemma_prefill_tiny_prompt_topk
-                else if (config.architecture == .gemma and
-                    self.prefill_embed_big_token_count > 0 and
-                    self.prefill_embed_big_token_count <= gemma_prefill_short_prompt_tokens and
-                    self.moe_prefill_tail_topk_limit > gemma_prefill_short_prompt_topk)
-                    gemma_prefill_short_prompt_topk
+                const gemma_short_prefill_limit: u32 = if (config.architecture == .gemma)
+                    gemmaPrefillTailTopkLimit(
+                        self.prefill_embed_big_token_count,
+                        self.moe_prefill_tail_topk_limit,
+                    )
                 else
                     self.moe_prefill_tail_topk_limit;
-                const gemma_effective_micro_guard: u32 = if (config.architecture == .gemma and
-                    self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
-                    self.prefill_embed_big_token_count <= gemma_prefill_micro_prompt_tokens)
-                    gemma_prefill_long_draft_prompt_guard_tokens
-                else
-                    gemma_prefill_micro_prompt_guard_tokens;
-                const effective_prefill_tail_topk_guard: u32 = if (config.architecture == .gemma and
-                    self.prefill_embed_big_token_count > 0 and
-                    self.prefill_embed_big_token_count <= gemma_prefill_micro_prompt_tokens and
-                    self.moe_prefill_tail_topk_guard_tokens > gemma_effective_micro_guard)
-                    gemma_effective_micro_guard
+                const effective_prefill_tail_topk_guard: u32 = if (config.architecture == .gemma)
+                    gemmaPrefillTailGuard(
+                        self.prefill_embed_big_token_count,
+                        self.moe_prefill_tail_topk_guard_tokens,
+                    )
                 else
                     self.moe_prefill_tail_topk_guard_tokens;
                 const use_prefill_tail_topk = self.prefill_active and
@@ -7784,13 +7819,15 @@ pub const InferenceEngine = struct {
                 // Available to both GPU-routed and CPU-routed MoE paths.
                 // The 49-72 token RDNA prefill fast tail already uses top-1
                 // routed experts, skips the shared expert, and preserves the
-                // terminal guard exactly. Reuse ffn_norm_buf for those early
-                // tokens to avoid the extra pre_ffw_norm_2 dispatch+barrier
-                // that is charged to the moe.topk bucket.
+                // terminal guard exactly. Reuse the cheapest available
+                // normalized input for those early tokens; when the standalone
+                // FFN norm was skipped above, feed hidden_buf directly.
                 const skip_gemma_short_prefill_pre_norm_2 =
                     gemma_gpu_topk_moe and gemma_short_prefill_fast_tail and lt.pre_ffw_norm_2 != null;
                 const defer_gemma_pre_ffw_norm_2 = gemma_gpu_topk_moe and lt.pre_ffw_norm_2 != null and !skip_gemma_short_prefill_pre_norm_2;
-                const expert_input_buf = if (skip_gemma_short_prefill_pre_norm_2)
+                const expert_input_buf = if (skip_gemma_short_prefill_pre_norm_2 and skip_gemma_short_prefill_ffn_norm)
+                    self.hidden_buf
+                else if (skip_gemma_short_prefill_pre_norm_2)
                     self.ffn_norm_buf
                 else if (defer_gemma_pre_ffw_norm_2)
                     self.residual_buf
