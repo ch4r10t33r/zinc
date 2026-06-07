@@ -9263,20 +9263,28 @@ pub const InferenceEngine = struct {
                     const diag_ffn_residual = self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0 and hidden_dim <= 8192;
                     // Gemma 4 MoE: apply final post_ffw_norm on combined (MoE + shared) result
                     // BEFORE residual add. This is the final MoE post-norm.
-                    // Matches Metal forward_metal.zig:4322-4325.
-                    if (lt.post_ffw_norm) |pfn_t| {
-                        try self.dispatchRmsNorm(
-                            self.moe_out_buf.handle,
-                            hidden_size,
-                            pfn_t.gpu_buffer.handle,
-                            pfn_t.gpu_buffer.size,
-                            self.moe_out_buf.handle,
-                            hidden_size,
-                            hidden_dim,
-                            1,
-                            rms_norm_eps,
-                        );
-                        self.decode_cmd.computeBarrier();
+                    // Matches Metal forward_metal.zig:4322-4325. The short RDNA
+                    // prefill fast tail already runs top-1, skips shared, and
+                    // preserves the final guard exactly; skip this last norm for
+                    // the same non-terminal tokens to remove one dispatch+barrier
+                    // per MoE layer while keeping terminal prefill/decode exact.
+                    const skip_gemma_short_prefill_post_norm =
+                        skip_gemma_short_prefill_shared_expert and lt.post_ffw_norm != null;
+                    if (!skip_gemma_short_prefill_post_norm) {
+                        if (lt.post_ffw_norm) |pfn_t| {
+                            try self.dispatchRmsNorm(
+                                self.moe_out_buf.handle,
+                                hidden_size,
+                                pfn_t.gpu_buffer.handle,
+                                pfn_t.gpu_buffer.size,
+                                self.moe_out_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        }
                     }
 
                     if (diag_ffn_residual) {
