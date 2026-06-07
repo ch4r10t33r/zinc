@@ -20194,6 +20194,11 @@ fn runDecodeStep(
     // using the next layer's attn_norm weights, skip the redundant attn_norm
     // dispatch + barrier at the start of this layer.
     var prev_fused_attn_norm: bool = false;
+    // When the same fused tail also wrote hidden_buf, defer that dependency to
+    // the next residual join. The next layer's Q/K/V projections consume only
+    // norm_buf, so this mirrors llama.cpp's range fencing and lets attention
+    // projection work overlap the previous hidden update.
+    var prev_fused_hidden_barrier_deferred: bool = false;
 
     for (start_layer..cfg.n_layers) |layer_idx| {
         const layer: u32 = @intCast(layer_idx);
@@ -20305,9 +20310,15 @@ fn runDecodeStep(
             } else {
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
             }
-            if (initial_hidden_barrier_deferred and layer_idx == 0) {
+            const fence_deferred_hidden = prev_fused_hidden_barrier_deferred;
+            if ((initial_hidden_barrier_deferred and layer_idx == 0) or fence_deferred_hidden) {
                 profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.down_buf, &engine.hidden_buf });
-                initial_hidden_barrier_deferred = false;
+                if (initial_hidden_barrier_deferred and layer_idx == 0) {
+                    initial_hidden_barrier_deferred = false;
+                }
+                if (fence_deferred_hidden) {
+                    prev_fused_hidden_barrier_deferred = false;
+                }
             } else {
                 profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             }
@@ -21916,7 +21927,8 @@ fn runDecodeStep(
                     prev_fused_attn_norm = true;
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
                     if (!ends_dense_cmd_chunk) {
-                        profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                        profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.norm_buf});
+                        prev_fused_hidden_barrier_deferred = true;
                     }
                 } else {
                     if (engine.post_ffn_norm_present[layer_idx]) {
@@ -21941,7 +21953,12 @@ fn runDecodeStep(
                             );
                             prev_fused_attn_norm = true;
                             if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
-                                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                                if (layer_scale_runs_after_dense) {
+                                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                                } else {
+                                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.norm_buf});
+                                    if (!ends_dense_cmd_chunk) prev_fused_hidden_barrier_deferred = true;
+                                }
                             }
                         } else {
                             const layer_scale_runs_after_dense = layer_output_scale != 1.0 and
