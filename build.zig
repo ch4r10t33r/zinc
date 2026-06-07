@@ -244,6 +244,7 @@ pub fn build(b: *std.Build) void {
         "flash_attn_batched",
         "kv_cache_write_batched",
         "residual_rms_norm",
+        "post_norm_residual_rms_norm",
         "rms_norm_add",
         "dmmv_q4k_wide",
         "dmmv_q4k_moe_batched",

@@ -228,6 +228,14 @@ pub const ResidualRmsNormPush = extern struct {
     scale_bits: u32,
 };
 
+/// Push constants for fused post-norm + residual-add + RMS norm
+/// (src/shaders/post_norm_residual_rms_norm.comp). One dispatch replaces
+/// Gemma's post_attention_norm -> barrier -> residual_rms_norm sequence.
+pub const PostNormResidualRmsNormPush = extern struct {
+    n: u32,
+    eps: f32,
+};
+
 /// Push constants for fused residual-add + RMS norm + Q8_1 activation quantize
 /// (src/shaders/residual_rms_norm_quant_q8_1.comp). Same residual/RMS math as
 /// ResidualRmsNormPush, but also emits packed int8 lanes + (scale, dsum) so
@@ -384,6 +392,8 @@ pub const ElementwiseDispatch = struct {
     pipeline_kv_cache_write_batched: ?Pipeline,
     /// Fused residual-add + RMS norm for prefillBatched (4 bindings).
     pipeline_residual_rms_norm: ?Pipeline,
+    /// Fused Gemma post-attention norm + residual-add + FFN RMS norm (5 bindings).
+    pipeline_post_norm_residual_rms_norm: ?Pipeline,
     /// Fused residual-add + RMS norm + Q8_1 quantize for the Qwen3.6-27B
     /// dense FFN prefill DP4a path (6 bindings: hidden(rw), residual,
     /// norm_out, weights, packed_i8, scale_dsum). Saves one quantize_act_q8_1
@@ -731,6 +741,15 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        // post_norm_residual_rms_norm: 5 bindings (hidden, residual,
+        // post_norm_weights, norm_out, ffn_norm_weights). Fuses Gemma's
+        // post_attention_norm + residual add + ffn_norm sequence.
+        const post_norm_resnorm_path = std.fmt.bufPrint(&path_buf, "{s}/post_norm_residual_rms_norm.spv", .{shader_dir}) catch unreachable;
+        const pipeline_post_norm_residual_rms_norm = pipeline_mod.createFromSpirvWithOptions(instance, post_norm_resnorm_path, 5, @sizeOf(PostNormResidualRmsNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("post_norm_residual_rms_norm shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // residual_rms_norm_quant_q8_1: 6 bindings (hidden, residual, norm_out,
         // weights, packed_i8, scale_dsum). Used by the Qwen3.6-27B dense FFN
         // prefill DP4a path to fuse the quantize_act_q8_1 dispatch into the
@@ -843,6 +862,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_kv_cache_write = pipeline_kv_cache_write,
             .pipeline_kv_cache_write_batched = pipeline_kv_cache_write_batched,
             .pipeline_residual_rms_norm = pipeline_residual_rms_norm,
+            .pipeline_post_norm_residual_rms_norm = pipeline_post_norm_residual_rms_norm,
             .pipeline_residual_rms_norm_quant_q8_1 = pipeline_residual_rms_norm_quant_q8_1,
             .pipeline_rms_norm_add = pipeline_rms_norm_add,
             .pipeline_norm_rope = pipeline_norm_rope,
@@ -1370,6 +1390,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_kv_cache_write) |*p| p.deinit();
         if (self.pipeline_kv_cache_write_batched) |*p| p.deinit();
         if (self.pipeline_residual_rms_norm) |*p| p.deinit();
+        if (self.pipeline_post_norm_residual_rms_norm) |*p| p.deinit();
         if (self.pipeline_residual_rms_norm_quant_q8_1) |*p| p.deinit();
         if (self.pipeline_rms_norm_add) |*p| p.deinit();
         if (self.pipeline_norm_rope) |*p| p.deinit();

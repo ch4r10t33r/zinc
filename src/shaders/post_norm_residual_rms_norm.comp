@@ -1,0 +1,75 @@
+#version 460
+// ZINC - fused post-norm + residual add + next RMS norm for Gemma dense prefill.
+//
+// Semantics per token:
+//   r_norm[i] = post_w[i] * residual[i] * rsqrt(mean(residual^2) + eps)
+//   hidden[i] += r_norm[i]
+//   norm_out[i] = norm_w[i] * hidden[i] * rsqrt(mean(hidden^2) + eps)
+//
+// This replaces:
+//   rms_norm_mul(residual -> residual)
+//   barrier
+//   residual_rms_norm(hidden, residual -> norm_out)
+//
+// Dispatch: (n_tokens, 1, 1), local_size_x = 64.
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  n;
+    float eps;
+};
+
+layout(set = 0, binding = 0)          buffer Hidden      { float hidden[];     };
+layout(set = 0, binding = 1) readonly buffer Residual    { float residual[];   };
+layout(set = 0, binding = 2) readonly buffer PostWeights { float post_w[];     };
+layout(set = 0, binding = 3) writeonly buffer NormOut    { float norm_out[];   };
+layout(set = 0, binding = 4) readonly buffer NormWeights { float norm_w[];     };
+
+shared float s_partial[64];
+
+float reduce_sum(float local_sum) {
+    float total = subgroupAdd(local_sum);
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) s_partial[gl_SubgroupID] = total;
+        barrier();
+        if (gl_LocalInvocationID.x == 0u) {
+            float merged = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; sg++) merged += s_partial[sg];
+            s_partial[0] = merged;
+        }
+        barrier();
+        total = s_partial[0];
+    }
+    return total;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint token = gl_WorkGroupID.x;
+    uint base = token * n;
+
+    float residual_sum_sq = 0.0;
+    for (uint i = tid; i < n; i += 64u) {
+        float r = residual[base + i];
+        residual_sum_sq += r * r;
+    }
+    float residual_total = reduce_sum(residual_sum_sq);
+    float residual_rms_inv = inversesqrt((residual_total / float(n)) + eps);
+
+    float hidden_sum_sq = 0.0;
+    for (uint i = tid; i < n; i += 64u) {
+        float r_norm = post_w[i] * residual[base + i] * residual_rms_inv;
+        float h = hidden[base + i] + r_norm;
+        hidden[base + i] = h;
+        hidden_sum_sq += h * h;
+    }
+    float hidden_total = reduce_sum(hidden_sum_sq);
+    float hidden_rms_inv = inversesqrt((hidden_total / float(n)) + eps);
+
+    for (uint i = tid; i < n; i += 64u) {
+        norm_out[base + i] = norm_w[i] * hidden[base + i] * hidden_rms_inv;
+    }
+}

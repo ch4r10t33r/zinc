@@ -56,6 +56,7 @@ const DeinterleavePush = elementwise_mod.DeinterleavePush;
 const KvCacheWritePush = elementwise_mod.KvCacheWritePush;
 const KvCacheWriteBatchedPush = elementwise_mod.KvCacheWriteBatchedPush;
 const ResidualRmsNormPush = elementwise_mod.ResidualRmsNormPush;
+const PostNormResidualRmsNormPush = elementwise_mod.PostNormResidualRmsNormPush;
 const ResidualRmsNormQuantQ8_1Push = elementwise_mod.ResidualRmsNormQuantQ8_1Push;
 const RmsNormAddPush = elementwise_mod.RmsNormAddPush;
 const NormRopePush = elementwise_mod.NormRopePush;
@@ -10387,6 +10388,68 @@ pub const InferenceEngine = struct {
         }
         const ds = try self.allocDescSet(pip.descriptor_set_layout);
         self.writeDescSet4(ds, hidden, hidden_size, residual, residual_size, norm_out, norm_out_size, weights, weights_size);
+        self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), n_tokens, 1, 1);
+    }
+
+    /// Fused Gemma post-attention norm + residual add + FFN RMS norm.
+    ///   post = post_weights * residual / rms(residual)
+    ///   hidden += post
+    ///   norm_out = norm_weights * hidden / rms(hidden)
+    ///
+    /// Replaces post_attention_norm + barrier + residual_rms_norm in the
+    /// dense batched prefill path.
+    fn dispatchPostNormResidualRmsNorm(
+        self: *InferenceEngine,
+        hidden: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        residual: vk.c.VkBuffer,
+        residual_size: vk.c.VkDeviceSize,
+        post_weights: vk.c.VkBuffer,
+        post_weights_size: vk.c.VkDeviceSize,
+        norm_out: vk.c.VkBuffer,
+        norm_out_size: vk.c.VkDeviceSize,
+        norm_weights: vk.c.VkBuffer,
+        norm_weights_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        n_tokens: u32,
+        eps: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_post_norm_residual_rms_norm orelse return error.ShaderNotLoaded);
+        const push = PostNormResidualRmsNormPush{ .n = hidden_dim, .eps = eps };
+        if (pip.uses_push_descriptors) {
+            self.pushDispatch5(
+                pip,
+                std.mem.asBytes(&push),
+                hidden,
+                hidden_size,
+                residual,
+                residual_size,
+                post_weights,
+                post_weights_size,
+                norm_out,
+                norm_out_size,
+                norm_weights,
+                norm_weights_size,
+                n_tokens,
+                1,
+                1,
+            );
+            return;
+        }
+        const ds = try self.allocDescSet(pip.descriptor_set_layout);
+        self.writeDescSet5(
+            ds,
+            hidden,
+            hidden_size,
+            residual,
+            residual_size,
+            post_weights,
+            post_weights_size,
+            norm_out,
+            norm_out_size,
+            norm_weights,
+            norm_weights_size,
+        );
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), n_tokens, 1, 1);
     }
 
@@ -21346,7 +21409,33 @@ pub const InferenceEngine = struct {
         // Ensure scratch buffers are sized for this prompt — reused across
         // subsequent prefill calls so the alloc is amortized.
         const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
+        const base_token: u32 = state.position;
         try self.ensureBatchedScratchCapacity(n_tokens);
+
+        self.prefill_token_samples = 0;
+        self.prefill_cpu_embed_ns = 0;
+        self.prefill_cpu_record_ns = 0;
+        self.prefill_submit_wait_ns = 0;
+        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_total_ns = 0;
+        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
+        const profile_was_enabled = self.profile_enabled;
+        const prefill_active_was = self.prefill_active;
+        const enable_gpu_phase_timing = self.timestamp_query_pool != null and (want_gpu_phases or profile_was_enabled);
+        var profile_restored = !enable_gpu_phase_timing;
+        if (enable_gpu_phase_timing) {
+            self.profile_enabled = true;
+            self.prefill_active = true;
+            self.resetProfilingSamples();
+        }
+        defer {
+            if (!profile_restored) {
+                self.resetProfilingSamples();
+                self.profile_enabled = profile_was_enabled;
+                self.prefill_active = prefill_active_was;
+            }
+        }
 
         // ── Step 1: pre-dequantize all N embedding rows on the CPU into
         // prefill_embed_big (host-staged), then DMA-copy into
@@ -21363,6 +21452,7 @@ pub const InferenceEngine = struct {
             self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
             self.prefill_embed_big_capacity_bytes = total_embed_bytes;
         }
+        const cpu_embed_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
         {
             const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
             const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
@@ -21387,11 +21477,14 @@ pub const InferenceEngine = struct {
             self.prefill_embed_big_hidden = hidden_dim;
             self.prefill_embed_big_token_count = n_tokens;
         }
+        if (enable_gpu_phase_timing) {
+            const cpu_embed_end = std.time.nanoTimestamp();
+            self.prefill_cpu_embed_ns = @intCast(cpu_embed_end - cpu_embed_start);
+        }
 
         // Reset request state for a fresh prefill, or grow the KV page pool
         // if we are extending an existing conversation. Mirror the shape of
         // prefillBatch so pipelined prefill / decodeStep invariants hold.
-        const base_token: u32 = state.position;
         // Invariant: after batched prefill finishes, `state.position = base_token + n_tokens;`.
         const target_context_tokens = if (state.requested_context_tokens > 0)
             @max(state.requested_context_tokens, base_token +| n_tokens)
@@ -21413,9 +21506,15 @@ pub const InferenceEngine = struct {
         const scratch_up = self.batched_scratch_up.?;
         const scratch_swiglu = self.batched_scratch_swiglu.?;
         const scratch_down = self.batched_scratch_down.?;
+        // The final LM head below still uses dispatchDmmvInner on the last token.
 
+        const cpu_record_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
+        if (enable_gpu_phase_timing) {
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
 
         // ── Step 2: DMA embeddings host-staged → device-local scratch_hidden.
         {
@@ -21474,6 +21573,7 @@ pub const InferenceEngine = struct {
             // q_dim for architectures without attn_q_norm.
             const o_input_cols: u32 = @intCast(o_t.info.numElements() / hidden_dim);
 
+            const attention_phase = self.beginProfilePhase();
             // attn RMS norm: hidden → norm
             try self.dispatchRmsNorm(scratch_hidden.handle, scratch_hidden.size, attn_norm_t.gpu_buffer.handle, attn_norm_t.gpu_buffer.size, scratch_norm.handle, scratch_norm.size, hidden_dim, n_tokens, eps);
             self.decode_cmd.computeBarrier();
@@ -21577,27 +21677,52 @@ pub const InferenceEngine = struct {
                 try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens);
             }
             self.decode_cmd.computeBarrier();
+            var ffn_norm_ready = false;
             if (cfg.architecture == .gemma) {
                 if (lt.post_attention_norm) |pan_t| {
-                    try self.dispatchRmsNorm(
-                        scratch_down.handle,
-                        scratch_down.size,
-                        pan_t.gpu_buffer.handle,
-                        pan_t.gpu_buffer.size,
-                        scratch_down.handle,
-                        scratch_down.size,
-                        hidden_dim,
-                        n_tokens,
-                        eps,
-                    );
-                    self.decode_cmd.computeBarrier();
+                    if (self.elementwise.pipeline_post_norm_residual_rms_norm != null) {
+                        try self.dispatchPostNormResidualRmsNorm(
+                            scratch_hidden.handle,
+                            scratch_hidden.size,
+                            scratch_down.handle,
+                            scratch_down.size,
+                            pan_t.gpu_buffer.handle,
+                            pan_t.gpu_buffer.size,
+                            scratch_norm.handle,
+                            scratch_norm.size,
+                            ffn_norm_t.gpu_buffer.handle,
+                            ffn_norm_t.gpu_buffer.size,
+                            hidden_dim,
+                            n_tokens,
+                            eps,
+                        );
+                        ffn_norm_ready = true;
+                    } else {
+                        try self.dispatchRmsNorm(
+                            scratch_down.handle,
+                            scratch_down.size,
+                            pan_t.gpu_buffer.handle,
+                            pan_t.gpu_buffer.size,
+                            scratch_down.handle,
+                            scratch_down.size,
+                            hidden_dim,
+                            n_tokens,
+                            eps,
+                        );
+                        self.decode_cmd.computeBarrier();
+                    }
                 }
             }
-            try self.dispatchResidualRmsNorm(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, scratch_norm.handle, scratch_norm.size, ffn_norm_t.gpu_buffer.handle, ffn_norm_t.gpu_buffer.size, hidden_dim, n_tokens, eps, 1.0);
+            if (!ffn_norm_ready) {
+                try self.dispatchResidualRmsNorm(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, scratch_norm.handle, scratch_norm.size, ffn_norm_t.gpu_buffer.handle, ffn_norm_t.gpu_buffer.size, hidden_dim, n_tokens, eps, 1.0);
+            }
+            self.endProfilePhase(.attention, attention_phase);
             self.decode_cmd.computeBarrier();
 
             // FFN: gate/up → SwiGLU/GEGLU → down → optional post-ffn norm
             // (Gemma) → residual.
+            const dense_ffn_phase = self.beginProfilePhase();
+            const dense_ffn_gateup_phase = self.beginProfilePhase();
             var gemma_gateup_dp4a_cols: u32 = 0;
             const gemma_gateup_result = try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, n_tokens, &gemma_gateup_dp4a_cols);
             if (gemma_gateup_result == .not_handled) {
@@ -21608,13 +21733,16 @@ pub const InferenceEngine = struct {
                 // on cfg.architecture. For Gemma this dispatches GEGLU.
                 try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
             }
+            self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
             self.decode_cmd.computeBarrier();
             const gemma_geglu_already_q8 = gemma_gateup_result == .q8_geglu;
             const gemma_geglu_already_q8_1 = gemma_gateup_result == .q8_1_geglu;
+            const dense_ffn_down_phase = self.beginProfilePhase();
             if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, gemma_geglu_already_q8, gemma_geglu_already_q8_1, gemma_gateup_dp4a_cols)) {
                 if (gemma_geglu_already_q8 or gemma_geglu_already_q8_1) return error.UnsupportedConfiguration;
                 try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
             }
+            self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
             self.decode_cmd.computeBarrier();
             // Fused post_ffw_norm + residual add for Gemma: one dispatch
             // instead of (rms_norm_mul in place) + barrier + (scale_accumulate).
@@ -21655,6 +21783,7 @@ pub const InferenceEngine = struct {
                 }
                 try self.dispatchScaleAcc(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, n_tokens * hidden_dim, 1.0);
             }
+            self.endProfilePhase(.dense_ffn, dense_ffn_phase);
             self.decode_cmd.computeBarrier();
 
             // Gemma 4 per-layer output scale: hidden *= scale (applied to the
@@ -21668,12 +21797,17 @@ pub const InferenceEngine = struct {
         }
 
         // Final RMS norm over all N tokens; LM head on the last one.
+        const final_tail_phase = self.beginProfilePhase();
         const output_norm_t = self.tensor_map.get("output_norm.weight") orelse return error.TensorNotFound;
         const lm_head_t = self.tensor_map.get("output.weight") orelse self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
+        const final_norm_phase = self.beginProfilePhase();
         try self.dispatchRmsNorm(scratch_hidden.handle, scratch_hidden.size, output_norm_t.gpu_buffer.handle, output_norm_t.gpu_buffer.size, scratch_norm.handle, scratch_norm.size, hidden_dim, n_tokens, eps);
+        self.endProfilePhase(.final_norm, final_norm_phase);
         self.decode_cmd.computeBarrier();
         const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
+        const final_lm_head_phase = self.beginProfilePhase();
         try self.dispatchDmmvInner(lm_head_t, scratch_norm, scratch_norm.size, self.logits_buf, cfg.vocab_size, hidden_dim, 0, x_offset_bytes, 0, 0);
+        self.endProfilePhase(.final_lm_head, final_lm_head_phase);
         self.decode_cmd.computeBarrier();
 
         // GPU argmax path — sampleGreedy reads argmax_result_staging
@@ -21683,15 +21817,18 @@ pub const InferenceEngine = struct {
         // logits matched the per-token path bit-for-bit.
         const have_gpu_argmax = self.argmax.pipeline != null and self.argmax_descriptor_set != null;
         if (have_gpu_argmax) {
+            const final_argmax_phase = self.beginProfilePhase();
             try self.argmax.record(
                 &self.decode_cmd,
                 self.argmax_descriptor_set.?,
                 cfg.vocab_size,
                 self.argmax_phase0_workgroups,
             );
+            self.endProfilePhase(.final_argmax, final_argmax_phase);
         }
 
         // Read logits and argmax result back for the sampler.
+        const final_copy_phase = self.beginProfilePhase();
         const barrier = vk.c.VkMemoryBarrier{
             .sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = null,
@@ -21706,9 +21843,33 @@ pub const InferenceEngine = struct {
             const token_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = @sizeOf(u32) };
             vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle, self.argmax_result_staging.handle, 1, &token_region);
         }
+        self.endProfilePhase(.final_copy, final_copy_phase);
+        self.endProfilePhase(.final_tail, final_tail_phase);
 
+        if (enable_gpu_phase_timing) {
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
         try self.decode_cmd.end();
+        if (enable_gpu_phase_timing) {
+            const cpu_record_end = std.time.nanoTimestamp();
+            self.prefill_cpu_record_ns = @intCast(cpu_record_end - cpu_record_start);
+        }
+        const submit_wait_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        if (enable_gpu_phase_timing) {
+            const submit_wait_end = std.time.nanoTimestamp();
+            self.prefill_submit_wait_ns = @intCast(submit_wait_end - submit_wait_start);
+            self.recordProfilingSample();
+            for (0..profile_phase_count) |p| {
+                self.prefill_gpu_phase_ns[p] = self.profile_total_counters.gpu_phase_ns[p];
+            }
+            self.prefill_gpu_total_ns = @intFromFloat(@max(self.profile_total_gpu_ms * 1_000_000.0, 0.0));
+            self.prefill_token_samples = n_tokens;
+            self.resetProfilingSamples();
+            self.profile_enabled = profile_was_enabled;
+            self.prefill_active = prefill_active_was;
+            profile_restored = true;
+        }
 
         state.position = base_token + n_tokens;
 
