@@ -249,6 +249,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q8_0_moe_fused_down_acc_scaled",
         "dmmv_q4k_o_proj_merge",
         "rms_norm_dmmv_f32",
+        "rms_norm_scale_dmmv_f32",
         "rms_norm_dmmv_q4k_alpha_beta",
         "qk_norm_rope_kv_write",
         // Effort-6 GEMM port: tiled Q4_K dense GEMM (Step 1) for LM head

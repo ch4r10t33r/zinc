@@ -386,6 +386,10 @@ pub const ElementwiseDispatch = struct {
     /// whose router uses f32 weights. Saves 1 dispatch + 1 barrier per
     /// MoE layer (~30 layers on Qwen 3.6 35B-A3B).
     pipeline_rms_norm_dmmv_f32: ?Pipeline,
+    /// Gemma router variant: unit RMS norm + ffn_gate_inp.scale + f32
+    /// router DMMV in one dispatch. The expert/shared FFN norm remains
+    /// separate because Gemma routes on a different normalized vector.
+    pipeline_rms_norm_scale_dmmv_f32: ?Pipeline,
     /// Fused RMS norm + Q4_K alpha/beta SSM proj DMMV pipeline (7 bindings:
     /// hidden, attn_norm_w, alpha_w, beta_w, norm_buf, alpha_out, beta_out).
     /// Replaces (rms_norm_mul → alpha DMMV → beta DMMV) trio at the start
@@ -739,6 +743,14 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        // rms_norm_scale_dmmv_f32: Gemma MoE router fast path, 4 bindings
+        // (hidden, ffn_gate_inp.scale, router_w, router_logits_buf).
+        const rms_norm_scale_dmmv_f32_path = std.fmt.bufPrint(&path_buf, "{s}/rms_norm_scale_dmmv_f32.spv", .{shader_dir}) catch unreachable;
+        const pipeline_rms_norm_scale_dmmv_f32 = pipeline_mod.createFromSpirvWithOptions(instance, rms_norm_scale_dmmv_f32_path, 4, @sizeOf(RmsNormDmmvF32Push), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("rms_norm_scale_dmmv_f32 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // rms_norm_dmmv_q4k_alpha_beta: fused RMS norm + Q4_K alpha/beta
         // SSM proj DMMV, 7 bindings (hidden, attn_norm_w, alpha_w, beta_w,
         // norm_buf, alpha_out, beta_out). Targets the per-SSM-layer
@@ -802,6 +814,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_rms_norm_add = pipeline_rms_norm_add,
             .pipeline_norm_rope = pipeline_norm_rope,
             .pipeline_rms_norm_dmmv_f32 = pipeline_rms_norm_dmmv_f32,
+            .pipeline_rms_norm_scale_dmmv_f32 = pipeline_rms_norm_scale_dmmv_f32,
             .pipeline_rms_norm_dmmv_q4k_alpha_beta = pipeline_rms_norm_dmmv_q4k_alpha_beta,
             .pipeline_qk_norm_rope_kv_write = pipeline_qk_norm_rope_kv_write,
             .descriptor_pool = descriptor_pool,
@@ -1325,6 +1338,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_rms_norm_add) |*p| p.deinit();
         if (self.pipeline_norm_rope) |*p| p.deinit();
         if (self.pipeline_rms_norm_dmmv_f32) |*p| p.deinit();
+        if (self.pipeline_rms_norm_scale_dmmv_f32) |*p| p.deinit();
         if (self.pipeline_rms_norm_dmmv_q4k_alpha_beta) |*p| p.deinit();
         if (self.pipeline_qk_norm_rope_kv_write) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);

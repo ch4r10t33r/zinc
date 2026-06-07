@@ -4606,6 +4606,61 @@ pub const InferenceEngine = struct {
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), wg_x, 1, 1);
     }
 
+    /// Gemma router fast path: unit RMS norm(hidden), multiply by
+    /// ffn_gate_inp.scale, then f32 router DMMV in one dispatch.
+    fn dispatchRmsNormScaleDmmvF32(
+        self: *InferenceEngine,
+        hidden_buf: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        router_scale_buf: vk.c.VkBuffer,
+        router_scale_size: vk.c.VkDeviceSize,
+        router_w_buf: vk.c.VkBuffer,
+        router_w_size: vk.c.VkDeviceSize,
+        router_logits_buf: vk.c.VkBuffer,
+        router_logits_size: vk.c.VkDeviceSize,
+        m: u32,
+        k: u32,
+        eps: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_rms_norm_scale_dmmv_f32 orelse return error.ShaderNotLoaded);
+        const push = elementwise_mod.RmsNormDmmvF32Push{
+            .M = m,
+            .K = k,
+            .eps_bits = @bitCast(eps),
+        };
+        if (pip.uses_push_descriptors) {
+            self.pushDispatch4(
+                pip,
+                std.mem.asBytes(&push),
+                hidden_buf,
+                hidden_size,
+                router_scale_buf,
+                router_scale_size,
+                router_w_buf,
+                router_w_size,
+                router_logits_buf,
+                router_logits_size,
+                m,
+                1,
+                1,
+            );
+            return;
+        }
+        const ds = try self.allocDescSet(pip.descriptor_set_layout);
+        self.writeDescSet4(
+            ds,
+            hidden_buf,
+            hidden_size,
+            router_scale_buf,
+            router_scale_size,
+            router_w_buf,
+            router_w_size,
+            router_logits_buf,
+            router_logits_size,
+        );
+        self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), m, 1, 1);
+    }
+
     /// Fused RMS norm + Q4_K alpha/beta SSM proj DMMV.
     /// Folds the per-SSM-layer (rms_norm_mul → alpha DMMV → beta DMMV)
     /// trio into a single dispatch. WG 0 also writes norm_buf so the
@@ -7254,6 +7309,17 @@ pub const InferenceEngine = struct {
                 lt.ffn_gate_inp_bias == null and
                 lt.ffn_gate_inp_scale == null and
                 (hidden_dim % 4) == 0;
+            const can_fuse_gemma_router = !resume_from_ffn_norm and
+                is_moe and
+                config.architecture == .gemma and
+                router_tensor_opt != null and
+                router_tensor_opt.?.info.type_ == .f32 and
+                lt.ffn_gate_inp_bias == null and
+                lt.ffn_gate_inp_scale != null and
+                lt.ffn_gate_inp_scale.?.info.type_ == .f32 and
+                lt.ffn_gate_inp_scale.?.info.numElements() >= hidden_dim and
+                self.elementwise.pipeline_rms_norm_scale_dmmv_f32 != null and
+                (hidden_dim % 4) == 0;
             const can_store_partial_stop = self.partial_decode_stop_after_ffn_norm and
                 !resume_from_ffn_norm and
                 !can_fuse_rms_router and
@@ -7399,104 +7465,121 @@ pub const InferenceEngine = struct {
                 var router_input_buf = self.ffn_norm_buf;
 
                 if (!use_precomputed_router) {
-                    // Gemma MoE uses plain RMS-normalized hidden (unit weights) for the router input,
-                    // while the FFN experts read the learned-weight ffn_norm output. Mirrors Metal
-                    // forward_metal.zig:4636-4639.
-                    router_input_buf = if (config.architecture == .gemma) blk: {
-                        try self.dispatchRmsNorm(
+                    if (can_fuse_gemma_router) {
+                        try self.dispatchRmsNormScaleDmmvF32(
                             self.hidden_buf.handle,
                             hidden_size,
-                            self.unit_norm_weights.handle,
-                            self.unit_norm_weights.size,
-                            self.residual_buf.handle,
-                            hidden_size,
-                            hidden_dim,
-                            1,
-                            rms_norm_eps,
-                        );
-                        self.decode_cmd.computeBarrier();
-                        // Gemma 4 MoE: apply ffn_gate_inp.scale elementwise to router input
-                        // before the router DMMV (matches Metal forward_metal.zig:4126-4129).
-                        if (lt.ffn_gate_inp_scale) |scale_t| {
-                            try self.dispatchMulElementwise(
-                                self.residual_buf.handle,
-                                hidden_size,
-                                scale_t.gpu_buffer.handle,
-                                scale_t.gpu_buffer.size,
-                                hidden_dim,
-                            );
-                            self.decode_cmd.computeBarrier();
-                        }
-                        break :blk self.residual_buf;
-                    } else self.ffn_norm_buf;
-
-                    if (can_fuse_rms_router) {
-                        // Fused path: one dispatch produces both ffn_norm_buf
-                        // (for downstream MoE gate/up + shared-expert reads) and
-                        // router_logits_buf in a single shader invocation. The
-                        // post-dispatch barrier covers BOTH outputs so the
-                        // downstream consumers see consistent state.
-                        try self.dispatchRmsNormDmmvF32(
-                            self.hidden_buf.handle,
-                            hidden_size,
-                            ffn_norm_tensor.gpu_buffer.handle,
-                            ffn_norm_tensor.gpu_buffer.size,
+                            lt.ffn_gate_inp_scale.?.gpu_buffer.handle,
+                            lt.ffn_gate_inp_scale.?.gpu_buffer.size,
                             router_tensor.gpu_buffer.handle,
                             router_tensor.gpu_buffer.size,
-                            self.ffn_norm_buf.handle,
-                            hidden_size,
                             self.router_logits_buf.handle,
                             self.router_logits_buf.size,
                             config.n_experts,
                             hidden_dim,
                             rms_norm_eps,
                         );
-                        // Effort-6 Step 5 prerequisite (cycle 36): when the FFN
-                        // input capture flag is on AND this layer's MoE input is
-                        // ffn_norm_buf (not pre_ffw_norm_2), copy the ffn_norm
-                        // output into the per-(token, layer) capture slot.
-                        // Promote the buffer-scoped compute→compute barrier to a
-                        // global compute→compute+transfer barrier so the upcoming
-                        // vkCmdCopyBuffer reads ffn_norm_buf under visibility
-                        // guarantees. Downstream gate/up/router consumers still
-                        // see the same write visibility through the broader
-                        // memory barrier.
-                        const capture_active = self.use_capture_ffn_input and
-                            lt.pre_ffw_norm_2 == null and
-                            state.position < self.prefill_ffn_input_capture_max_tokens;
-                        if (capture_active) {
-                            self.decode_cmd.computeAndTransferBarrier();
-                            const slot_off: vk.c.VkDeviceSize =
-                                (@as(vk.c.VkDeviceSize, state.position) *
-                                    @as(vk.c.VkDeviceSize, config.n_layers) +
-                                    @as(vk.c.VkDeviceSize, layer)) *
-                                @as(vk.c.VkDeviceSize, hidden_dim) *
-                                @sizeOf(f32);
-                            const capture_size: vk.c.VkDeviceSize = hidden_size;
-                            if (slot_off + capture_size <= self.prefill_ffn_input_capture_buf.size) {
-                                const region = vk.c.VkBufferCopy{
-                                    .srcOffset = 0,
-                                    .dstOffset = slot_off,
-                                    .size = capture_size,
-                                };
-                                vk.c.vkCmdCopyBuffer(
-                                    self.decode_cmd.handle,
-                                    self.ffn_norm_buf.handle,
-                                    self.prefill_ffn_input_capture_buf.handle,
-                                    1,
-                                    &region,
+                        self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
+                    } else {
+                        // Gemma MoE uses plain RMS-normalized hidden (unit weights) for the router input,
+                        // while the FFN experts read the learned-weight ffn_norm output. Mirrors Metal
+                        // forward_metal.zig:4636-4639.
+                        router_input_buf = if (config.architecture == .gemma) blk: {
+                            try self.dispatchRmsNorm(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.unit_norm_weights.handle,
+                                self.unit_norm_weights.size,
+                                self.residual_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            self.decode_cmd.computeBarrier();
+                            // Gemma 4 MoE: apply ffn_gate_inp.scale elementwise to router input
+                            // before the router DMMV (matches Metal forward_metal.zig:4126-4129).
+                            if (lt.ffn_gate_inp_scale) |scale_t| {
+                                try self.dispatchMulElementwise(
+                                    self.residual_buf.handle,
+                                    hidden_size,
+                                    scale_t.gpu_buffer.handle,
+                                    scale_t.gpu_buffer.size,
+                                    hidden_dim,
                                 );
+                                self.decode_cmd.computeBarrier();
+                            }
+                            break :blk self.residual_buf;
+                        } else self.ffn_norm_buf;
+
+                        if (can_fuse_rms_router) {
+                            // Fused path: one dispatch produces both ffn_norm_buf
+                            // (for downstream MoE gate/up + shared-expert reads) and
+                            // router_logits_buf in a single shader invocation. The
+                            // post-dispatch barrier covers BOTH outputs so the
+                            // downstream consumers see consistent state.
+                            try self.dispatchRmsNormDmmvF32(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                ffn_norm_tensor.gpu_buffer.handle,
+                                ffn_norm_tensor.gpu_buffer.size,
+                                router_tensor.gpu_buffer.handle,
+                                router_tensor.gpu_buffer.size,
+                                self.ffn_norm_buf.handle,
+                                hidden_size,
+                                self.router_logits_buf.handle,
+                                self.router_logits_buf.size,
+                                config.n_experts,
+                                hidden_dim,
+                                rms_norm_eps,
+                            );
+                            // Effort-6 Step 5 prerequisite (cycle 36): when the FFN
+                            // input capture flag is on AND this layer's MoE input is
+                            // ffn_norm_buf (not pre_ffw_norm_2), copy the ffn_norm
+                            // output into the per-(token, layer) capture slot.
+                            // Promote the buffer-scoped compute→compute barrier to a
+                            // global compute→compute+transfer barrier so the upcoming
+                            // vkCmdCopyBuffer reads ffn_norm_buf under visibility
+                            // guarantees. Downstream gate/up/router consumers still
+                            // see the same write visibility through the broader
+                            // memory barrier.
+                            const capture_active = self.use_capture_ffn_input and
+                                lt.pre_ffw_norm_2 == null and
+                                state.position < self.prefill_ffn_input_capture_max_tokens;
+                            if (capture_active) {
+                                self.decode_cmd.computeAndTransferBarrier();
+                                const slot_off: vk.c.VkDeviceSize =
+                                    (@as(vk.c.VkDeviceSize, state.position) *
+                                        @as(vk.c.VkDeviceSize, config.n_layers) +
+                                        @as(vk.c.VkDeviceSize, layer)) *
+                                    @as(vk.c.VkDeviceSize, hidden_dim) *
+                                    @sizeOf(f32);
+                                const capture_size: vk.c.VkDeviceSize = hidden_size;
+                                if (slot_off + capture_size <= self.prefill_ffn_input_capture_buf.size) {
+                                    const region = vk.c.VkBufferCopy{
+                                        .srcOffset = 0,
+                                        .dstOffset = slot_off,
+                                        .size = capture_size,
+                                    };
+                                    vk.c.vkCmdCopyBuffer(
+                                        self.decode_cmd.handle,
+                                        self.ffn_norm_buf.handle,
+                                        self.prefill_ffn_input_capture_buf.handle,
+                                        1,
+                                        &region,
+                                    );
+                                }
+                            } else {
+                                const fused_ranges = [_]CommandBuffer.BufferRange{
+                                    .{ .buffer = self.ffn_norm_buf.handle, .size = hidden_size },
+                                    .{ .buffer = self.router_logits_buf.handle, .size = self.router_logits_buf.size },
+                                };
+                                self.decode_cmd.computeBuffersBarrier(&fused_ranges);
                             }
                         } else {
-                            const fused_ranges = [_]CommandBuffer.BufferRange{
-                                .{ .buffer = self.ffn_norm_buf.handle, .size = hidden_size },
-                                .{ .buffer = self.router_logits_buf.handle, .size = self.router_logits_buf.size },
-                            };
-                            self.decode_cmd.computeBuffersBarrier(&fused_ranges);
+                            try self.dispatchDmmv(router_tensor, router_input_buf, hidden_size, self.router_logits_buf, config.n_experts, hidden_dim);
+                            self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                         }
-                    } else {
-                        try self.dispatchDmmv(router_tensor, router_input_buf, hidden_size, self.router_logits_buf, config.n_experts, hidden_dim);
-                        self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                     }
                 }
 
