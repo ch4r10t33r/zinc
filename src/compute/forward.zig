@@ -13374,9 +13374,10 @@ pub const InferenceEngine = struct {
     }
 
     fn qwen36DensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
-        if (!self.isQwen36DenseHybrid27B()) return n_tokens;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return n_tokens;
         if (!self.isAmdRdna()) return n_tokens;
-        if (n_tokens < 128) return n_tokens;
+        const min_dp4a_tokens: u32 = if (self.isQwen35DenseHybrid9B()) 64 else 128;
+        if (n_tokens < min_dp4a_tokens) return n_tokens;
         return (n_tokens + 31) & ~@as(u32, 31);
     }
 
