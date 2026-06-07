@@ -72,6 +72,9 @@ const kv_cache_mod = @import("../scheduler/kv_cache.zig");
 
 const log = std.log.scoped(.forward);
 const kv_page_size_tokens: u32 = 16;
+const gemma_prefill_tail_topk_default: u32 = 4;
+const gemma_prefill_short_prompt_topk: u32 = 3;
+const gemma_prefill_short_prompt_tokens: u32 = 96;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -2303,7 +2306,6 @@ pub const InferenceEngine = struct {
         const is_amd_rdna_vendor = gpu_config.vendor == .amd_rdna3 or
             gpu_config.vendor == .amd_rdna4 or
             gpu_config.vendor == .amd_rdna4_apu;
-        const gemma_prefill_tail_topk_default: u32 = 4;
         const gemma_prefill_tail_topk_guard_default: u32 = 16;
         const gemma_prefill_tail_topk_limit: u32 = if (config.architecture == .gemma and
             config.n_experts > 0 and
@@ -2318,9 +2320,11 @@ pub const InferenceEngine = struct {
         else
             0;
         if (gemma_prefill_tail_topk_limit > 0) {
-            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
+            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
                 gemma_prefill_tail_topk_limit,
                 gemma_prefill_tail_topk_guard_tokens,
+                gemma_prefill_short_prompt_tokens,
+                gemma_prefill_short_prompt_topk,
                 config.n_experts_used,
             });
         }
@@ -7466,12 +7470,19 @@ pub const InferenceEngine = struct {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
                 const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
+                const gemma_short_prefill_limit: u32 = if (config.architecture == .gemma and
+                    self.prefill_embed_big_token_count > 0 and
+                    self.prefill_embed_big_token_count <= gemma_prefill_short_prompt_tokens and
+                    self.moe_prefill_tail_topk_limit > gemma_prefill_short_prompt_topk)
+                    gemma_prefill_short_prompt_topk
+                else
+                    self.moe_prefill_tail_topk_limit;
                 const use_prefill_tail_topk = self.prefill_active and
                     !collect_output and
-                    self.moe_prefill_tail_topk_limit > 0 and
+                    gemma_short_prefill_limit > 0 and
                     self.prefill_current_token_idx + self.moe_prefill_tail_topk_guard_tokens < self.prefill_embed_big_token_count;
                 const effective_moe_topk_limit = if (use_prefill_tail_topk)
-                    self.moe_prefill_tail_topk_limit
+                    gemma_short_prefill_limit
                 else
                     self.moe_topk_limit;
                 const n_used = if (effective_moe_topk_limit > 0)
