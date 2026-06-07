@@ -887,3 +887,69 @@ __device__ __forceinline__ void dmmv_q5k_mrow_impl(const unsigned* a_u32, const 
     }
 }
 extern "C" __global__ void dmmv_q5k_mr2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc){ dmmv_q5k_mrow_impl<2>(a_u32,x,y,pc); }
+
+// ---- gemm_q4k_tiled (perf research, agenda 5: PREFILL) -----------------------
+// Y[T,M] = A[T,K] x W[M,K]^T, W = Q4_K, A = f32. Block computes an 8-row x
+// 32-token output tile. Per K-superblock (256 elems): dequant the 8 W-rows and
+// stage 32 A-rows into shared (transposed: [e][row] so warp-lane reads are
+// bank-conflict-free), __syncthreads, then a 256-thread tile-multiply (each
+// thread owns one Y[tok,row], mm=warp, tt=lane). W (dequant) reused 32x across
+// tokens, A reused 8x across rows -> both operands served from shared memory.
+// fp32 accumulate (correctness-first; tensor-core inner product is the next step).
+struct GemmPush { unsigned M, K, T, a_offset, x_offset, y_offset, acc_mode; };
+extern "C" __global__ void gemm_q4k_tiled(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    __shared__ float Ws[256 * 8];   // Ws[e*8 + mm]  (8 rows)
+    __shared__ float As[256 * 32];  // As[e*32 + tt] (32 tokens)
+    const unsigned BM = 8u, BT = 32u;
+    unsigned m0 = blockIdx.x * BM;
+    unsigned t0 = blockIdx.y * BT;
+    unsigned bpr = pc.K >> 8;
+    unsigned tid = threadIdx.x;                 // 0..255
+    unsigned warp = tid >> 5, lane = tid & 31u; // 8 warps x 32 lanes
+    unsigned a0 = (pc.a_offset >> 2);
+    const float* Abase = A + (pc.x_offset >> 2);
+    unsigned mm = warp, tt = lane;              // this thread's output (row mm, token tt)
+    float acc = 0.0f;
+    for (unsigned sb = 0; sb < bpr; sb++) {
+        // --- dequant W: warp `warp` dequants row (m0+warp)'s superblock sb ---
+        unsigned row = m0 + warp;
+        if (row < pc.M) {
+            unsigned blk = a0 + row * bpr * 36u + sb * 36u;
+            unsigned dd = a_u32[blk];
+            float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+            float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+            const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+            const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned e = lane + (unsigned)j * 32u;
+                unsigned chunk = e >> 6, half_ = (e & 63u) >> 5, l = e & 31u;
+                unsigned char sc, mn; zinc_q4k_scale_min((int)(chunk * 2u + half_), scales, &sc, &mn);
+                unsigned char qb = qs[chunk * 32u + l];
+                unsigned nib = (half_ == 0u) ? (qb & 0xFu) : (unsigned)(qb >> 4);
+                Ws[e * 8u + warp] = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) Ws[(lane + (unsigned)j * 32u) * 8u + warp] = 0.0f;
+        }
+        // --- load A tile: As[e*32 + t], 256 threads x 32 = 8192 elems ---
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            unsigned idx = tid + (unsigned)j * 256u;   // 0..8191
+            unsigned t = idx >> 8, e = idx & 255u;     // token 0..31, elem 0..255
+            unsigned tok = t0 + t;
+            As[e * 32u + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + sb * 256u + e] : 0.0f;
+        }
+        __syncthreads();
+        // --- tile multiply: acc += sum_e Ws[mm] * As[tt] ---
+        #pragma unroll 8
+        for (int e = 0; e < 256; e++) acc += Ws[(unsigned)e * 8u + mm] * As[(unsigned)e * 32u + tt];
+        __syncthreads();
+    }
+    unsigned tok = t0 + tt, row = m0 + mm;
+    if (tok < pc.T && row < pc.M) {
+        unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+        if (pc.acc_mode != 0u) Y[yi] += acc; else Y[yi] = acc;
+    }
+}
