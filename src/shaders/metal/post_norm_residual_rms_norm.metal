@@ -61,7 +61,7 @@ kernel void main0(
     // protects partial_sums reuse across simdgroups.
     const float part_r = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
     const float total_sq_r = simd_sum(part_r);
-    const float rms_inv_r = rsqrt((total_sq_r / float(p.n)) + p.eps);
+    const float rms_inv_r = fast::rsqrt(fast::divide(total_sq_r, float(p.n)) + p.eps);
 
     // Pass 2: hidden += residual_w[i] * residual[i] * rms_inv_r;
     // accumulate sum of squares for hidden norm; cache new hidden in registers.
@@ -91,7 +91,7 @@ kernel void main0(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float part_h = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
     const float total_sq_h = simd_sum(part_h);
-    const float rms_inv_h = rsqrt((total_sq_h / float(p.n)) + p.eps);
+    const float rms_inv_h = fast::rsqrt(fast::divide(total_sq_h, float(p.n)) + p.eps);
 
     // Pass 3: norm_out = output_w[i] * h * rms_inv_h.
     count = 0;
