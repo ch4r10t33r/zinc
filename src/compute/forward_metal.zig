@@ -20039,10 +20039,12 @@ fn runDecodeStep(
     // gap on Gemma 31B (Serial and Concurrent encoders measured the same
     // 0.25 tok/s with 9 cmd buffers/token), leaving cmd-buffer-boundary
     // scheduling and GPU clock throttling between small chunks as the
-    // dominant remaining cost. Cut the dense chunks from 8 to 2 by raising
-    // the per-chunk layer count from 8 to 30 — the older single-chunk (60)
-    // attempt broke correctness, so 30 is a conservative step toward
-    // llama.cpp's n_cb=2 target while staying clear of the prior cliff.
+    // dominant remaining cost. Earlier cycles cut the dense chunks from 8 to
+    // 2 by raising the per-chunk layer count from 8 to 30. After the dense
+    // tail barriers were tightened to skip only true command-buffer tails,
+    // try the full 60-layer Gemma 31B decode body in one dense command buffer:
+    // it removes one async command-buffer boundary per decoded token while the
+    // existing in-encoder barriers still order every cross-layer dependency.
     //
     // For Qwen3-8B (36 dense layers, qwen2 arch) tried bumping to 36 so all
     // dense layers fit in ONE chunk. Profile confirmed cmds/step dropped 2.89
@@ -20055,7 +20057,7 @@ fn runDecodeStep(
     // with 30+6 chunks already tightly back-to-back. Reverted; do not
     // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
     // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
-    const dense_cmd_group_layers: usize = 30;
+    const dense_cmd_group_layers: usize = 60;
     const use_single_gpu_cmd = !engine.debug_validation_enabled and
         !engine.gemma_moe_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
