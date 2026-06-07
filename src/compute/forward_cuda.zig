@@ -216,6 +216,11 @@ pub const ForwardCuda = struct {
     down_buf: CudaBuffer, // ssm beta [dt_rank]; MoE: slot-major down outputs [n_used*n_embd]
     logits_buf: CudaBuffer,
     argmax_buf: CudaBuffer, // u32 x1
+    // async decode command ring (dense path): commitAsync'd layer commands are
+    // stashed here and freed after the tail commitAndWait drains the shared
+    // CUstream. Defaults so the init literal need not list them.
+    pending: [128]command.CudaCommand = undefined,
+    n_pending: u32 = 0,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -429,7 +434,8 @@ pub const ForwardCuda = struct {
         }
         const am = ArgmaxPush{ .N = d.vocab };
         cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
-        cmd.commitAndWait();
+        cmd.commitAndWait(); // drains the whole stream incl. the async layer ops
+        self.drainPending(); // free the stashed async commands (completion guaranteed)
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
@@ -484,7 +490,7 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &self.attn_out_buf }, &sm, @sizeOf(SigmoidMulPush), 0);
         // O projection, accumulate into hidden
         self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.hidden, d.n_embd, d.q_dim, 1, 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
     }
 
     fn ssmLayer(self: *ForwardCuda, L: u32) !void {
@@ -536,7 +542,7 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &wnorm.gpu_buffer, &self.swiglu_buf }, &gn, @sizeOf(GatedNormPush), 0);
         // out projection, accumulate into hidden
         self.dmmvDispatch(&cmd, wout, &self.swiglu_buf, &self.hidden, d.n_embd, d.d_inner, 1, 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
 
         // advance circular conv offset (host), AFTER this token's conv.
         self.conv_off[L] = (self.conv_off[L] + 1) % (d.d_conv - 1);
@@ -559,7 +565,7 @@ pub const ForwardCuda = struct {
         const sg = SwigluPush{ .N = d.n_ff };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
         self.dmmvDispatch(&cmd, wdown, &self.swiglu_buf, &self.hidden, d.n_embd, d.n_ff, 1, 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
     }
 
     /// MoE FFN block (qwen2_moe / qwen36). Replaces the dense ffnBlock when
@@ -649,13 +655,51 @@ pub const ForwardCuda = struct {
     // Public wrappers for the per-block builders (used by the v1 driver to run
     // and inspect one block type at a time).
     pub fn attentionLayerPub(self: *ForwardCuda, L: u32, pos: u32) !void {
-        return self.attentionLayer(L, pos);
+        try self.attentionLayer(L, pos);
+        self.waitPending(); // dump callers read hidden right after — make it sync
     }
     pub fn ssmLayerPub(self: *ForwardCuda, L: u32) !void {
-        return self.ssmLayer(L);
+        try self.ssmLayer(L);
+        self.waitPending();
     }
     pub fn ffnBlockPub(self: *ForwardCuda, L: u32) !void {
-        return self.ffnBlock(L);
+        try self.ffnBlock(L);
+        self.waitPending();
+    }
+
+    /// Async decode command ring. For the dense path (n_experts==0) each layer-op
+    /// commits asynchronously and is stashed; the ops pipeline on the shared
+    /// CUstream (the CPU never blocks per-op), then the tail's single
+    /// commitAndWait drains the stream and `drainPending` frees the events. This
+    /// removes the ~0.4 ms/op WSL2 CPU↔GPU sync round-trip (and the boost-
+    /// starvation those idle gaps cause — see Effort 21 Cycles 7–8). MoE layers
+    /// keep the synchronous path: routing reads the expert ids back to the host
+    /// mid-block, so they cannot be deferred.
+    fn submit(self: *ForwardCuda, cmd: command.CudaCommand) void {
+        var c = cmd;
+        if (self.d.n_experts == 0 and self.n_pending < self.pending.len) {
+            c.commitAsync();
+            self.pending[self.n_pending] = c;
+            self.n_pending += 1;
+        } else {
+            c.commitAndWait();
+        }
+    }
+
+    /// Free the stashed async commands. Safe once a later same-stream
+    /// commitAndWait (the tail) has drained the stream — completion is guaranteed.
+    fn drainPending(self: *ForwardCuda) void {
+        var i: u32 = 0;
+        while (i < self.n_pending) : (i += 1) self.pending[i].releaseCompleted();
+        self.n_pending = 0;
+    }
+
+    /// Wait on + free the stashed async commands, for callers that read GPU
+    /// results before any tail sync (the per-block Pub wrappers).
+    fn waitPending(self: *ForwardCuda) void {
+        var i: u32 = 0;
+        while (i < self.n_pending) : (i += 1) self.pending[i].wait();
+        self.n_pending = 0;
     }
 
     /// Download the current hidden state (for sanity checks).
