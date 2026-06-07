@@ -16,8 +16,24 @@ const std = @import("std");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 const forward = @import("compute/forward_cuda.zig");
+const pipeline = @import("cuda/pipeline.zig");
+const buffer = @import("cuda/buffer.zig");
+const command = @import("cuda/command.zig");
 
 const DEFAULT_MODEL = "/home/agent-zinc/workspace/Qwen3.5-9B-Q4_K_M.gguf";
+
+// Synthetic compute kernel for the dispatch sync-vs-async bench: a per-thread
+// FMA loop of `iters` so each dispatch costs a tunable, decode-matvec-like amount.
+const BENCH_CU =
+    \\struct BenchPush { int iters; };
+    \\extern "C" __global__ void benchk(float* x, BenchPush pc) {
+    \\    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    \\    float a = x[idx];
+    \\    for (int i = 0; i < pc.iters; i++) a = a * 1.0000001f + 0.0000001f;
+    \\    x[idx] = a;
+    \\}
+;
+const BenchPush = extern struct { iters: i32 };
 
 fn stats(label: []const u8, v: []const f32) void {
     var ss: f64 = 0;
@@ -51,6 +67,10 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, first, "prof")) {
         const model_path = args.next() orelse DEFAULT_MODEL;
         try profMode(allocator, model_path);
+    } else if (std.mem.eql(u8, first, "bench")) {
+        const iters: i32 = std.fmt.parseInt(i32, args.next() orelse "2000", 10) catch 2000;
+        const n: u32 = std.fmt.parseInt(u32, args.next() orelse "300", 10) catch 300;
+        try benchMode(allocator, iters, n);
     } else if (std.mem.eql(u8, first, "logits")) {
         const token: u32 = std.fmt.parseInt(u32, args.next() orelse "100", 10) catch 100;
         const out_path = args.next() orelse "/tmp/zinc_logits.bin";
@@ -112,6 +132,70 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
         const steps: f64 = @floatFromInt(ngen - 1);
         std.debug.print("DECODE: {d} tokens in {d:.3}s = {d:.2} tok/s (correctness-first, sync-per-layer)\n", .{ ngen - 1, secs, steps / secs });
     }
+}
+
+/// Dispatch sync-vs-async microbench: the same kernel launched N times under the
+/// current decode pattern (commitAndWait each → CPU blocks per dispatch) vs the
+/// async-ring pattern (commitAsync all, one drain → GPU runs back-to-back). The
+/// ratio quantifies the async `CUstream`/`CUevent` ring's prize on this WSL2 box:
+/// both the removed per-dispatch sync round-trip AND the GPU staying loaded
+/// (which holds boost — see the 525 vs 2520 MHz finding). Read-only, no model.
+fn benchMode(allocator: std.mem.Allocator, iters: i32, n: u32) !void {
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    const ctx = dev.ctx;
+
+    const src = try allocator.dupeZ(u8, BENCH_CU);
+    defer allocator.free(src);
+    var pipe = try pipeline.createPipeline(ctx, src.ptr, "benchk");
+    defer pipeline.freePipeline(&pipe);
+
+    const grid = [3]u32{ 2048, 1, 1 };
+    const block = [3]u32{ 256, 1, 1 };
+    const nthreads: usize = 2048 * 256;
+    var buf = try buffer.createBuffer(ctx, nthreads * @sizeOf(f32));
+    defer buffer.freeBuffer(&buf);
+    const push = BenchPush{ .iters = iters };
+
+    // warmup (also lets the GPU boost before timing)
+    var w: u32 = 0;
+    while (w < 30) : (w += 1) {
+        var cmd = try command.beginCommand(ctx);
+        cmd.dispatch(&pipe, grid, block, &.{&buf}, &push, @sizeOf(BenchPush), 0);
+        cmd.commitAndWait();
+    }
+
+    // SYNC: commitAndWait after every dispatch (the current decodeStep pattern).
+    var t = try std.time.Timer.start();
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var cmd = try command.beginCommand(ctx);
+        cmd.dispatch(&pipe, grid, block, &.{&buf}, &push, @sizeOf(BenchPush), 0);
+        cmd.commitAndWait();
+    }
+    const sync_ns = t.read();
+
+    // ASYNC: commitAsync all (pipelined on one stream), then drain in order.
+    const cmds = try allocator.alloc(command.CudaCommand, n);
+    defer allocator.free(cmds);
+    t.reset();
+    i = 0;
+    while (i < n) : (i += 1) {
+        cmds[i] = try command.beginCommand(ctx);
+        cmds[i].dispatch(&pipe, grid, block, &.{&buf}, &push, @sizeOf(BenchPush), 0);
+        cmds[i].commitAsync();
+    }
+    i = 0;
+    while (i < n) : (i += 1) cmds[i].wait();
+    const async_ns = t.read();
+
+    const nf: f64 = @floatFromInt(n);
+    const sync_ms = @as(f64, @floatFromInt(sync_ns)) / 1e6;
+    const async_ms = @as(f64, @floatFromInt(async_ns)) / 1e6;
+    std.debug.print("=== dispatch sync-vs-async bench (N={d}, grid=2048x256, iters={d}) ===\n", .{ n, iters });
+    std.debug.print("sync  (commitAndWait each) : {d:>8.2} ms  {d:.4} ms/disp  {d:>8.0} disp/s\n", .{ sync_ms, sync_ms / nf, nf / (sync_ms / 1000.0) });
+    std.debug.print("async (commitAsync + drain): {d:>8.2} ms  {d:.4} ms/disp  {d:>8.0} disp/s\n", .{ async_ms, async_ms / nf, nf / (async_ms / 1000.0) });
+    std.debug.print("async speedup: {d:.2}x   (per-dispatch saving: {d:.4} ms — the sync round-trip + boost-starvation the ring removes)\n", .{ sync_ms / async_ms, (sync_ms - async_ms) / nf });
 }
 
 /// Decode-bottleneck profile: splits per-token time into embed+tail vs the
