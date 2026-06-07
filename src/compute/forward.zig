@@ -11080,6 +11080,45 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn dispatchGemmaGateUpGegluBatched(
+        self: *InferenceEngine,
+        gate_t: *const LoadedTensor,
+        up_t: *const LoadedTensor,
+        norm_buf: Buffer,
+        geglu_buf: Buffer,
+        inter_dim: u32,
+        hidden_dim: u32,
+        n_tokens: u32,
+    ) !bool {
+        if (self.model.config.architecture != .gemma) return false;
+        if (!self.use_mul_mm_proj) return false;
+        if (gate_t.info.type_ != .q4_k or up_t.info.type_ != .q4_k) return false;
+        if (n_tokens < 16 or (hidden_dim & 255) != 0) return false;
+        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return false;
+
+        try self.dmmv.recordMulMmQ4KGateUpGeglu(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            gate_t.gpu_buffer.handle,
+            gate_t.gpu_buffer.size,
+            up_t.gpu_buffer.handle,
+            up_t.gpu_buffer.size,
+            norm_buf.handle,
+            norm_buf.size,
+            geglu_buf.handle,
+            geglu_buf.size,
+            inter_dim,
+            n_tokens,
+            hidden_dim,
+            hidden_dim,
+            inter_dim,
+            0,
+            0,
+            0,
+        );
+        return true;
+    }
+
     fn dispatchF32DualBatched(
         self: *InferenceEngine,
         alpha_tensor: *const LoadedTensor,
@@ -20648,12 +20687,14 @@ pub const InferenceEngine = struct {
 
             // FFN: gate/up → SwiGLU/GEGLU → down → optional post-ffn norm
             // (Gemma) → residual.
-            try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
-            try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
-            self.decode_cmd.computeBarrier();
-            // dispatchFfnActivation picks SwiGLU / GEGLU / SwiGLU-OAI based
-            // on cfg.architecture. For Gemma this dispatches GEGLU.
-            try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
+            if (!try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, n_tokens)) {
+                try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
+                try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+                self.decode_cmd.computeBarrier();
+                // dispatchFfnActivation picks SwiGLU / GEGLU / SwiGLU-OAI based
+                // on cfg.architecture. For Gemma this dispatches GEGLU.
+                try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
+            }
             self.decode_cmd.computeBarrier();
             try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
             self.decode_cmd.computeBarrier();

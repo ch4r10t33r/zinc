@@ -519,6 +519,9 @@ pub const DmmvDispatch = struct {
     /// Batched dense FFN front-end for Qwen3.6-27B: gate/up Q4_K GEMMs plus
     /// SwiGLU in one tiled dispatch.
     pipeline_mul_mm_q4k_gate_up_swiglu: ?Pipeline,
+    /// Batched dense FFN front-end for Gemma 4: gate/up Q4_K GEMMs plus
+    /// GEGLU in one tiled dispatch.
+    pipeline_mul_mm_q4k_gate_up_geglu: ?Pipeline,
     /// Branchless full-tile variant of the fused Q4_K gate/up/SwiGLU GEMM.
     pipeline_mul_mm_q4k_gate_up_swiglu_full: ?Pipeline,
     /// Tiled Q6_K dense GEMM for Qwen3.6-27B batched dense-down prefill.
@@ -1085,6 +1088,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_gate_up_swiglu != null) {
             log.info("mul_mm_q4k_gate_up_swiglu pipeline loaded (Qwen3.6-27B batched dense FFN)", .{});
         }
+        const mul_mm_q4k_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gate_up_geglu_path, 4, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_geglu shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_geglu != null) {
+            log.info("mul_mm_q4k_gate_up_geglu pipeline loaded (Gemma 4 batched dense FFN)", .{});
+        }
         const mul_mm_q4k_gate_up_swiglu_full_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_swiglu_full.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gate_up_swiglu_full_path, 4, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_gate_up_swiglu_full shader not loaded: {s}", .{@errorName(err)});
@@ -1341,6 +1352,7 @@ pub const DmmvDispatch = struct {
             .pipeline_moe_route_pack = pipeline_moe_route_pack,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
             .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
+            .pipeline_mul_mm_q4k_gate_up_geglu = pipeline_mul_mm_q4k_gate_up_geglu,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mul_mm_q4k_gate_up_swiglu_full,
             .pipeline_mul_mm_q6k = pipeline_mul_mm_q6k,
             .pipeline_mul_mm_q6k_full = pipeline_mul_mm_q6k_full,
@@ -2133,6 +2145,61 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
     ) !void {
         const pip = if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
+    /// Tiled Q4_K batched Gemma dense FFN front-end: computes gelu(gate_weight * B) * (up_weight * B) directly into D.
+    /// Same binding and push layout as recordMulMmQ4KGateUpSwiglu.
+    pub fn recordMulMmQ4KGateUpGeglu(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_geglu) |*p| p else return error.PipelineNotLoaded;
         if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
         if (M == 0 or N == 0) return error.InvalidArgument;
         const push = MulMmQ4KPush{
@@ -3043,6 +3110,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_moe_route_pack) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
