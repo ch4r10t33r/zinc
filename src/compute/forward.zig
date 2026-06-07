@@ -5407,6 +5407,40 @@ pub const InferenceEngine = struct {
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), 1, 1, 1);
     }
 
+    fn dispatchSoftmaxTop1(
+        self: *InferenceEngine,
+        logits_buf: vk.c.VkBuffer,
+        logits_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_size: vk.c.VkDeviceSize,
+        n_experts: u32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_softmax_top1 orelse return error.ShaderNotLoaded);
+        const push = SoftmaxTopkPush{
+            .n_experts = n_experts,
+            .k = 1,
+            .scale_bits = @bitCast(@as(f32, 1.0)),
+        };
+        if (pip.uses_push_descriptors) {
+            self.pushDispatch2(
+                pip,
+                std.mem.asBytes(&push),
+                logits_buf,
+                logits_size,
+                output_buf,
+                output_size,
+                1,
+                1,
+                1,
+            );
+            return;
+        }
+
+        const ds = try self.allocDescSet(pip.descriptor_set_layout);
+        self.writeDescSet2(ds, logits_buf, logits_size, output_buf, output_size);
+        self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), 1, 1, 1);
+    }
+
     fn dispatchRouterF32Batch(
         self: *InferenceEngine,
         input_buf: vk.c.VkBuffer,
@@ -8467,7 +8501,15 @@ pub const InferenceEngine = struct {
                             log.info("FASTPATH: Gemma GPU-topk MoE ENABLED (q4k gate+up+geglu, scaled fused down+acc, n_used={d})", .{n_used});
                         }
                         const moe_topk_phase = self.beginProfilePhase();
-                        if (gemma_topk_scales_router) {
+                        if (gemma_short_prefill_fast_tail and n_used == 1 and self.elementwise.pipeline_softmax_top1 != null) {
+                            try self.dispatchSoftmaxTop1(
+                                self.router_logits_buf.handle,
+                                @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
+                                self.router_output_buf.handle,
+                                self.router_output_buf.size,
+                                config.n_experts,
+                            );
+                        } else if (gemma_topk_scales_router) {
                             try self.dispatchSoftmaxTopkScaled(
                                 self.router_logits_buf.handle,
                                 @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),

@@ -352,6 +352,8 @@ pub const ElementwiseDispatch = struct {
     pipeline_softmax_topk: ?Pipeline,
     /// SOFTMAX TOPK v2 (subgroup-parallel reduction), or null.
     pipeline_softmax_topk_v2: ?Pipeline,
+    /// TOP-1 MoE router fast path, or null.
+    pipeline_softmax_top1: ?Pipeline,
     /// Token-batched f32 MoE router matvec, or null.
     pipeline_router_f32_batch: ?Pipeline,
     /// Token-batched MoE top-k, or null.
@@ -637,6 +639,11 @@ pub const ElementwiseDispatch = struct {
             log.warn("softmax_topk_v2 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const top1_path = std.fmt.bufPrint(&path_buf, "{s}/softmax_top1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_softmax_top1 = pipeline_mod.createFromSpirvWithOptions(instance, top1_path, 2, @sizeOf(SoftmaxTopkPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("softmax_top1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const router_f32_batch_path = std.fmt.bufPrint(&path_buf, "{s}/router_f32_batch.spv", .{shader_dir}) catch unreachable;
         const pipeline_router_f32_batch = pipeline_mod.createFromSpirvWithOptions(instance, router_f32_batch_path, 3, @sizeOf(RouterF32BatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
@@ -801,6 +808,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_ssm_gated_norm_batch_tok = pipeline_ssm_gated_norm_batch_tok,
             .pipeline_softmax_topk = pipeline_softmax_topk,
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
+            .pipeline_softmax_top1 = pipeline_softmax_top1,
             .pipeline_router_f32_batch = pipeline_router_f32_batch,
             .pipeline_softmax_topk_batch = pipeline_softmax_topk_batch,
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
@@ -1325,6 +1333,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_ssm_gated_norm_batch_tok) |*p| p.deinit();
         if (self.pipeline_softmax_topk) |*p| p.deinit();
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();
+        if (self.pipeline_softmax_top1) |*p| p.deinit();
         if (self.pipeline_router_f32_batch) |*p| p.deinit();
         if (self.pipeline_softmax_topk_batch) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
