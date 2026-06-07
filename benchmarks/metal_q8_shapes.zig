@@ -57,6 +57,12 @@ const RmsNormPush = extern struct {
     eps: f32,
 };
 
+const PostNormResidualRmsNormPush = extern struct {
+    n: u32,
+    eps: f32,
+    hidden_scale: f32,
+};
+
 const MoeDmmvPush = extern struct {
     M: u32,
     K: u32,
@@ -189,6 +195,7 @@ const CaseId = enum {
     shared_dual,
     shared_pair_swiglu,
     dense_gate_up_geglu,
+    post_norm_residual_wide,
     moe_gate,
     moe_up,
     moe_down,
@@ -326,6 +333,7 @@ fn helpText() []const u8 {
     \\                            | shared_gate_gemm | shared_up_gemm | shared_down_gemm
     \\                            | shared_pair_swiglu
     \\                            | dense_gate_up_geglu
+    \\                            | post_norm_residual_wide
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_geglu | moe_gate_up_geglu_cols | moe_gate_up_swiglu
@@ -372,6 +380,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "shared_dual")) return .shared_dual;
     if (std.mem.eql(u8, arg, "shared_pair_swiglu")) return .shared_pair_swiglu;
     if (std.mem.eql(u8, arg, "dense_gate_up_geglu")) return .dense_gate_up_geglu;
+    if (std.mem.eql(u8, arg, "post_norm_residual_wide")) return .post_norm_residual_wide;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
     if (std.mem.eql(u8, arg, "moe_down")) return .moe_down;
@@ -394,6 +403,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .shared_up_gemm,
             .shared_down_gemm,
             .dense_gate_up_geglu,
+            .post_norm_residual_wide,
             => false,
             else => true,
         },
@@ -982,6 +992,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             };
         },
         .all, .gemma26_prefill_hot => error.InvalidCase,
+        .post_norm_residual_wide => error.InvalidCase,
     };
 }
 
@@ -1386,6 +1397,53 @@ fn runDispatchBatch(
             @sizeOf(DmmvPush),
             selection.push_idx,
         );
+    }
+    cmd.commitAndWait();
+}
+
+fn postNormResidualBytesPerIter(n: u32, rereads_hidden_for_norm_out: bool) u64 {
+    // base: residual read twice, residual_w read, hidden read+write, output_w read, norm_out write.
+    // wide: same plus a hidden reread for the final norm_out write.
+    const bytes_per_elem: u64 = if (rereads_hidden_for_norm_out) 32 else 28;
+    return @as(u64, n) * bytes_per_elem;
+}
+
+fn runPostNormResidualDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    hidden_buf: *const MetalBuffer,
+    residual_buf: *const MetalBuffer,
+    residual_w_buf: *const MetalBuffer,
+    norm_out_buf: *const MetalBuffer,
+    output_w_buf: *const MetalBuffer,
+    n: u32,
+    hidden_scale: f32,
+    block_size: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = PostNormResidualRmsNormPush{
+        .n = n,
+        .eps = 1.0e-6,
+        .hidden_scale = hidden_scale,
+    };
+    const bufs = [_]*const MetalBuffer{ hidden_buf, residual_buf, residual_w_buf, norm_out_buf, output_w_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ 1, 1, 1 },
+            .{ block_size, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(PostNormResidualRmsNormPush),
+            0,
+        );
+        // The shader updates hidden in place and downstream production work
+        // consumes both hidden/norm_out edges, so the microbench keeps the same
+        // dependent-dispatch cadence instead of overlapping invalid repeats.
+        cmd.barrierBuffers(&.{ hidden_buf, norm_out_buf });
     }
     cmd.commitAndWait();
 }
@@ -2638,6 +2696,105 @@ fn benchmarkDenseGateUpGegluVariant(
     };
 }
 
+fn benchmarkPostNormResidualVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    shader_name: []const u8,
+    variant_label: []const u8,
+    n: u32,
+    block_size: u32,
+    rereads_hidden_for_norm_out: bool,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    var pipe = try loadShaderPipeline(device.ctx, shader_name);
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < block_size) return error.InvalidThreadgroupSize;
+
+    const bytes = @as(usize, n) * @sizeOf(f32);
+    var hidden_buf = try metal_buffer.createBuffer(device.ctx, bytes);
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var residual_buf = try metal_buffer.createBuffer(device.ctx, bytes);
+    defer metal_buffer.freeBuffer(&residual_buf);
+    var residual_w_buf = try metal_buffer.createBuffer(device.ctx, bytes);
+    defer metal_buffer.freeBuffer(&residual_w_buf);
+    var norm_out_buf = try metal_buffer.createBuffer(device.ctx, bytes);
+    defer metal_buffer.freeBuffer(&norm_out_buf);
+    var output_w_buf = try metal_buffer.createBuffer(device.ctx, bytes);
+    defer metal_buffer.freeBuffer(&output_w_buf);
+
+    fillInputBuffer(&hidden_buf, n);
+    fillInputBuffer(&residual_buf, n);
+    fillInputBuffer(&residual_w_buf, n);
+    fillInputBuffer(&output_w_buf, n);
+    @memset(norm_out_buf.cpu_ptr.?[0..norm_out_buf.size], 0);
+
+    const hidden_scale: f32 = 0.875;
+    try runPostNormResidualDispatchBatch(
+        device.ctx,
+        &pipe,
+        &hidden_buf,
+        &residual_buf,
+        &residual_w_buf,
+        &norm_out_buf,
+        &output_w_buf,
+        n,
+        hidden_scale,
+        block_size,
+        warmup_iterations,
+    );
+
+    fillInputBuffer(&hidden_buf, n);
+    fillInputBuffer(&residual_buf, n);
+    fillInputBuffer(&residual_w_buf, n);
+    fillInputBuffer(&output_w_buf, n);
+    @memset(norm_out_buf.cpu_ptr.?[0..norm_out_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runPostNormResidualDispatchBatch(
+        device.ctx,
+        &pipe,
+        &hidden_buf,
+        &residual_buf,
+        &residual_w_buf,
+        &norm_out_buf,
+        &output_w_buf,
+        n,
+        hidden_scale,
+        block_size,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const traffic_bytes = postNormResidualBytesPerIter(n, rereads_hidden_for_norm_out);
+    const total_bytes = traffic_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &norm_out_buf, n);
+
+    return .{
+        .case_key = "post_norm_residual_wide",
+        .variant_label = variant_label,
+        .shader_name = shader_name,
+        .tensor_name = "synthetic_hidden_5376",
+        .rows = 1,
+        .cols = n,
+        .expert_slots = 1,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = block_size,
+        .rows_per_wg = 1,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = traffic_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows: u32) ![]f32 {
     const ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     return try allocator.dupe(f32, ptr[0..rows]);
@@ -3452,7 +3609,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -3478,6 +3635,62 @@ pub fn main() !void {
 
     for (hot_case_ids) |case_id| {
         if (!caseMatchesSelection(config.case_id, case_id)) continue;
+
+        if (case_id == .post_norm_residual_wide) {
+            if (model.config.architecture != .gemma or model.config.n_experts != 0 or model.config.hidden_dim != 5376) {
+                return error.ExpectedDenseGemma5376;
+            }
+            try stdout.interface.print(
+                "Case post_norm_residual_wide: Dense Gemma FFN tail post_norm+residual+next_norm | synthetic buffers | N={d} | traffic base {d:.2} KiB/iter wide {d:.2} KiB/iter\n",
+                .{
+                    model.config.hidden_dim,
+                    @as(f64, @floatFromInt(postNormResidualBytesPerIter(model.config.hidden_dim, false))) / 1024.0,
+                    @as(f64, @floatFromInt(postNormResidualBytesPerIter(model.config.hidden_dim, true))) / 1024.0,
+                },
+            );
+
+            var base_result: ?BenchResult = null;
+            defer if (base_result) |*result| allocator.free(result.output);
+            var wide_result: ?BenchResult = null;
+            defer if (wide_result) |*result| allocator.free(result.output);
+
+            base_result = try benchmarkPostNormResidualVariant(
+                allocator,
+                &device,
+                "post_norm_residual_rms_norm",
+                "base-256",
+                model.config.hidden_dim,
+                256,
+                false,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, base_result.?);
+
+            wide_result = try benchmarkPostNormResidualVariant(
+                allocator,
+                &device,
+                "post_norm_residual_rms_norm_wide",
+                "wide-512",
+                model.config.hidden_dim,
+                512,
+                true,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, wide_result.?);
+
+            const diff = compareOutputs(base_result.?.output, wide_result.?.output);
+            const delta_pct = if (base_result.?.ms_per_iter > 0.0)
+                ((base_result.?.ms_per_iter - wide_result.?.ms_per_iter) / base_result.?.ms_per_iter) * 100.0
+            else
+                0.0;
+            try stdout.interface.print(
+                "  wide vs base: {d:.2}% ms/iter | max_abs {d:.6} | mean_abs {d:.6}\n\n",
+                .{ delta_pct, diff.max_abs, diff.mean_abs },
+            );
+            continue;
+        }
 
         const hot_case = try resolveHotCase(&model, case_id);
         if (hot_case.is_batched_gemm) {
