@@ -591,8 +591,10 @@ fn denseGemmaQ4KGeGLUValidationScanRequested() bool {
 
 fn denseGemmaQ4KGeGLUProfileScanEnabled(cfg: ModelConfig, profile_enabled: bool) bool {
     if (!profile_enabled) return false;
-    const requested = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN") orelse
-        isDenseGemma31Q4KGeGLUShape(cfg);
+    // The automatic profile scan has already proven that the unchecked-fast
+    // GeGLU path has no safe layer mask on Gemma31. Keep the validator
+    // available by env, but let plain --profile measure production decode.
+    const requested = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN") orelse false;
     return requested and isDenseGemma31Q4KGeGLUShape(cfg);
 }
 
