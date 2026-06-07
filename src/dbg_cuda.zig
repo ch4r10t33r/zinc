@@ -51,6 +51,11 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, first, "prof")) {
         const model_path = args.next() orelse DEFAULT_MODEL;
         try profMode(allocator, model_path);
+    } else if (std.mem.eql(u8, first, "logits")) {
+        const token: u32 = std.fmt.parseInt(u32, args.next() orelse "100", 10) catch 100;
+        const out_path = args.next() orelse "/tmp/zinc_logits.bin";
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try logitsMode(allocator, token, out_path, model_path);
     } else {
         const token: u32 = std.fmt.parseInt(u32, first, 10) catch 100;
         const model_path = args.next() orelse DEFAULT_MODEL;
@@ -146,6 +151,35 @@ fn profMode(allocator: std.mem.Allocator, model_path: []const u8) !void {
     std.debug.print("full       : {d:.3} ms/token  ({d:.2} tok/s)\n", .{ full_ms, 1000.0 / full_ms });
     std.debug.print("~per-commit: {d:.3} ms  ({d:.0} sync round-trips/token)\n", .{ full_ms / commits, commits });
     std.debug.print("(async ring batches these into ~1 submit/token — the headroom to the 97 t/s bar)\n", .{});
+}
+
+/// Dump the full vocab logit vector for `token` at pos 0 to a raw-f32 file,
+/// for numerical-fidelity comparison vs a llama.cpp logit dump.
+fn logitsMode(allocator: std.mem.Allocator, token: u32, out_path: []const u8, model_path: []const u8) !void {
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try forward.ForwardCuda.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    const vocab = fwd.d.vocab;
+    const buf = try allocator.alloc(f32, vocab);
+    defer allocator.free(buf);
+    _ = try fwd.decodeStep(token, 0, true);
+    fwd.readLogits(buf);
+
+    const f = try std.fs.cwd().createFile(out_path, .{});
+    defer f.close();
+    try f.writeAll(std.mem.sliceAsBytes(buf));
+
+    var bi: usize = 0;
+    var bm = buf[0];
+    for (buf, 0..) |v, i| if (v > bm) {
+        bm = v;
+        bi = i;
+    };
+    std.debug.print("wrote {d} logits to {s}; argmax={d} ({d:.4})\n", .{ vocab, out_path, bi, bm });
 }
 
 /// Per-layer residual-norm dump at pos 0 (single token).
