@@ -11,7 +11,7 @@ const impl = if (gpu.is_metal)
 else
     @import("model_manager.zig");
 
-/// Specification describing which model to load (path, managed ID, or default).
+/// Specification describing which model to load: a filesystem path, an optional managed-catalog ID, and an optional context-length override.
 pub const LoadSpec = impl.LoadSpec;
-/// Owns the loaded model, tokenizer, and inference engine for the HTTP server.
+/// Thread-safe manager for the currently active model and inference engine; handles loading, hot-swapping, catalog queries, and VRAM budget enforcement.
 pub const ModelManager = impl.ModelManager;
