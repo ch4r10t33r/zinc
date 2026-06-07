@@ -7497,6 +7497,7 @@ pub const InferenceEngine = struct {
             }
 
             var gpu_moe_barriers_cover_hidden = false;
+            var gemma_moe_accumulated_into_hidden = false;
             if (is_moe) {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
@@ -8521,32 +8522,43 @@ pub const InferenceEngine = struct {
                         self.endProfilePhase(.moe_gate_up, moe_gate_up_phase);
 
                         const moe_down_phase = self.beginProfilePhase();
+                        const gemma_short_prefill_direct_hidden_accum = gemma_short_prefill_fast_tail;
+                        const gemma_short_prefill_moe_output_buf = if (gemma_short_prefill_direct_hidden_accum)
+                            self.hidden_buf
+                        else
+                            self.moe_out_buf;
                         if (down_exps.info.type_ == .q8_0) {
                             try self.dispatchDmmvQ8_0MoeFusedDownAccScaled(
                                 down_exps,
                                 self.swiglu_buf,
                                 self.swiglu_buf.size,
-                                self.moe_out_buf,
+                                gemma_short_prefill_moe_output_buf,
                                 lt.ffn_down_exps_scale.?,
                                 hidden_dim,
                                 inter_dim,
                                 expert_down_row_bytes,
                                 n_used,
+                                gemma_short_prefill_direct_hidden_accum,
                             );
                         } else {
                             try self.dispatchDmmvQ5_1MoeFusedDownAccScaled(
                                 down_exps,
                                 self.swiglu_buf,
                                 self.swiglu_buf.size,
-                                self.moe_out_buf,
+                                gemma_short_prefill_moe_output_buf,
                                 lt.ffn_down_exps_scale.?,
                                 hidden_dim,
                                 inter_dim,
                                 expert_down_row_bytes,
                                 n_used,
+                                gemma_short_prefill_direct_hidden_accum,
                             );
                         }
                         self.decode_cmd.computeBarrier();
+                        if (gemma_short_prefill_direct_hidden_accum) {
+                            gemma_moe_accumulated_into_hidden = true;
+                            gpu_moe_barriers_cover_hidden = true;
+                        }
                         self.endProfilePhase(.moe_down, moe_down_phase);
                     } else {
                         if (self.profile_enabled) self.profile_token_counters.cpu_moe_fallbacks += 1;
@@ -9297,14 +9309,16 @@ pub const InferenceEngine = struct {
                         self.decode_cmd.transferToComputeBarrier();
                     }
 
-                    try self.dispatchScaleAcc(
-                        self.hidden_buf.handle,
-                        hidden_size,
-                        self.moe_out_buf.handle,
-                        hidden_size,
-                        hidden_dim,
-                        1.0,
-                    );
+                    if (!gemma_moe_accumulated_into_hidden) {
+                        try self.dispatchScaleAcc(
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.moe_out_buf.handle,
+                            hidden_size,
+                            hidden_dim,
+                            1.0,
+                        );
+                    }
 
                     if (diag_ffn_residual) {
                         self.decode_cmd.computeBarrier();
@@ -11901,6 +11915,7 @@ pub const InferenceEngine = struct {
         K: u32,
         expert_stride: u32,
         n_used: u32,
+        accumulate: bool,
     ) !void {
         const pip = &(self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled orelse return error.ShaderNotLoaded);
         const push = MoeFusedDownAccPushConstants{
@@ -11911,6 +11926,7 @@ pub const InferenceEngine = struct {
             .x_offset = 0,
             .y_offset = 0,
             .n_used = n_used,
+            .acc_mode = if (accumulate) 1 else 0,
         };
         self.pushDispatch5(
             pip,
@@ -11944,6 +11960,7 @@ pub const InferenceEngine = struct {
         K: u32,
         expert_stride: u32,
         n_used: u32,
+        accumulate: bool,
     ) !void {
         const pip = &(self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled orelse return error.ShaderNotLoaded);
         const push = MoeFusedDownAccPushConstants{
@@ -11954,6 +11971,7 @@ pub const InferenceEngine = struct {
             .x_offset = 0,
             .y_offset = 0,
             .n_used = n_used,
+            .acc_mode = if (accumulate) 1 else 0,
         };
         self.pushDispatch5(
             pip,

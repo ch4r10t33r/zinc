@@ -86,6 +86,7 @@ pub const MoeFusedDownAccPushConstants = extern struct {
     x_offset: u32,
     y_offset: u32,
     n_used: u32,
+    acc_mode: u32 = 0, // 0 = overwrite, 1 = accumulate into Y
 };
 
 /// Push constants for Gemma's packed Q4_K MoE gate+up+GEGLU shader.
