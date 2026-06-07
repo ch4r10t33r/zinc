@@ -1973,7 +1973,8 @@ async function prepareIntel(args, creds, remoteLibcConf) {
 
   if (args.intelBuild) {
     console.log("Building ReleaseFast on Intel node...");
-    const remote = `cd ${shellQuote(creds.workdir)} && zig build -Doptimize=ReleaseFast`;
+    const envPrefix = remoteEnvPrefix(creds);
+    const remote = `cd ${shellQuote(creds.workdir)} && ${envPrefix ? `${envPrefix} ` : ""}zig build -Doptimize=ReleaseFast`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -2284,6 +2285,12 @@ async function buildIntelConfig(args) {
   const workdir = args.intelWorkdir ?? envValue(dotEnv, "ZINC_INTEL_WORKDIR", "ZINC_INTEL_REMOTE_DIR") ?? `${remoteHome}/zinc-gpu-loop`;
   const modelRoot = args.intelModelRoot ?? envValue(dotEnv, "ZINC_INTEL_MODEL_ROOT") ?? `${xdgCacheHome}/zinc/models/models`;
   const remoteLibcConf = args.intelRemoteLibcConf ?? envValue(dotEnv, "ZINC_INTEL_REMOTE_LIBC_CONF");
+  const remoteZig = envValue(dotEnv, "ZINC_INTEL_ZIG_REMOTE");
+  const remoteZigDir = envValue(dotEnv, "ZINC_INTEL_ZIG_DIR", "ZINC_INTEL_REMOTE_ZIG_DIR")
+    ?? (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.local/zig/0.15.2`);
+  const remoteEnv = {
+    PATH: `${remoteZigDir}:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin`,
+  };
   const llamaSearchRoots = [
     `${remoteHome}/llama.cpp`,
     "/workspace/llama.cpp",
@@ -2295,7 +2302,7 @@ async function buildIntelConfig(args) {
       user,
       port,
       workdir,
-      env: {},
+      env: remoteEnv,
     },
     remoteHome,
     xdgCacheHome,
