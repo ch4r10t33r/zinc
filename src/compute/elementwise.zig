@@ -156,6 +156,14 @@ pub const RouterF32BatchPush = extern struct {
     stride_y: u32,
 };
 
+/// Push constants for token-batched Gemma router RMS norm + scale + f32 DMMV.
+pub const RmsNormScaleDmmvF32BatchPush = extern struct {
+    M: u32,
+    K: u32,
+    n_tokens: u32,
+    eps_bits: u32,
+};
+
 /// Push constants for token-batched MoE top-k.
 pub const SoftmaxTopkBatchPush = extern struct {
     n_experts: u32,
@@ -356,6 +364,8 @@ pub const ElementwiseDispatch = struct {
     pipeline_softmax_top1: ?Pipeline,
     /// Token-batched f32 MoE router matvec, or null.
     pipeline_router_f32_batch: ?Pipeline,
+    /// Token-batched Gemma router RMS norm + scale + f32 DMMV, or null.
+    pipeline_rms_norm_scale_dmmv_f32_batch: ?Pipeline,
     /// Token-batched MoE top-k, or null.
     pipeline_softmax_topk_batch: ?Pipeline,
     /// SIGMOID SCALE ACC pipeline: a[i] += sigmoid(c[0]) * b[i], 3 bindings.
@@ -651,6 +661,12 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const rms_norm_scale_router_batch_path = std.fmt.bufPrint(&path_buf, "{s}/rms_norm_scale_dmmv_f32_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_rms_norm_scale_dmmv_f32_batch = pipeline_mod.createFromSpirvWithOptions(instance, rms_norm_scale_router_batch_path, 4, @sizeOf(RmsNormScaleDmmvF32BatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("rms_norm_scale_dmmv_f32_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         const topk_batch_path = std.fmt.bufPrint(&path_buf, "{s}/softmax_topk_batch.spv", .{shader_dir}) catch unreachable;
         const pipeline_softmax_topk_batch = pipeline_mod.createFromSpirvWithOptions(instance, topk_batch_path, 2, @sizeOf(SoftmaxTopkBatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
             log.warn("softmax_topk_batch shader not loaded: {s}", .{@errorName(err)});
@@ -810,6 +826,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
             .pipeline_softmax_top1 = pipeline_softmax_top1,
             .pipeline_router_f32_batch = pipeline_router_f32_batch,
+            .pipeline_rms_norm_scale_dmmv_f32_batch = pipeline_rms_norm_scale_dmmv_f32_batch,
             .pipeline_softmax_topk_batch = pipeline_softmax_topk_batch,
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
             .pipeline_moe_weighted_acc = pipeline_moe_weighted_acc,
@@ -1335,6 +1352,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();
         if (self.pipeline_softmax_top1) |*p| p.deinit();
         if (self.pipeline_router_f32_batch) |*p| p.deinit();
+        if (self.pipeline_rms_norm_scale_dmmv_f32_batch) |*p| p.deinit();
         if (self.pipeline_softmax_topk_batch) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
         if (self.pipeline_moe_weighted_acc) |*p| p.deinit();

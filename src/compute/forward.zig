@@ -3450,7 +3450,7 @@ pub const InferenceEngine = struct {
         try growSlot(self.instance, &self.batched_scratch_up, up_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_swiglu, swiglu_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_down, hidden_bytes, storage_xfer);
-        if (cfg.architecture == .qwen2_moe and cfg.n_experts > 0 and cfg.n_experts_used > 0) {
+        if ((cfg.architecture == .qwen2_moe or cfg.architecture == .gemma) and cfg.n_experts > 0 and cfg.n_experts_used > 0) {
             const route_slots = n * @as(u64, cfg.n_experts_used);
             const expert_major_ids = n * @as(u64, cfg.n_experts);
             const indirect_storage_xfer = storage_xfer | vk.c.VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
@@ -4742,6 +4742,49 @@ pub const InferenceEngine = struct {
             router_logits_size,
         );
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), m, 1, 1);
+    }
+
+    /// Token-batched Gemma router: unit RMS norm(hidden), multiply by
+    /// ffn_gate_inp.scale, then f32 router DMMV for every prompt token.
+    fn dispatchRmsNormScaleDmmvF32Batch(
+        self: *InferenceEngine,
+        hidden_buf: vk.c.VkBuffer,
+        hidden_size: vk.c.VkDeviceSize,
+        router_scale_buf: vk.c.VkBuffer,
+        router_scale_size: vk.c.VkDeviceSize,
+        router_w_buf: vk.c.VkBuffer,
+        router_w_size: vk.c.VkDeviceSize,
+        router_logits_buf: vk.c.VkBuffer,
+        router_logits_size: vk.c.VkDeviceSize,
+        m: u32,
+        k: u32,
+        n_tokens: u32,
+        eps: f32,
+    ) !void {
+        if (n_tokens == 0) return;
+        const pip = &(self.elementwise.pipeline_rms_norm_scale_dmmv_f32_batch orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        const push = elementwise_mod.RmsNormScaleDmmvF32BatchPush{
+            .M = m,
+            .K = k,
+            .n_tokens = n_tokens,
+            .eps_bits = @bitCast(eps),
+        };
+        self.pushDispatch4(
+            pip,
+            std.mem.asBytes(&push),
+            hidden_buf,
+            hidden_size,
+            router_scale_buf,
+            router_scale_size,
+            router_w_buf,
+            router_w_size,
+            router_logits_buf,
+            router_logits_size,
+            m,
+            n_tokens,
+            1,
+        );
     }
 
     /// Fused RMS norm + Q4_K alpha/beta SSM proj DMMV.
@@ -11942,6 +11985,96 @@ pub const InferenceEngine = struct {
             self.router_output_buf.size,
             (M + 1) / 2,
             n_used,
+            1,
+        );
+    }
+
+    /// Gemma short-prefill top-1 MoE front-end over a token batch.
+    /// Routing is token-major and only slot 0 is consumed.
+    fn dispatchDmmvGemmaTop1GateUpGegluBatch(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        swiglu_buf: Buffer,
+        swiglu_size: vk.c.VkDeviceSize,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        up_offset: u32,
+        routing_stride: u32,
+        n_tokens: u32,
+    ) !void {
+        if (n_tokens == 0) return;
+        const pip = &(self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 orelse return error.ShaderNotLoaded);
+        const push = dmmv_mod.GemmaTop1MoeBatchPushConstants{
+            .M = M,
+            .K = K,
+            .expert_stride = expert_stride,
+            .up_or_routing_stride = up_offset,
+            .routing_stride = routing_stride,
+        };
+        self.pushDispatch4(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            swiglu_buf.handle,
+            swiglu_size,
+            routing_buf,
+            routing_size,
+            (M + 1) / 2,
+            n_tokens,
+            1,
+        );
+    }
+
+    /// Gemma short-prefill top-1 Q5_1 down projection fused with
+    /// ffn_down_exps.scale and hidden accumulation over a token batch.
+    fn dispatchDmmvGemmaTop1Q5_1DownAccScaledBatch(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output_buf: Buffer,
+        output_size: vk.c.VkDeviceSize,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        scale_tensor: *const LoadedTensor,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        routing_stride: u32,
+        n_tokens: u32,
+    ) !void {
+        if (n_tokens == 0) return;
+        const pip = &(self.dmmv.pipeline_q5_1_moe_down_acc_scaled_batch_top1 orelse return error.ShaderNotLoaded);
+        const push = dmmv_mod.GemmaTop1MoeBatchPushConstants{
+            .M = M,
+            .K = K,
+            .expert_stride = expert_stride,
+            .up_or_routing_stride = routing_stride,
+            .routing_stride = 0,
+        };
+        self.pushDispatch5(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            output_buf.handle,
+            output_size,
+            routing_buf,
+            routing_size,
+            scale_tensor.gpu_buffer.handle,
+            scale_tensor.gpu_buffer.size,
+            (M + 1) / 2,
+            n_tokens,
             1,
         );
     }
@@ -19494,8 +19627,352 @@ pub const InferenceEngine = struct {
         }
     }
 
-    /// Batched prompt prefill for the RDNA/Vulkan backend.
-    /// This is the Vulkan analogue of `forward_metal.InferenceEngine.prefillBatched`.
+    fn gemmaShortMoePrefixPrefillEnabled(self: *const InferenceEngine, prompt_len: usize) bool {
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
+        if (prompt_len < gemma_prefill_long_draft_prompt_min_tokens or prompt_len > gemma_prefill_shared_skip_max_tokens) return false;
+        if (!self.isAmdRdna() or self.instance.push_descriptor_fn == null) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+
+        const prompt_u32: u32 = @intCast(@min(prompt_len, @as(usize, std.math.maxInt(u32))));
+        const limit = gemmaPrefillTailTopkLimit(prompt_u32, self.moe_prefill_tail_topk_limit);
+        const guard = gemmaPrefillTailGuard(prompt_u32, self.moe_prefill_tail_topk_guard_tokens);
+        if (limit != gemma_prefill_micro_prompt_topk or guard == 0 or guard >= prompt_u32) return false;
+
+        if (self.elementwise.pipeline_rms_norm_scale_dmmv_f32_batch == null) return false;
+        if (self.elementwise.pipeline_softmax_topk_batch == null) return false;
+        if (self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 == null) return false;
+        if (self.dmmv.pipeline_q5_1_moe_down_acc_scaled_batch_top1 == null) return false;
+        var layer: u32 = 0;
+        while (layer + 1 < cfg.n_layers) : (layer += 1) {
+            const lt = self.layer_tensors[layer];
+            const router_tensor = lt.ffn_gate_inp orelse return false;
+            const router_scale = lt.ffn_gate_inp_scale orelse return false;
+            const gate_up = lt.ffn_gate_up_exps orelse return false;
+            const down_exps = lt.ffn_down_exps orelse return false;
+            const down_scale = lt.ffn_down_exps_scale orelse return false;
+            if (router_tensor.info.type_ != .f32 or router_scale.info.type_ != .f32 or down_scale.info.type_ != .f32) return false;
+            if (gate_up.info.type_ != .q4_k or down_exps.info.type_ != .q5_1) return false;
+            if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
+        }
+        return true;
+    }
+
+    fn prefillGemmaShortMoePrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        if (prompt_tokens.len == 0) return;
+        const cfg = self.model.config;
+        const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
+        const hidden_dim = cfg.hidden_dim;
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const hidden_size: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+        const hidden_batch_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tokens) * hidden_size;
+        const total_embed_bytes: u64 = @as(u64, hidden_dim) * @as(u64, n_tokens) * @sizeOf(f32);
+        const guard = gemmaPrefillTailGuard(n_tokens, self.moe_prefill_tail_topk_guard_tokens);
+        const prefix_tokens = n_tokens - guard;
+        if (prefix_tokens == 0) return self.prefillBatch(state, prompt_tokens);
+
+        const base_token: u32 = state.position;
+        const target_context_tokens = if (state.requested_context_tokens > 0)
+            @max(state.requested_context_tokens, base_token +| n_tokens)
+        else
+            base_token +| n_tokens;
+        if (base_token == 0 and state.generated_tokens.items.len == 0) {
+            try self.resetRequestState(target_context_tokens);
+        } else if (base_token > 0 and self.active_kv_page_ids == null) {
+            return error.KvStateNotAvailable;
+        } else {
+            try self.ensureKvPagesForContext(target_context_tokens);
+        }
+
+        try self.ensureBatchedScratchCapacity(n_tokens);
+        const scratch_hidden = self.batched_scratch_hidden.?;
+        const scratch_norm = self.batched_scratch_norm.?;
+        const scratch_router_logits = self.batched_scratch_gate.?;
+        const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const route_buf = self.batched_scratch_moe_ids orelse return error.BufferTooSmall;
+        if (scratch_hidden.size < hidden_batch_bytes or scratch_norm.size < hidden_batch_bytes) return error.BufferTooSmall;
+
+        if (self.prefill_embed_big == null or self.prefill_embed_big_capacity_bytes < total_embed_bytes) {
+            if (self.prefill_embed_big) |*b| b.deinit();
+            self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
+            self.prefill_embed_big_capacity_bytes = total_embed_bytes;
+        }
+        {
+            const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
+            const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
+            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+            const data_start: usize = @intCast(self.model.gguf_file.tensor_data_offset + embd.info.offset);
+            const vocab_last = cfg.vocab_size -| 1;
+            const gemma_scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(hidden_dim))));
+            for (prompt_tokens, 0..) |tok, i| {
+                const safe_id = @min(tok, vocab_last);
+                const dst = big_f32[i * hidden_dim ..][0..hidden_dim];
+                dequantRow(mmap[data_start..], safe_id, hidden_dim, embd.info.type_, dst);
+                for (dst) |*v| v.* *= gemma_scale;
+            }
+        }
+        self.prefill_embed_big_hidden = hidden_dim;
+        self.prefill_embed_big_token_count = n_tokens;
+        self.prefill_current_token_idx = 0;
+        defer {
+            self.prefill_embed_big_hidden = 0;
+            self.prefill_embed_big_token_count = 0;
+            self.prefill_current_token_idx = 0;
+        }
+
+        const saved_partial_start = self.partial_decode_start_layer;
+        const saved_partial_end = self.partial_decode_end_layer;
+        const saved_hidden_in = self.partial_decode_hidden_in;
+        const saved_hidden_in_offset = self.partial_decode_hidden_in_offset;
+        const saved_hidden_out = self.partial_decode_hidden_out;
+        const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
+        const saved_advance = self.partial_decode_advance_position;
+        const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
+        const saved_norm_out = self.partial_decode_ffn_norm_out;
+        const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_resume = self.partial_decode_resume_from_ffn_norm;
+        const saved_norm_in = self.partial_decode_ffn_norm_in;
+        const saved_norm_in_offset = self.partial_decode_ffn_norm_in_offset;
+        const saved_router_in = self.partial_decode_router_output_in;
+        const saved_router_in_offset = self.partial_decode_router_output_in_offset;
+        const saved_router_in_size = self.partial_decode_router_output_in_size;
+        defer {
+            self.partial_decode_start_layer = saved_partial_start;
+            self.partial_decode_end_layer = saved_partial_end;
+            self.partial_decode_hidden_in = saved_hidden_in;
+            self.partial_decode_hidden_in_offset = saved_hidden_in_offset;
+            self.partial_decode_hidden_out = saved_hidden_out;
+            self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
+            self.partial_decode_advance_position = saved_advance;
+            self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
+            self.partial_decode_ffn_norm_out = saved_norm_out;
+            self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_resume_from_ffn_norm = saved_resume;
+            self.partial_decode_ffn_norm_in = saved_norm_in;
+            self.partial_decode_ffn_norm_in_offset = saved_norm_in_offset;
+            self.partial_decode_router_output_in = saved_router_in;
+            self.partial_decode_router_output_in_offset = saved_router_in_offset;
+            self.partial_decode_router_output_in_size = saved_router_in_size;
+            self.prefill_pipeline_mode = false;
+        }
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_embed_bytes,
+        });
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        self.prefill_token_samples = 0;
+        self.prefill_cpu_embed_ns = 0;
+        self.prefill_cpu_record_ns = 0;
+        self.prefill_submit_wait_ns = 0;
+        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_total_ns = 0;
+        self.prefill_active = true;
+        defer self.prefill_active = false;
+
+        log.info("FASTPATH: Gemma short-prefill layer-major top-1 MoE prefix ENABLED (prefix={d}/{d}, guard={d})", .{ prefix_tokens, n_tokens, guard });
+
+        const route_stride_u32: u32 = 2 * cfg.n_experts_used;
+        const route_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, route_stride_u32) *
+            @sizeOf(u32);
+        const router_logits_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, cfg.n_experts) *
+            @sizeOf(f32);
+        const swiglu_prefix_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        if (route_buf.size < route_bytes or scratch_router_logits.size < router_logits_bytes or scratch_swiglu.size < swiglu_prefix_bytes) {
+            return error.BufferTooSmall;
+        }
+
+        const pipeline_tail =
+            n_tokens >= 16 and
+            !self.validation_diagnostics_enabled and
+            !self.profile_enabled and
+            self.instance.push_descriptor_fn != null and
+            self.isAmdRdna();
+
+        var layer: u32 = 0;
+        while (layer + 1 < cfg.n_layers) : (layer += 1) {
+            try self.prefillQwen36RunPartialTokenLoop(
+                state,
+                prompt_tokens,
+                base_token,
+                n_tokens,
+                hidden_size,
+                layer,
+                layer + 1,
+                scratch_hidden,
+                scratch_norm,
+                true,
+                true,
+                false,
+                false,
+                pipeline_tail,
+            );
+
+            const lt = self.layer_tensors[layer];
+            const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
+            const router_scale = lt.ffn_gate_inp_scale orelse return error.TensorNotFound;
+            const gate_up = lt.ffn_gate_up_exps orelse return error.TensorNotFound;
+            const down_exps = lt.ffn_down_exps orelse return error.TensorNotFound;
+            const down_scale = lt.ffn_down_exps_scale orelse return error.TensorNotFound;
+            if (router_tensor.info.type_ != .f32 or router_scale.info.type_ != .f32 or gate_up.info.type_ != .q4_k or down_exps.info.type_ != .q5_1) {
+                return error.UnsupportedQuantType;
+            }
+            if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) {
+                return error.UnsupportedQuantType;
+            }
+
+            const fused_inter = inter_dim * 2;
+            const expert_gate_row_bytes = expertSliceBytes(gate_up.info.type_, fused_inter, hidden_dim);
+            const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
+            const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.decode_cmd.transferToComputeBarrier();
+            const moe_phase = self.beginProfilePhase();
+
+            const router_phase = self.beginProfilePhase();
+            try self.dispatchRmsNormScaleDmmvF32Batch(
+                scratch_hidden.handle,
+                hidden_batch_bytes,
+                router_scale.gpu_buffer.handle,
+                router_scale.gpu_buffer.size,
+                router_tensor.gpu_buffer.handle,
+                router_tensor.gpu_buffer.size,
+                scratch_router_logits.handle,
+                router_logits_bytes,
+                cfg.n_experts,
+                hidden_dim,
+                prefix_tokens,
+                cfg.rms_norm_eps,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_router_logits.handle, router_logits_bytes);
+            self.endProfilePhase(.moe_router, router_phase);
+
+            const topk_phase = self.beginProfilePhase();
+            try self.dispatchSoftmaxTopkBatch(
+                scratch_router_logits.handle,
+                router_logits_bytes,
+                route_buf.handle,
+                route_bytes,
+                cfg.n_experts,
+                1,
+                0,
+                prefix_tokens,
+                route_stride_u32,
+            );
+            self.decode_cmd.computeBufferBarrier(route_buf.handle, route_bytes);
+            self.endProfilePhase(.moe_topk, topk_phase);
+
+            const gate_up_phase = self.beginProfilePhase();
+            try self.dispatchDmmvGemmaTop1GateUpGegluBatch(
+                gate_up,
+                scratch_hidden,
+                hidden_batch_bytes,
+                scratch_swiglu,
+                swiglu_prefix_bytes,
+                route_buf.handle,
+                route_bytes,
+                inter_dim,
+                hidden_dim,
+                expert_gate_row_bytes,
+                up_base_offset,
+                route_stride_u32,
+                prefix_tokens,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_prefix_bytes);
+            self.endProfilePhase(.moe_gate_up, gate_up_phase);
+
+            const down_phase = self.beginProfilePhase();
+            try self.dispatchDmmvGemmaTop1Q5_1DownAccScaledBatch(
+                down_exps,
+                scratch_swiglu,
+                swiglu_prefix_bytes,
+                scratch_hidden,
+                hidden_batch_bytes,
+                route_buf.handle,
+                route_bytes,
+                down_scale,
+                hidden_dim,
+                inter_dim,
+                expert_down_row_bytes,
+                route_stride_u32,
+                prefix_tokens,
+            );
+            self.decode_cmd.computeToTransferBarrier();
+            self.endProfilePhase(.moe_down, down_phase);
+            self.endProfilePhase(.moe_routed, moe_phase);
+            try self.decode_cmd.end();
+            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            self.recordProfilingSample();
+
+            var tok_idx = prefix_tokens;
+            while (tok_idx < n_tokens) : (tok_idx += 1) {
+                const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                self.prefill_current_token_idx = tok_idx;
+                state.position = base_token + tok_idx;
+                self.partial_decode_start_layer = layer;
+                self.partial_decode_end_layer = layer + 1;
+                self.partial_decode_hidden_in = scratch_hidden.handle;
+                self.partial_decode_hidden_in_offset = hidden_offset;
+                self.partial_decode_hidden_out = scratch_hidden.handle;
+                self.partial_decode_hidden_out_offset = hidden_offset;
+                self.partial_decode_advance_position = false;
+                self.partial_decode_allow_final_tail = false;
+                self.partial_decode_stop_after_ffn_norm = false;
+                self.partial_decode_ffn_norm_out = null;
+                self.partial_decode_ffn_norm_out_offset = 0;
+                self.partial_decode_resume_from_ffn_norm = true;
+                self.partial_decode_ffn_norm_in = scratch_norm.handle;
+                self.partial_decode_ffn_norm_in_offset = hidden_offset;
+                self.partial_decode_router_output_in = null;
+                self.partial_decode_router_output_in_offset = 0;
+                self.partial_decode_router_output_in_size = 0;
+                try self.decodeStep(state, prompt_tokens[tok_idx], false);
+            }
+        }
+
+        try self.prefillQwen36RunPartialTokenLoop(
+            state,
+            prompt_tokens,
+            base_token,
+            n_tokens,
+            hidden_size,
+            cfg.n_layers - 1,
+            cfg.n_layers,
+            scratch_hidden,
+            null,
+            false,
+            false,
+            false,
+            true,
+            pipeline_tail,
+        );
+
+        self.prefill_token_samples = n_tokens;
+        state.position = base_token + n_tokens;
+    }
+
+    /// Experimental batched prompt prefill for the RDNA/Vulkan backend.
+    /// Gated by `ZINC_BATCHED_PREFILL=1`. This is the Vulkan analogue of
+    /// `forward_metal.InferenceEngine.prefillBatched`.
     ///
     /// Routes to `prefillA3bProduction` or `prefillQwen36DenseFfnPrefix` when the
     /// model and prompt length match those specialized paths; otherwise falls back to
@@ -19545,6 +20022,9 @@ pub const InferenceEngine = struct {
             const dense_prefix_layers = self.qwen36DensePrefillPrefixLayers(prompt_tokens.len);
             if (dense_prefix_layers > 0) {
                 return self.prefillQwen36DenseFfnPrefix(state, prompt_tokens, dense_prefix_layers);
+            }
+            if (self.gemmaShortMoePrefixPrefillEnabled(prompt_tokens.len)) {
+                return self.prefillGemmaShortMoePrefix(state, prompt_tokens);
             }
         }
         if ((batched_disabled and !validate_mode) or !canUseBatchedPrefillRdna(self)) {
