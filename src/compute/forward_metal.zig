@@ -16134,6 +16134,11 @@ fn dispatchFullAttnPrepOnCmd(
         // Dense Gemma attention path: Q/K are Q4_K and V is Q6_K. Prefer the
         // heterogeneous Q+K+V dispatch when available; otherwise keep the older
         // Q+K dual projection and launch V separately.
+        const can_reuse_raw_k_as_v =
+            attn.use_k_as_v and
+            !engine.debug_validation_enabled and
+            !engine.kv_cache_q8 and
+            (attn.rope_dim % 2) == 0;
         const can_triple_qkv = !gate_mode.separate_attn_gate and
             !attn.use_k_as_v and
             canUseDenseQ4KQKQ6KV(engine, q_tensor, k_tensor, v_tensor, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
@@ -16159,7 +16164,9 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
-                dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+                if (!can_reuse_raw_k_as_v) {
+                    dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+                }
             }
         } else {
             dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
@@ -16170,10 +16177,12 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
-                dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+                if (!can_reuse_raw_k_as_v) {
+                    dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+                }
             }
         }
-        profileFullAttnQkvBarrier(cmd, profile, .qkv, true, true, true, gate_mode.apply_attn_gate, engine);
+        profileFullAttnQkvBarrier(cmd, profile, .qkv, true, true, !can_reuse_raw_k_as_v, gate_mode.apply_attn_gate, engine);
     }
     recordFullAttnDispatchDelta(profile, .qkv, qkv_dispatch_before, cmd.dispatch_count);
 
@@ -16199,8 +16208,8 @@ fn dispatchFullAttnPrepOnCmd(
 
     // Fuse RoPE-K with the K/V cache write when:
     //   - cache is f32 (kv_cache_q8 path keeps its own quantizing kernel),
-    //   - v_buf has been materialized (Gemma use_k_as_v layers project the
-    //     same K tensor into both k_buf and v_buf before this edge),
+    //   - v_buf has been materialized, or Gemma use_k_as_v can read raw k_buf
+    //     directly as the V stream,
     //   - rope_dim is even (the kernel processes pairs).
     // Saves one barrier and one dispatch per dense full-attn layer (≈60/token
     // on Gemma 31B). The rope→kv-write barrier can be skipped because the
@@ -16305,6 +16314,10 @@ fn dispatchFullAttnPrepOnCmd(
         // n_kv_heads; the first n_q_heads slots normalize+rotate q_buf in
         // place, the rest normalize+rotate K and write K/V into the layer's
         // cache slot.
+        const v_input_buf: *const MetalBuffer = if (attn.use_k_as_v and !engine.debug_validation_enabled)
+            &engine.k_buf
+        else
+            &engine.v_buf;
         dispatchFusedRopeKvCacheWriteOnCmd(
             engine,
             cmd,
@@ -16313,6 +16326,7 @@ fn dispatchFullAttnPrepOnCmd(
             cfg.n_heads,
             engine.position,
             engine.position * attn.kv_dim,
+            v_input_buf,
             fuse_v_unit_norm_into_rope_kv,
             fuse_qk_norm_into_rope_kv,
         );
@@ -16394,6 +16408,12 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     const cfg = engine.config;
     const k_tensor = lt.attn_k orelse return error.MissingTensor;
     const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
+    const can_reuse_raw_k_as_v =
+        !fuse_attn_norm and
+        attn.use_k_as_v and
+        !engine.debug_validation_enabled and
+        !engine.kv_cache_q8 and
+        (attn.rope_dim % 2) == 0;
 
     const qkv_dispatch_before = cmd.dispatch_count;
     if (fuse_attn_norm) {
@@ -16425,10 +16445,12 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
             dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else {
             dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
-            dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            if (!can_reuse_raw_k_as_v) {
+                dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            }
         }
     }
-    profileFullAttnQkvBarrier(cmd, profile, .qkv, false, true, true, false, engine);
+    profileFullAttnQkvBarrier(cmd, profile, .qkv, false, true, !can_reuse_raw_k_as_v, false, engine);
     recordFullAttnDispatchDelta(profile, .qkv, qkv_dispatch_before, cmd.dispatch_count);
 
     if (lt.attn_k_bias != null or lt.attn_v_bias != null) {
@@ -16467,6 +16489,10 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     if (can_fuse_rope_kv_write) {
         // K/V-only variant of the llama.cpp-style RoPE materialization path:
         // final non-terminal prompt tokens write rotated K/V directly to cache.
+        const v_input_buf: *const MetalBuffer = if (attn.use_k_as_v and !engine.debug_validation_enabled)
+            &engine.k_buf
+        else
+            &engine.v_buf;
         dispatchFusedRopeKvCacheWriteOnCmd(
             engine,
             cmd,
@@ -16475,6 +16501,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
             0,
             engine.position,
             engine.position * attn.kv_dim,
+            v_input_buf,
             fuse_v_unit_norm_into_rope_kv,
             fuse_qk_norm_into_rope_kv,
         );
@@ -16499,7 +16526,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
 }
 
 /// Adapted from llama.cpp `ggml_metal_op_rope_set_rows`: rotates the K vector
-/// for the current token and writes the result (plus an unrotated V copy)
+/// for the current token and writes the result plus a caller-selected V stream
 /// directly into the layer's KV cache slot. Extended to also rotate the Q
 /// vector in the same dispatch so the dense decode path collapses
 /// (Q-rope, K-rope+kv-write, V-norm+kv-write) into one kernel — one fewer
@@ -16515,6 +16542,7 @@ fn dispatchFusedRopeKvCacheWriteOnCmd(
     n_q_heads: u32,
     position: u32,
     dst_offset: u32,
+    v_input: *const MetalBuffer,
     apply_v_norm: bool,
     apply_qk_norm: bool,
 ) void {
@@ -16543,7 +16571,7 @@ fn dispatchFusedRopeKvCacheWriteOnCmd(
     const bufs = [_]*const MetalBuffer{
         &engine.q_buf,
         &engine.k_buf,
-        &engine.v_buf,
+        v_input,
         freq_buf,
         &engine.kv_k_cache[layer_idx],
         &engine.kv_v_cache[layer_idx],
