@@ -151,29 +151,17 @@ kernel void main0(
     }
 
     if (p.apply_v_norm != 0u) {
-        // Compute per-head sum of squares for V, threadgroup-reduce, then
-        // multiply each element by rsqrt(mean + eps) while writing to v_cache.
-        // Mirrors `rms_norm_mul.metal` but folds the read/normalize/write into
-        // the same kernel that performs the V cache copy.
-        threadgroup float v_shmem[2];
-        threadgroup float v_shared_rms_inv;
-
+        // Same per-simdgroup full-stride reduction used by the Q/K norm
+        // branches above: both simdgroups compute the complete V RMS scale,
+        // avoiding threadgroup memory and two barriers per KV head. The extra
+        // 2x read is only ~1 KiB/head on Gemma 31B and stays L1-resident.
         float sum_sq = 0.0f;
-        for (uint i = tid; i < stride; i += 64) {
+        for (uint i = simd_lane; i < stride; i += 32u) {
             const float v = v_in[base + i];
             sum_sq += v * v;
         }
         sum_sq = simd_sum(sum_sq);
-        if (simd_lane == 0) {
-            v_shmem[simd_group] = sum_sq;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            const float total = v_shmem[0] + v_shmem[1];
-            v_shared_rms_inv = rsqrt((total / float(stride)) + p.eps);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float rms_inv = v_shared_rms_inv;
+        const float rms_inv = rsqrt((sum_sq / float(stride)) + p.eps);
 
         for (uint i = tid; i < stride; i += 64) {
             v_cache[dst_base + i] = v_in[base + i] * rms_inv;
