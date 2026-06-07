@@ -72,7 +72,9 @@ kernel void main0(
     device const uchar* x_base = src0 + (uint64_t)first_row * nb01;
     device const float* y = src1;
 
-    float sumf[NR0] = {0.f, 0.f};
+    // Keep the NR0=2 row pair as one vector accumulator, matching the base
+    // Q4_K matvec and avoiding a two-slot thread-private scalar array.
+    float2 sumf = float2(0.0f);
 
     device const float* y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
@@ -339,8 +341,7 @@ kernel void main0(
         const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
         const float2 tail_dots = float2(dot(sumy, sc_neg_0), dot(sumy, sc_neg_1));
         const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
-        sumf[0] += delta[0];
-        sumf[1] += delta[1];
+        sumf += delta;
 
         y4 += 4 * QK_K;
     }
