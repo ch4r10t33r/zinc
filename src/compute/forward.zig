@@ -2300,6 +2300,31 @@ pub const InferenceEngine = struct {
             log.info("Qwen 3.6 non-terminal prefill MoE top-k cap disabled via ZINC_QWEN36_MOE_PREFILL_TOPK={s}", .{qwen36_prefill_topk_env.?});
         }
 
+        const is_amd_rdna_vendor = gpu_config.vendor == .amd_rdna3 or
+            gpu_config.vendor == .amd_rdna4 or
+            gpu_config.vendor == .amd_rdna4_apu;
+        const gemma_prefill_tail_topk_default: u32 = 4;
+        const gemma_prefill_tail_topk_guard_default: u32 = 16;
+        const gemma_prefill_tail_topk_limit: u32 = if (config.architecture == .gemma and
+            config.n_experts > 0 and
+            config.n_experts_used > gemma_prefill_tail_topk_default and
+            is_amd_rdna_vendor and
+            gemma_topk_env == null)
+            gemma_prefill_tail_topk_default
+        else
+            0;
+        const gemma_prefill_tail_topk_guard_tokens: u32 = if (gemma_prefill_tail_topk_limit > 0)
+            gemma_prefill_tail_topk_guard_default
+        else
+            0;
+        if (gemma_prefill_tail_topk_limit > 0) {
+            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
+                gemma_prefill_tail_topk_limit,
+                gemma_prefill_tail_topk_guard_tokens,
+                config.n_experts_used,
+            });
+        }
+
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
         // rms_norm_dmmv_f32 pipeline is loaded. Folds the standalone
         // ffn-norm dispatch into the MoE router DMMV, saving one
@@ -3053,8 +3078,8 @@ pub const InferenceEngine = struct {
             .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
             .moe_topk_limit = if (gemma_topk_limit > 0) gemma_topk_limit else qwen36_topk_limit,
-            .moe_prefill_tail_topk_limit = qwen36_prefill_tail_topk_limit,
-            .moe_prefill_tail_topk_guard_tokens = qwen36_prefill_tail_topk_guard_tokens,
+            .moe_prefill_tail_topk_limit = if (gemma_prefill_tail_topk_limit > 0) gemma_prefill_tail_topk_limit else qwen36_prefill_tail_topk_limit,
+            .moe_prefill_tail_topk_guard_tokens = if (gemma_prefill_tail_topk_limit > 0) gemma_prefill_tail_topk_guard_tokens else qwen36_prefill_tail_topk_guard_tokens,
             .use_fused_rms_router = fused_rms_router_enabled,
             .use_fused_ssm_pre_norm = fused_ssm_ab_enabled,
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
