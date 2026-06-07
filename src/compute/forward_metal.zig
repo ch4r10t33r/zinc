@@ -4122,6 +4122,7 @@ pub const InferenceEngine = struct {
     max_context_tokens: u32,
     profile_enabled: bool,
     q8_repacked_dispatch_profile_enabled: bool,
+    gemma_q8_repacked_dispatch_decode_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
@@ -4323,6 +4324,8 @@ pub const InferenceEngine = struct {
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
         self.q8_repacked_dispatch_profile_enabled = readBoolEnv("ZINC_METAL_Q8_DISPATCH_PROFILE") orelse false;
+        self.gemma_q8_repacked_dispatch_decode_enabled =
+            readBoolEnv("ZINC_METAL_GEMMA_Q8_REPACKED_DISPATCH_DECODE") orelse false;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
         self.qwen_prefill_validation_enabled =
@@ -9573,6 +9576,13 @@ fn selectQ8RepackedDispatchKind(
     return selectQ8RepackedDispatchKindUncached(engine, tensor, M, K);
 }
 
+fn shouldUseQ8RepackedDispatchHelper(engine: *const InferenceEngine) bool {
+    if (engine.config.architecture == .gemma and !engine.in_prefill_phase) {
+        return engine.gemma_q8_repacked_dispatch_decode_enabled;
+    }
+    return true;
+}
+
 fn dispatchQ8RepackedDmmvOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -9770,20 +9780,22 @@ fn dispatchDmmvOnCmdWithWeightBuf(
 
     // Fast path: SIMD-coalesced repacked Q8_0 layout
     if (weight_buf.is_repacked_q8 and engine.dmmv_q8_0_repacked_pipe.handle != null) {
-        const cached_kind = selectQ8RepackedDispatchKind(engine, tensor, M, K);
-        if (dispatchQ8RepackedDmmvOnCmd(
-            engine,
-            cmd,
-            tensor,
-            weight_buf,
-            weight_offset,
-            input_buf,
-            output_buf,
-            M,
-            K,
-            extra_byte_offset,
-            cached_kind,
-        )) return;
+        if (shouldUseQ8RepackedDispatchHelper(engine)) {
+            const cached_kind = selectQ8RepackedDispatchKind(engine, tensor, M, K);
+            if (dispatchQ8RepackedDmmvOnCmd(
+                engine,
+                cmd,
+                tensor,
+                weight_buf,
+                weight_offset,
+                input_buf,
+                output_buf,
+                M,
+                K,
+                extra_byte_offset,
+                cached_kind,
+            )) return;
+        }
 
         const push = DmmvPush{
             .M = M,
@@ -27897,6 +27909,27 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, false, true));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.qwen35, false, false));
+}
+
+test "Gemma decode keeps Q8 repacked dispatch helper opt-in" {
+    var engine: InferenceEngine = undefined;
+    engine.config = std.mem.zeroes(ModelConfig);
+    engine.config.architecture = .gemma;
+    engine.in_prefill_phase = false;
+    engine.gemma_q8_repacked_dispatch_decode_enabled = false;
+
+    try std.testing.expect(!shouldUseQ8RepackedDispatchHelper(&engine));
+
+    engine.in_prefill_phase = true;
+    try std.testing.expect(shouldUseQ8RepackedDispatchHelper(&engine));
+
+    engine.in_prefill_phase = false;
+    engine.gemma_q8_repacked_dispatch_decode_enabled = true;
+    try std.testing.expect(shouldUseQ8RepackedDispatchHelper(&engine));
+
+    engine.config.architecture = .qwen2_moe;
+    engine.gemma_q8_repacked_dispatch_decode_enabled = false;
+    try std.testing.expect(shouldUseQ8RepackedDispatchHelper(&engine));
 }
 
 test "gemma26 exact 20 token prefill keeps accepted queued split" {
