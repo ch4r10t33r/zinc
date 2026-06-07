@@ -3928,6 +3928,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_qk_q6k_v_pipe: MetalPipeline,
     dmmv_q4k_lmhead_pipe: MetalPipeline,
     dmmv_q4k_lmhead_1024_pipe: MetalPipeline,
+    dmmv_q4k_lmhead_argmax_pipe: MetalPipeline,
     dmmv_q4k_lmhead_norm_pipe: MetalPipeline,
     dmmv_q5k_pipe: MetalPipeline,
     dmmv_q5k_native_pipe: MetalPipeline,
@@ -4343,7 +4344,9 @@ pub const InferenceEngine = struct {
         const up_size: usize = @max(@as(usize, inter_dim) * @sizeOf(f32), @as(usize, shexp_inter_dim) * @sizeOf(f32));
         const swiglu_size: usize = @max(up_size, @as(usize, conv_channels) * @sizeOf(f32));
         const vocab_size: usize = @as(usize, cfg.vocab_size) * @sizeOf(f32);
-        const argmax_pairs_size: usize = @max(((@as(usize, cfg.vocab_size) + 1023) / 1024) * 2 * @sizeOf(u32), 2 * @sizeOf(u32));
+        const argmax_chunk_pairs: usize = (@as(usize, cfg.vocab_size) + 1023) / 1024;
+        const argmax_lmhead_pairs: usize = (@as(usize, cfg.vocab_size) + 3) / 4;
+        const argmax_pairs_size: usize = @max(@max(argmax_chunk_pairs, argmax_lmhead_pairs) * 2 * @sizeOf(u32), 2 * @sizeOf(u32));
         const kv_cache_size: usize = @as(usize, max_ctx) * kv_cache_bytes_per_token;
         const page_table_size: usize = @as(usize, max_ctx) * @sizeOf(u32);
         const router_size: usize = @max(@as(usize, cfg.n_experts), @as(usize, if (cfg.ssm_dt_rank > 0) cfg.ssm_dt_rank else 1)) * @sizeOf(f32);
@@ -4608,6 +4611,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_qk_q6k_v_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_q6k_v");
         self.dmmv_q4k_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead");
         self.dmmv_q4k_lmhead_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
+        self.dmmv_q4k_lmhead_argmax_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_argmax");
         self.dmmv_q4k_lmhead_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_norm");
         self.dmmv_q5k_pipe = try loadShaderPipeline(ctx, "dmmv_q5k");
         self.dmmv_q5k_native_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_native");
@@ -5562,6 +5566,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_q6k_v_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_1024_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_argmax_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_native_pipe);
@@ -8422,16 +8427,26 @@ fn dispatchArgmaxOnCmd(
         const chunk_bufs = [_]*const MetalBuffer{ logits_buf, &engine.argmax_partials_buf };
         cmd.dispatchV2(&engine.argmax_chunks_pipe, .{ n_pairs, 1, 1 }, .{ 256, 1, 1 }, &chunk_bufs, &chunk_push, @sizeOf(ArgmaxPush), 2);
         profileBarrierBuffers(cmd, profile, .final, &.{&engine.argmax_partials_buf});
-
-        const reduce_push = ArgmaxPairsPush{ .n_pairs = n_pairs };
-        const reduce_bufs = [_]*const MetalBuffer{ &engine.argmax_partials_buf, output_buf };
-        cmd.dispatchV2(&engine.argmax_pairs_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &reduce_bufs, &reduce_push, @sizeOf(ArgmaxPairsPush), 2);
+        dispatchArgmaxPairsOnCmd(engine, cmd, &engine.argmax_partials_buf, output_buf, n_pairs);
         return;
     }
 
     const push = ArgmaxPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ logits_buf, output_buf };
     cmd.dispatchV2(&engine.argmax_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ArgmaxPush), 2);
+}
+
+fn dispatchArgmaxPairsOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    partials_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    n_pairs: u32,
+) void {
+    if (n_pairs == 0) return;
+    const reduce_push = ArgmaxPairsPush{ .n_pairs = n_pairs };
+    const reduce_bufs = [_]*const MetalBuffer{ partials_buf, output_buf };
+    cmd.dispatchV2(&engine.argmax_pairs_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &reduce_bufs, &reduce_push, @sizeOf(ArgmaxPairsPush), 2);
 }
 
 fn writeCpuArgmax(engine: *const InferenceEngine, logits: [*]const f32, n: u32) void {
@@ -10154,6 +10169,82 @@ fn dispatchLmHeadOnCmd(
     }
 
     dispatchDmmvOnCmd(engine, cmd, engine.lm_head, input_buf, output_buf, vocab_size, hidden_dim, 0);
+}
+
+fn canUseLmHeadQ4KArgmaxPartials(engine: *const InferenceEngine, hidden_dim: u32, vocab_size: u32) bool {
+    const rows_per_wg: u32 = 4;
+    const n_pairs: usize = @intCast((vocab_size + rows_per_wg - 1) / rows_per_wg);
+    return engine.lm_head.info.type_ == .q4_k and
+        hidden_dim > 3072 and
+        hidden_dim % 256 == 0 and
+        vocab_size >= 65536 and
+        vocab_size % rows_per_wg == 0 and
+        engine.lm_head_private_buf.handle == null and
+        engine.dmmv_q4k_lmhead_argmax_pipe.handle != null and
+        engine.dmmv_q4k_lmhead_argmax_pipe.max_threads_per_threadgroup >= 64 and
+        engine.argmax_pairs_pipe.handle != null and
+        engine.argmax_partials_buf.handle != null and
+        engine.argmax_partials_buf.size >= n_pairs * 2 * @sizeOf(u32);
+}
+
+fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    input_buf: *const MetalBuffer,
+    logits_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    hidden_dim: u32,
+    vocab_size: u32,
+    profile: ?*RuntimeProfile,
+) void {
+    recordDmmvProfile(engine, engine.lm_head, vocab_size, hidden_dim);
+
+    const rows_per_wg: u32 = 4;
+    const n_pairs = (vocab_size + rows_per_wg - 1) / rows_per_wg;
+    const push = DmmvPush{
+        .M = vocab_size,
+        .K = hidden_dim,
+        .a_offset = tensorPageOffset(engine.model, engine.lm_head),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &engine.lm_head.gpu_buffer,
+        input_buf,
+        logits_buf,
+        &engine.argmax_partials_buf,
+    };
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_lmhead_argmax_pipe,
+        .{ n_pairs, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DmmvPush),
+        1,
+    );
+    profileBarrierBuffers(cmd, profile, .final, &.{&engine.argmax_partials_buf});
+    dispatchArgmaxPairsOnCmd(engine, cmd, &engine.argmax_partials_buf, output_buf, n_pairs);
+}
+
+fn dispatchLmHeadAndArgmaxOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    input_buf: *const MetalBuffer,
+    logits_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    hidden_dim: u32,
+    vocab_size: u32,
+    profile: ?*RuntimeProfile,
+) void {
+    if (canUseLmHeadQ4KArgmaxPartials(engine, hidden_dim, vocab_size)) {
+        dispatchLmHeadQ4KArgmaxPartialsOnCmd(engine, cmd, input_buf, logits_buf, output_buf, hidden_dim, vocab_size, profile);
+        return;
+    }
+
+    dispatchLmHeadOnCmd(engine, cmd, input_buf, logits_buf, hidden_dim, vocab_size);
+    profileBarrierBuffers(cmd, profile, .final, &.{logits_buf});
+    dispatchArgmaxOnCmd(engine, cmd, logits_buf, output_buf, vocab_size, profile);
 }
 
 /// True when the dense Gemma final LM head can fuse `final_norm` (RMS
@@ -22248,9 +22339,7 @@ fn runDecodeStep(
     const fuse_final_norm = !final_norm_ready_from_dense_tail and !cpu_lm_head and canUseLmHeadFusedNorm(engine, hidden_dim);
     if (shared_cmd) |cmd| {
         if (final_norm_ready_from_dense_tail) {
-            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
+            dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else if (cpu_lm_head) {
@@ -22276,10 +22365,7 @@ fn runDecodeStep(
             // only the normalized row, so order norm_buf instead of fencing
             // unrelated buffer writes still draining in the concurrent encoder.
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
-            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            // Argmax reads only the logits row.
-            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
+            dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
@@ -22292,9 +22378,7 @@ fn runDecodeStep(
             break :blk &final_cmd_storage;
         };
         if (final_norm_ready_from_dense_tail) {
-            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
+            dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(cmd, profile);
         } else if (cpu_lm_head) {
@@ -22317,9 +22401,7 @@ fn runDecodeStep(
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
-            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
+            dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(cmd, profile);
         }
@@ -28973,6 +29055,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&lmhead_pipe);
     var lmhead_pipe_1024 = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
     defer metal_pipeline.freePipeline(&lmhead_pipe_1024);
+    var lmhead_argmax_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_argmax");
+    defer metal_pipeline.freePipeline(&lmhead_argmax_pipe);
     var argmax_chunks_pipe = try loadShaderPipeline(ctx, "argmax_chunks");
     defer metal_pipeline.freePipeline(&argmax_chunks_pipe);
     var argmax_pairs_pipe = try loadShaderPipeline(ctx, "argmax_pairs");
@@ -29112,6 +29196,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(acc_pipe.handle != null);
     try std.testing.expect(lmhead_pipe.handle != null);
     try std.testing.expect(lmhead_pipe_1024.handle != null);
+    try std.testing.expect(lmhead_argmax_pipe.handle != null);
     try std.testing.expect(argmax_chunks_pipe.handle != null);
     try std.testing.expect(argmax_pairs_pipe.handle != null);
     try std.testing.expect(topk_pipe.handle != null);
