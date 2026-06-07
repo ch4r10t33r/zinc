@@ -75,27 +75,33 @@ pub const CudaDevice = struct {
         }
     }
 
+    /// Total device memory (VRAM capacity) in bytes.
     pub fn totalMemory(self: *const CudaDevice) u64 {
         return self.caps.total_memory;
     }
 
+    /// Currently free device memory in bytes; 0 if the context has been destroyed.
     pub fn freeMemory(self: *const CudaDevice) u64 {
         if (self.ctx) |ctx| return shim.cuda_free_memory(ctx);
         return 0;
     }
 
+    /// Compute capability encoded as `major*10 + minor` (e.g. 120 = sm_120).
     pub fn computeCapability(self: *const CudaDevice) u32 {
         return self.caps.compute_capability;
     }
 
+    /// Number of streaming multiprocessors (SMs) on the device.
     pub fn smCount(self: *const CudaDevice) u32 {
         return self.caps.sm_count;
     }
 
+    /// Threads per warp (32 on all current NVIDIA hardware).
     pub fn warpSize(self: *const CudaDevice) u32 {
         return self.caps.warp_size;
     }
 
+    /// Maximum static shared memory per block, in bytes.
     pub fn maxSharedMemPerBlock(self: *const CudaDevice) u64 {
         return self.caps.max_shared_mem_per_block;
     }

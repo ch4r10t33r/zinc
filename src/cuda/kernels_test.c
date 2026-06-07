@@ -533,6 +533,222 @@ int main(void) {
         free(a0); free(b); free(aref); free(agpu);
     }
 
+    // ===== Test 14: ssm_conv1d (validates out + in-place state update) =====
+    {
+        const unsigned cc = 512, d_conv = 4, state_offset = 1; unsigned d_conv_1 = d_conv - 1;
+        float* ci = malloc((size_t)cc * 4); float* ker = malloc((size_t)cc * d_conv * 4); float* st0 = malloc((size_t)d_conv_1 * cc * 4);
+        float* out_ref = malloc((size_t)cc * 4); float* st_ref = malloc((size_t)d_conv_1 * cc * 4);
+        float* out_gpu = malloc((size_t)cc * 4); float* st_gpu = malloc((size_t)d_conv_1 * cc * 4);
+        for (unsigned i = 0; i < cc; i++) ci[i] = frand();
+        for (unsigned i = 0; i < cc * d_conv; i++) ker[i] = frand();
+        for (unsigned i = 0; i < d_conv_1 * cc; i++) st0[i] = frand();
+        memcpy(st_ref, st0, (size_t)d_conv_1 * cc * 4);
+        for (unsigned ch = 0; ch < cc; ch++) {
+            float sum = 0;
+            for (unsigned ki = 0; ki < d_conv; ki++) {
+                float kw = ker[ch * d_conv + ki]; float sv;
+                if (ki < d_conv_1) { unsigned slot = state_offset + ki; if (slot >= d_conv_1) slot -= d_conv_1; sv = st0[slot * cc + ch]; }
+                else sv = ci[ch];
+                sum += kw * sv;
+            }
+            out_ref[ch] = sum / (1.0f + expf(-sum));
+            st_ref[state_offset * cc + ch] = ci[ch];
+        }
+        CudaBuf* dci = cuda_create_buffer(c, (size_t)cc * 4); CudaBuf* dk = cuda_create_buffer(c, (size_t)cc * d_conv * 4);
+        CudaBuf* dst = cuda_create_buffer(c, (size_t)d_conv_1 * cc * 4); CudaBuf* dout = cuda_create_buffer(c, (size_t)cc * 4);
+        cuda_upload(c, dci, ci, (size_t)cc * 4); cuda_upload(c, dk, ker, (size_t)cc * d_conv * 4); cuda_upload(c, dst, st0, (size_t)d_conv_1 * cc * 4);
+        CudaPipe* p = cuda_create_pipeline(c, src, "ssm_conv1d", NULL, 0);
+        if (!p) { printf("FAIL ssm_conv1d compile: %s\n", cuda_last_error()); return 2; }
+        struct { unsigned cc, dc, f16, so; } push = { cc, d_conv, 0, state_offset };
+        uint32_t grid[3] = { (cc + 255) / 256, 1, 1 }, block[3] = { 256, 1, 1 }; CudaBuf* bufs[4] = { dci, dk, dst, dout };
+        CudaCmd* cmd = cuda_begin_command(c); cuda_dispatch(cmd, p, grid, block, bufs, 4, &push, sizeof push, 0); cuda_commit_and_wait(cmd);
+        cuda_download(c, dout, out_gpu, (size_t)cc * 4); cuda_download(c, dst, st_gpu, (size_t)d_conv_1 * cc * 4);
+        float mo = 0; for (unsigned i = 0; i < cc; i++) { float r = fabsf(out_ref[i] - out_gpu[i]) / (fabsf(out_ref[i]) + 1e-4f); if (r > mo) mo = r; }
+        float msv = 0; for (unsigned i = 0; i < d_conv_1 * cc; i++) { float r = fabsf(st_ref[i] - st_gpu[i]) / (fabsf(st_ref[i]) + 1e-4f); if (r > msv) msv = r; }
+        int ok = (mo < 1e-3f && msv < 1e-3f); all_ok &= ok;
+        printf("ssm_conv1d [cc=%u d_conv=%u]: out_err=%.2e state_err=%.2e -> %s\n", cc, d_conv, mo, msv, ok ? "PASS" : "FAIL");
+        cuda_free_buffer(dci); cuda_free_buffer(dk); cuda_free_buffer(dst); cuda_free_buffer(dout); cuda_free_pipeline(p);
+        free(ci); free(ker); free(st0); free(out_ref); free(st_ref); free(out_gpu); free(st_gpu);
+    }
+
+    // ===== Test 15: ssm_gated_norm =====
+    {
+        const unsigned dt_rank = 4, head_v_dim = 128, d_state = 128, norm_per_head = 1; unsigned d_inner = dt_rank * head_v_dim;
+        float* o = malloc((size_t)d_inner * 4); float* z = malloc((size_t)d_inner * 4); float* nw = malloc((size_t)d_inner * 4);
+        float* ref = malloc((size_t)d_inner * 4); float* gpu = malloc((size_t)d_inner * 4);
+        for (unsigned i = 0; i < d_inner; i++) { o[i] = frand(); z[i] = frand() * 2.0f; nw[i] = frand() * 0.5f + 1.0f; }
+        for (unsigned h = 0; h < dt_rank; h++) {
+            unsigned base = h * head_v_dim;
+            double ss = 0; for (unsigned i = 0; i < head_v_dim; i++) { float v = o[base + i]; ss += (double)v * v; }
+            float rinv = 1.0f / sqrtf((float)(ss / head_v_dim) + 1e-6f);
+            for (unsigned i = 0; i < head_v_dim; i++) {
+                float nv = o[base + i] * rinv; unsigned ni = norm_per_head ? base + i : i % d_state; nv *= nw[ni];
+                float zv = z[base + i]; ref[base + i] = nv * (zv / (1.0f + expf(-zv)));
+            }
+        }
+        CudaBuf* doo = cuda_create_buffer(c, (size_t)d_inner * 4); CudaBuf* dz = cuda_create_buffer(c, (size_t)d_inner * 4);
+        CudaBuf* dnw = cuda_create_buffer(c, (size_t)d_inner * 4); CudaBuf* dout = cuda_create_buffer(c, (size_t)d_inner * 4);
+        cuda_upload(c, doo, o, (size_t)d_inner * 4); cuda_upload(c, dz, z, (size_t)d_inner * 4); cuda_upload(c, dnw, nw, (size_t)d_inner * 4);
+        CudaPipe* p = cuda_create_pipeline(c, src, "ssm_gated_norm", NULL, 0);
+        if (!p) { printf("FAIL ssm_gated_norm compile: %s\n", cuda_last_error()); return 2; }
+        struct { unsigned di, dt, hv, ds, nph; } push = { d_inner, dt_rank, head_v_dim, d_state, norm_per_head };
+        uint32_t grid[3] = { dt_rank, 1, 1 }, block[3] = { 128, 1, 1 }; CudaBuf* bufs[4] = { doo, dz, dnw, dout };
+        CudaCmd* cmd = cuda_begin_command(c); cuda_dispatch(cmd, p, grid, block, bufs, 4, &push, sizeof push, 0); cuda_commit_and_wait(cmd);
+        cuda_download(c, dout, gpu, (size_t)d_inner * 4);
+        float mr = 0; for (unsigned i = 0; i < d_inner; i++) { float r = fabsf(ref[i] - gpu[i]) / (fabsf(ref[i]) + 1e-4f); if (r > mr) mr = r; }
+        int ok = mr < 1e-3f; all_ok &= ok;
+        printf("ssm_gated_norm [heads=%u hv=%u]: max_rel_err=%.2e -> %s\n", dt_rank, head_v_dim, mr, ok ? "PASS" : "FAIL");
+        cuda_free_buffer(doo); cuda_free_buffer(dz); cuda_free_buffer(dnw); cuda_free_buffer(dout); cuda_free_pipeline(p);
+        free(o); free(z); free(nw); free(ref); free(gpu);
+    }
+
+    // ===== Test 16: kv_cache_write =====
+    {
+        const unsigned kv_dim = 1024, dst_offset = 2048, cache_sz = 8192;
+        float* ks = malloc((size_t)kv_dim * 4); float* vs = malloc((size_t)kv_dim * 4);
+        float* kd = malloc((size_t)cache_sz * 4); float* vd = malloc((size_t)cache_sz * 4);
+        float* kref = malloc((size_t)cache_sz * 4); float* vref = malloc((size_t)cache_sz * 4);
+        float* kg = malloc((size_t)cache_sz * 4); float* vg = malloc((size_t)cache_sz * 4);
+        for (unsigned i = 0; i < kv_dim; i++) { ks[i] = frand(); vs[i] = frand(); }
+        for (unsigned i = 0; i < cache_sz; i++) { kd[i] = frand(); vd[i] = frand(); }
+        memcpy(kref, kd, (size_t)cache_sz * 4); memcpy(vref, vd, (size_t)cache_sz * 4);
+        for (unsigned i = 0; i < kv_dim; i++) { kref[dst_offset + i] = ks[i]; vref[dst_offset + i] = vs[i]; }
+        CudaBuf* dks = cuda_create_buffer(c, (size_t)kv_dim * 4); CudaBuf* dvs = cuda_create_buffer(c, (size_t)kv_dim * 4);
+        CudaBuf* dkd = cuda_create_buffer(c, (size_t)cache_sz * 4); CudaBuf* dvd = cuda_create_buffer(c, (size_t)cache_sz * 4);
+        cuda_upload(c, dks, ks, (size_t)kv_dim * 4); cuda_upload(c, dvs, vs, (size_t)kv_dim * 4);
+        cuda_upload(c, dkd, kd, (size_t)cache_sz * 4); cuda_upload(c, dvd, vd, (size_t)cache_sz * 4);
+        CudaPipe* p = cuda_create_pipeline(c, src, "kv_cache_write", NULL, 0);
+        if (!p) { printf("FAIL kv_cache_write compile: %s\n", cuda_last_error()); return 2; }
+        struct { unsigned kv, off; } push = { kv_dim, dst_offset };
+        uint32_t grid[3] = { (kv_dim + 63) / 64, 1, 1 }, block[3] = { 64, 1, 1 };
+        CudaBuf* bufs[4] = { dks, dkd, dvs, dvd };
+        CudaCmd* cmd = cuda_begin_command(c); cuda_dispatch(cmd, p, grid, block, bufs, 4, &push, sizeof push, 0); cuda_commit_and_wait(cmd);
+        cuda_download(c, dkd, kg, (size_t)cache_sz * 4); cuda_download(c, dvd, vg, (size_t)cache_sz * 4);
+        float me = 0; for (unsigned i = 0; i < cache_sz; i++) { me = fmaxf(me, fabsf(kref[i] - kg[i])); me = fmaxf(me, fabsf(vref[i] - vg[i])); }
+        int ok = (me == 0.0f); all_ok &= ok;
+        printf("kv_cache_write [kv_dim=%u off=%u]: max_abs_err=%.2e -> %s\n", kv_dim, dst_offset, me, ok ? "PASS" : "FAIL");
+        cuda_free_buffer(dks); cuda_free_buffer(dvs); cuda_free_buffer(dkd); cuda_free_buffer(dvd); cuda_free_pipeline(p);
+        free(ks); free(vs); free(kd); free(vd); free(kref); free(vref); free(kg); free(vg);
+    }
+
+    // ===== Test 17: naive_attention (GQA + mixed sinks) =====
+    {
+        const unsigned head_dim = 64, n_heads = 4, n_kv_heads = 2, seq_len = 48;
+        float scale = 0.125f; unsigned sbits; memcpy(&sbits, &scale, 4);
+        float* q = malloc((size_t)n_heads * head_dim * 4);
+        float* k = malloc((size_t)seq_len * n_kv_heads * head_dim * 4);
+        float* v = malloc((size_t)seq_len * n_kv_heads * head_dim * 4);
+        float* sinks = malloc((size_t)n_heads * 4);
+        float* ref = malloc((size_t)n_heads * head_dim * 4); float* gpu = malloc((size_t)n_heads * head_dim * 4);
+        for (unsigned i = 0; i < n_heads * head_dim; i++) q[i] = frand();
+        for (unsigned i = 0; i < seq_len * n_kv_heads * head_dim; i++) { k[i] = frand(); v[i] = frand(); }
+        for (unsigned h = 0; h < n_heads; h++) sinks[h] = (h % 2 == 0) ? NAN : (frand() * 2.0f);
+        for (unsigned h = 0; h < n_heads; h++) {
+            unsigned kvh = h / (n_heads / n_kv_heads); float* qh = q + h * head_dim;
+            float* sc = malloc((size_t)seq_len * 4); float mx = -1e30f;
+            for (unsigned i = 0; i < seq_len; i++) {
+                float* ki = k + ((size_t)i * n_kv_heads + kvh) * head_dim; float dot = 0;
+                for (unsigned d = 0; d < head_dim; d++) dot += qh[d] * ki[d];
+                sc[i] = dot * scale; if (sc[i] > mx) mx = sc[i];
+            }
+            float sum = 0; for (unsigned i = 0; i < seq_len; i++) { sc[i] = expf(sc[i] - mx); sum += sc[i]; }
+            float rescale = 1.0f, fsum = sum, sv = sinks[h];
+            if (!isnan(sv)) { float smax = fmaxf(mx, sv); rescale = (sum > 0) ? expf(mx - smax) : 0; fsum = sum * rescale + expf(sv - smax); }
+            float inv = (fsum > 0) ? 1.0f / fsum : 0;
+            for (unsigned d = 0; d < head_dim; d++) {
+                float acc = 0; for (unsigned i = 0; i < seq_len; i++) { float* vi = v + ((size_t)i * n_kv_heads + kvh) * head_dim; acc += sc[i] * vi[d]; }
+                ref[h * head_dim + d] = acc * rescale * inv;
+            }
+            free(sc);
+        }
+        CudaBuf* dq = cuda_create_buffer(c, (size_t)n_heads * head_dim * 4);
+        CudaBuf* dk = cuda_create_buffer(c, (size_t)seq_len * n_kv_heads * head_dim * 4);
+        CudaBuf* dv = cuda_create_buffer(c, (size_t)seq_len * n_kv_heads * head_dim * 4);
+        CudaBuf* dsink = cuda_create_buffer(c, (size_t)n_heads * 4);
+        CudaBuf* dout = cuda_create_buffer(c, (size_t)n_heads * head_dim * 4);
+        cuda_upload(c, dq, q, (size_t)n_heads * head_dim * 4);
+        cuda_upload(c, dk, k, (size_t)seq_len * n_kv_heads * head_dim * 4);
+        cuda_upload(c, dv, v, (size_t)seq_len * n_kv_heads * head_dim * 4);
+        cuda_upload(c, dsink, sinks, (size_t)n_heads * 4);
+        CudaPipe* p = cuda_create_pipeline(c, src, "naive_attention", NULL, 0);
+        if (!p) { printf("FAIL naive_attention compile: %s\n", cuda_last_error()); return 2; }
+        struct { unsigned hd, nh, nkv, sl, sbits, soff; } push = { head_dim, n_heads, n_kv_heads, seq_len, sbits, 0 };
+        uint32_t grid[3] = { n_heads, 1, 1 }, block[3] = { 128, 1, 1 };
+        CudaBuf* bufs[5] = { dq, dk, dv, dsink, dout };
+        CudaCmd* cmd = cuda_begin_command(c); cuda_dispatch(cmd, p, grid, block, bufs, 5, &push, sizeof push, (unsigned)(seq_len * 4)); cuda_commit_and_wait(cmd);
+        cuda_download(c, dout, gpu, (size_t)n_heads * head_dim * 4);
+        float mr = 0; for (unsigned i = 0; i < n_heads * head_dim; i++) { float r = fabsf(ref[i] - gpu[i]) / (fabsf(ref[i]) + 1e-4f); if (r > mr) mr = r; }
+        int ok = mr < 1e-3f; all_ok &= ok;
+        printf("naive_attention [H=%u KVH=%u hd=%u seq=%u, mixed sinks]: max_rel_err=%.2e -> %s\n", n_heads, n_kv_heads, head_dim, seq_len, mr, ok ? "PASS" : "FAIL");
+        cuda_free_buffer(dq); cuda_free_buffer(dk); cuda_free_buffer(dv); cuda_free_buffer(dsink); cuda_free_buffer(dout); cuda_free_pipeline(p);
+        free(q); free(k); free(v); free(sinks); free(ref); free(gpu);
+    }
+
+    // ===== Test 18: ssm_delta_net (autoregressive selective scan, multi-token) =====
+    {
+        const unsigned dt_rank = 4, hv = 64, d_state = 64, n_group = 2, n_tok = 3;
+        unsigned qk_dim = d_state * n_group, d_inner = dt_rank * hv, k_len = (hv < d_state) ? hv : d_state;
+        unsigned conv_stride = 2 * qk_dim + d_inner, ab_stride = dt_rank, y_stride = d_inner;
+        size_t conv_n = (size_t)n_tok * conv_stride, ab_n = (size_t)n_tok * dt_rank;
+        size_t state_n = (size_t)dt_rank * hv * hv, out_n = (size_t)n_tok * d_inner;
+        float* conv = malloc(conv_n * 4); float* dtb = malloc((size_t)dt_rank * 4);
+        float* al = malloc(ab_n * 4); float* be = malloc(ab_n * 4); float* sa = malloc((size_t)dt_rank * 4);
+        float* st0 = malloc(state_n * 4);
+        for (size_t i = 0; i < conv_n; i++) conv[i] = frand();
+        for (unsigned i = 0; i < dt_rank; i++) { dtb[i] = frand() * 0.1f; sa[i] = -(0.5f + 0.5f * fabsf(frand())); } // ssm_a < 0 => decay
+        for (size_t i = 0; i < ab_n; i++) { al[i] = frand(); be[i] = frand(); }
+        for (size_t i = 0; i < state_n; i++) st0[i] = frand() * 0.1f;
+        // CPU reference scan
+        float* st = malloc(state_n * 4); memcpy(st, st0, state_n * 4);
+        float* out_ref = malloc(out_n * 4);
+        float* sqv = malloc((size_t)k_len * 4); float* skv = malloc((size_t)k_len * 4);
+        for (unsigned t = 0; t < n_tok; t++) {
+            for (unsigned h = 0; h < dt_rank; h++) {
+                unsigned k_hi = (n_group == dt_rank) ? h : (h % n_group);
+                unsigned q_off = t * conv_stride + k_hi * d_state;
+                unsigned k_off = t * conv_stride + qk_dim + k_hi * d_state;
+                unsigned v_off = t * conv_stride + 2 * qk_dim + h * hv;
+                double sumq = 0, sumk = 0;
+                for (unsigned i = 0; i < k_len; i++) { float q = conv[q_off + i], k = conv[k_off + i]; sumq += (double)q * q; sumk += (double)k * k; }
+                float invq = 1.0f / sqrtf(fmaxf((float)sumq, 1e-12f)), invk = 1.0f / sqrtf(fmaxf((float)sumk, 1e-12f));
+                float q_scale = invq / sqrtf((float)d_state);
+                for (unsigned i = 0; i < k_len; i++) { sqv[i] = conv[q_off + i] * q_scale; skv[i] = conv[k_off + i] * invk; }
+                float a = al[t * dt_rank + h] + dtb[h]; float sp = logf(1.0f + expf(a));
+                float g = expf(sp * sa[h]); float bb = 1.0f / (1.0f + expf(-be[t * dt_rank + h]));
+                for (unsigned row = 0; row < hv; row++) {
+                    float* strow = st + ((size_t)h * hv + row) * hv;
+                    float v = conv[v_off + row];
+                    for (unsigned col = 0; col < hv; col++) strow[col] *= g;
+                    float sk = 0; for (unsigned col = 0; col < k_len; col++) sk += strow[col] * skv[col];
+                    float dd = bb * (v - sk);
+                    float o = 0; for (unsigned col = 0; col < k_len; col++) { strow[col] += skv[col] * dd; o += strow[col] * sqv[col]; }
+                    out_ref[t * y_stride + h * hv + row] = o;
+                }
+            }
+        }
+        // GPU
+        CudaBuf* dconv = cuda_create_buffer(c, conv_n * 4); CudaBuf* ddtb = cuda_create_buffer(c, (size_t)dt_rank * 4);
+        CudaBuf* dal = cuda_create_buffer(c, ab_n * 4); CudaBuf* dbe = cuda_create_buffer(c, ab_n * 4); CudaBuf* dsa = cuda_create_buffer(c, (size_t)dt_rank * 4);
+        CudaBuf* dst = cuda_create_buffer(c, state_n * 4); CudaBuf* dout = cuda_create_buffer(c, out_n * 4);
+        cuda_upload(c, dconv, conv, conv_n * 4); cuda_upload(c, ddtb, dtb, (size_t)dt_rank * 4); cuda_upload(c, dal, al, ab_n * 4);
+        cuda_upload(c, dbe, be, ab_n * 4); cuda_upload(c, dsa, sa, (size_t)dt_rank * 4); cuda_upload(c, dst, st0, state_n * 4);
+        CudaPipe* p = cuda_create_pipeline(c, src, "ssm_delta_net", NULL, 0);
+        if (!p) { printf("FAIL ssm_delta_net compile: %s\n", cuda_last_error()); return 2; }
+        struct { unsigned d_inner, dt_rank, hv, d_state, n_group, saf16, dbf16, has_dtb, has_sa, n_tok, conv_st, ab_st, y_st; } push =
+            { d_inner, dt_rank, hv, d_state, n_group, 0, 0, 1, 1, n_tok, conv_stride, ab_stride, y_stride };
+        uint32_t grid[3] = { dt_rank, hv, 1 }, block[3] = { hv, 1, 1 };
+        CudaBuf* bufs[7] = { dconv, ddtb, dal, dbe, dsa, dst, dout };
+        CudaCmd* cmd = cuda_begin_command(c); cuda_dispatch(cmd, p, grid, block, bufs, 7, &push, sizeof push, 0); cuda_commit_and_wait(cmd);
+        float* out_gpu = malloc(out_n * 4); float* st_gpu = malloc(state_n * 4);
+        cuda_download(c, dout, out_gpu, out_n * 4); cuda_download(c, dst, st_gpu, state_n * 4);
+        float mo = 0; for (size_t i = 0; i < out_n; i++) { float r = fabsf(out_ref[i] - out_gpu[i]) / (fabsf(out_ref[i]) + 1e-4f); if (r > mo) mo = r; }
+        float ms = 0; for (size_t i = 0; i < state_n; i++) { float r = fabsf(st[i] - st_gpu[i]) / (fabsf(st[i]) + 1e-4f); if (r > ms) ms = r; }
+        int ok = (mo < 2e-3f && ms < 2e-3f); all_ok &= ok;
+        printf("ssm_delta_net [heads=%u hv=%u dstate=%u ngrp=%u ntok=%u]: out_err=%.2e state_err=%.2e -> %s\n", dt_rank, hv, d_state, n_group, n_tok, mo, ms, ok ? "PASS" : "FAIL");
+        cuda_free_buffer(dconv); cuda_free_buffer(ddtb); cuda_free_buffer(dal); cuda_free_buffer(dbe); cuda_free_buffer(dsa); cuda_free_buffer(dst); cuda_free_buffer(dout); cuda_free_pipeline(p);
+        free(conv); free(dtb); free(al); free(be); free(sa); free(st0); free(st); free(out_ref); free(sqv); free(skv); free(out_gpu); free(st_gpu);
+    }
+
     printf("RESULT: %s\n", all_ok ? "ALL PASS" : "FAIL");
     cuda_destroy(c);
     free(src);

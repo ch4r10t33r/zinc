@@ -170,6 +170,20 @@ function computeStructExtractorExcluded(fileContents: Map<string, string>): Set<
       }
     }
   }
+
+  // The CUDA backend subtree reaches `cuda/c.zig`'s `@cImport(@cInclude("cuda_shim.h"))`,
+  // whose CUDA-toolkit headers exist only on the NVIDIA build box, so `zig run`
+  // against the standalone analyzer cannot compile it off-box. Exclude `src/cuda/*`
+  // DIRECTLY rather than seeding it into the BFS above: every cuda import outside
+  // the subtree (e.g. in `gpu/interface.zig`) sits behind a comptime-dead
+  // `if (is_cuda)` branch on the analyzer host, so those importers still compile
+  // and must stay analyzable — feeding cuda through the BFS would wrongly taint
+  // the whole backend abstraction. The Metal `c.zig` is unaffected: its `shim.h`
+  // resolves via the analyzer's `-I src/metal` include path.
+  for (const path of importsByFile.keys()) {
+    if (path.startsWith('src/cuda/')) excluded.add(path);
+  }
+
   return excluded;
 }
 
@@ -284,6 +298,14 @@ const SECTION_META = new Map<string, { title: string; description: string; order
       title: 'Tool Calling',
       description: 'Tool-use protocol helpers: chat-template-aware tool definitions, argument parsing, and response formatting for function-calling-capable models.',
       order: 13,
+    },
+  ],
+  [
+    'cuda-runtime',
+    {
+      title: 'CUDA Runtime',
+      description: 'CUDA device discovery, context management, device buffers, NVRTC-compiled pipelines, and stream-based command submission for the NVIDIA backend.',
+      order: 14,
     },
   ],
 ]);

@@ -124,6 +124,36 @@ describe('loadZigApi', () => {
     }
   }, 30000);
 
+  it('skips struct layout extraction for the CUDA backend subtree', async () => {
+    // src/cuda/c.zig does `@cImport(@cInclude("cuda_shim.h"))`; the CUDA toolkit
+    // headers only exist on the NVIDIA build box, so the standalone analyzer
+    // cannot compile the cuda subtree off-box. The loader excludes `src/cuda/*`
+    // from struct-layout extraction directly (not via the import BFS — cuda
+    // imports elsewhere sit behind a comptime-dead `if (is_cuda)` branch). The
+    // per-file docs still render; only the @sizeOf/@offsetOf numbers are skipped.
+    const api = await loadZigApi();
+    const cudaModules = api.modules.filter(mod => mod.sourcePath.startsWith('src/cuda/'));
+    expect(cudaModules.length, 'expected CUDA backend modules in the API').toBeGreaterThan(0);
+    for (const module of cudaModules) {
+      expect(
+        (module.summary ?? '').length,
+        `cuda module ${module.sourcePath} should still render docs`
+      ).toBeGreaterThan(0);
+      for (const sym of module.symbols) {
+        if (sym.symbolKind === 'struct') {
+          expect(
+            sym.size,
+            `struct ${module.sourcePath}::${sym.qualifiedName} should have no extracted size`
+          ).toBeUndefined();
+        }
+      }
+    }
+    // The backend abstraction textually imports cuda behind a comptime-dead branch
+    // and must stay analyzable — it must not be swept up by the cuda exclusion.
+    const iface = api.modules.find(mod => mod.sourcePath === 'src/gpu/interface.zig');
+    expect(iface, 'gpu/interface.zig should remain in the analyzable set').toBeDefined();
+  }, 30000);
+
   it('registers every section used by source files in SECTION_META', async () => {
     // Catches the regression where a file declares `//! @section Foo` but the
     // loader has no entry for `foo` and falls back to an auto-generated meta

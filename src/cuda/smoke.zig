@@ -9,6 +9,7 @@
 //!     -I. -I/usr/local/cuda/include -lc \
 //!     -L/usr/local/cuda/lib64 -L/usr/lib/wsl/lib -lcuda -lnvrtc \
 //!     -rpath /usr/local/cuda/lib64 -femit-bin=smoke_zig
+//! @section CUDA Runtime
 const std = @import("std");
 const device = @import("device.zig");
 const buffer = @import("buffer.zig");
@@ -27,6 +28,12 @@ const KSRC =
 
 const Push = extern struct { n: i32 };
 
+/// Run the CUDA Zig<->shim smoke test end to end and report PASS/FAIL.
+///
+/// Selects the best device, then exercises the full seam: a `vadd` kernel via the
+/// synchronous commit path and a `dp4a` kernel via the async commit path, checking
+/// both results.
+/// @returns `error.SmokeFailed` if any computed value mismatches its expected output.
 pub fn main() !void {
     var dev = try device.CudaDevice.initBest(std.heap.page_allocator);
     defer dev.deinit();

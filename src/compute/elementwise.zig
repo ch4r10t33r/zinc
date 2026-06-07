@@ -175,6 +175,9 @@ pub const MoeWeightedAccPush = extern struct {
     src_stride: u32,
 };
 
+/// Push constants for the **batched** MoE weighted-accumulate shader.
+/// Sums each token's `n_used` selected-expert outputs across a token batch in one
+/// dispatch: `a[t,i] = sum_j(weight_{t,j} * b[...])`.
 pub const MoeWeightedAccBatchPush = extern struct {
     hidden_dim: u32,
     n_tokens: u32,
@@ -184,6 +187,9 @@ pub const MoeWeightedAccBatchPush = extern struct {
     accum_token_base: u32,
 };
 
+/// Push constants for the **batched** `sigmoid_scale_acc` shader.
+/// Applies a per-token sigmoid-gated shared-expert add across a token batch:
+/// `accum[t,i] += sigmoid(gate_t) * src[t,i]`.
 pub const SigmoidScaleAccBatchPush = extern struct {
     hidden_dim: u32,
     n_tokens: u32,

@@ -1,6 +1,6 @@
 # CUDA backend for ZINC — design & implementation plan
 
-Status: **M0.5 complete** — Zig CUDA primitive layer validated on the 5090. Branch: `feat/cuda-backend`.
+Status: **M1 kernel library COMPLETE** — all 18 decode kernels validated on the 5090 (≤7.6e-5 vs CPU ref). Next: integration (`forward_cuda.zig`). Branch: `feat/cuda-backend`.
 Target hardware: NVIDIA RTX 5090 (Blackwell, sm_120) + RTX 4090 (Ada, sm_89), CUDA 13.2.
 
 ## 1. Why a CUDA backend
@@ -167,8 +167,11 @@ Milestones:
     Plus `softmax_topk` (router), `rope`, `argmax` (exact), `moe_weighted_acc` (4.4e-5) —
     **13 done**; `qk_norm` reuses `rms_norm` per-head (no new kernel). The entire
     non-attention/non-SSM decode path is complete. Remaining: `kv_cache_write`, naive attention
-    (`softmax(QKᵀ)V` for the 1-query decode), and the SSM trio (`ssm_conv1d`, `ssm_delta_net`,
-    `ssm_gated_norm`) (+ MoE-indexed dmmv variants for M2).
+    (`softmax(QKᵀ)V` for the 1-query decode), and `ssm_delta_net` (the one hard SSM kernel left). **Now 15 done** (added `ssm_conv1d`
+    exact-state + `ssm_gated_norm`) — **ALL 18 DONE** (added `kv_cache_write`, `naive_attention` GQA+sinks, and
+    `ssm_delta_net` — the gated delta-net selective scan, validated multi-token incl. final
+    recurrent state at 7.6e-5). **The M1 kernel library is COMPLETE.** (MoE-indexed dmmv variants
+    + flash/paged attention are M2/M3 perf items.)
 - **M2 — full model, coherent generation.** Paged KV pool, SSM conv/recurrent state ring
   buffers (conv `(d_conv-1)*8192` f32/layer; recurrent `dt_rank*128*128` f32/layer), all quant
   formats, prompt prefill, chat template, server path (`model_manager_cuda.zig`). Correctness

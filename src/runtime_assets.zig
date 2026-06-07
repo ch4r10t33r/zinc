@@ -7,8 +7,11 @@
 //! @section Shader Dispatch
 const std = @import("std");
 
+/// Which compiled shader family to locate.
 pub const ShaderKind = enum {
+    /// SPIR-V modules consumed by the Vulkan backend.
     spirv,
+    /// Metallib/`.metal` sources consumed by the Apple Silicon backend.
     metal,
 };
 
@@ -23,6 +26,15 @@ const metal_cwd_candidates = [_][]const u8{
     "src/shaders/metal",
 };
 
+/// Resolve the directory holding compiled shaders of `kind`, honoring `ZINC_SHADER_DIR`.
+///
+/// Checks the `ZINC_SHADER_DIR` environment override first, then falls back to the
+/// executable-relative install layout and the in-tree development paths.
+/// @param allocator Allocator for the returned path; the caller owns the result.
+/// @param kind Shader family to locate (SPIR-V or Metal).
+/// @returns Newly allocated path to the shader directory.
+/// @note Returns `error.ShaderDirOverrideNotFound` when the override is set but absent,
+///   or `error.ShaderDirNotFound` when no known layout exists.
 pub fn resolveShaderDir(allocator: std.mem.Allocator, kind: ShaderKind) ![]u8 {
     if (std.posix.getenv("ZINC_SHADER_DIR")) |override| {
         if (!dirExists(std.fs.cwd(), override)) return error.ShaderDirOverrideNotFound;
@@ -31,6 +43,16 @@ pub fn resolveShaderDir(allocator: std.mem.Allocator, kind: ShaderKind) ![]u8 {
     return resolveShaderDirFrom(allocator, std.fs.cwd(), null, kind);
 }
 
+/// Resolve the shader directory against explicit base/exe dirs — the testable core of `resolveShaderDir`.
+///
+/// Tries the executable-relative install layout first, then the working-directory
+/// candidates for the requested shader family.
+/// @param allocator Allocator for the returned path; the caller owns the result.
+/// @param base_dir Directory the cwd-relative candidates are resolved against.
+/// @param exe_dir_override Optional executable directory; when null the real exe path is queried.
+/// @param kind Shader family to locate (SPIR-V or Metal).
+/// @returns Newly allocated path to the shader directory.
+/// @note Returns `error.ShaderDirNotFound` when no known layout exists.
 pub fn resolveShaderDirFrom(
     allocator: std.mem.Allocator,
     base_dir: std.fs.Dir,

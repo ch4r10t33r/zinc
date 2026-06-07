@@ -65,6 +65,43 @@ __device__ __forceinline__ float zinc_block_reduce_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float zinc_warp_reduce_max(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float zinc_block_reduce_max(float v) {
+    __shared__ float shm[32];
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+    v = zinc_warp_reduce_max(v);
+    if (lane == 0) shm[wid] = v;
+    __syncthreads();
+    int nwarps = (blockDim.x + 31) >> 5;
+    v = (threadIdx.x < nwarps) ? shm[lane] : -3.4e38f;
+    if (wid == 0) v = zinc_warp_reduce_max(v);
+    return v;
+}
+
+// Block sum reduction with result broadcast to ALL threads (blockDim mult of 32).
+__device__ __forceinline__ float zinc_block_reduce_sum_all(float v) {
+    __shared__ float shs[32];
+    __shared__ float bc;
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+    v = zinc_warp_reduce_sum(v);
+    if (lane == 0) shs[wid] = v;
+    __syncthreads();
+    int nwarps = (blockDim.x + 31) >> 5;
+    v = (threadIdx.x < nwarps) ? shs[lane] : 0.0f;
+    if (wid == 0) v = zinc_warp_reduce_sum(v);
+    if (threadIdx.x == 0) bc = v;
+    __syncthreads();
+    float r = bc;
+    __syncthreads();
+    return r;
+}
+
 // ---- rms_norm (port of rms_norm_mul.comp) -----------------------------------
 // y = weight * (x / sqrt(mean(x^2) + eps)). One block per token.
 struct RmsPush { unsigned N; float eps; };
@@ -458,4 +495,154 @@ extern "C" __global__ void ssm_gated_norm(const float* o, const float* z, const 
         float zv = z[base + i];
         out[base + i] = nv * (zv / (1.0f + expf(-zv)));
     }
+}
+
+// ---- kv_cache_write (port of kv_cache_write.comp) ---------------------------
+// Append K and V vectors into their caches at dst_offset (= physical_token*kv_dim).
+struct KvWritePush { unsigned kv_dim, dst_offset; };
+
+extern "C" __global__ void kv_cache_write(const float* k_src, float* k_dst, const float* v_src, float* v_dst, KvWritePush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < pc.kv_dim) {
+        k_dst[pc.dst_offset + i] = k_src[i];
+        v_dst[pc.dst_offset + i] = v_src[i];
+    }
+}
+
+// ---- naive_attention (decode: softmax(QK^T)V, GQA + attention sinks) --------
+// Correctness-first decode attention (the flash/paged version is M3). One block
+// per query head, contiguous KV cache [seq_len, n_kv_heads, head_dim]. Dynamic
+// shared holds seq_len scores. Sink: sinks[sink_offset+head] (NaN = no sink).
+struct AttnPush { unsigned head_dim, n_heads, n_kv_heads, seq_len, attn_scale_bits, sink_offset; };
+
+extern "C" __global__ void naive_attention(const float* q, const float* k, const float* v,
+                                           const float* sinks, float* out, AttnPush pc) {
+    extern __shared__ float s_scores[];           // size = seq_len floats (dynamic)
+    __shared__ float s_m, s_rescale, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + (size_t)head * hd;
+    float scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)hd);
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) {
+        float sum = lsum, rescale = 1.0f, final_sum = lsum;
+        float sink_val = sinks[pc.sink_offset + head];
+        if (sink_val == sink_val) {   // sink present (NaN == NaN is false)
+            float sink_max = fmaxf(m, sink_val);
+            rescale = (sum > 0.0f) ? expf(m - sink_max) : 0.0f;
+            final_sum = sum * rescale + expf(sink_val - sink_max);
+        }
+        s_rescale = rescale;
+        s_inv = (final_sum > 0.0f) ? 1.0f / final_sum : 0.0f;
+    }
+    __syncthreads();
+    float rescale = s_rescale, inv = s_inv;
+
+    // Pass 3: out[d] = (sum_i e_i * V[i,d]) * rescale * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = 0; i < pc.seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[(size_t)head * hd + d] = acc * rescale * inv;
+    }
+}
+
+// ---- ssm_delta_net (port of ssm_delta_net.comp) -----------------------------
+// Gated delta-net autoregressive selective scan. One block per (head,row), one
+// state column per thread (blockDim == head_v_dim, must be a multiple of 32).
+// State [dt_rank][head_v_dim][head_v_dim] carries across the n_tok token loop:
+// per token — L2-norm Q/K per group, gate=exp(softplus(alpha+dt_bias)*ssm_a),
+// beta=sigmoid; decay state*=gate; sk=<state,k>; d=beta*(v-sk); state+=k*d;
+// readout o=<state,q>. Unfused scalar form (perf/coopmat fusion is M3).
+struct DeltaNetPush {
+    unsigned d_inner, dt_rank, head_v_dim, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned n_tok, conv_stride_tok, ab_stride_tok, y_stride_tok;
+};
+
+extern "C" __global__ void ssm_delta_net(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    DeltaNetPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned row = blockIdx.y;
+    unsigned col = threadIdx.x;                  // 0..head_v_dim-1
+    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
+    unsigned hv = pc.head_v_dim;
+    unsigned qk_dim = pc.d_state * pc.n_group;
+    unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
+    size_t row_base = ((size_t)h * hv + row) * hv;
+    float rs = state[row_base + col];            // state[h][row][col]
+
+    float dt_bias_val = 0.0f;
+    if (pc.has_dt_bias != 0u)
+        dt_bias_val = pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                                        : ((const float*)dt_bias)[h];
+    float ssm_a_val = 0.0f;
+    if (pc.has_ssm_a != 0u)
+        ssm_a_val = pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                                    : ((const float*)ssm_a)[h];
+    unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+
+    __shared__ float s_g, s_b;
+
+    for (unsigned t = 0; t < pc.n_tok; t++) {
+        unsigned conv_base = t * pc.conv_stride_tok;
+        unsigned q_off = conv_base + k_hi * pc.d_state;
+        unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
+        unsigned v_off = conv_base + 2u * qk_dim + h * hv;
+
+        // L2-normalize Q/K per group (sum-sq reduced across cols), scale Q.
+        float qi = (col < k_len) ? conv_out[q_off + col] : 0.0f;
+        float ki = (col < k_len) ? conv_out[k_off + col] : 0.0f;
+        float sumq = zinc_block_reduce_sum_all(qi * qi);
+        float sumk = zinc_block_reduce_sum_all(ki * ki);
+        float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
+        float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
+
+        if (col == 0) {
+            float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
+            float sp = logf(1.0f + expf(a));               // softplus
+            float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
+            s_g = expf(gate_val);
+            s_b = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+        }
+        __syncthreads();
+        float g = s_g, b = s_b;
+
+        float v_val = conv_out[v_off + row];
+        rs *= g;                                            // decay
+        float sk = zinc_block_reduce_sum_all((col < k_len) ? rs * skv : 0.0f);
+        float d = b * (v_val - sk);
+        if (col < k_len) rs += skv * d;                     // rank-1 update
+        float o = zinc_block_reduce_sum_all((col < k_len) ? rs * sq : 0.0f);  // readout
+        if (col == 0) out_data[t * pc.y_stride_tok + h * hv + row] = o;
+        __syncthreads();
+    }
+    state[row_base + col] = rs;                             // write final state
 }

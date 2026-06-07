@@ -6,12 +6,23 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+/// Semantic version string for this build (from `-Dversion`, e.g. `0.3.1`).
 pub const version = build_options.version;
+/// Short git commit hash this binary was built from (from `-Dcommit`).
 pub const commit = build_options.commit;
+/// Compilation target triple this binary was built for (from `-Dtarget`).
 pub const target = build_options.target;
+/// Active optimize mode, e.g. `ReleaseFast` or `Debug` (from `-Doptimize`).
 pub const optimize = build_options.optimize;
+/// GPU backend(s) compiled into this binary, e.g. `vulkan` or `metal`.
 pub const backend = build_options.backend;
 
+/// Write the full `zinc --version` report to `writer`.
+///
+/// Emits the version, commit, target, optimize mode, and compiled-in backends,
+/// each on its own line.
+/// @param writer Any writer the multi-line metadata block is printed to.
+/// @returns Propagates only the writer's own error if printing fails.
 pub fn writeVersion(writer: anytype) !void {
     try writer.print(
         \\zinc {s}

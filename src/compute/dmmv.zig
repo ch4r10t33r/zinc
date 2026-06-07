@@ -196,6 +196,9 @@ pub const CountExpertsPush = extern struct {
     a_offset: u32,
 };
 
+/// Push constants for `moe_route_pack` — turns per-token expert routing into
+/// expert-grouped work lists (per-expert counts, packed token IDs, the active-block
+/// list, and the indirect dispatch args consumed by the MoE columns kernels).
 pub const MoeRoutePackPush = extern struct {
     n_tokens: u32,
     n_experts: u32,
@@ -1424,6 +1427,24 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Record the single-workgroup `moe_route_pack` dispatch that compacts per-token
+    /// expert routing into expert-grouped work lists for the MoE columns kernels.
+    ///
+    /// Reads `routing_buf`/`ids_buf` and writes the per-expert `counts_buf`, the packed
+    /// `active_blocks_buf` + `active_count_buf`, and `dispatch_args_buf` for the
+    /// subsequent indirect MoE dispatch. Each buffer is paired with its byte size.
+    /// @param cmd Command buffer to record into.
+    /// @param push_desc_fn Optional push-descriptor function (null uses bound descriptor sets).
+    /// @param n_tokens Number of tokens being routed.
+    /// @param n_experts Total expert count in the layer.
+    /// @param k Experts selected per token (top-k).
+    /// @param routing_stride Per-token stride (elements) into the routing buffer.
+    /// @param ids_stride Per-token stride into the packed IDs buffer.
+    /// @param gate_up_workgroups_x Workgroups-X to encode into the gate/up columns dispatch args.
+    /// @param down_workgroups_x Workgroups-X to encode into the down columns dispatch args.
+    /// @param routing_token_base First token offset within the routing buffer.
+    /// @returns `error.PipelineNotLoaded` if the route-pack pipeline is absent, or
+    ///   `error.InvalidArgument` on a zero token/expert/k/stride/workgroup count.
     pub fn recordMoeRoutePack(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -1481,6 +1502,25 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Record an **indirect** MoE columns DMMV — the per-expert weight×activation
+    /// matvec whose workgroup count is read from `indirect_buf` rather than the host.
+    ///
+    /// Indirect form: the active-block count is GPU-resident (produced by
+    /// `recordMoeRoutePack`), so the host never stalls on a readback. Each buffer is
+    /// paired with its byte size.
+    /// @param cmd Command buffer to record into.
+    /// @param push_desc_fn Optional push-descriptor function (null uses bound descriptor sets).
+    /// @param quant_type Weight quantization; only `q4_k` and `q5_k` are supported here.
+    /// @param indirect_buf Buffer holding the `VkDispatchIndirectCommand` workgroup dims.
+    /// @param indirect_offset Byte offset of the dispatch args within `indirect_buf`.
+    /// @param M Output rows (expert weight rows).
+    /// @param K Contraction width; must be a multiple of 256.
+    /// @param expert_stride Per-expert stride (elements) into the weight buffer.
+    /// @param ids_stride Per-token stride into the packed IDs buffer.
+    /// @param x_route_divisor Divisor mapping output rows back to source activation rows.
+    /// @param accumulate When true, add into `y_buf` instead of overwriting it.
+    /// @returns `error.UnsupportedQuantType` for non-q4_k/q5_k weights, or
+    ///   `error.InvalidArgument` on zero M/K/ids_stride or K not 256-aligned.
     pub fn recordMoeColsDispatchIndirect(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -1546,6 +1586,23 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Record a **direct** MoE columns DMMV using a host-known `active_block_count`
+    /// (the non-indirect sibling of `recordMoeColsDispatchIndirect`).
+    ///
+    /// Prefer this when the active block count is already known on the CPU; otherwise
+    /// use the indirect form to avoid a GPU→CPU readback. This variant always
+    /// overwrites `y_buf` (no accumulate). Each buffer is paired with its byte size.
+    /// @param cmd Command buffer to record into.
+    /// @param push_desc_fn Optional push-descriptor function (null uses bound descriptor sets).
+    /// @param quant_type Weight quantization; only `q4_k` and `q5_k` are supported here.
+    /// @param M Output rows (expert weight rows).
+    /// @param K Contraction width; must be a multiple of 256.
+    /// @param expert_stride Per-expert stride (elements) into the weight buffer.
+    /// @param active_block_count Number of active expert blocks to dispatch (workgroups-Y).
+    /// @param ids_stride Per-token stride into the packed IDs buffer.
+    /// @param x_route_divisor Divisor mapping output rows back to source activation rows.
+    /// @returns `error.UnsupportedQuantType` for non-q4_k/q5_k weights, or
+    ///   `error.InvalidArgument` on zero M/K/active_block_count/ids_stride or K not 256-aligned.
     pub fn recordMoeColsDispatch(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
