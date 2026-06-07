@@ -564,14 +564,32 @@ fn qwenRoutePackedFullValidationBisectEnabled() bool {
         (readBoolEnv("ZINC_QWEN36_ROUTE_PACK_VALIDATE_FULL_BISECT") orelse false);
 }
 
-fn denseGemmaQ4KGeGLUValidationScansLayers() bool {
-    return qwenRoutePackedFullValidationBisectEnabled();
+fn isDenseGemma31Q4KGeGLUShape(cfg: ModelConfig) bool {
+    return cfg.architecture == .gemma and
+        cfg.n_experts == 0 and
+        usesGeglu(cfg) and
+        cfg.n_layers == 60 and
+        cfg.hidden_dim == 5376 and
+        cfg.intermediate_dim == 21504;
+}
+
+fn denseGemmaQ4KGeGLUValidationScanRequested() bool {
+    return qwenRoutePackedFullValidationBisectEnabled() or
+        (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_SCAN") orelse false);
+}
+
+fn denseGemmaQ4KGeGLUProfileScanEnabled(cfg: ModelConfig, profile_enabled: bool) bool {
+    if (!profile_enabled) return false;
+    const requested = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN") orelse
+        isDenseGemma31Q4KGeGLUShape(cfg);
+    return requested and isDenseGemma31Q4KGeGLUShape(cfg);
 }
 
 fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
     if (cfg.architecture != .gemma or cfg.n_experts != 0 or !usesGeglu(cfg)) return false;
     return (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE") orelse false) or
         std.posix.getenv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") != null or
+        denseGemmaQ4KGeGLUValidationScanRequested() or
         qwenRoutePackedFullValidationEnabled() or
         qwenRoutePackedFullValidationBisectEnabled();
 }
@@ -4625,6 +4643,7 @@ pub const InferenceEngine = struct {
     gemma_moe_post_norm_residual_decode_enabled: bool,
     gemma_q4k_geglu_exact5_enabled: bool,
     dense_gemma_q4k_geglu_validation_enabled: bool,
+    dense_gemma_q4k_geglu_validation_scan_layers: bool,
     dense_gemma_q4k_geglu_validation_emitted: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
@@ -4790,8 +4809,15 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
-        self.dense_gemma_q4k_geglu_validation_enabled = denseGemmaQ4KGeGLUValidationRequested(cfg);
+        const dense_gemma_q4k_geglu_profile_scan = denseGemmaQ4KGeGLUProfileScanEnabled(cfg, self.profile_enabled);
+        self.dense_gemma_q4k_geglu_validation_scan_layers =
+            denseGemmaQ4KGeGLUValidationScanRequested() or dense_gemma_q4k_geglu_profile_scan;
+        self.dense_gemma_q4k_geglu_validation_enabled =
+            denseGemmaQ4KGeGLUValidationRequested(cfg) or dense_gemma_q4k_geglu_profile_scan;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
+        if (dense_gemma_q4k_geglu_profile_scan) {
+            log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator scan enabled; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip", .{});
+        }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
             readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
@@ -17566,7 +17592,7 @@ fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
 
 fn shouldValidateDenseGemmaQ4KGeGLU(engine: *const InferenceEngine, layer_idx: usize, fused_gate_up_geglu: bool) bool {
     const requested_layer = denseGemmaQ4KGeGLUValidateLayer(engine);
-    const layer_matches = if (denseGemmaQ4KGeGLUValidationScansLayers())
+    const layer_matches = if (engine.dense_gemma_q4k_geglu_validation_scan_layers)
         layer_idx >= requested_layer
     else
         layer_idx == requested_layer;
@@ -17617,7 +17643,7 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
     const ref_value = if (inter_dim > 0) ref_slice[diff.max_idx] else 0.0;
     const candidate_value = if (inter_dim > 0) candidate_slice[diff.max_idx] else 0.0;
     const tol: f32 = 5e-2;
-    const scan_layers = denseGemmaQ4KGeGLUValidationScansLayers();
+    const scan_layers = engine.dense_gemma_q4k_geglu_validation_scan_layers;
     const last_layer_idx = if (engine.config.n_layers == 0)
         0
     else
