@@ -157,13 +157,13 @@ kernel void main0(
         sumy[2] = yh_tot.x + yh_tot.y;
         sumy[3] = yh_tot.z + yh_tot.w;
 
+        // The Zig dispatcher only routes M % 4 == 0 shapes here, so the
+        // NR0=2 rows in both simdgroups are always in bounds.
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             const int dst_row = first_row + row;
-            if (dst_row < int(p.M0)) {
-                const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
-                gate_sum[row] += q4k_block_dot(gate_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
-                up_sum[row] += q4k_block_dot(up_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
-            }
+            const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
+            gate_sum[row] += q4k_block_dot(gate_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
+            up_sum[row] += q4k_block_dot(up_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
         }
 
         y4 += 4 * QK_K;
@@ -171,12 +171,10 @@ kernel void main0(
 
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const int dst_row = first_row + row;
-        if (dst_row < int(p.M0)) {
-            const float gate_total = simd_sum(gate_sum[row]);
-            const float up_total = simd_sum(up_sum[row]);
-            if (tiisg == 0) {
-                out[dst_row] = geglu(gate_total, up_total);
-            }
+        const float gate_total = simd_sum(gate_sum[row]);
+        const float up_total = simd_sum(up_sum[row]);
+        if (tiisg == 0) {
+            out[dst_row] = geglu(gate_total, up_total);
         }
     }
 }

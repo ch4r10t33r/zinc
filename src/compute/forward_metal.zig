@@ -8975,6 +8975,7 @@ fn canUseDenseQ4KGateUpGeGLU(
         gate.info.type_ == .q4_k and
         up.info.type_ == .q4_k and
         M > 0 and
+        (M % 4) == 0 and
         K > 0 and
         K % 256 == 0 and
         engine.dmmv_q4k_dense_gate_up_geglu_pipe.handle != null and
