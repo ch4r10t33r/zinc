@@ -12030,7 +12030,7 @@ pub const InferenceEngine = struct {
             swiglu_size,
             routing_buf,
             routing_size,
-            (M + 1) / 2,
+            (M + 3) / 4,
             n_tokens,
             1,
         );
@@ -12076,7 +12076,7 @@ pub const InferenceEngine = struct {
             routing_size,
             scale_tensor.gpu_buffer.handle,
             scale_tensor.gpu_buffer.size,
-            (M + 1) / 2,
+            (M + 3) / 4,
             n_tokens,
             1,
         );

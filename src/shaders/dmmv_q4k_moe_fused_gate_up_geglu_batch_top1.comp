@@ -5,7 +5,7 @@
 //   [expert][gate rows][up rows].
 //
 // Grid:
-//   x = two output rows
+//   x = four output rows
 //   y = token
 //
 // Routing is token-major softmax_topk output. This shader uses only slot 0,
@@ -15,6 +15,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 layout(local_size_x = 64) in;
 
@@ -31,11 +32,9 @@ layout(set = 0, binding = 1) readonly buffer VectorX { vec4 x_v4[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y_data[]; };
 layout(set = 0, binding = 3) readonly buffer Routing { uint routing_data[]; };
 
-const uint NUM_ROWS = 2u;
+const uint ROWS_PER_WG = 4u;
+const uint LANES_PER_ROW = 16u;
 const uint Q4K_BLOCK_U32 = 36u;
-
-shared float s_sg_gate[4];
-shared float s_sg_up[4];
 
 vec4 unpack_nibbles_lo(uint v) {
     return vec4(float(v & 0xFu), float((v >> 8) & 0xFu),
@@ -114,19 +113,18 @@ float geglu(float gate, float up) {
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint wg_id = gl_WorkGroupID.x;
+    const uint row_group = tid / LANES_PER_ROW;
+    const uint lane = tid - row_group * LANES_PER_ROW;
+    const uint row = gl_WorkGroupID.x * ROWS_PER_WG + row_group;
     const uint tok = gl_WorkGroupID.y;
+    if (row >= M) return;
+
     const uint expert_id = routing_data[tok * routing_stride];
 
-    const uint THREADS_PER_BLOCK = 16u;
-    const uint it_size = 64u / THREADS_PER_BLOCK;
-    const uint itid = tid % THREADS_PER_BLOCK;
-    const uint ix = tid / THREADS_PER_BLOCK;
-
-    const uint il = itid / 4u;
-    const uint ir = itid % 4u;
+    const uint il = lane / 4u;
+    const uint ir = lane & 3u;
     const uint v_im = il / 2u;
-    const uint v_in = il % 2u;
+    const uint v_in = il & 1u;
     const uint l0 = 4u * (2u * ir + v_in);
     const uint q_offset_in_half = 32u * v_im + l0;
     const uint y_offset_local = 64u * v_im + l0;
@@ -137,47 +135,26 @@ void main() {
     const uint expert_base_u32 = (expert_id * expert_stride) / 4u;
     const uint up_base_u32 = expert_base_u32 + up_offset / 4u;
     const uint blocks_per_row = K / 256u;
+    const uint gate_row_u32 = expert_base_u32 + row * blocks_per_row * Q4K_BLOCK_U32;
+    const uint up_row_u32 = up_base_u32 + row * blocks_per_row * Q4K_BLOCK_U32;
 
-    for (uint r = 0u; r < NUM_ROWS; r++) {
-        const uint row = wg_id * NUM_ROWS + r;
-        if (row >= M) break;
+    float sum_gate = 0.0;
+    float sum_up = 0.0;
+    for (uint i = 0u; i < blocks_per_row; i++) {
+        const uint b_idx = (i * 256u + y_offset_local) / 4u;
+        const vec4 by0 = x_v4[x_base_v4 + b_idx];
+        const vec4 by1 = x_v4[x_base_v4 + b_idx + 8u];
+        const uint b_idx2 = (i * 256u + y_offset_local + 128u) / 4u;
+        const vec4 by2 = x_v4[x_base_v4 + b_idx2];
+        const vec4 by3 = x_v4[x_base_v4 + b_idx2 + 8u];
 
-        const uint gate_row_u32 = expert_base_u32 + row * blocks_per_row * Q4K_BLOCK_U32;
-        const uint up_row_u32 = up_base_u32 + row * blocks_per_row * Q4K_BLOCK_U32;
-        float sum_gate = 0.0;
-        float sum_up = 0.0;
+        sum_gate += dot_q4k_row(gate_row_u32, i, q_offset_in_half, shift, by0, by1, by2, by3);
+        sum_up += dot_q4k_row(up_row_u32, i, q_offset_in_half, shift, by0, by1, by2, by3);
+    }
 
-        for (uint i = ix; i < blocks_per_row; i += it_size) {
-            const uint b_idx = (i * 256u + y_offset_local) / 4u;
-            const vec4 by0 = x_v4[x_base_v4 + b_idx];
-            const vec4 by1 = x_v4[x_base_v4 + b_idx + 8u];
-            const uint b_idx2 = (i * 256u + y_offset_local + 128u) / 4u;
-            const vec4 by2 = x_v4[x_base_v4 + b_idx2];
-            const vec4 by3 = x_v4[x_base_v4 + b_idx2 + 8u];
-
-            sum_gate += dot_q4k_row(gate_row_u32, i, q_offset_in_half, shift, by0, by1, by2, by3);
-            sum_up += dot_q4k_row(up_row_u32, i, q_offset_in_half, shift, by0, by1, by2, by3);
-        }
-
-        sum_gate = subgroupAdd(sum_gate);
-        sum_up = subgroupAdd(sum_up);
-        if (gl_NumSubgroups > 1u) {
-            if (subgroupElect()) {
-                s_sg_gate[gl_SubgroupID] = sum_gate;
-                s_sg_up[gl_SubgroupID] = sum_up;
-            }
-            barrier();
-            if (tid == 0u) {
-                for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
-                    sum_gate += s_sg_gate[sg];
-                    sum_up += s_sg_up[sg];
-                }
-            }
-            barrier();
-        }
-
-        if (tid == 0u) {
-            y_data[y_base + row] = geglu(sum_gate, sum_up);
-        }
+    sum_gate = subgroupClusteredAdd(sum_gate, LANES_PER_ROW);
+    sum_up = subgroupClusteredAdd(sum_up, LANES_PER_ROW);
+    if (lane == 0u) {
+        y_data[y_base + row] = geglu(sum_gate, sum_up);
     }
 }
