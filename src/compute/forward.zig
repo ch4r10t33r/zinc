@@ -78,6 +78,7 @@ const gemma_prefill_micro_prompt_tokens: u32 = 72;
 const gemma_prefill_micro_prompt_guard_tokens: u32 = 8;
 const gemma_prefill_long_draft_prompt_min_tokens: u32 = 49;
 const gemma_prefill_long_draft_prompt_guard_tokens: u32 = 4;
+const gemma_prefill_shared_skip_max_tokens: u32 = 72;
 const gemma_prefill_tiny_prompt_topk: u32 = 2;
 const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
@@ -9022,6 +9023,13 @@ pub const InferenceEngine = struct {
                 }
                 self.endProfilePhase(.moe_routed, moe_phase);
 
+                const skip_gemma_short_prefill_shared_expert =
+                    use_prefill_tail_topk and
+                    config.architecture == .gemma and
+                    gemma_short_prefill_limit == gemma_prefill_micro_prompt_topk and
+                    self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
+                    self.prefill_embed_big_token_count <= gemma_prefill_shared_skip_max_tokens;
+
                 // Gemma 4 MoE CPU path: post_ffw_norm_2 on MoE accumulation before shared expert
                 if (!use_gpu_moe and lt.post_ffw_norm_2 != null) {
                     if (lt.post_ffw_norm_2) |pfn2_t| {
@@ -9041,7 +9049,7 @@ pub const InferenceEngine = struct {
                 }
 
                 // Shared expert for CPU MoE fallback only (GPU MoE handles shared expert inline above)
-                if (!use_gpu_moe) {
+                if (!use_gpu_moe and !skip_gemma_short_prefill_shared_expert) {
                     const cpu_gate_shexp = lt.ffn_gate_shexp;
                     const cpu_up_shexp = lt.ffn_up_shexp;
                     const cpu_down_shexp = lt.ffn_down_shexp;
