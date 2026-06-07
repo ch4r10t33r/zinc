@@ -1639,6 +1639,10 @@ const ArgmaxPush = extern struct {
     n: u32,
 };
 
+const ArgmaxPairsPush = extern struct {
+    n_pairs: u32,
+};
+
 /// Push constants for SwiGLU dispatch (matches SPIRV-Cross layout: buffer(0)).
 const SwiGLUPush = extern struct {
     n: u32, // number of elements
@@ -3890,6 +3894,7 @@ pub const InferenceEngine = struct {
     logits_buf: MetalBuffer,
     logits_readback_buf: MetalBuffer,
     argmax_buf: MetalBuffer,
+    argmax_partials_buf: MetalBuffer,
     embed_staging: MetalBuffer,
     prefill_embed_buf: MetalBuffer,
     lm_head_private_buf: MetalBuffer,
@@ -4067,6 +4072,8 @@ pub const InferenceEngine = struct {
     copy_f32_pipe: MetalPipeline,
     zero_f32_pipe: MetalPipeline,
     argmax_pipe: MetalPipeline,
+    argmax_chunks_pipe: MetalPipeline,
+    argmax_pairs_pipe: MetalPipeline,
 
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
     gemm_q4k_pipe: MetalPipeline,
@@ -4336,6 +4343,7 @@ pub const InferenceEngine = struct {
         const up_size: usize = @max(@as(usize, inter_dim) * @sizeOf(f32), @as(usize, shexp_inter_dim) * @sizeOf(f32));
         const swiglu_size: usize = @max(up_size, @as(usize, conv_channels) * @sizeOf(f32));
         const vocab_size: usize = @as(usize, cfg.vocab_size) * @sizeOf(f32);
+        const argmax_pairs_size: usize = @max(((@as(usize, cfg.vocab_size) + 1023) / 1024) * 2 * @sizeOf(u32), 2 * @sizeOf(u32));
         const kv_cache_size: usize = @as(usize, max_ctx) * kv_cache_bytes_per_token;
         const page_table_size: usize = @as(usize, max_ctx) * @sizeOf(u32);
         const router_size: usize = @max(@as(usize, cfg.n_experts), @as(usize, if (cfg.ssm_dt_rank > 0) cfg.ssm_dt_rank else 1)) * @sizeOf(f32);
@@ -4498,6 +4506,7 @@ pub const InferenceEngine = struct {
         else
             .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
+        self.argmax_partials_buf = try createMetalBufferForMode(ctx, argmax_pairs_size, self.private_decode_buffers);
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
         self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
         self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * hidden_size, 4));
@@ -4767,6 +4776,8 @@ pub const InferenceEngine = struct {
         self.copy_f32_pipe = try loadShaderPipeline(ctx, "copy_f32");
         self.zero_f32_pipe = try loadShaderPipeline(ctx, "zero_f32");
         self.argmax_pipe = try loadShaderPipeline(ctx, "argmax");
+        self.argmax_chunks_pipe = try loadShaderPipeline(ctx, "argmax_chunks");
+        self.argmax_pairs_pipe = try loadShaderPipeline(ctx, "argmax_pairs");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
         self.gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
@@ -5408,6 +5419,7 @@ pub const InferenceEngine = struct {
         add(rs, &self.logits_buf);
         add(rs, &self.logits_readback_buf);
         add(rs, &self.argmax_buf);
+        add(rs, &self.argmax_partials_buf);
         add(rs, &self.embed_staging);
         add(rs, &self.prefill_embed_buf);
         add(rs, &self.qwen_ssm_prefill_proj_norm_buf);
@@ -5485,6 +5497,7 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.logits_buf);
         metal_buffer.freeBuffer(&self.logits_readback_buf);
         metal_buffer.freeBuffer(&self.argmax_buf);
+        metal_buffer.freeBuffer(&self.argmax_partials_buf);
         metal_buffer.freeBuffer(&self.embed_staging);
         metal_buffer.freeBuffer(&self.prefill_embed_buf);
         metal_buffer.freeBuffer(&self.lm_head_private_buf);
@@ -5691,6 +5704,8 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.copy_f32_pipe);
         metal_pipeline.freePipeline(&self.zero_f32_pipe);
         metal_pipeline.freePipeline(&self.argmax_pipe);
+        metal_pipeline.freePipeline(&self.argmax_chunks_pipe);
+        metal_pipeline.freePipeline(&self.argmax_pairs_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q5k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
@@ -6723,7 +6738,7 @@ pub const InferenceEngine = struct {
                 const x_offset_bytes: u32 = @intCast(final_base * @sizeOf(f32));
                 dispatchLmHeadWithInputOffset(self, &final_cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
                 profileBarrier(&final_cmd, profile, .final);
-                dispatchArgmaxOnCmd(self, &final_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
+                dispatchArgmaxOnCmd(self, &final_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size, profile);
                 if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
                 commitAndWaitProfiled(&final_cmd, profile);
             }
@@ -7062,7 +7077,7 @@ pub const InferenceEngine = struct {
             const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
             dispatchLmHeadWithInputOffset(self, &cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
             profileBarrier(&cmd, profile, .final);
-            dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size, profile);
             if (mode == .validate and self.private_decode_buffers) {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
@@ -8390,8 +8405,30 @@ fn dispatchArgmaxOnCmd(
     logits_buf: *const MetalBuffer,
     output_buf: *const MetalBuffer,
     n: u32,
+    profile: ?*RuntimeProfile,
 ) void {
     if (n == 0) return;
+    const chunk_size: u32 = 1024;
+    const use_chunked =
+        !engine.in_prefill_phase and
+        n >= 65536 and
+        engine.argmax_chunks_pipe.handle != null and
+        engine.argmax_pairs_pipe.handle != null and
+        engine.argmax_partials_buf.handle != null and
+        engine.argmax_partials_buf.size >= @as(usize, ((n + chunk_size - 1) / chunk_size)) * 2 * @sizeOf(u32);
+    if (use_chunked) {
+        const n_pairs = (n + chunk_size - 1) / chunk_size;
+        const chunk_push = ArgmaxPush{ .n = n };
+        const chunk_bufs = [_]*const MetalBuffer{ logits_buf, &engine.argmax_partials_buf };
+        cmd.dispatchV2(&engine.argmax_chunks_pipe, .{ n_pairs, 1, 1 }, .{ 256, 1, 1 }, &chunk_bufs, &chunk_push, @sizeOf(ArgmaxPush), 2);
+        profileBarrierBuffers(cmd, profile, .final, &.{&engine.argmax_partials_buf});
+
+        const reduce_push = ArgmaxPairsPush{ .n_pairs = n_pairs };
+        const reduce_bufs = [_]*const MetalBuffer{ &engine.argmax_partials_buf, output_buf };
+        cmd.dispatchV2(&engine.argmax_pairs_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &reduce_bufs, &reduce_push, @sizeOf(ArgmaxPairsPush), 2);
+        return;
+    }
+
     const push = ArgmaxPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ logits_buf, output_buf };
     cmd.dispatchV2(&engine.argmax_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ArgmaxPush), 2);
@@ -22213,7 +22250,7 @@ fn runDecodeStep(
         if (final_norm_ready_from_dense_tail) {
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else if (cpu_lm_head) {
@@ -22230,7 +22267,7 @@ fn runDecodeStep(
             // final-phase join resource-scoped instead of fencing unrelated
             // layer-tail writes still draining in the concurrent encoder.
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
@@ -22242,7 +22279,7 @@ fn runDecodeStep(
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             // Argmax reads only the logits row.
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
@@ -22257,7 +22294,7 @@ fn runDecodeStep(
         if (final_norm_ready_from_dense_tail) {
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(cmd, profile);
         } else if (cpu_lm_head) {
@@ -22274,7 +22311,7 @@ fn runDecodeStep(
             // final-phase join resource-scoped instead of fencing unrelated
             // layer-tail writes still draining in the concurrent encoder.
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(cmd, profile);
         } else {
@@ -22282,7 +22319,7 @@ fn runDecodeStep(
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(cmd, profile);
         }
@@ -28936,6 +28973,10 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&lmhead_pipe);
     var lmhead_pipe_1024 = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
     defer metal_pipeline.freePipeline(&lmhead_pipe_1024);
+    var argmax_chunks_pipe = try loadShaderPipeline(ctx, "argmax_chunks");
+    defer metal_pipeline.freePipeline(&argmax_chunks_pipe);
+    var argmax_pairs_pipe = try loadShaderPipeline(ctx, "argmax_pairs");
+    defer metal_pipeline.freePipeline(&argmax_pairs_pipe);
     var topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
     defer metal_pipeline.freePipeline(&topk_pipe);
     var topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
@@ -29071,6 +29112,8 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(acc_pipe.handle != null);
     try std.testing.expect(lmhead_pipe.handle != null);
     try std.testing.expect(lmhead_pipe_1024.handle != null);
+    try std.testing.expect(argmax_chunks_pipe.handle != null);
+    try std.testing.expect(argmax_pairs_pipe.handle != null);
     try std.testing.expect(topk_pipe.handle != null);
     try std.testing.expect(topk_scaled_pipe.handle != null);
     try std.testing.expect(topk_batched_pipe.handle != null);
