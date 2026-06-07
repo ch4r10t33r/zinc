@@ -4266,6 +4266,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_dual_pipe: MetalPipeline,
     dmmv_q4k_dual_llama_pipe: MetalPipeline,
     dmmv_q4k_qk_dual_pipe: MetalPipeline,
+    dmmv_q4k_qkv_pipe: MetalPipeline,
     dmmv_q4k_qk_q6k_v_pipe: MetalPipeline,
     dmmv_q4k_lmhead_pipe: MetalPipeline,
     dmmv_q4k_lmhead_1024_pipe: MetalPipeline,
@@ -4954,6 +4955,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
         self.dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
         self.dmmv_q4k_qk_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_dual");
+        self.dmmv_q4k_qkv_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qkv");
         self.dmmv_q4k_qk_q6k_v_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_q6k_v");
         self.dmmv_q4k_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead");
         self.dmmv_q4k_lmhead_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
@@ -5909,6 +5911,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_qkv_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_q6k_v_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_1024_pipe);
@@ -9415,6 +9418,39 @@ fn canUseDenseQ4KQKQ6KV(
         engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn canUseDenseQ4KQKV(
+    engine: *const InferenceEngine,
+    q: *const metal_loader.LoadedTensor,
+    k: *const metal_loader.LoadedTensor,
+    v: *const metal_loader.LoadedTensor,
+    M_q: u32,
+    M_k: u32,
+    M_v: u32,
+    K: u32,
+) bool {
+    // All-Q4 sibling of canUseDenseQ4KQKQ6KV. Some Gemma 31B attention layers
+    // quantize V as Q4_K; without this guard those layers fall back to Q+K dual
+    // plus a separate V dispatch before the same QKV barrier. Keep prefill on
+    // the established split path unless the existing explicit fusion env enables
+    // dense Gemma QKV prefill fusion.
+    return engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        (!engine.in_prefill_phase or engine.dense_gemma_qkv_prefill_fusion_enabled) and
+        q.info.type_ == .q4_k and
+        k.info.type_ == .q4_k and
+        v.info.type_ == .q4_k and
+        K > 0 and
+        K % 256 == 0 and
+        M_q > 0 and
+        M_k > 0 and
+        M_v > 0 and
+        (M_q % 4) == 0 and
+        (M_k % 4) == 0 and
+        (M_v % 4) == 0 and
+        engine.dmmv_q4k_qkv_pipe.handle != null and
+        engine.dmmv_q4k_qkv_pipe.max_threads_per_threadgroup >= 64;
+}
+
 fn dispatchDenseQ4KQKDualOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -9445,6 +9481,45 @@ fn dispatchDenseQ4KQKDualOnCmd(
     const block_size: u32 = 64;
     const total_rows = M_q + M_k;
     cmd.dispatchV2(&engine.dmmv_q4k_qk_dual_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKDualPush), 2);
+}
+
+fn dispatchDenseQ4KQKVOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    q_tensor: *const metal_loader.LoadedTensor,
+    k_tensor: *const metal_loader.LoadedTensor,
+    v_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    q_buf: *const MetalBuffer,
+    k_buf: *const MetalBuffer,
+    v_buf: *const MetalBuffer,
+    M_q: u32,
+    M_k: u32,
+    M_v: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, q_tensor, M_q, K);
+    recordDmmvProfile(engine, k_tensor, M_k, K);
+    recordDmmvProfile(engine, v_tensor, M_v, K);
+
+    const push = QKVDensePush{
+        .M_q = M_q,
+        .M_k = M_k,
+        .M_v = M_v,
+        .K = K,
+        .a_q_offset = tensorPageOffset(engine.model, q_tensor),
+        .a_k_offset = tensorPageOffset(engine.model, k_tensor),
+        .a_v_offset = tensorPageOffset(engine.model, v_tensor),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+        .y_v_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &q_tensor.gpu_buffer, &k_tensor.gpu_buffer, &v_tensor.gpu_buffer, input_buf, q_buf, k_buf, v_buf };
+    const rows_per_wg: u32 = 4; // NSG=2 * NR0=2
+    const block_size: u32 = 64;
+    const total_rows = M_q + M_k + M_v;
+    cmd.dispatchV2(&engine.dmmv_q4k_qkv_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
 }
 
 fn dispatchDenseQ4KQKQ6KVOnCmd(
@@ -16062,12 +16137,19 @@ fn dispatchFullAttnPrepOnCmd(
         const can_triple_qkv = !gate_mode.separate_attn_gate and
             !attn.use_k_as_v and
             canUseDenseQ4KQKQ6KV(engine, q_tensor, k_tensor, v_tensor, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
+        const can_triple_q4_qkv = !can_triple_qkv and
+            !gate_mode.separate_attn_gate and
+            !attn.use_k_as_v and
+            canUseDenseQ4KQKV(engine, q_tensor, k_tensor, v_tensor, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
         const can_dual_qk = !can_triple_qkv and
+            !can_triple_q4_qkv and
             !gate_mode.separate_attn_gate and
             !attn.use_k_as_v and
             canUseDenseQ4KQKDual(engine, q_tensor, k_tensor, attn.q_dim, attn.kv_dim, hidden_dim);
         if (can_triple_qkv) {
             dispatchDenseQ4KQKQ6KVOnCmd(engine, cmd, q_tensor, k_tensor, v_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, &engine.v_buf, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
+        } else if (can_triple_q4_qkv) {
+            dispatchDenseQ4KQKVOnCmd(engine, cmd, q_tensor, k_tensor, v_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, &engine.v_buf, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
         } else if (can_dual_qk) {
             dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
@@ -29668,6 +29750,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_dual_pipe);
     var dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dual_llama_pipe);
+    var dmmv_q4k_qkv_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qkv");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_qkv_pipe);
     var dmmv_q4k_qk_q6k_v_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_q6k_v");
     defer metal_pipeline.freePipeline(&dmmv_q4k_qk_q6k_v_pipe);
 
@@ -29822,6 +29906,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_qkv_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_qk_q6k_v_pipe.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048_1024.handle != null);
