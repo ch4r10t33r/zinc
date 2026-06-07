@@ -4161,6 +4161,7 @@ pub const InferenceEngine = struct {
     // erode the prefill metric. Decode keeps its packed kernel by default.
     in_prefill_phase: bool,
     dense_gemma_wide_post_norm_prefill_enabled: bool,
+    dense_gemma_qkv_prefill_fusion_enabled: bool,
     qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
     fused_ssm_delta_gated_norm_enabled: bool,
@@ -4361,6 +4362,8 @@ pub const InferenceEngine = struct {
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
             readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
+        self.dense_gemma_qkv_prefill_fusion_enabled =
+            readBoolEnv("ZINC_METAL_DENSE_GEMMA_QKV_PREFILL_FUSION") orelse false;
         self.qwen_ssm_prefill_proj_enabled =
             readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse
             readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse
@@ -8836,8 +8839,11 @@ fn canUseDenseQ4KQKQ6KV(
     // barrier. This heterogeneous kernel keeps the exact row work but encodes
     // all three projections as one dispatch, saving one dispatch per dense
     // full-attn layer while preserving the shared Q/K/V visibility barrier.
+    // Keep that decode win, but default prefill back to the older Q+K/V split
+    // while the cross-effort prefill regression is isolated.
     return engine.config.architecture == .gemma and
         engine.config.n_experts == 0 and
+        (!engine.in_prefill_phase or engine.dense_gemma_qkv_prefill_fusion_enabled) and
         q.info.type_ == .q4_k and
         k.info.type_ == .q4_k and
         v.info.type_ == .q6_k and
