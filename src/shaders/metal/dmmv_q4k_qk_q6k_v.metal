@@ -118,7 +118,12 @@ kernel void main0(
         const int dst_row_base = is_k ? (first_linear_row - int(p.M_q)) : first_linear_row;
 
         device const float* x = X + (p.x_offset / 4);
-        float sumf[NR0] = {0.f, 0.f};
+        // Dense Gemma dispatches Q/K row counts as multiples of NSG*NR0, so
+        // keep the llama.cpp NR0=2 row pair in one vector accumulator instead
+        // of a thread-private scalar array. This matches the Q6_K V half below
+        // and gives the compiler the same 2-wide reduction shape for the Q4_K
+        // Q/K half of the fused attention projection.
+        float2 sumf = float2(0.0f);
         device const float* y4 = x + ix * QK_K + 64 * iq + 8 * ir;
 
         for (int ib = ix; ib < nb; ib += 4) {
@@ -233,16 +238,16 @@ kernel void main0(
             const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
             const float2 tail_dots = float2(dot(sumy, sc_neg_0), dot(sumy, sc_neg_1));
             const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
-            sumf[0] += delta[0];
-            sumf[1] += delta[1];
+            sumf += delta;
 
             y4 += 4 * QK_K;
         }
 
-        for (short row = 0; row < NR0; ++row) {
-            const int dst_row = dst_row_base + row;
-            const float total = simd_sum(sumf[row]);
-            if (tiisg == 0) out[dst_row] = total;
+        const float total0 = simd_sum(sumf.x);
+        const float total1 = simd_sum(sumf.y);
+        if (tiisg == 0) {
+            out[dst_row_base + 0] = total0;
+            out[dst_row_base + 1] = total1;
         }
         return;
     }
