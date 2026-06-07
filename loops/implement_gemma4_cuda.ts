@@ -77,8 +77,11 @@ function run(cmd: string, args: string[], opts: { timeout?: number; stream?: boo
   });
 }
 
+// Pass the remote command as a SINGLE arg; ssh runs it via the remote login
+// shell. (Splitting into `bash -lc <cmd>` separate args lets ssh re-join them
+// and the remote shell drops the quoting → `cd` loses its arg.)
 const ssh = (remoteCmd: string, timeout = 600_000) =>
-  run("ssh", [...SSH, SSH_TARGET, "bash", "-lc", remoteCmd], { timeout, stream: false });
+  run("ssh", [...SSH, SSH_TARGET, remoteCmd], { timeout, stream: false });
 
 // ── cycle steps ──────────────────────────────────────────────────────
 async function syncToBox(): Promise<void> {

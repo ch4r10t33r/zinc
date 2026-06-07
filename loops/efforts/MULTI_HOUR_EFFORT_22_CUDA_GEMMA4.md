@@ -10,7 +10,7 @@ Catalog coherence on the 4090 (ZINC CUDA) is **3/5**: `qwen35-9b`, `qwen36-27b`,
 
 ## Target models (on box at `~/workspace/models/`, all fit the 4090's 24 GB)
 
-- **`gemma-4-31B-it-Q4_K_M.gguf`** (18 GB) — gemma4 **dense**. Loader sees: `gemma4 | 60 layers | 32 heads (16 KV) | dim 5376 | vocab 262144`.
+- **`gemma-4-31B-it-Q4_K_M.gguf`** (18 GB) — gemma4 **dense**. Confirmed config: 60 layers, n_embd 5376, n_ff 21504, n_head 32, **per-layer n_kv** (`[16×5, 4, …]` — SWA layers 16 KV, full layers 4 KV), **head_dim 512 (full) / 256 (SWA)**, rms_eps 1e-6, **rope freq_base 1e6 (full) / 1e4 (SWA)**, rope_dim 512, **sliding_window 1024**, **swa_pattern `[T,T,T,T,T,F,…]` (period 6)**, **final_logit_softcapping 30.0**, `n_embd_per_layer_input = 0` (no altup), vocab 262144.
 - **`gemma-4-26B-A4B-it-UD-Q4_K_M.gguf`** (16 GB) — gemma4 **MoE** (`a4b`).
 
 ## gemma4 architecture (from llama.cpp `src/models/gemma4.cpp`) — what's NEW vs qwen35
@@ -18,7 +18,7 @@ Catalog coherence on the 4090 (ZINC CUDA) is **3/5**: `qwen35-9b`, `qwen36-27b`,
 A standard transformer (no SSM) but with several gemma-specific pieces:
 
 1. **Scaled embeddings** — `inpL = tok_embd[token] * sqrt(n_embd)` (token input only).
-2. **Per-layer input embeddings (altup)** — `per_layer_token_embd` `[n_embd_per_layer*n_layer, vocab]` + `per_layer_model_proj` + per-layer `per_layer_inp_gate`/`per_layer_proj`/`per_layer_post_norm`. **`gemma4-31b` HAS these** (`per_layer_input` tensor present). A whole subsystem qwen lacks — confirm exact dims/wiring from `project_per_layer_inputs`.
+2. **Per-layer input embeddings (altup)** — gated behind `n_embd_per_layer > 0`. **`gemma4-31b` has `embedding_length_per_layer_input = 0` → NONE** (the dense 31b is a plain transformer + SWA, no altup; that's a big simplification). Only handle this subsystem if the 26b/MoE config sets it >0 — check at that point.
 3. **Sliding-window attention (SWA)** — per-layer `is_swa` pattern (period ~6: 5 SWA + 1 full). SWA layers use `n_swa` window + separate head dims (`n_embd_head_k_swa`); full layers use `rope_freqs` (proportional rope). `naive_attention` is full-context only → needs a windowed-mask variant (or pass the window to the existing kernel).
 4. **Per-head q/k RMS norm** — `attn_q_norm`/`attn_k_norm` `[n_embd_head]` (like qwen3; reuse the per-head rms_norm path).
 5. **4 norms/layer** — `attn_norm` (pre-attn) + `attn_post_norm` (post-attn) + `ffn_norm` (pre-ffn) + `ffn_post_norm` (post-ffn). The MoE layers add `ffn_pre_norm_2`/`ffn_post_norm_1`/`ffn_post_norm_2`.
