@@ -585,6 +585,12 @@ fn denseGemmaQ4KGeGLUProfileScanEnabled(cfg: ModelConfig, profile_enabled: bool)
     return requested and isDenseGemma31Q4KGeGLUShape(cfg);
 }
 
+fn denseGemmaQ4KGeGLUValidateTokens(default_tokens: u32) u32 {
+    const requested = readU32Env("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_TOKENS") orelse
+        default_tokens;
+    return @min(@max(requested, 1), 8);
+}
+
 fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
     if (cfg.architecture != .gemma or cfg.n_experts != 0 or !usesGeglu(cfg)) return false;
     return (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE") orelse false) or
@@ -4645,6 +4651,8 @@ pub const InferenceEngine = struct {
     dense_gemma_q4k_geglu_validation_enabled: bool,
     dense_gemma_q4k_geglu_validation_scan_layers: bool,
     dense_gemma_q4k_geglu_validation_emitted: bool,
+    dense_gemma_q4k_geglu_validation_scanned_tokens: u32,
+    dense_gemma_q4k_geglu_validation_token_limit: u32,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     lm_head_argmax_cpu_reduce_pairs: u32,
@@ -4815,8 +4823,11 @@ pub const InferenceEngine = struct {
         self.dense_gemma_q4k_geglu_validation_enabled =
             denseGemmaQ4KGeGLUValidationRequested(cfg) or dense_gemma_q4k_geglu_profile_scan;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
+        self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
+        self.dense_gemma_q4k_geglu_validation_token_limit =
+            denseGemmaQ4KGeGLUValidateTokens(if (dense_gemma_q4k_geglu_profile_scan) 4 else 1);
         if (dense_gemma_q4k_geglu_profile_scan) {
-            log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator scan enabled; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip", .{});
+            log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator scan enabled for {d} decode tokens; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip", .{self.dense_gemma_q4k_geglu_validation_token_limit});
         }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
@@ -6386,6 +6397,7 @@ pub const InferenceEngine = struct {
         self.qwen_moe_route_validate_target_tokens = 0;
         self.qwen_moe_route_validate_failure_hint_emitted = false;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
+        self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -17596,8 +17608,11 @@ fn shouldValidateDenseGemmaQ4KGeGLU(engine: *const InferenceEngine, layer_idx: u
         layer_idx >= requested_layer
     else
         layer_idx == requested_layer;
+    const token_matches = !engine.dense_gemma_q4k_geglu_validation_scan_layers or
+        engine.dense_gemma_q4k_geglu_validation_scanned_tokens < engine.dense_gemma_q4k_geglu_validation_token_limit;
     return engine.dense_gemma_q4k_geglu_validation_enabled and
         !engine.dense_gemma_q4k_geglu_validation_emitted and
+        token_matches and
         !engine.in_prefill_phase and
         fused_gate_up_geglu and
         layer_matches and
@@ -17649,6 +17664,7 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
     else
         @as(usize, @intCast(engine.config.n_layers - 1));
     const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    const scan_token = engine.dense_gemma_q4k_geglu_validation_scanned_tokens + 1;
     if (diff.max_abs <= tol) {
         if (!scan_layers) {
             log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
@@ -17717,8 +17733,10 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
 
     if (scan_layers) {
         if (diff.max_abs > tol) {
-            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
+            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} scan_token={d}/{d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
                 engine.position,
+                scan_token,
+                engine.dense_gemma_q4k_geglu_validation_token_limit,
                 layer_idx,
                 diff.max_abs,
                 diff.max_idx,
@@ -17730,8 +17748,10 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             });
             engine.dense_gemma_q4k_geglu_validation_emitted = true;
         } else if (validate_fast_unchecked and fast_diff.max_abs > tol) {
-            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
+            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} scan_token={d}/{d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
                 engine.position,
+                scan_token,
+                engine.dense_gemma_q4k_geglu_validation_token_limit,
                 layer_idx,
                 fast_diff.max_abs,
                 fast_diff.max_idx,
@@ -17743,13 +17763,26 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             });
             engine.dense_gemma_q4k_geglu_validation_emitted = true;
         } else if (layer_idx >= last_layer_idx) {
-            log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_ALL_OK: token={d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
-                engine.position,
-                denseGemmaQ4KGeGLUValidateLayer(engine),
-                layer_idx + 1,
-                tol,
-            });
-            engine.dense_gemma_q4k_geglu_validation_emitted = true;
+            engine.dense_gemma_q4k_geglu_validation_scanned_tokens += 1;
+            if (engine.dense_gemma_q4k_geglu_validation_scanned_tokens >= engine.dense_gemma_q4k_geglu_validation_token_limit) {
+                log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_ALL_OK: token={d} scan_tokens={d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
+                    engine.position,
+                    engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
+                    denseGemmaQ4KGeGLUValidateLayer(engine),
+                    layer_idx + 1,
+                    tol,
+                });
+                engine.dense_gemma_q4k_geglu_validation_emitted = true;
+            } else {
+                log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_TOKEN_OK: token={d} scan_token={d}/{d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
+                    engine.position,
+                    engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
+                    engine.dense_gemma_q4k_geglu_validation_token_limit,
+                    denseGemmaQ4KGeGLUValidateLayer(engine),
+                    layer_idx + 1,
+                    tol,
+                });
+            }
         }
     } else {
         engine.dense_gemma_q4k_geglu_validation_emitted = true;
