@@ -17,10 +17,10 @@ struct DmmvPush {
 // Gemma 31B's 262k-vocab logits in greedy decode.
 //
 // Thread organization:
-//   256 threads per threadgroup = 8 simdgroups x 32 threads
-//   Each simdgroup processes 2 rows => 16 rows per threadgroup.
+//   512 threads per threadgroup = 16 simdgroups x 32 threads
+//   Each simdgroup processes 2 rows => 32 rows per threadgroup.
 // This keeps the same per-row llama.cpp matvec math while halving the
-// LM-head partial count again versus the 8-row greedy argmax path.
+// LM-head partial count again versus the 16-row greedy argmax path.
 //
 // Q4_K block layout (144 bytes, 256 elements):
 //   [0..1]   d    (float16)
@@ -28,7 +28,7 @@ struct DmmvPush {
 //   [4..15]  scales (12 bytes, packed 6-bit scale/min pairs)
 //   [16..143] qs  (128 bytes, 256 x 4-bit quants)
 
-#define NSG   8
+#define NSG   16
 #define NR0   2
 #define QK_K  256
 #define BLOCK_SIZE 144

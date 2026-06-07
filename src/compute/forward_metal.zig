@@ -1644,6 +1644,9 @@ const ArgmaxPairsPush = extern struct {
     stride: u32,
 };
 
+const q4k_lmhead_argmax_rows_per_wg: u32 = 32;
+const q4k_lmhead_argmax_block_size: u32 = 512;
+
 /// Push constants for SwiGLU dispatch (matches SPIRV-Cross layout: buffer(0)).
 const SwiGLUPush = extern struct {
     n: u32, // number of elements
@@ -4348,7 +4351,8 @@ pub const InferenceEngine = struct {
         const swiglu_size: usize = @max(up_size, @as(usize, conv_channels) * @sizeOf(f32));
         const vocab_size: usize = @as(usize, cfg.vocab_size) * @sizeOf(f32);
         const argmax_chunk_pairs: usize = (@as(usize, cfg.vocab_size) + 1023) / 1024;
-        const argmax_lmhead_pairs: usize = (@as(usize, cfg.vocab_size) + 15) / 16;
+        const lmhead_argmax_rows_per_wg_usize: usize = @intCast(q4k_lmhead_argmax_rows_per_wg);
+        const argmax_lmhead_pairs: usize = (@as(usize, cfg.vocab_size) + lmhead_argmax_rows_per_wg_usize - 1) / lmhead_argmax_rows_per_wg_usize;
         const argmax_pairs_size: usize = @max(@max(argmax_chunk_pairs, argmax_lmhead_pairs) * 2 * @sizeOf(u32), 2 * @sizeOf(u32));
         const kv_cache_size: usize = @as(usize, max_ctx) * kv_cache_bytes_per_token;
         const page_table_size: usize = @as(usize, max_ctx) * @sizeOf(u32);
@@ -10233,7 +10237,7 @@ fn dispatchLmHeadOnCmd(
 }
 
 fn canUseLmHeadQ4KArgmaxPartials(engine: *const InferenceEngine, hidden_dim: u32, vocab_size: u32) bool {
-    const rows_per_wg: u32 = 16;
+    const rows_per_wg: u32 = q4k_lmhead_argmax_rows_per_wg;
     const n_pairs: usize = @intCast((vocab_size + rows_per_wg - 1) / rows_per_wg);
     return engine.lm_head.info.type_ == .q4_k and
         hidden_dim > 3072 and
@@ -10242,7 +10246,7 @@ fn canUseLmHeadQ4KArgmaxPartials(engine: *const InferenceEngine, hidden_dim: u32
         vocab_size % rows_per_wg == 0 and
         engine.lm_head_private_buf.handle == null and
         engine.dmmv_q4k_lmhead_argmax_pipe.handle != null and
-        engine.dmmv_q4k_lmhead_argmax_pipe.max_threads_per_threadgroup >= 256 and
+        engine.dmmv_q4k_lmhead_argmax_pipe.max_threads_per_threadgroup >= q4k_lmhead_argmax_block_size and
         engine.argmax_pairs_pipe.handle != null and
         engine.argmax_partials_buf.handle != null and
         engine.argmax_partials_buf.size >= n_pairs * 2 * @sizeOf(u32);
@@ -10260,7 +10264,7 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
 ) void {
     recordDmmvProfile(engine, engine.lm_head, vocab_size, hidden_dim);
 
-    const rows_per_wg: u32 = 16;
+    const rows_per_wg: u32 = q4k_lmhead_argmax_rows_per_wg;
     const n_pairs = (vocab_size + rows_per_wg - 1) / rows_per_wg;
     const reduce_partials_on_cpu =
         !engine.in_prefill_phase and
@@ -10283,7 +10287,7 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
     cmd.dispatchV2(
         &engine.dmmv_q4k_lmhead_argmax_pipe,
         .{ n_pairs, 1, 1 },
-        .{ 256, 1, 1 },
+        .{ q4k_lmhead_argmax_block_size, 1, 1 },
         &bufs,
         &push,
         @sizeOf(DmmvPush),

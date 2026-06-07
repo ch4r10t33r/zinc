@@ -1443,7 +1443,7 @@ fn runLmHeadQ4KArgmaxDispatchBatch(
         .y_offset = if (write_logits) 0 else skip_logits_y_offset,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, logits_buf, partials_buf };
-    const rows_per_wg: u32 = 4;
+    const rows_per_wg: u32 = 32;
     const workgroups = (rows + rows_per_wg - 1) / rows_per_wg;
 
     var cmd = try metal_command.beginCommand(ctx);
@@ -1451,7 +1451,7 @@ fn runLmHeadQ4KArgmaxDispatchBatch(
         cmd.dispatchV2(
             pipe,
             .{ workgroups, 1, 1 },
-            .{ 64, 1, 1 },
+            .{ 512, 1, 1 },
             &bufs,
             &push,
             @sizeOf(DmmvPush),
@@ -2967,9 +2967,9 @@ fn benchmarkLmHeadQ4KArgmaxVariant(
 ) !BenchResult {
     var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_lmhead_argmax");
     defer metal_pipeline.freePipeline(&pipe);
-    if (pipe.max_threads_per_threadgroup < 256) return error.InvalidThreadgroupSize;
+    if (pipe.max_threads_per_threadgroup < 512) return error.InvalidThreadgroupSize;
 
-    const rows_per_wg: u32 = 16;
+    const rows_per_wg: u32 = 32;
     const n_pairs = (hot_case.rows0 + rows_per_wg - 1) / rows_per_wg;
     var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&input_buf);
@@ -3030,7 +3030,7 @@ fn benchmarkLmHeadQ4KArgmaxVariant(
         .expert_slots = 1,
         .x_expert_stride = 0,
         .iterations = iterations,
-        .block_size = 64,
+        .block_size = 512,
         .rows_per_wg = rows_per_wg,
         .thread_execution_width = pipe.thread_execution_width,
         .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
