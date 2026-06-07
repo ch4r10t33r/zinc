@@ -42,6 +42,8 @@ pub const SamplingParams = forward_mod.SamplingParams;
 pub fn enableLogitsReadback(_engine: *InferenceEngine) void {
     if (comptime gpu.is_vulkan) {
         _engine.enableLogitsReadback();
+    } else if (comptime gpu.is_metal) {
+        _engine.enableLogitsReadback();
     }
 }
 
@@ -52,14 +54,17 @@ pub fn enableLogitsReadback(_engine: *InferenceEngine) void {
 pub fn logitsReadbackEnabled(_engine: *const InferenceEngine) bool {
     if (comptime gpu.is_vulkan) {
         return _engine.logits_readback_enabled;
+    } else if (comptime gpu.is_metal) {
+        return _engine.logits_readback_enabled;
     }
-    // Metal uses UMA — logits are always CPU-accessible.
-    return true;
+    return false;
 }
 
-/// Set the logits readback flag on the engine (Vulkan-only, no-op on Metal).
+/// Set the logits readback intent flag on backends that can elide full logit materialization.
 pub fn setLogitsReadbackEnabled(_engine: *InferenceEngine, _enabled: bool) void {
     if (comptime gpu.is_vulkan) {
+        _engine.logits_readback_enabled = _enabled;
+    } else if (comptime gpu.is_metal) {
         _engine.logits_readback_enabled = _enabled;
     }
 }

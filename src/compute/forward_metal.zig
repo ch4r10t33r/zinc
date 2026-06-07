@@ -4159,6 +4159,7 @@ pub const InferenceEngine = struct {
     position: u32,
     max_context_tokens: u32,
     profile_enabled: bool,
+    logits_readback_enabled: bool,
     q8_repacked_dispatch_profile_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
@@ -4366,6 +4367,7 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
+        self.logits_readback_enabled = false;
         self.q8_repacked_dispatch_profile_enabled = readBoolEnv("ZINC_METAL_Q8_DISPATCH_PROFILE") orelse false;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
@@ -5892,10 +5894,14 @@ pub const InferenceEngine = struct {
     /// Falls back to greedy if parameters are near-default or buffers are private.
     pub fn sample(self: *const InferenceEngine, history: []const u32, params: SamplingParams, random: std.Random) u32 {
         if (!params.requiresLogitsReadback()) return self.sampleGreedy();
-        if (self.private_decode_buffers) return self.sampleGreedy();
+        if (self.private_decode_buffers or !self.logits_readback_enabled) return self.sampleGreedy();
         const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
         const logits = logits_ptr[0..self.config.vocab_size];
         return sampleFromLogits(logits, history, params, random, self.config.final_logit_softcapping);
+    }
+
+    pub fn enableLogitsReadback(self: *InferenceEngine) void {
+        self.logits_readback_enabled = true;
     }
 
     fn normalizeRequestedContext(self: *const InferenceEngine, requested_context_tokens: u32, minimum_tokens: u32) u32 {
@@ -10256,12 +10262,17 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
 
     const rows_per_wg: u32 = 4;
     const n_pairs = (vocab_size + rows_per_wg - 1) / rows_per_wg;
+    const reduce_partials_on_cpu =
+        !engine.in_prefill_phase and
+        !engine.logits_readback_enabled and
+        !engine.debug_validation_enabled and
+        engine.argmax_partials_buf.cpu_ptr != null;
     const push = DmmvPush{
         .M = vocab_size,
         .K = hidden_dim,
         .a_offset = tensorPageOffset(engine.model, engine.lm_head),
         .x_offset = 0,
-        .y_offset = 0,
+        .y_offset = if (reduce_partials_on_cpu) std.math.maxInt(u32) else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &engine.lm_head.gpu_buffer,
@@ -10278,7 +10289,7 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
         @sizeOf(DmmvPush),
         1,
     );
-    if (!engine.in_prefill_phase and engine.argmax_partials_buf.cpu_ptr != null) {
+    if (reduce_partials_on_cpu) {
         engine.lm_head_argmax_cpu_reduce_pairs = n_pairs;
         return;
     }

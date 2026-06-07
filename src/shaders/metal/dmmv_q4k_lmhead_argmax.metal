@@ -30,6 +30,7 @@ struct DmmvPush {
 #define NR0   2
 #define QK_K  256
 #define BLOCK_SIZE 144
+#define SKIP_LOGITS_Y_OFFSET 0xffffffffu
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 kernel void main0(
@@ -342,7 +343,8 @@ kernel void main0(
         y4 += 4 * QK_K;
     }
 
-    device float* dst_f32 = Y + (p.y_offset / 4);
+    const bool write_logits = p.y_offset != SKIP_LOGITS_Y_OFFSET;
+    device float* dst_f32 = Y + (write_logits ? (p.y_offset / 4) : 0u);
 
     // The Zig dispatcher only routes vocab-size multiples of 4 here, so the
     // NR0=2 rows in both simdgroups are always in bounds.
@@ -350,7 +352,9 @@ kernel void main0(
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             const uint idx = uint(first_row + row);
-            dst_f32[idx] = sum_all;
+            if (write_logits) {
+                dst_f32[idx] = sum_all;
+            }
             const uint slot = uint(sgitg) * uint(NR0) + uint(row);
             tg_best_vals[slot] = sum_all;
             tg_best_idxs[slot] = idx;
