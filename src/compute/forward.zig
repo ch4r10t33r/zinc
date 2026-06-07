@@ -21161,17 +21161,20 @@ pub fn generate(
             var dense_ffn_ns: u64 = 0;
             var tail_ns: u64 = 0;
             var embed_ns: u64 = 0;
-            // `.ssm` wraps all ssm_* sub-phases and `.moe_routed` wraps all moe_*
-            // sub-phases. `.dense_ffn` likewise wraps dense_ffn_* sub-phases.
-            // Bucket with the wrappers only; shared_* and tail/attn/embed have
-            // no wrapper.
+            // `.ssm` wraps all ssm_* sub-phases, `.moe_routed` wraps all moe_*
+            // sub-phases, and `.dense_ffn` likewise wraps dense_ffn_* sub-phases.
+            // Gemma's CPU-routed shared expert also has a `.shared_expert`
+            // wrapper; use it when present to avoid double-counting child phases.
+            var shared_wrapper_ns: u64 = 0;
+            var shared_children_ns: u64 = 0;
             inline for (@typeInfo(ProfilePhase).@"enum".fields) |f| {
                 const phase_val: ProfilePhase = @enumFromInt(f.value);
                 const v = engine.prefill_gpu_phase_ns[f.value];
                 switch (phase_val) {
                     .attention => attn_ns += v,
                     .moe_routed => moe_ns += v,
-                    .shared_expert, .shared_proj, .shared_swiglu, .shared_down, .shared_gate_acc => shared_ns += v,
+                    .shared_expert => shared_wrapper_ns += v,
+                    .shared_proj, .shared_swiglu, .shared_down, .shared_gate_acc => shared_children_ns += v,
                     .ssm => ssm_ns += v,
                     .dense_ffn => dense_ffn_ns += v,
                     .final_tail => tail_ns += v,
@@ -21179,6 +21182,7 @@ pub fn generate(
                     else => {},
                 }
             }
+            shared_ns = if (shared_wrapper_ns > 0) shared_wrapper_ns else shared_children_ns;
             const to_ms = struct {
                 fn f(v: u64) f64 {
                     return @as(f64, @floatFromInt(v)) / 1_000_000.0;
@@ -21210,8 +21214,8 @@ pub fn generate(
                     to_ms(embed_ns),
                 },
             );
-            // Drill-down inside the two biggest composite buckets so the next
-            // cycle can target the largest MoE sub-phase directly.
+            // Drill-down inside the composite buckets so the next cycle can
+            // target a named sub-phase instead of a top-level guess.
             const router_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_router)];
             const topk_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_topk)];
             const gate_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_gate_up)];
@@ -21227,6 +21231,21 @@ pub fn generate(
                     to_ms(swiglu_ns),
                     to_ms(down_ns),
                     to_ms(weighted_ns),
+                },
+            );
+            const shared_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_proj)];
+            const shared_swiglu_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_swiglu)];
+            const shared_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_down)];
+            const shared_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_gate_acc)];
+            log.info(
+                "Prefill shared subphases totals: wrapper={d:.1} proj={d:.1} swiglu={d:.1} down={d:.1} gate_acc={d:.1} children_sum={d:.1} ms",
+                .{
+                    to_ms(shared_wrapper_ns),
+                    to_ms(shared_proj_ns),
+                    to_ms(shared_swiglu_ns),
+                    to_ms(shared_down_ns),
+                    to_ms(shared_gate_ns),
+                    to_ms(shared_children_ns),
                 },
             );
             const ssm_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj)];
