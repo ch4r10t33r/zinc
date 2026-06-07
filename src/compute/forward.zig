@@ -19961,33 +19961,82 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.moe_down, down_phase);
             self.endProfilePhase(.moe_routed, moe_phase);
             try self.decode_cmd.end();
-            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-            self.recordProfilingSample();
+            if (pipeline_tail and prefix_tokens < n_tokens) {
+                try self.decode_cmd.submit(self.instance.compute_queue);
+                self.recordProfilingSample();
 
-            var tok_idx = prefix_tokens;
-            while (tok_idx < n_tokens) : (tok_idx += 1) {
-                const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
-                self.prefill_current_token_idx = tok_idx;
-                state.position = base_token + tok_idx;
-                self.partial_decode_start_layer = layer;
-                self.partial_decode_end_layer = layer + 1;
-                self.partial_decode_hidden_in = scratch_hidden.handle;
-                self.partial_decode_hidden_in_offset = hidden_offset;
-                self.partial_decode_hidden_out = scratch_hidden.handle;
-                self.partial_decode_hidden_out_offset = hidden_offset;
-                self.partial_decode_advance_position = false;
-                self.partial_decode_allow_final_tail = false;
-                self.partial_decode_stop_before_ffn_norm = false;
-                self.partial_decode_stop_after_ffn_norm = false;
-                self.partial_decode_ffn_norm_out = null;
-                self.partial_decode_ffn_norm_out_offset = 0;
-                self.partial_decode_resume_from_ffn_norm = true;
-                self.partial_decode_ffn_norm_in = scratch_norm.handle;
-                self.partial_decode_ffn_norm_in_offset = hidden_offset;
-                self.partial_decode_router_output_in = null;
-                self.partial_decode_router_output_in_offset = 0;
-                self.partial_decode_router_output_in_size = 0;
-                try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                var primary_pending: bool = true;
+                var alt_pending: bool = false;
+                var tok_idx = prefix_tokens;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                    std.mem.swap(bool, &primary_pending, &alt_pending);
+                    if (primary_pending) {
+                        try self.decode_cmd.waitForCompletion();
+                        primary_pending = false;
+                    }
+                    self.prefill_pipeline_mode = true;
+
+                    const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.prefill_current_token_idx = tok_idx;
+                    state.position = base_token + tok_idx;
+                    self.partial_decode_start_layer = layer;
+                    self.partial_decode_end_layer = layer + 1;
+                    self.partial_decode_hidden_in = scratch_hidden.handle;
+                    self.partial_decode_hidden_in_offset = hidden_offset;
+                    self.partial_decode_hidden_out = scratch_hidden.handle;
+                    self.partial_decode_hidden_out_offset = hidden_offset;
+                    self.partial_decode_advance_position = false;
+                    self.partial_decode_allow_final_tail = false;
+                    self.partial_decode_stop_before_ffn_norm = false;
+                    self.partial_decode_stop_after_ffn_norm = false;
+                    self.partial_decode_ffn_norm_out = null;
+                    self.partial_decode_ffn_norm_out_offset = 0;
+                    self.partial_decode_resume_from_ffn_norm = true;
+                    self.partial_decode_ffn_norm_in = scratch_norm.handle;
+                    self.partial_decode_ffn_norm_in_offset = hidden_offset;
+                    self.partial_decode_router_output_in = null;
+                    self.partial_decode_router_output_in_offset = 0;
+                    self.partial_decode_router_output_in_size = 0;
+                    try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                    primary_pending = true;
+                }
+                self.prefill_pipeline_mode = false;
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                }
+            } else {
+                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                self.recordProfilingSample();
+
+                var tok_idx = prefix_tokens;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.prefill_current_token_idx = tok_idx;
+                    state.position = base_token + tok_idx;
+                    self.partial_decode_start_layer = layer;
+                    self.partial_decode_end_layer = layer + 1;
+                    self.partial_decode_hidden_in = scratch_hidden.handle;
+                    self.partial_decode_hidden_in_offset = hidden_offset;
+                    self.partial_decode_hidden_out = scratch_hidden.handle;
+                    self.partial_decode_hidden_out_offset = hidden_offset;
+                    self.partial_decode_advance_position = false;
+                    self.partial_decode_allow_final_tail = false;
+                    self.partial_decode_stop_before_ffn_norm = false;
+                    self.partial_decode_stop_after_ffn_norm = false;
+                    self.partial_decode_ffn_norm_out = null;
+                    self.partial_decode_ffn_norm_out_offset = 0;
+                    self.partial_decode_resume_from_ffn_norm = true;
+                    self.partial_decode_ffn_norm_in = scratch_norm.handle;
+                    self.partial_decode_ffn_norm_in_offset = hidden_offset;
+                    self.partial_decode_router_output_in = null;
+                    self.partial_decode_router_output_in_offset = 0;
+                    self.partial_decode_router_output_in_size = 0;
+                    try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                }
             }
         }
 
