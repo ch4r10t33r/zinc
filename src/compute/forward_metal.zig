@@ -890,6 +890,12 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_barrier_calls: u32 = 0,
     dense_ffn_tail_barrier_calls: u32 = 0,
     dense_ffn_scale_barrier_calls: u32 = 0,
+    dense_ffn_norm_dispatch_calls: u32 = 0,
+    dense_ffn_gate_up_dispatch_calls: u32 = 0,
+    dense_ffn_activation_dispatch_calls: u32 = 0,
+    dense_ffn_down_dispatch_calls: u32 = 0,
+    dense_ffn_tail_dispatch_calls: u32 = 0,
+    dense_ffn_scale_dispatch_calls: u32 = 0,
     final_barrier_calls: u32 = 0,
     sample_calls: u32 = 0,
     full_attn_layers: u32 = 0,
@@ -1179,6 +1185,19 @@ fn recordDenseFfnBarrierPhase(profile: ?*RuntimeProfile, phase: DenseFfnBarrierP
     }
 }
 
+fn recordDenseFfnDispatchDelta(profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, before: u32, after: u32) void {
+    const delta = after -| before;
+    if (delta == 0) return;
+    if (profile) |p| switch (phase) {
+        .norm => p.dense_ffn_norm_dispatch_calls += delta,
+        .gate_up => p.dense_ffn_gate_up_dispatch_calls += delta,
+        .activation => p.dense_ffn_activation_dispatch_calls += delta,
+        .down => p.dense_ffn_down_dispatch_calls += delta,
+        .tail => p.dense_ffn_tail_dispatch_calls += delta,
+        .scale => p.dense_ffn_scale_dispatch_calls += delta,
+    };
+}
+
 fn profileDenseFfnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase) void {
     const before_count = cmd.barrier_count;
     cmd.barrier();
@@ -1393,6 +1412,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_barrier_calls = total.dense_ffn_down_barrier_calls -| prefix.dense_ffn_down_barrier_calls;
     delta.dense_ffn_tail_barrier_calls = total.dense_ffn_tail_barrier_calls -| prefix.dense_ffn_tail_barrier_calls;
     delta.dense_ffn_scale_barrier_calls = total.dense_ffn_scale_barrier_calls -| prefix.dense_ffn_scale_barrier_calls;
+    delta.dense_ffn_norm_dispatch_calls = total.dense_ffn_norm_dispatch_calls -| prefix.dense_ffn_norm_dispatch_calls;
+    delta.dense_ffn_gate_up_dispatch_calls = total.dense_ffn_gate_up_dispatch_calls -| prefix.dense_ffn_gate_up_dispatch_calls;
+    delta.dense_ffn_activation_dispatch_calls = total.dense_ffn_activation_dispatch_calls -| prefix.dense_ffn_activation_dispatch_calls;
+    delta.dense_ffn_down_dispatch_calls = total.dense_ffn_down_dispatch_calls -| prefix.dense_ffn_down_dispatch_calls;
+    delta.dense_ffn_tail_dispatch_calls = total.dense_ffn_tail_dispatch_calls -| prefix.dense_ffn_tail_dispatch_calls;
+    delta.dense_ffn_scale_dispatch_calls = total.dense_ffn_scale_dispatch_calls -| prefix.dense_ffn_scale_dispatch_calls;
     delta.final_barrier_calls = total.final_barrier_calls -| prefix.final_barrier_calls;
     delta.sample_calls = total.sample_calls -| prefix.sample_calls;
     delta.full_attn_layers = total.full_attn_layers -| prefix.full_attn_layers;
@@ -1711,6 +1736,24 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_tail_barrier_calls,
             profile.dense_ffn_scale_barrier_calls,
             other_dense_barriers,
+        });
+    }
+    const dense_dispatches =
+        profile.dense_ffn_norm_dispatch_calls +
+        profile.dense_ffn_gate_up_dispatch_calls +
+        profile.dense_ffn_activation_dispatch_calls +
+        profile.dense_ffn_down_dispatch_calls +
+        profile.dense_ffn_tail_dispatch_calls +
+        profile.dense_ffn_scale_dispatch_calls;
+    if (dense_dispatches > 0) {
+        log.info("  {s} dense dispatches: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            profile.dense_ffn_norm_dispatch_calls,
+            profile.dense_ffn_gate_up_dispatch_calls,
+            profile.dense_ffn_activation_dispatch_calls,
+            profile.dense_ffn_down_dispatch_calls,
+            profile.dense_ffn_tail_dispatch_calls,
+            profile.dense_ffn_scale_dispatch_calls,
         });
     }
 }
@@ -21051,6 +21094,7 @@ fn runDecodeStep(
             // FFN-side fusion (cycle 44). Saves ≈60 dispatches and ≈60 barriers
             // per token on Gemma 31B's 60 dense full-attn layers.
             const can_fuse_post_attn_norm = engine.post_attn_norm_present[layer_idx] and !should_debug_attn_compare;
+            const dense_norm_dispatch_before = cmd.dispatch_count;
             if (engine.post_attn_norm_present[layer_idx] and !can_fuse_post_attn_norm) {
                 dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_attn_norm_bufs[layer_idx], hidden_dim, 1);
                 profileFullAttnBarrierBuffers(cmd, profile, .residual, &.{&engine.down_buf});
@@ -21174,6 +21218,9 @@ fn runDecodeStep(
                 // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
                 // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
                 dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
+            }
+            if (!is_moe) {
+                recordDenseFfnDispatchDelta(profile, .norm, dense_norm_dispatch_before, cmd.dispatch_count);
             }
             if (!is_moe and layer_shared_cmd != null) {
                 if (prefer_dense_gemma_scope_norm_join) {
@@ -22575,6 +22622,7 @@ fn runDecodeStep(
                 const fused_gate_up_swiglu = !fused_gate_up_geglu and
                     canUseDenseQ4KGateUpSwiGLU(engine, gate_t, up_t, inter_dim, hidden_dim);
                 const fused_gate_up = fused_gate_up_geglu or fused_gate_up_swiglu;
+                const gate_up_dispatch_before = cmd.dispatch_count;
                 if (fused_gate_up_geglu) {
                     dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
                 } else if (fused_gate_up_swiglu) {
@@ -22585,9 +22633,12 @@ fn runDecodeStep(
                     dispatchDmmvOnCmd(engine, cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
                     dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
                 }
+                recordDenseFfnDispatchDelta(profile, .gate_up, gate_up_dispatch_before, cmd.dispatch_count);
                 if (!fused_gate_up) {
                     profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    const activation_dispatch_before = cmd.dispatch_count;
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
+                    recordDenseFfnDispatchDelta(profile, .activation, activation_dispatch_before, cmd.dispatch_count);
                 }
                 // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: the
                 // dense activation join has exactly one prior producer
@@ -22599,7 +22650,9 @@ fn runDecodeStep(
                 // independent dependency.
                 profileDenseFfnBarrier(cmd, profile, .activation);
 
+                const down_dispatch_before = cmd.dispatch_count;
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
+                recordDenseFfnDispatchDelta(profile, .down, down_dispatch_before, cmd.dispatch_count);
                 if (layer_shared_cmd != null) {
                     // The post-FFN residual reads both down_buf and hidden_buf.
                     // hidden_buf was intentionally not fenced at the dense FFN input
@@ -22651,6 +22704,7 @@ fn runDecodeStep(
                 // the previous (post_norm_residual_rms_norm → barrier → scale_in_place)
                 // ordering. Removes the trailing scale_in_place dispatch+barrier
                 // (≈60 dispatches/60 barriers per token on Gemma 31B).
+                const tail_dispatch_before = cmd.dispatch_count;
                 if ((can_fuse_next_attn_norm or can_fuse_final_norm_tail) and engine.post_ffn_norm_present[layer_idx]) {
                     const hidden_scale: f32 = if (can_fold_layer_scale_here) layer_output_scale else 1.0;
                     const output_norm_weights = if (can_fuse_final_norm_tail)
@@ -22737,6 +22791,7 @@ fn runDecodeStep(
                         }
                     }
                 }
+                recordDenseFfnDispatchDelta(profile, .tail, tail_dispatch_before, cmd.dispatch_count);
                 if (profile) |p| p.dense_ffn_record_ns += profileElapsedNs(dense_record_start);
                 if (using_local_cmd) {
                     if (use_async_local_decode) {
@@ -22770,10 +22825,14 @@ fn runDecodeStep(
                     !is_moe and
                     (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) and
                     !(emit_logits and shared_cmd == null and next_layer == layer_count);
+                const scale_dispatch_before = cmd.dispatch_count;
                 dispatchScaleInPlaceOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class, !scale_at_dense_cmd_tail);
+                if (!is_moe) recordDenseFfnDispatchDelta(profile, .scale, scale_dispatch_before, cmd.dispatch_count);
             } else {
                 var scale_cmd = try beginProfiledCommand(engine, profile);
+                const scale_dispatch_before = scale_cmd.dispatch_count;
                 dispatchScaleInPlaceOnCmd(engine, &scale_cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class, true);
+                if (!is_moe) recordDenseFfnDispatchDelta(profile, .scale, scale_dispatch_before, scale_cmd.dispatch_count);
                 commitAndWaitProfiled(&scale_cmd, profile);
             }
         }
