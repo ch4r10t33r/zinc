@@ -5571,6 +5571,33 @@ pub const InferenceEngine = struct {
         n_tokens: u32,
         output_stride: u32,
     ) !void {
+        return self.dispatchSoftmaxTopkBatchScaled(
+            logits_buf,
+            logits_size,
+            output_buf,
+            output_size,
+            n_experts,
+            k,
+            token_base,
+            n_tokens,
+            output_stride,
+            1.0,
+        );
+    }
+
+    fn dispatchSoftmaxTopkBatchScaled(
+        self: *InferenceEngine,
+        logits_buf: vk.c.VkBuffer,
+        logits_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_size: vk.c.VkDeviceSize,
+        n_experts: u32,
+        k: u32,
+        token_base: u32,
+        n_tokens: u32,
+        output_stride: u32,
+        scale: f32,
+    ) !void {
         if (n_tokens == 0) return;
         const pip = if (k == 1 and self.elementwise.pipeline_softmax_top1_batch != null)
             &self.elementwise.pipeline_softmax_top1_batch.?
@@ -5580,7 +5607,7 @@ pub const InferenceEngine = struct {
         const push = SoftmaxTopkBatchPush{
             .n_experts = n_experts,
             .k = k,
-            .scale_bits = @bitCast(@as(f32, 1.0)),
+            .scale_bits = @bitCast(scale),
             .token_base = token_base,
             .n_tokens = n_tokens,
             .logits_stride = n_experts,
@@ -7678,8 +7705,21 @@ pub const InferenceEngine = struct {
                     config.n_experts_used;
                 const precomputed_route_copy_size: vk.c.VkDeviceSize =
                     @as(vk.c.VkDeviceSize, 2) * @as(vk.c.VkDeviceSize, n_used) * @sizeOf(u32);
+                const gemma_precomputed_router_eligible =
+                    config.architecture == .gemma and
+                    lt.ffn_gate_up_exps != null and
+                    lt.ffn_gate_up_exps.?.info.type_ == .q4_k and
+                    lt.ffn_down_exps != null and
+                    ((lt.ffn_down_exps.?.info.type_ == .q5_1 and self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled != null) or
+                        (lt.ffn_down_exps.?.info.type_ == .q8_0 and self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled != null)) and
+                    lt.ffn_gate_inp_bias == null and
+                    lt.ffn_gate_exps_bias == null and
+                    lt.ffn_up_exps_bias == null and
+                    lt.ffn_down_exps_bias == null and
+                    lt.ffn_down_exps_scale != null and
+                    self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null;
                 const use_precomputed_router = resume_from_ffn_norm and
-                    config.architecture == .qwen2_moe and
+                    (config.architecture == .qwen2_moe or gemma_precomputed_router_eligible) and
                     !self.use_capture_routing and
                     self.partial_decode_router_output_in != null and
                     precomputed_route_copy_size <= self.router_output_buf.size and
@@ -7866,7 +7906,7 @@ pub const InferenceEngine = struct {
                 // The GPU-topk fast path folds the same positive scale into topk
                 // softmax weights, avoiding a separate in-place dispatch + barrier.
                 // Matches Metal forward_metal.zig:4134-4137 for other Gemma paths.
-                if (config.architecture == .gemma and !gemma_topk_scales_router) {
+                if (!use_precomputed_router and config.architecture == .gemma and !gemma_topk_scales_router) {
                     try self.dispatchScaleInPlace(
                         self.router_logits_buf.handle,
                         self.router_logits_buf.size,
@@ -8605,7 +8645,15 @@ pub const InferenceEngine = struct {
                             log.info("FASTPATH: Gemma GPU-topk MoE ENABLED (q4k gate+up+geglu, scaled fused down+acc, n_used={d})", .{n_used});
                         }
                         const moe_topk_phase = self.beginProfilePhase();
-                        if (gemma_short_prefill_fast_tail and n_used == 1 and self.elementwise.pipeline_softmax_top1 != null) {
+                        if (use_precomputed_router) {
+                            const route_region = vk.c.VkBufferCopy{
+                                .srcOffset = self.partial_decode_router_output_in_offset,
+                                .dstOffset = 0,
+                                .size = precomputed_route_copy_size,
+                            };
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_decode_router_output_in.?, self.router_output_buf.handle, 1, &route_region);
+                            self.decode_cmd.transferToComputeBarrier();
+                        } else if (gemma_short_prefill_fast_tail and n_used == 1 and self.elementwise.pipeline_softmax_top1 != null) {
                             try self.dispatchSoftmaxTop1(
                                 self.router_logits_buf.handle,
                                 @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
@@ -19823,12 +19871,14 @@ pub const InferenceEngine = struct {
         log.info("FASTPATH: Gemma short-prefill layer-major top-1 MoE prefix ENABLED (prefix={d}/{d}, guard={d})", .{ prefix_tokens, n_tokens, guard });
 
         const route_stride_u32: u32 = 2 * cfg.n_experts_used;
+        const route_slot_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, route_stride_u32) * @sizeOf(u32);
         const route_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, route_stride_u32) *
             @sizeOf(u32);
         const router_logits_bytes: vk.c.VkDeviceSize =
-            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, n_tokens) *
             @as(vk.c.VkDeviceSize, cfg.n_experts) *
             @sizeOf(f32);
         const swiglu_prefix_bytes: vk.c.VkDeviceSize =
@@ -19901,7 +19951,7 @@ pub const InferenceEngine = struct {
                 router_logits_bytes,
                 cfg.n_experts,
                 hidden_dim,
-                prefix_tokens,
+                n_tokens,
                 cfg.rms_norm_eps,
             );
             self.decode_cmd.computeBufferBarrier(scratch_router_logits.handle, router_logits_bytes);
@@ -19919,6 +19969,25 @@ pub const InferenceEngine = struct {
                 prefix_tokens,
                 route_stride_u32,
             );
+            if (guard > 0) {
+                const guard_k = if (self.moe_topk_limit > 0)
+                    @min(cfg.n_experts_used, self.moe_topk_limit)
+                else
+                    cfg.n_experts_used;
+                const gemma_router_scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hidden_dim)));
+                try self.dispatchSoftmaxTopkBatchScaled(
+                    scratch_router_logits.handle,
+                    router_logits_bytes,
+                    route_buf.handle,
+                    route_bytes,
+                    cfg.n_experts,
+                    guard_k,
+                    prefix_tokens,
+                    guard,
+                    route_stride_u32,
+                    gemma_router_scale,
+                );
+            }
             self.decode_cmd.computeBufferBarrier(route_buf.handle, route_bytes);
             self.endProfilePhase(.moe_topk, topk_phase);
 
@@ -19995,9 +20064,9 @@ pub const InferenceEngine = struct {
                     self.partial_decode_resume_from_ffn_norm = true;
                     self.partial_decode_ffn_norm_in = scratch_norm.handle;
                     self.partial_decode_ffn_norm_in_offset = hidden_offset;
-                    self.partial_decode_router_output_in = null;
-                    self.partial_decode_router_output_in_offset = 0;
-                    self.partial_decode_router_output_in_size = 0;
+                    self.partial_decode_router_output_in = route_buf.handle;
+                    self.partial_decode_router_output_in_offset = @as(vk.c.VkDeviceSize, tok_idx) * route_slot_bytes;
+                    self.partial_decode_router_output_in_size = route_buf.size;
                     try self.decodeStep(state, prompt_tokens[tok_idx], false);
                     primary_pending = true;
                 }
@@ -20032,9 +20101,9 @@ pub const InferenceEngine = struct {
                     self.partial_decode_resume_from_ffn_norm = true;
                     self.partial_decode_ffn_norm_in = scratch_norm.handle;
                     self.partial_decode_ffn_norm_in_offset = hidden_offset;
-                    self.partial_decode_router_output_in = null;
-                    self.partial_decode_router_output_in_offset = 0;
-                    self.partial_decode_router_output_in_size = 0;
+                    self.partial_decode_router_output_in = route_buf.handle;
+                    self.partial_decode_router_output_in_offset = @as(vk.c.VkDeviceSize, tok_idx) * route_slot_bytes;
+                    self.partial_decode_router_output_in_size = route_buf.size;
                     try self.decodeStep(state, prompt_tokens[tok_idx], false);
                 }
             }
