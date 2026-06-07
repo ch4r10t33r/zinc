@@ -11168,26 +11168,72 @@ pub const InferenceEngine = struct {
         if (n_tokens < 16 or (hidden_dim & 255) != 0) return false;
         if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return false;
 
-        try self.dmmv.recordMulMmQ4KGateUpGeglu(
-            &self.decode_cmd,
-            self.instance.push_descriptor_fn,
-            gate_t.gpu_buffer.handle,
-            gate_t.gpu_buffer.size,
-            up_t.gpu_buffer.handle,
-            up_t.gpu_buffer.size,
-            norm_buf.handle,
-            norm_buf.size,
-            geglu_buf.handle,
-            geglu_buf.size,
-            inter_dim,
-            n_tokens,
-            hidden_dim,
-            hidden_dim,
-            inter_dim,
-            0,
-            0,
-            0,
-        );
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full != null) {
+            try self.dmmv.recordMulMmQ4KGateUpGegluFull(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                norm_buf.handle,
+                norm_buf.size,
+                geglu_buf.handle,
+                geglu_buf.size,
+                inter_dim,
+                full_cols,
+                hidden_dim,
+                hidden_dim,
+                inter_dim,
+                0,
+                0,
+                0,
+            );
+            if (full_cols < n_tokens) {
+                try self.dmmv.recordMulMmQ4KGateUpGeglu(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    norm_buf.handle,
+                    norm_buf.size,
+                    geglu_buf.handle,
+                    geglu_buf.size,
+                    inter_dim,
+                    n_tokens - full_cols,
+                    hidden_dim,
+                    hidden_dim,
+                    inter_dim,
+                    0,
+                    full_cols * hidden_dim,
+                    full_cols * inter_dim,
+                );
+            }
+        } else {
+            try self.dmmv.recordMulMmQ4KGateUpGeglu(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                norm_buf.handle,
+                norm_buf.size,
+                geglu_buf.handle,
+                geglu_buf.size,
+                inter_dim,
+                n_tokens,
+                hidden_dim,
+                hidden_dim,
+                inter_dim,
+                0,
+                0,
+                0,
+            );
+        }
         return true;
     }
 

@@ -267,6 +267,7 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q4k",
         "mul_mm_q4k_gate_up_swiglu",
         "mul_mm_q4k_gate_up_geglu",
+        "mul_mm_q4k_gate_up_geglu_full",
         "mul_mm_q6k",
         "count_experts",
         // Previously-orphaned shaders: these .comp files were added by their
