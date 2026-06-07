@@ -63,4 +63,21 @@ const lastIndex = items.length - 1;
     color: var(--color-accent);
     text-decoration: none;
   }
+
+  @media (max-width: 700px) {
+    .breadcrumbs {
+      margin-bottom: var(--space-sm);
+      font-size: 0.78rem;
+    }
+
+    /* Drop the current-page crumb on mobile — it duplicates the H1 right below,
+       and a long title would otherwise wrap and bloat the top of the screen. */
+    .breadcrumbs li:last-child {
+      display: none;
+    }
+
+    .breadcrumbs li:nth-last-child(2)::after {
+      content: none;
+    }
+  }
   </style>
