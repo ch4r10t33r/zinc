@@ -1155,7 +1155,11 @@ pub fn main() !void {
     var first = true;
 ${structSymbols.map((s) => {
       const modIdx = structModulePaths.indexOf(s.modulePath);
-      return `    if (@TypeOf(mod${modIdx}.${s.qualifiedName}) == type) {\n        dumpStruct(mod${modIdx}.${s.qualifiedName}, "${s.qualifiedName}", &first, out) catch {};\n    }`;
+      // Guard with @hasDecl so any symbol the source parser surfaced that is not a
+      // real top-level module decl (e.g. a nested `pub const X = struct` inside a
+      // container, which Zig sees as `Parent.X`, not `mod.X`) is skipped at comptime
+      // instead of failing the entire analyzer compile.
+      return `    if (@hasDecl(mod${modIdx}, "${s.qualifiedName}") and @TypeOf(mod${modIdx}.${s.qualifiedName}) == type) {\n        dumpStruct(mod${modIdx}.${s.qualifiedName}, "${s.qualifiedName}", &first, out) catch {};\n    }`;
     }).join('\n')}
     try out.print("}}", .{});
     try out.flush();
