@@ -20455,6 +20455,15 @@ fn canUseDenseSharedDecodeCommand(engine: *const InferenceEngine) bool {
     return true;
 }
 
+fn preferDenseGemmaScopeNormJoin(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    return cfg.architecture == .gemma and
+        cfg.n_experts == 0 and
+        cfg.ssm_d_inner == 0 and
+        engine.command_encoder_mode == .concurrent and
+        canUseDenseSharedDecodeCommand(engine);
+}
+
 fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !MetalCommand {
     const cmd = try metal_command.beginCommandWithMode(engine.device.ctx, engine.command_encoder_mode);
     if (profile) |p| p.command_buffers += 1;
@@ -20606,6 +20615,7 @@ fn runDecodeStep(
     const head_v_dim: u32 = if (d_inner > 0) d_inner / @max(dt_rank, 1) else 0;
     const d_conv: u32 = cfg.ssm_d_conv;
     const use_dense_layer_cmd = canUseDenseSharedDecodeCommand(engine);
+    const prefer_dense_gemma_scope_norm_join = preferDenseGemmaScopeNormJoin(engine);
     // Adapted from llama.cpp `ggml_metal_op_concurrency_check/reset` graph-tail
     // fusion: the residual+RMS-norm+F32-router(+shared-gate) megakernel operates
     // on per-layer per-token state (hidden, norm_buf, router_output_buf,
@@ -21055,11 +21065,20 @@ fn runDecodeStep(
                 dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             }
             if (!is_moe and layer_shared_cmd != null) {
-                // Adapt llama.cpp `ggml_metal_op_concurrency_check`: dense
-                // gate/up consumes only the FFN norm row. Defer hidden_buf's
-                // dependency until the post-FFN residual join so the attention
-                // residual write can drain while the dense FFN DMMVs run.
-                profileDenseFfnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
+                if (prefer_dense_gemma_scope_norm_join) {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: this
+                    // fused post-attn producer writes both hidden_buf and the
+                    // FFN norm row in one dispatch, and dense Gemma has no
+                    // independent in-flight branch at this edge. Avoid the hot
+                    // single-resource barrier path before every dense gate/up.
+                    profileDenseFfnBarrier(cmd, profile, .norm);
+                } else {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_check`: dense
+                    // gate/up consumes only the FFN norm row. Defer hidden_buf's
+                    // dependency until the post-FFN residual join so the attention
+                    // residual write can drain while the dense FFN DMMVs run.
+                    profileDenseFfnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
+                }
             }
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
@@ -22547,9 +22566,17 @@ fn runDecodeStep(
                     }
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
                     if (can_fuse_final_norm_tail) {
-                        profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                        if (prefer_dense_gemma_scope_norm_join) {
+                            profileDenseFfnBarrier(cmd, profile, .tail);
+                        } else {
+                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                        }
                     } else if (!ends_dense_cmd_chunk) {
-                        profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                        if (prefer_dense_gemma_scope_norm_join) {
+                            profileDenseFfnBarrier(cmd, profile, .tail);
+                        } else {
+                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                        }
                         prev_fused_hidden_barrier_deferred = true;
                     }
                 } else {
@@ -22577,6 +22604,9 @@ fn runDecodeStep(
                             if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
                                 if (layer_scale_runs_after_dense) {
                                     profileDenseFfnBarrierBuffers(cmd, profile, .scale, &.{ &engine.hidden_buf, &engine.norm_buf });
+                                } else if (prefer_dense_gemma_scope_norm_join) {
+                                    profileDenseFfnBarrier(cmd, profile, .tail);
+                                    if (!ends_dense_cmd_chunk) prev_fused_hidden_barrier_deferred = true;
                                 } else {
                                     profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
                                     if (!ends_dense_cmd_chunk) prev_fused_hidden_barrier_deferred = true;
