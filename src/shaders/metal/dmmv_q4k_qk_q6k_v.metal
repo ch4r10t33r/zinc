@@ -150,20 +150,89 @@ kernel void main0(
             sumy[2] = yh_tot.x + yh_tot.y;
             sumy[3] = yh_tot.z + yh_tot.w;
 
-            const int dst_row_0 = dst_row_base + 0;
-            const int dst_row_1 = dst_row_base + 1;
-            const ulong row_off_0 = ulong(dst_row_0) * ulong(row_bytes) + ulong(ib) * Q4_BLOCK_SIZE;
-            const ulong row_off_1 = ulong(dst_row_1) * ulong(row_bytes) + ulong(ib) * Q4_BLOCK_SIZE;
-            const float4 parts_0 = (dst_row_0 < M)
-                ? q4k_block_dot_parts(src + row_off_0, yl4_arr, yh4_arr, sumy, iq, ir)
-                : float4(0.0f);
-            const float4 parts_1 = (dst_row_1 < M)
-                ? q4k_block_dot_parts(src + row_off_1, yl4_arr, yh4_arr, sumy, iq, ir)
-                : float4(0.0f);
-            const float2 dh_d = float2(parts_0[2], parts_1[2]);
-            const float2 dh_dmin = float2(parts_0[3], parts_1[3]);
-            const float2 head_dots = float2(parts_0[0], parts_1[0]);
-            const float2 tail_dots = float2(parts_0[1], parts_1[1]);
+            // Match the base dmmv_q4k row-interleaved body: load both adjacent
+            // rows' headers/quants, then advance their accumulators together.
+            // The dispatch guard requires M_q/M_k multiples of 4, so an NR0=2
+            // simdgroup never straddles Q/K or a tail row.
+            device const uchar* blk_0 = src + ulong(dst_row_base) * ulong(row_bytes) + ulong(ib) * Q4_BLOCK_SIZE;
+            device const uchar* blk_1 = blk_0 + row_bytes;
+            const packed_uint4 hdr_0 = *((device const packed_uint4*)blk_0);
+            const packed_uint4 hdr_1 = *((device const packed_uint4*)blk_1);
+            const half2 dh_pair_0 = as_type<half2>(hdr_0.x);
+            const half2 dh_pair_1 = as_type<half2>(hdr_1.x);
+            const uint sc_shift = uint(iq) * 16u;
+
+            constexpr ushort kmask1 = 0x3f3f;
+            constexpr ushort kmask2 = 0x0f0f;
+            constexpr ushort kmask3 = 0xc0c0;
+            const uint3 sc_u3v_0 = uint3(hdr_0.y, hdr_0.z, hdr_0.w);
+            const ushort sc_0_0 = ushort((sc_u3v_0.x >> sc_shift) & 0xFFFFu);
+            const ushort sc_2_0 = ushort((sc_u3v_0.y >> sc_shift) & 0xFFFFu);
+            const ushort sc_4_0 = ushort((sc_u3v_0.z >> sc_shift) & 0xFFFFu);
+            const ushort4 sc16_0 = ushort4(
+                sc_0_0 & kmask1,
+                sc_2_0 & kmask1,
+                ((sc_4_0 >> 0) & kmask2) | ((sc_0_0 & kmask3) >> 2),
+                ((sc_4_0 >> 4) & kmask2) | ((sc_2_0 & kmask3) >> 2));
+
+            const uint3 sc_u3v_1 = uint3(hdr_1.y, hdr_1.z, hdr_1.w);
+            const ushort sc_0_1 = ushort((sc_u3v_1.x >> sc_shift) & 0xFFFFu);
+            const ushort sc_2_1 = ushort((sc_u3v_1.y >> sc_shift) & 0xFFFFu);
+            const ushort sc_4_1 = ushort((sc_u3v_1.z >> sc_shift) & 0xFFFFu);
+            const ushort4 sc16_1 = ushort4(
+                sc_0_1 & kmask1,
+                sc_2_1 & kmask1,
+                ((sc_4_1 >> 0) & kmask2) | ((sc_0_1 & kmask3) >> 2),
+                ((sc_4_1 >> 4) & kmask2) | ((sc_2_1 & kmask3) >> 2));
+
+            device const ushort* q1_0 = (device const ushort*)(blk_0 + 16) + 16 * iq + 4 * ir;
+            device const ushort* q1_1 = (device const ushort*)(blk_1 + 16) + 16 * iq + 4 * ir;
+            const ushort4 q1v_0 = *((device const ushort4*)q1_0);
+            const ushort4 q2v_0 = *((device const ushort4*)(q1_0 + 32));
+            const ushort4 q1v_1 = *((device const ushort4*)q1_1);
+            const ushort4 q2v_1 = *((device const ushort4*)(q1_1 + 32));
+
+            float4 acc1_0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1_1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
+            constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const float4 yl4 = yl4_arr[i];
+                const float4 yh4 = yh4_arr[i];
+                const ushort q1_0i = q1v_0[i];
+                const ushort q1_1i = q1v_1[i];
+                const ushort q2_0i = q2v_0[i];
+                const ushort q2_1i = q2v_1[i];
+                const float4 q1m_0 = float4(ushort4(q1_0i) & nibble_mask);
+                const float4 q1m_1 = float4(ushort4(q1_1i) & nibble_mask);
+                const float4 q2m_0 = float4(ushort4(q2_0i) & nibble_mask);
+                const float4 q2m_1 = float4(ushort4(q2_1i) & nibble_mask);
+                acc1_0 = fma(yl4, q1m_0, acc1_0);
+                acc1_1 = fma(yl4, q1m_1, acc1_1);
+                acc2_0 = fma(yh4, q2m_0, acc2_0);
+                acc2_1 = fma(yh4, q2m_1, acc2_1);
+            }
+
+            const float4 head_pair_0 = fma(
+                float4(acc1_0[1], acc1_0[3], acc2_0[1], acc2_0[3]),
+                float4(1.f / 256.f),
+                float4(acc1_0[0], acc1_0[2], acc2_0[0], acc2_0[2]));
+            const float4 head_pair_1 = fma(
+                float4(acc1_1[1], acc1_1[3], acc2_1[1], acc2_1[3]),
+                float4(1.f / 256.f),
+                float4(acc1_1[0], acc1_1[2], acc2_1[0], acc2_1[2]));
+            constexpr ushort4 lo_mask = ushort4(0x00FFu);
+            constexpr float4 sc_pos_scale = float4(1.f, 1.f / 16.f, 1.f, 1.f / 16.f);
+            const float4 sc_pos_0 = float4(ushort4(sc16_0.x, sc16_0.x >> 8, sc16_0.z, sc16_0.z >> 8) & lo_mask) * sc_pos_scale;
+            const float4 sc_pos_1 = float4(ushort4(sc16_1.x, sc16_1.x >> 8, sc16_1.z, sc16_1.z >> 8) & lo_mask) * sc_pos_scale;
+            const float4 sc_neg_0 = float4(ushort4(sc16_0.y, sc16_0.y >> 8, sc16_0.w, sc16_0.w >> 8) & lo_mask);
+            const float4 sc_neg_1 = float4(ushort4(sc16_1.y, sc16_1.y >> 8, sc16_1.w, sc16_1.w >> 8) & lo_mask);
+            const float2 dh_d = float2(float(dh_pair_0.x), float(dh_pair_1.x));
+            const float2 dh_dmin = float2(float(dh_pair_0.y), float(dh_pair_1.y));
+            const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
+            const float2 tail_dots = float2(dot(sumy, sc_neg_0), dot(sumy, sc_neg_1));
             const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
             sumf[0] += delta[0];
             sumf[1] += delta[1];
