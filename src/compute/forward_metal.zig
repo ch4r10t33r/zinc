@@ -20722,7 +20722,12 @@ fn runDecodeStep(
             }
             const fence_deferred_hidden = prev_fused_hidden_barrier_deferred;
             if ((initial_hidden_barrier_deferred and layer_idx == 0) or fence_deferred_hidden) {
-                profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.down_buf, &engine.hidden_buf });
+                // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: this edge is
+                // a true producer join. The following fused post-attn residual
+                // kernel consumes both pending writes (`down_buf` from O-proj and
+                // `hidden_buf` from the deferred residual), so there is no
+                // independent prior work left to preserve with a resource list.
+                profileBarrier(cmd, profile, .full_attn);
                 if (initial_hidden_barrier_deferred and layer_idx == 0) {
                     initial_hidden_barrier_deferred = false;
                 }
@@ -22279,9 +22284,11 @@ fn runDecodeStep(
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
                 if (layer_shared_cmd != null) {
                     // The post-FFN residual reads both down_buf and hidden_buf.
-                    // hidden_buf was intentionally not fenced at the dense FFN
-                    // input edge above because gate/up does not consume it.
-                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.down_buf, &engine.hidden_buf });
+                    // hidden_buf was intentionally not fenced at the dense FFN input
+                    // edge above because gate/up and down do not consume it. This is
+                    // now the actual join, so mirror llama.cpp's reset barrier rather
+                    // than paying a two-resource barrier on every dense layer.
+                    profileBarrier(cmd, profile, .dense_ffn);
                 } else {
                     profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
                 }
