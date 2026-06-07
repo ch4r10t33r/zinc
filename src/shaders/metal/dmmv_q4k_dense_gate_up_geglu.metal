@@ -84,9 +84,9 @@ inline float q4k_block_dot(
 
 inline float geglu(float gate, float up) {
     const float g3 = gate * gate * gate;
-    float inner = 0.7978845608f * (gate + 0.044715f * g3);
+    float inner = 0.7978845608f * fma(0.044715f, g3, gate);
     inner = clamp(inner, -15.0f, 15.0f);
-    const float gelu_gate = 0.5f * gate * (1.0f + precise::tanh(inner));
+    const float gelu_gate = 0.5f * gate * (1.0f + fast::tanh(inner));
     return gelu_gate * up;
 }
 
