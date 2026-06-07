@@ -22010,7 +22010,10 @@ fn runDecodeStep(
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
         } else if (fuse_final_norm) {
             dispatchLmHeadFusedNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrier(cmd, profile, .final);
+            // Argmax depends only on the fused LM-head output, so keep the
+            // final-phase join resource-scoped instead of fencing unrelated
+            // layer-tail writes still draining in the concurrent encoder.
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
@@ -22039,7 +22042,10 @@ fn runDecodeStep(
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
         } else if (fuse_final_norm) {
             dispatchLmHeadFusedNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrier(&cmd, profile, .final);
+            // Argmax depends only on the fused LM-head output, so keep the
+            // final-phase join resource-scoped instead of fencing unrelated
+            // layer-tail writes still draining in the concurrent encoder.
+            profileBarrierBuffers(&cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             commitAndWaitProfiled(&cmd, profile);
