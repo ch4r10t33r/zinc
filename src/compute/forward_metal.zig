@@ -564,6 +564,24 @@ fn qwenRoutePackedFullValidationBisectEnabled() bool {
         (readBoolEnv("ZINC_QWEN36_ROUTE_PACK_VALIDATE_FULL_BISECT") orelse false);
 }
 
+fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
+    if (cfg.architecture != .gemma or cfg.n_experts != 0 or !usesGeglu(cfg)) return false;
+    return (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE") orelse false) or
+        std.posix.getenv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") != null or
+        qwenRoutePackedFullValidationEnabled() or
+        qwenRoutePackedFullValidationBisectEnabled();
+}
+
+fn denseGemmaQ4KGeGLUValidateLayer(engine: *const InferenceEngine) usize {
+    const requested =
+        readU32Env("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_VALIDATE_LAYER") orelse
+        0;
+    if (engine.config.n_layers == 0) return 0;
+    return @min(@as(usize, @intCast(requested)), @as(usize, @intCast(engine.config.n_layers - 1)));
+}
+
 fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -4601,6 +4619,8 @@ pub const InferenceEngine = struct {
     gemma_q8_moe_fallback_down_enabled: bool,
     gemma_moe_post_norm_residual_decode_enabled: bool,
     gemma_q4k_geglu_exact5_enabled: bool,
+    dense_gemma_q4k_geglu_validation_enabled: bool,
+    dense_gemma_q4k_geglu_validation_emitted: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     lm_head_argmax_cpu_reduce_pairs: u32,
@@ -4765,6 +4785,8 @@ pub const InferenceEngine = struct {
         self.qwen_prefill_validation_enabled =
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.dense_gemma_q4k_geglu_validation_enabled = denseGemmaQ4KGeGLUValidationRequested(cfg);
+        self.dense_gemma_q4k_geglu_validation_emitted = false;
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
             readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
@@ -4789,7 +4811,8 @@ pub const InferenceEngine = struct {
             defaultQwen36SsmPrefillProjectionEnabled(cfg);
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
-            self.qwen_prefill_validation_enabled)
+            self.qwen_prefill_validation_enabled or
+            self.dense_gemma_q4k_geglu_validation_enabled)
             false
         else
             options.private_decode_buffers_override orelse
@@ -6329,6 +6352,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_prefill_router_active_tokens = 0;
         self.qwen_moe_route_validate_target_tokens = 0;
         self.qwen_moe_route_validate_failure_hint_emitted = false;
+        self.dense_gemma_q4k_geglu_validation_emitted = false;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -17520,6 +17544,76 @@ fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
     return .{ .max_abs = max_abs, .max_idx = max_idx, .rms = rms };
 }
 
+fn shouldValidateDenseGemmaQ4KGeGLU(engine: *const InferenceEngine, layer_idx: usize, fused_gate_up_geglu: bool) bool {
+    return engine.dense_gemma_q4k_geglu_validation_enabled and
+        !engine.dense_gemma_q4k_geglu_validation_emitted and
+        !engine.in_prefill_phase and
+        fused_gate_up_geglu and
+        layer_idx == denseGemmaQ4KGeGLUValidateLayer(engine) and
+        engine.gate_buf.cpu_ptr != null and
+        engine.up_buf.cpu_ptr != null and
+        engine.swiglu_buf.cpu_ptr != null;
+}
+
+fn validateDenseGemmaQ4KGeGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    gate_t: *const metal_loader.LoadedTensor,
+    up_t: *const metal_loader.LoadedTensor,
+    inter_dim: u32,
+    hidden_dim: u32,
+) !void {
+    // The production fused path has already written swiglu_buf. Materialize the
+    // precise reference into gate_buf via separate gate/up matvecs plus
+    // geglu.metal, then diff before down projection consumes swiglu_buf.
+    dispatchDmmvOnCmd(engine, cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
+    dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
+    profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+    dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.gate_buf, &engine.up_buf, inter_dim);
+    profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{ &engine.gate_buf, &engine.swiglu_buf });
+    commitAndWaitProfiled(cmd, profile);
+
+    const ref_ptr: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+    const candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
+    const ref_slice = ref_ptr[0..inter_dim];
+    const candidate_slice = candidate_ptr[0..inter_dim];
+    const diff = diffF32Slices(ref_slice, candidate_slice);
+    const ref_value = if (inter_dim > 0) ref_slice[diff.max_idx] else 0.0;
+    const candidate_value = if (inter_dim > 0) candidate_slice[diff.max_idx] else 0.0;
+    const tol: f32 = 5e-2;
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+
+    engine.dense_gemma_q4k_geglu_validation_emitted = true;
+    cmd.* = try beginProfiledCommand(engine, profile);
+}
+
 fn shouldValidateGemmaMoe(engine: *const InferenceEngine, layer_idx: usize) bool {
     return engine.gemma_moe_validation_enabled and
         engine.config.architecture == .gemma and
@@ -20865,7 +20959,9 @@ fn canUseDenseSharedDecodeCommand(engine: *const InferenceEngine) bool {
     }
     if (cfg.n_experts != 0) return false;
     if (cfg.ssm_d_inner != 0) return false;
-    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled) return false;
+    if (engine.debug_validation_enabled or
+        engine.gemma_moe_validation_enabled or
+        engine.dense_gemma_q4k_geglu_validation_enabled) return false;
 
     for (engine.layer_tensors) |lt| {
         if (lt.attn_gate != null) return false;
@@ -22911,6 +23007,9 @@ fn runDecodeStep(
                     dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
                 }
                 recordDenseFfnDispatchDelta(profile, .gate_up, gate_up_dispatch_before, cmd.dispatch_count);
+                if (shouldValidateDenseGemmaQ4KGeGLU(engine, layer_idx, fused_gate_up_geglu)) {
+                    try validateDenseGemmaQ4KGeGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, inter_dim, hidden_dim);
+                }
                 if (!fused_gate_up) {
                     profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
                     const activation_dispatch_before = cmd.dispatch_count;
