@@ -1034,3 +1034,58 @@ extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float*
         }
     }
 }
+
+// ---- gemm_q6k_tiled_v2 — register-blocked prefill GEMM for Q6_K weights ------
+// Mirror of gemm_q4k_tiled_v2 (64x64 tile, 256 threads, 4x4 register micro-tile,
+// BK=32) with the Q6_K dequant in the stage-to-shared step. Q6_K block = 210
+// bytes/256 elems: ql[0..127] low4, qh[128..191] high2, scales[192..207] int8,
+// d[208..209] f16; q = (ql_nibble | (qh_bits<<4)) 6-bit; value = d*sc*(q-32).
+// Q6_K is BYTE-addressed -> param `const unsigned char* a`, pc.a_offset is BYTES.
+extern "C" __global__ void gemm_q6k_tiled_v2(const unsigned char* a, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float Ws[BK*BM]; __shared__ float As[BK*BT];
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT, bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x, tx=tid&15u, ty=tid>>4;
+    const float* Abase=A+(pc.x_offset>>2);
+    float acc[4][4];
+    #pragma unroll
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]=0.0f;
+    for(unsigned c=0;c<nchunk;c++){
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, r=idx>>5, l=idx&31u, row=m0+r; float wv=0.0f;
+            if(row<pc.M){ unsigned e=c*32u+l, within=e&255u, sb=e>>8;
+                const unsigned char* blk=a+pc.a_offset+(size_t)row*bpr*210u+(size_t)sb*210u;
+                float d=zinc_half_to_float((unsigned short)((unsigned)blk[208]|((unsigned)blk[209]<<8)));
+                unsigned half_=within>>7, wh=within&127u, ll=wh&31u, group=wh>>5;
+                const unsigned char* ql=blk+(size_t)half_*64u;
+                const unsigned char* qh=blk+128u+(size_t)half_*32u;
+                const signed char* sc=(const signed char*)(blk+192u+(size_t)half_*8u);
+                unsigned is=ll>>4, qhb=qh[ll], q, sci;
+                if(group==0u){ q=(ql[ll]&0xFu)|(((qhb>>0)&3u)<<4); sci=is+0u; }
+                else if(group==1u){ q=(ql[ll+32u]&0xFu)|(((qhb>>2)&3u)<<4); sci=is+2u; }
+                else if(group==2u){ q=(ql[ll]>>4)|(((qhb>>4)&3u)<<4); sci=is+4u; }
+                else { q=(ql[ll+32u]>>4)|(((qhb>>6)&3u)<<4); sci=is+6u; }
+                wv=d*(float)sc[sci]*((float)q-32.0f); }
+            Ws[l*BM+r]=wv; }
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, t=idx>>5, l=idx&31u, tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?Abase[(size_t)tok*pc.K+c*32u+l]:0.0f; }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned kk=0;kk<BK;kk++){ float wr[4],ar[4];
+            #pragma unroll
+            for(int i=0;i<4;i++) wr[i]=Ws[kk*BM+ty*4u+(unsigned)i];
+            #pragma unroll
+            for(int j=0;j<4;j++) ar[j]=As[kk*BT+tx*4u+(unsigned)j];
+            #pragma unroll
+            for(int i=0;i<4;i++)
+                #pragma unroll
+                for(int j=0;j<4;j++) acc[i][j]+=wr[i]*ar[j]; }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int i=0;i<4;i++){ unsigned row=m0+ty*4u+(unsigned)i;
+        #pragma unroll
+        for(int j=0;j<4;j++){ unsigned tok=t0+tx*4u+(unsigned)j;
+            if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
+}
