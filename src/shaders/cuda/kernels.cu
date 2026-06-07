@@ -831,3 +831,59 @@ __device__ __forceinline__ void dmmv_q4k_mrow_impl(const unsigned* a_u32, const 
 }
 extern "C" __global__ void dmmv_q4k_mr2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<2>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_mr4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<4>(a_u32, x, y, pc); }
+
+// ---- dmmv_q5k multi-row (perf research, agenda 1: extend mr2 to Q5_K) --------
+// One block computes R=2 output rows; each shared x-superblock loaded once and
+// reused across both rows. Same Q5_K dequant as dmmv_q5k_fast (qh 5th-bit
+// promote). Targets Q5_K mid-M matvecs (ffn_down / attn_v in Q4_K_M mixes),
+// stuck ~65% peak at M=12288 in the single-row fast kernel.
+template<int R>
+__device__ __forceinline__ void dmmv_q5k_mrow_impl(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row0 = blockIdx.x * (unsigned)R;
+    if (row0 >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u, ngrp = blockDim.x >> 4;
+    unsigned sba = 2u*v_im, sbb = 2u*v_im+1u, sbc = 2u*v_im+4u, sbd = 2u*v_im+5u;
+    unsigned a0 = (pc.a_offset >> 2);
+    float sum[R];
+    #pragma unroll
+    for (int r=0;r<R;r++) sum[r]=0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned bidx = (i*256u + y_loc) >> 2, bidx2 = (i*256u + y_loc + 128u) >> 2;
+        float4 by0=xv[bidx], by1=xv[bidx+8u], by2=xv[bidx2], by3=xv[bidx2+8u];
+        #pragma unroll
+        for (int r=0;r<R;r++){
+            unsigned row = row0 + (unsigned)r;
+            if (row >= pc.M) continue;
+            unsigned blk = a0 + row * bpr * 44u + i * 44u, dd = a_u32[blk];
+            float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF)), dm = zinc_half_to_float((unsigned short)(dd >> 16));
+            unsigned sc0 = a_u32[blk+1u], sc1 = a_u32[blk+2u], sc2 = a_u32[blk+3u];
+            unsigned qh = a_u32[blk + 4u + (l0 >> 2)];
+            unsigned qs0 = a_u32[blk + 12u + (q_off >> 2)], qs1 = a_u32[blk + 12u + (q_off >> 2) + 16u];
+            unsigned s0=sc0>>shift, s1=sc1>>shift, s2=sc2>>shift;
+            float f0=d*(float)(s0&0x3Fu), b0=dm*(float)(s1&0x3Fu);
+            float f1=d*(float)((s0>>8)&0x3Fu), b1=dm*(float)((s1>>8)&0x3Fu);
+            float f2=d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2=dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+            float f3=d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3=dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+            #define Q5MR(q,sh,sb,j) ((float)(((q)>>(sh))&0xFu) + 16.0f*(float)(((qh)>>((sb)+(j)*8u))&1u))
+            float s = 0.0f;
+            s += (f0*Q5MR(qs0,0,sba,0)-b0)*by0.x + (f0*Q5MR(qs0,8,sba,1)-b0)*by0.y + (f0*Q5MR(qs0,16,sba,2)-b0)*by0.z + (f0*Q5MR(qs0,24,sba,3)-b0)*by0.w;
+            s += (f1*Q5MR(qs0,4,sbb,0)-b1)*by1.x + (f1*Q5MR(qs0,12,sbb,1)-b1)*by1.y + (f1*Q5MR(qs0,20,sbb,2)-b1)*by1.z + (f1*Q5MR(qs0,28,sbb,3)-b1)*by1.w;
+            s += (f2*Q5MR(qs1,0,sbc,0)-b2)*by2.x + (f2*Q5MR(qs1,8,sbc,1)-b2)*by2.y + (f2*Q5MR(qs1,16,sbc,2)-b2)*by2.z + (f2*Q5MR(qs1,24,sbc,3)-b2)*by2.w;
+            s += (f3*Q5MR(qs1,4,sbd,0)-b3)*by3.x + (f3*Q5MR(qs1,12,sbd,1)-b3)*by3.y + (f3*Q5MR(qs1,20,sbd,2)-b3)*by3.z + (f3*Q5MR(qs1,28,sbd,3)-b3)*by3.w;
+            #undef Q5MR
+            sum[r] += s;
+        }
+    }
+    #pragma unroll
+    for (int r=0;r<R;r++){
+        float t = zinc_block_reduce_sum(sum[r]);
+        if (tid==0){ unsigned row=row0+(unsigned)r; if(row<pc.M){ unsigned yi=(pc.y_offset>>2)+row; if(pc.acc_mode!=0u) y[yi]+=t; else y[yi]=t; } }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q5k_mr2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc){ dmmv_q5k_mrow_impl<2>(a_u32,x,y,pc); }
