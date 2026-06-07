@@ -612,11 +612,17 @@ fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
 }
 
 fn denseGemmaQ4KGeGLUValidateLayer(engine: *const InferenceEngine) usize {
+    const default_layer = if (engine.profile_enabled and
+        isDenseGemma31Q4KGeGLUShape(engine.config) and
+        !denseGemmaQ4KGeGLUValidationScanRequested())
+        @min(denseGemmaQ4KGeGLUFastPrefixLayers(engine.config) + 1, @as(usize, @intCast(engine.config.n_layers - 1)))
+    else
+        0;
     const requested =
         readU32Env("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") orelse
         readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER") orelse
         readU32Env("ZINC_QWEN36_ROUTE_PACK_VALIDATE_LAYER") orelse
-        0;
+        @as(u32, @intCast(default_layer));
     if (engine.config.n_layers == 0) return 0;
     return @min(@as(usize, @intCast(requested)), @as(usize, @intCast(engine.config.n_layers - 1)));
 }
@@ -4871,16 +4877,17 @@ pub const InferenceEngine = struct {
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
         const dense_gemma_q4k_geglu_profile_scan = denseGemmaQ4KGeGLUProfileScanEnabled(cfg, self.profile_enabled);
+        const dense_gemma_q4k_geglu_explicit_scan = denseGemmaQ4KGeGLUValidationScanRequested();
         self.dense_gemma_q4k_geglu_validation_scan_layers =
-            denseGemmaQ4KGeGLUValidationScanRequested() or dense_gemma_q4k_geglu_profile_scan;
+            dense_gemma_q4k_geglu_explicit_scan;
         self.dense_gemma_q4k_geglu_validation_enabled =
             denseGemmaQ4KGeGLUValidationRequested(cfg) or dense_gemma_q4k_geglu_profile_scan;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
         self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
         self.dense_gemma_q4k_geglu_validation_token_limit =
-            denseGemmaQ4KGeGLUValidateTokens(if (dense_gemma_q4k_geglu_profile_scan) 4 else 1);
+            denseGemmaQ4KGeGLUValidateTokens(if (dense_gemma_q4k_geglu_profile_scan and dense_gemma_q4k_geglu_explicit_scan) 4 else 1);
         if (dense_gemma_q4k_geglu_profile_scan) {
-            log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator scan enabled for {d} decode tokens; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip", .{self.dense_gemma_q4k_geglu_validation_token_limit});
+            log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator probe enabled at layer {d}; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip or ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_SCAN=1 for full scan", .{denseGemmaQ4KGeGLUValidateLayer(&self)});
         }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
