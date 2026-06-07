@@ -1439,6 +1439,7 @@ pub const InferenceEngine = struct {
     partial_decode_hidden_out_offset: vk.c.VkDeviceSize = 0,
     partial_decode_advance_position: bool = true,
     partial_decode_allow_final_tail: bool = false,
+    partial_decode_stop_before_ffn_norm: bool = false,
     partial_decode_stop_after_ffn_norm: bool = false,
     partial_decode_ffn_norm_out: ?vk.c.VkBuffer = null,
     partial_decode_ffn_norm_out_offset: vk.c.VkDeviceSize = 0,
@@ -5841,6 +5842,7 @@ pub const InferenceEngine = struct {
             layer_end != config.n_layers or
             has_partial_hidden_in or
             has_partial_hidden_out or
+            self.partial_decode_stop_before_ffn_norm or
             !self.partial_decode_advance_position;
         var partial_hidden_out_written_by_stop = false;
 
@@ -7455,6 +7457,20 @@ pub const InferenceEngine = struct {
             // state. Saves one full MoE pass per non-terminal prompt token.
             if (self.prefill_active and !collect_output and layer + 1 == config.n_layers) {
                 continue;
+            }
+
+            if (self.partial_decode_stop_before_ffn_norm) {
+                if (self.partial_decode_hidden_out) |hidden_out| {
+                    self.decode_cmd.computeToTransferBarrier();
+                    const hidden_region = vk.c.VkBufferCopy{
+                        .srcOffset = 0,
+                        .dstOffset = self.partial_decode_hidden_out_offset,
+                        .size = hidden_size,
+                    };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, hidden_out, 1, &hidden_region);
+                    partial_hidden_out_written_by_stop = true;
+                }
+                break;
             }
 
             // --- FFN norm: prefer ffn_norm.weight, fall back to post_attention_norm for models
@@ -15595,6 +15611,7 @@ pub const InferenceEngine = struct {
         scratch_hidden: Buffer,
         scratch_norm: ?Buffer,
         copy_hidden_out: bool,
+        stop_before_ffn_norm_prefix_tokens: u32,
         stop_after_ffn_norm: bool,
         advance_position: bool,
         allow_final_tail_last: bool,
@@ -15640,8 +15657,10 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = hidden_offset;
             self.partial_decode_advance_position = advance_position;
             self.partial_decode_allow_final_tail = collect_output;
-            self.partial_decode_stop_after_ffn_norm = stop_after_ffn_norm;
-            if (stop_after_ffn_norm) {
+            const stop_before_ffn_norm = tok_idx < stop_before_ffn_norm_prefix_tokens;
+            self.partial_decode_stop_before_ffn_norm = stop_before_ffn_norm;
+            self.partial_decode_stop_after_ffn_norm = stop_after_ffn_norm and !stop_before_ffn_norm;
+            if (self.partial_decode_stop_after_ffn_norm) {
                 const norm_buf = scratch_norm orelse return error.BufferTooSmall;
                 self.partial_decode_ffn_norm_out = norm_buf.handle;
                 self.partial_decode_ffn_norm_out_offset = hidden_offset;
@@ -16482,6 +16501,7 @@ pub const InferenceEngine = struct {
         const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
         const saved_advance = self.partial_decode_advance_position;
         const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_before_norm = self.partial_decode_stop_before_ffn_norm;
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
@@ -16500,6 +16520,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
             self.partial_decode_advance_position = saved_advance;
             self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_before_ffn_norm = saved_stop_before_norm;
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
@@ -16599,6 +16620,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = hidden_offset;
             self.partial_decode_advance_position = false;
             self.partial_decode_allow_final_tail = false;
+            self.partial_decode_stop_before_ffn_norm = false;
             self.partial_decode_stop_after_ffn_norm = false;
             self.partial_decode_ffn_norm_out = null;
             self.partial_decode_ffn_norm_out_offset = 0;
@@ -17353,6 +17375,7 @@ pub const InferenceEngine = struct {
                 self.partial_decode_hidden_out_offset = 0;
                 self.partial_decode_advance_position = false;
                 self.partial_decode_allow_final_tail = false;
+                self.partial_decode_stop_before_ffn_norm = false;
                 self.partial_decode_stop_after_ffn_norm = false;
                 self.partial_decode_ffn_norm_out = null;
                 self.partial_decode_ffn_norm_out_offset = 0;
@@ -17670,6 +17693,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = 0;
             self.partial_decode_advance_position = false;
             self.partial_decode_allow_final_tail = false;
+            self.partial_decode_stop_before_ffn_norm = false;
             self.partial_decode_stop_after_ffn_norm = false;
             self.partial_decode_ffn_norm_out = null;
             self.partial_decode_ffn_norm_out_offset = 0;
@@ -18417,6 +18441,7 @@ pub const InferenceEngine = struct {
         self.partial_decode_hidden_out_offset = hidden_offset;
         self.partial_decode_advance_position = false;
         self.partial_decode_allow_final_tail = allow_final_tail;
+        self.partial_decode_stop_before_ffn_norm = false;
         self.partial_decode_stop_after_ffn_norm = false;
         self.partial_decode_ffn_norm_out = null;
         self.partial_decode_ffn_norm_out_offset = 0;
@@ -18905,6 +18930,7 @@ pub const InferenceEngine = struct {
         const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
         const saved_advance = self.partial_decode_advance_position;
         const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_before_norm = self.partial_decode_stop_before_ffn_norm;
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
@@ -18932,6 +18958,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
             self.partial_decode_advance_position = saved_advance;
             self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_before_ffn_norm = saved_stop_before_norm;
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
@@ -18998,6 +19025,7 @@ pub const InferenceEngine = struct {
                         scratch_hidden,
                         null,
                         false,
+                        0,
                         false,
                         true,
                         true,
@@ -19054,6 +19082,7 @@ pub const InferenceEngine = struct {
                         scratch_hidden,
                         null,
                         true,
+                        0,
                         false,
                         false,
                         false,
@@ -19220,6 +19249,7 @@ pub const InferenceEngine = struct {
         const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
         const saved_advance = self.partial_decode_advance_position;
         const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_before_norm = self.partial_decode_stop_before_ffn_norm;
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
@@ -19252,6 +19282,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
             self.partial_decode_advance_position = saved_advance;
             self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_before_ffn_norm = saved_stop_before_norm;
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
@@ -19391,6 +19422,7 @@ pub const InferenceEngine = struct {
                     self.partial_decode_hidden_out_offset = hidden_offset;
                     self.partial_decode_advance_position = false;
                     self.partial_decode_allow_final_tail = false;
+                    self.partial_decode_stop_before_ffn_norm = false;
                     self.partial_decode_stop_after_ffn_norm = true;
                     self.partial_decode_ffn_norm_out = scratch_norm.handle;
                     self.partial_decode_ffn_norm_out_offset = hidden_offset;
@@ -19435,6 +19467,7 @@ pub const InferenceEngine = struct {
                     scratch_hidden,
                     null,
                     true,
+                    0,
                     false,
                     false,
                     false,
@@ -19539,6 +19572,7 @@ pub const InferenceEngine = struct {
                     scratch_hidden,
                     scratch_norm,
                     true,
+                    0,
                     true,
                     false,
                     false,
@@ -19561,6 +19595,7 @@ pub const InferenceEngine = struct {
             tail_start_layer = segment_layer + 1;
         }
 
+        self.partial_decode_stop_before_ffn_norm = false;
         self.partial_decode_stop_after_ffn_norm = false;
         self.partial_decode_ffn_norm_out = null;
         self.partial_decode_ffn_norm_out_offset = 0;
@@ -19733,6 +19768,7 @@ pub const InferenceEngine = struct {
         const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
         const saved_advance = self.partial_decode_advance_position;
         const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_before_norm = self.partial_decode_stop_before_ffn_norm;
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
@@ -19751,6 +19787,7 @@ pub const InferenceEngine = struct {
             self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
             self.partial_decode_advance_position = saved_advance;
             self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_before_ffn_norm = saved_stop_before_norm;
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
@@ -19822,6 +19859,7 @@ pub const InferenceEngine = struct {
                 scratch_hidden,
                 scratch_norm,
                 true,
+                prefix_tokens,
                 true,
                 false,
                 false,
@@ -19939,6 +19977,7 @@ pub const InferenceEngine = struct {
                 self.partial_decode_hidden_out_offset = hidden_offset;
                 self.partial_decode_advance_position = false;
                 self.partial_decode_allow_final_tail = false;
+                self.partial_decode_stop_before_ffn_norm = false;
                 self.partial_decode_stop_after_ffn_norm = false;
                 self.partial_decode_ffn_norm_out = null;
                 self.partial_decode_ffn_norm_out_offset = 0;
@@ -19963,6 +20002,7 @@ pub const InferenceEngine = struct {
             scratch_hidden,
             null,
             false,
+            0,
             false,
             false,
             true,
