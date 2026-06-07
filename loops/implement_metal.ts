@@ -329,6 +329,12 @@ function isGemmaRun(state?: Pick<RunState, "effortId" | "effortFile" | "effortPl
     state?.effortId === 11;
 }
 
+function isGemmaDecodeRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan" | "metricMode">,
+): boolean {
+  return isGemmaRun(state) && (state?.metricMode ?? METRIC_MODE) === "decode";
+}
+
 function isQwen36PrefillRun(
   state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">,
 ): boolean {
@@ -843,6 +849,10 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
       lines.push("- For Gemma26 M4 prefill, stop spending cycles on another weighted-finalizer or narrow Q8 threadgroup retune unless the latest profile or `bench-metal-shapes` evidence names that exact shape as underperforming.");
       lines.push("- Productive directions so far are queued-prefill schedule changes and router/RMS fusion. Prefer consuming exact-shape evidence, auditing full batched-prefill guard blockers, or validating public-suite prompt lengths.");
     }
+  } else if (isGemmaDecodeRun(state)) {
+    lines.push("- For Gemma31 dense decode, the cycle-46..66 tail already mined Q4/Q6 row-pair carries, LM-head argmax widening, wide post-norm variants, hidden-scale tail fusion, and scope-vs-resource barrier swaps.");
+    lines.push("- Neutral arithmetic cleanup is now churn. A valid next speed step must either remove a named dispatch/barrier bucket from the latest profile, consume the decode-split hot-shape table to target the top Q4/Q6 byte bucket, or add analysis/enablement that directly unlocks one of those two paths.");
+    lines.push("- Avoid another local variant of `dmmv_q4k`, `dmmv_q6k_llama`, `post_norm_residual_rms_norm_wide`, LM-head argmax row grouping, or resource-list-to-scope barriers unless fresh quantified evidence shows that exact family can beat the current progress band.");
   } else {
     lines.push("- Stop spending cycles on local arithmetic cleanup. Pick a scheduler/fusion/measurement change that can alter a named hot bucket, or explicitly mark the step as analysis.");
   }
@@ -3787,6 +3797,11 @@ export function shouldRejectPlateauNeutralKeep(args: {
       cyclesSinceBestKept(args.state) >= GEMMA_PLATEAU_STALL_CYCLES;
   }
 
+  if (isGemmaDecodeRun(args.state)) {
+    return args.state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES ||
+      cyclesSinceBestKept(args.state) >= GEMMA_PLATEAU_STALL_CYCLES;
+  }
+
   return false;
 }
 
@@ -3807,7 +3822,10 @@ function shouldPreservePromotedBestStallPressure(
   verifyTokPerSec: number,
   bestTokPerSec: number,
 ): boolean {
-  return isGemmaPrefillPostBreakthrough(state) && verifyTokPerSec < bestTokPerSec;
+  return (
+    isGemmaPrefillPostBreakthrough(state) ||
+    (isGemmaDecodeRun(state) && cyclesSinceBestKept(state) >= GEMMA_PLATEAU_STALL_CYCLES)
+  ) && verifyTokPerSec < bestTokPerSec;
 }
 
 // ── Main loop ────────────────────────────────────────────────────────

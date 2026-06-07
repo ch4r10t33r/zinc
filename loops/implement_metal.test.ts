@@ -1236,6 +1236,48 @@ describe("buildPrompt", () => {
     })).toBe(false);
   });
 
+  test("Gemma dense decode plateau rejects neutral optimization churn", () => {
+    const state = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      bestTokPerSec: 23.71,
+      currentBest: { tokPerSec: 23.69, containsReference: true },
+      stalledCycles: 6,
+      cycles: [
+        makeCycle({ cycle: 46, kept: true, containsReference: true, tokPerSec: 23.71 }),
+        ...Array.from({ length: 6 }, (_, idx) => makeCycle({
+          cycle: 47 + idx,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 23.69,
+          description: "Another dense Q6_K row-pair arithmetic cleanup",
+        })),
+      ],
+    });
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Retune dense Q6_K row-pair tail",
+      selfAnalysis: "Expected small +0.05 tok/s cleanup.",
+      verifyTokPerSec: 23.69,
+      acceptedTokPerSec: 23.69,
+      currentProgressBand: 0.15,
+    })).toBe(true);
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "analysis",
+      description: "Add decode-split hot-shape evidence for the remaining Q4_K/Q6_K buckets",
+      selfAnalysis: "Names the next dispatch bucket to remove.",
+      verifyTokPerSec: 23.69,
+      acceptedTokPerSec: 23.69,
+      currentProgressBand: 0.15,
+    })).toBe(false);
+  });
+
   test("structural pivot directive appears for Gemma prefill plateau", () => {
     const state = makeState({
       effortId: 11,
@@ -2000,6 +2042,35 @@ describe("plateau controls", () => {
     expect(lines).toContain("HARD PIVOT MODE");
     expect(lines).toContain("MoE finalizer/barrier fusion");
     expect(lines).toContain("command-buffer batching");
+  });
+
+  test("structural pivot directive names exhausted Gemma31 decode families", () => {
+    const state = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      currentBest: { tokPerSec: 23.69, containsReference: true },
+      bestTokPerSec: 23.71,
+      stalledCycles: 6,
+      cycles: [
+        makeCycle({ cycle: 46, kept: true, containsReference: true, tokPerSec: 23.71 }),
+        ...Array.from({ length: 12 }, (_, idx) =>
+          makeCycle({
+            cycle: 47 + idx,
+            kept: true,
+            containsReference: true,
+            tokPerSec: 23.6,
+            description: "Dense Gemma Q4/Q6 row-pair or wide post-norm variant",
+          }),
+        ),
+      ],
+    });
+
+    const lines = buildStructuralPivotDirective(state).join("\n");
+    expect(lines).toContain("Gemma31 dense decode");
+    expect(lines).toContain("cycle-46..66 tail");
+    expect(lines).toContain("post_norm_residual_rms_norm_wide");
   });
 
   test("best-tree finalization restores when current accepted tree is below promoted best", () => {

@@ -86,6 +86,51 @@ Interpretation:
 - Do not optimize from the May 2026 baseline below unless explicitly analyzing
   historical regressions.
 
+## Current continuation baseline
+
+Updated 2026-06-07 after the target-25 continuation run
+`.metal_optimize/2026-06-07T04-27-15`:
+
+```text
+Fresh run baseline:      22.52 decode tok/s
+Best promoted cycle:     cycle 46, 23.71 decode tok/s
+Final accepted cycle:    cycle 66, 23.69 decode tok/s
+Target:                  25.00 decode tok/s (not reached)
+Cross-effort prefill:    86.30 tok/s vs 88.30 baseline (-2.3% drift)
+Correctness:             "The capital of France is Paris."
+Plateau stop:            20 cycles after promoted-best cycle 46
+```
+
+Profile shape at cycle 66:
+
+```text
+Decode wait:             293.66 ms over 7 generated tokens
+DMMV decode bytes:       119.72 GiB/request
+Effective DMMV BW:       ~408 GiB/s on the measured decode request
+Dispatch/step:           196.0 total, 163.7 barriers
+Barrier kinds/step:      scope 109.1, resource 54.6, resource entries 122.0
+Path bytes:              attn 32.42 GiB, dense 82.14 GiB, lm-head 5.91 GiB
+Quant bytes:             q4_k 98.97 GiB (82.2%), q6_k 21.49 GiB (17.8%)
+Dense barriers/request:  norm 420, activation 420, down 420, tail 420,
+                         scale 0, other 300
+```
+
+What this proved:
+
+- Cycles 25-46 moved the real band from about `22.5` to `23.7 tok/s`.
+- The useful wins came from dense-tail shape work and a few real fusions:
+  `post_norm_residual_rms_norm_wide`, row-pair Q4/Q6 carry, LM-head argmax
+  widening, and folding `layer_output_scale` into `residual_rms_norm`.
+- Cycles 47-66 were mostly neutral. Do not repeat local variants of
+  `dmmv_q4k`, `dmmv_q6k_llama`, `post_norm_residual_rms_norm_wide`,
+  LM-head argmax row grouping, or resource-list-to-scope barrier swaps unless
+  fresh profile or exact-shape evidence names that exact family and the
+  expected gain beats the harness progress band.
+- The next productive change must either remove a named remaining
+  dispatch/barrier bucket, consume the decode-split hot-shape table to attack
+  the top Q4/Q6 byte bucket, or be explicit `analysis`/`enablement` that
+  unlocks one of those paths. Neutral `optimization` keeps are churn now.
+
 Loader output on the canonical chat prompt:
 
 ```text
@@ -411,6 +456,41 @@ Acceptance:
 ### Step 2 [LIVE] - Find and remove the per-dispatch overhead
 
 This is the active step as of 2026-05-01.
+
+2026-06-07 correction: the old `3460 ms/token` profile below is historical.
+Current `main` is already in the `23.7 tok/s` band, with `293-298 ms` total
+decode wait over the 7-token canonical completion. The current request moves
+`119.72 GiB` of decode DMMV bytes, so the measured path is already around
+`400 GiB/s` effective on the dense DMMV portion. The remaining `25 tok/s`
+gap is about `+5.5%`, not another 5x/50x unlock.
+
+The live cycle-66 facts are:
+
+```text
+dispatch/step:      total 196.0, barriers 163.7
+barrier kinds/step: scope 109.1, resource 54.6, resource-entries 122.0
+path bytes:         attn 32.42 GiB, dense 82.14 GiB, lm-head 5.91 GiB
+quant bytes:        q4_k 98.97 GiB, q6_k 21.49 GiB
+dense barriers:     norm 420, activation 420, down 420, tail 420, other 300
+```
+
+The next step must use those live facts. Good directions:
+
+1. Remove one named remaining barrier/dispatch family from the profile, not a
+   cosmetic resource-vs-scope swap that leaves `barriers/step` unchanged.
+2. Use the decode-split Q4/Q6 hot-shape table to pick one top byte bucket and
+   change its default production path.
+3. Add evidence only if it directly chooses between those two paths; mark it
+   `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement`.
+
+Do not repeat:
+
+- Q4/Q6 row-pair carry rewrites.
+- Q6 packed-scale / output-tail-guard cleanup.
+- `post_norm_residual_rms_norm_wide` cache/vectorization variants.
+- LM-head argmax row grouping or 512-thread widening.
+- Resource-list-to-scope barrier swaps unless the profile names the exact edge
+  and the change removes real barrier count or dispatch count.
 
 The kernel side is fine. Per-token GPU work is 3460 ms but the sum of
 the kernels is ~60 ms. The 57x gap is dispatch overhead.
