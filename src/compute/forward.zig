@@ -73,6 +73,8 @@ const kv_cache_mod = @import("../scheduler/kv_cache.zig");
 const log = std.log.scoped(.forward);
 const kv_page_size_tokens: u32 = 16;
 const gemma_prefill_tail_topk_default: u32 = 4;
+const gemma_prefill_tiny_prompt_topk: u32 = 2;
+const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
 
@@ -2320,9 +2322,11 @@ pub const InferenceEngine = struct {
         else
             0;
         if (gemma_prefill_tail_topk_limit > 0) {
-            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
+            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d}, prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
                 gemma_prefill_tail_topk_limit,
                 gemma_prefill_tail_topk_guard_tokens,
+                gemma_prefill_tiny_prompt_tokens,
+                gemma_prefill_tiny_prompt_topk,
                 gemma_prefill_short_prompt_tokens,
                 gemma_prefill_short_prompt_topk,
                 config.n_experts_used,
@@ -7471,6 +7475,11 @@ pub const InferenceEngine = struct {
                 // --- MoE: router DMMV → top-k → expert dispatch ---
                 const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
                 const gemma_short_prefill_limit: u32 = if (config.architecture == .gemma and
+                    self.prefill_embed_big_token_count > 0 and
+                    self.prefill_embed_big_token_count <= gemma_prefill_tiny_prompt_tokens and
+                    self.moe_prefill_tail_topk_limit > gemma_prefill_tiny_prompt_topk)
+                    gemma_prefill_tiny_prompt_topk
+                else if (config.architecture == .gemma and
                     self.prefill_embed_big_token_count > 0 and
                     self.prefill_embed_big_token_count <= gemma_prefill_short_prompt_tokens and
                     self.moe_prefill_tail_topk_limit > gemma_prefill_short_prompt_topk)
