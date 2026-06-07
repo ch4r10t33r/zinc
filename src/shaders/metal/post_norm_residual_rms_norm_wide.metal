@@ -15,7 +15,9 @@ struct Params {
 #define N_SIMDGROUPS 16
 #define SIMD_WIDTH 32
 #define TG_SIZE (N_SIMDGROUPS * SIMD_WIDTH)
-#define MAX_PER_THREAD 64
+// This variant is only dispatched for n=5376 with TG_SIZE=512, so each thread
+// caches at most ceil(5376 / 512) = 11 hidden values between reductions.
+#define MAX_PER_THREAD 12
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
