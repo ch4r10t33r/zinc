@@ -162,6 +162,7 @@ const Derived = struct {
 const Pipelines = struct {
     rms_norm: CudaPipeline,
     dmmv: [5]CudaPipeline, // q4k, q5k, q6k, q8_0, f32
+    dmmv_fast: [4]CudaPipeline, // q4k_fast, q5k_fast, q6k_fast, q8_0_fast (block=64)
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
@@ -230,6 +231,12 @@ pub const ForwardCuda = struct {
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
         pipes.dmmv[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0");
         pipes.dmmv[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_f32");
+        // Fast single-row matvec variants (84-90% bandwidth peak vs ~12-15% base);
+        // same DmmvPush ABI + [weight, x, y] buffer order, dispatched at block=64.
+        pipes.dmmv_fast[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast");
+        pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
+        pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
+        pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
@@ -240,7 +247,7 @@ pub const ForwardCuda = struct {
         pipes.ssm_gated_norm = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm");
         pipes.swiglu = try pipeline.createPipeline(ctx, src.ptr, "swiglu");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{16});
+        log.info("nvrtc: compiled {d} kernel pipelines", .{20});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -339,6 +346,8 @@ pub const ForwardCuda = struct {
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
+                for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
             } else {
                 pipeline.freePipeline(&@field(self.pipes, f.name));
             }
@@ -377,7 +386,14 @@ pub const ForwardCuda = struct {
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
         const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
-        cmd.dispatch(&self.pipes.dmmv[dmmvIdx(lm_head.info.type_)], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        // LM head is the single biggest matvec (vocab x n_embd, Q6_K). Use the fast
+        // variant at block=64 like every other quant matvec; f32 falls back to base.
+        const lm_idx = dmmvIdx(lm_head.info.type_);
+        if (lm_idx < 4) {
+            cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        }
         const am = ArgmaxPush{ .N = d.vocab };
         cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
         cmd.commitAndWait();
@@ -545,9 +561,16 @@ pub const ForwardCuda = struct {
     }
 
     /// Dispatch the right DMMV kernel for `w`'s quant type: y[M] = W[M,K] · x.
+    /// Quant types (idx < 4: q4k/q5k/q6k/q8_0) use the fast single-row variant at
+    /// block=64; f32 (idx == 4) has no fast variant and keeps the base at block=256.
     fn dmmvDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, acc_mode: u32) void {
         const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode };
-        cmd.dispatch(&self.pipes.dmmv[dmmvIdx(w.info.type_)], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+        const idx = dmmvIdx(w.info.type_);
+        if (idx < 4) {
+            cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+        }
     }
 };
 
