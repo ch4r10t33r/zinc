@@ -26839,7 +26839,7 @@ test "dmmv_q5_1_moe_cols shader matches per-route CPU reference" {
 
     const M: usize = 5;
     const K: usize = 64;
-    const n_tokens: usize = 5;
+    const n_tokens: usize = 7;
     const k_used: usize = 2;
     const n_experts: usize = 3;
     const route_slots = n_tokens * k_used;
