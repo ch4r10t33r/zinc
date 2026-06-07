@@ -1897,6 +1897,20 @@ pub fn main() !void {
         return;
     }
 
+    if (gpu.is_cuda) {
+        // CUDA backend (Linux/WSL2 + NVIDIA). Device init is live; the model
+        // forward pass (src/compute/forward_cuda.zig) is still being wired —
+        // see docs/cuda-backend.md and Effort 20/21. Mirrors the Metal branch
+        // above: this returns, so the Vulkan tail below is comptime-dead here.
+        var cuda_device = gpu.backend.CudaDevice.init(allocator, config.device_index) catch |err| {
+            log.err("CUDA init failed: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer cuda_device.deinit();
+        log.info("CUDA backend: device {d} initialized, {d} MiB VRAM. Forward pass not yet wired (M2 in progress).", .{ config.device_index, cuda_device.totalMemory() / (1024 * 1024) });
+        return;
+    }
+
     // Vulkan backend (Linux)
     var vk_instance = instance_mod.Instance.init(allocator, config.device_index) catch |err| {
         log.err("Vulkan init failed: {s}", .{@errorName(err)});
