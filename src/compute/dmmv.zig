@@ -564,6 +564,8 @@ pub const DmmvDispatch = struct {
     /// downstream dense-down DP4a kernel can skip the standalone
     /// quantize_act_q8 dispatch + barrier.
     pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8: ?Pipeline,
+    /// Same Q8_0 fused-output producer specialized to Gemma's GEGLU activation.
+    pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8: ?Pipeline,
     /// K=4096 specialization of the Q8_0 fused gate/up producer for
     /// Qwen3.5-9B dense FFN gate/up projections.
     pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096: ?Pipeline,
@@ -576,6 +578,8 @@ pub const DmmvDispatch = struct {
     /// DP4a (mul_mm_q4k_full_dp4a) skip its standalone quantize_act_q8_1
     /// dispatch + barrier per Q4_K-down layer.
     pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1: ?Pipeline,
+    /// Same Q8_1 fused-output producer specialized to Gemma's GEGLU activation.
+    pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1: ?Pipeline,
     /// K=4096 specialization of the Q8_1 fused gate/up producer for
     /// Qwen3.5-9B dense FFN gate/up projections when down is Q4_K.
     pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096: ?Pipeline,
@@ -1264,6 +1268,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null) {
             log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_0 output)", .{});
         }
+        const geglu_q8_activation_spec = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 1 }};
+        const pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &geglu_q8_activation_spec, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_geglu_full_dp4a_q8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8 != null) {
+            log.info("mul_mm_q4k_gate_up_geglu_full_dp4a_q8 pipeline loaded (int8 DP4a Gemma dense gate+up prefill with fused Q8_0 output)", .{});
+        }
         const pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &spec_k_4096, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 K=4096 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -1290,6 +1302,13 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 != null) {
             log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_1 output for Q4_K-down)", .{});
+        }
+        const pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_1_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &geglu_q8_activation_spec, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 != null) {
+            log.info("mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 pipeline loaded (int8 DP4a Gemma dense gate+up prefill with fused Q8_1 output for Q4_K-down)", .{});
         }
         const pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_1_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &spec_k_4096, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 K=4096 shader not loaded: {s}", .{@errorName(err)});
@@ -1417,9 +1436,11 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a,
             .pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a = pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8,
+            .pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1,
+            .pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 = pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64,
             .pipeline_mul_mm_q4k_full_dp4a = pipeline_mul_mm_q4k_full_dp4a,
@@ -3184,6 +3205,65 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Gemma GEGLU variant of recordMulMmQ4KGateUpSwigluFullDp4aQ8. Emits
+    /// Q8_0-style packed GEGLU activation for Q6_K dense-down DP4a.
+    pub fn recordMulMmQ4KGateUpGegluFullDp4aQ8(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_dsum_buf: vk.c.VkBuffer,
+        b_scale_dsum_size: vk.c.VkDeviceSize,
+        d_packed_buf: vk.c.VkBuffer,
+        d_packed_size: vk.c.VkDeviceSize,
+        d_scale_buf: vk.c.VkBuffer,
+        d_scale_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_packed_offset: u32,
+        d_scale_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ4KGateUpDp4aQ8Push{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d_packed = M / 4,
+            .stride_d_scale = M / 32,
+            .a_offset = a_offset,
+            .d_packed_offset = d_packed_offset,
+            .d_scale_offset = d_scale_offset,
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_dsum_buf, .offset = 0, .range = b_scale_dsum_size },
+            .{ .buffer = d_packed_buf, .offset = 0, .range = d_packed_size },
+            .{ .buffer = d_scale_buf, .offset = 0, .range = d_scale_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
     /// Q4_K-down sibling of recordMulMmQ4KGateUpSwigluFullDp4aQ8. Same fused
     /// gate+up+SwiGLU DP4a GEMM, but emits Q8_1-style activation (packed int8
     /// + per-32-block (scale, dsum) vec2) so the downstream mul_mm_q4k_full_dp4a
@@ -3255,6 +3335,65 @@ pub const DmmvDispatch = struct {
             std.mem.asBytes(&push),
             M / 32,
             N / n_tile,
+            1,
+        );
+    }
+
+    /// Gemma GEGLU variant of recordMulMmQ4KGateUpSwigluFullDp4aQ8_1. Emits
+    /// Q8_1-style packed GEGLU activation for Q4_K dense-down DP4a.
+    pub fn recordMulMmQ4KGateUpGegluFullDp4aQ8_1(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_dsum_buf: vk.c.VkBuffer,
+        b_scale_dsum_size: vk.c.VkDeviceSize,
+        d_packed_buf: vk.c.VkBuffer,
+        d_packed_size: vk.c.VkDeviceSize,
+        d_scale_dsum_buf: vk.c.VkBuffer,
+        d_scale_dsum_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_packed_offset: u32,
+        d_scale_dsum_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ4KGateUpDp4aQ8Push{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d_packed = M / 4,
+            .stride_d_scale = M / 32,
+            .a_offset = a_offset,
+            .d_packed_offset = d_packed_offset,
+            .d_scale_offset = d_scale_dsum_offset,
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_dsum_buf, .offset = 0, .range = b_scale_dsum_size },
+            .{ .buffer = d_packed_buf, .offset = 0, .range = d_packed_size },
+            .{ .buffer = d_scale_dsum_buf, .offset = 0, .range = d_scale_dsum_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
             1,
         );
     }
@@ -3445,9 +3584,11 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a) |*p| p.deinit();

@@ -47,6 +47,7 @@ const uint SPACK = 9u;
 
 layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
+layout(constant_id = 2) const uint ACTIVATION = 0u; // 0 = SwiGLU, 1 = GEGLU
 
 const uint BN = SPEC_BN;
 const uint TPR_N = WG_SIZE / TPR_M;  // 8
@@ -90,6 +91,13 @@ float fast_silu(float x) {
     if (x > 8.0) return x;
     if (x < -8.0) return 0.0;
     return x / (1.0 + exp(-x));
+}
+
+float fast_gelu(float x) {
+    const float g3 = x * x * x;
+    float inner = 0.7978845608 * (x + 0.044715 * g3);
+    inner = clamp(inner, -15.0, 15.0);
+    return 0.5 * x * (1.0 + tanh(inner));
 }
 
 void q4k_scale_min(uint sb, uint sc0, uint sc1, uint sc2, out float sc_val, out float mn_val) {
@@ -254,14 +262,14 @@ void main() {
     // the BM=32 rows for each of their TN=4 cols; subgroupClusteredMax cluster
     // size 8 = TPR_M.
     [[unroll]] for (uint n = 0u; n < TN; n++) {
-        float swiglu_vals[TM];
+        float act_vals[TM];
         float local_max = 0.0;
         [[unroll]] for (uint m = 0u; m < TM; m++) {
             const float gate = sums_gate[m][n];
             const float up = sums_up[m][n];
-            const float silu_gate = fast_silu(gate);
-            const float v = silu_gate * up;
-            swiglu_vals[m] = v;
+            const float gate_act = (ACTIVATION == 1u) ? fast_gelu(gate) : fast_silu(gate);
+            const float v = gate_act * up;
+            act_vals[m] = v;
             local_max = max(local_max, abs(v));
         }
         const float global_max = subgroupClusteredMax(local_max, TPR_M);
@@ -271,7 +279,7 @@ void main() {
         const uint col_g = ic * BN + tiwc * TN + n;
         uint packed = 0u;
         [[unroll]] for (uint m = 0u; m < TM; m++) {
-            int q = int(round(swiglu_vals[m] * inv));
+            int q = int(round(act_vals[m] * inv));
             q = clamp(q, -127, 127);
             packed |= (uint(q) & 0xFFu) << (m * 8u);
         }

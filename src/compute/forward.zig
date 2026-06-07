@@ -11515,21 +11515,31 @@ pub const InferenceEngine = struct {
         }
     }
 
+    const GemmaGateUpGegluResult = enum {
+        not_handled,
+        f32_geglu,
+        q8_geglu,
+        q8_1_geglu,
+    };
+
     fn dispatchGemmaGateUpGegluBatched(
         self: *InferenceEngine,
         gate_t: *const LoadedTensor,
         up_t: *const LoadedTensor,
+        down_t: *const LoadedTensor,
         norm_buf: Buffer,
         geglu_buf: Buffer,
         inter_dim: u32,
         hidden_dim: u32,
         n_tokens: u32,
-    ) !bool {
-        if (self.model.config.architecture != .gemma) return false;
-        if (!self.use_mul_mm_proj) return false;
-        if (gate_t.info.type_ != .q4_k or up_t.info.type_ != .q4_k) return false;
-        if (n_tokens < 16 or (hidden_dim & 255) != 0) return false;
-        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return false;
+        dp4a_cols_out: *u32,
+    ) !GemmaGateUpGegluResult {
+        dp4a_cols_out.* = 0;
+        if (self.model.config.architecture != .gemma) return .not_handled;
+        if (!self.use_mul_mm_proj) return .not_handled;
+        if (gate_t.info.type_ != .q4_k or up_t.info.type_ != .q4_k) return .not_handled;
+        if (n_tokens < 16 or (hidden_dim & 255) != 0) return .not_handled;
+        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return .not_handled;
 
         const full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full != null) {
@@ -11549,9 +11559,46 @@ pub const InferenceEngine = struct {
                     @sizeOf(f32);
                 break :blk hidden_i8.size >= need_i8 and hidden_sd.size >= need_sd;
             };
+            var dp4a_result: GemmaGateUpGegluResult = .f32_geglu;
             if (dp4a_full) {
                 const hidden_i8 = self.batched_scratch_hidden_i8.?;
                 const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
+                const fuse_q8 = blk: {
+                    if (down_t.info.type_ != .q6_k) break :blk false;
+                    if ((inter_dim & 255) != 0 or (hidden_dim & 31) != 0) break :blk false;
+                    if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8 == null) break :blk false;
+                    if (self.dmmv.pipeline_mul_mm_q6k_full_dp4a == null or self.dmmv.pipeline_mul_mm_q6k == null) break :blk false;
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8 orelse break :blk false;
+                    const swiglu_scale = self.batched_scratch_swiglu_scale orelse break :blk false;
+                    const need_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                        @sizeOf(u32);
+                    const need_scale: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                        @sizeOf(f32);
+                    break :blk swiglu_i8.size >= need_i8 and swiglu_scale.size >= need_scale;
+                };
+                const fuse_q8_1 = blk: {
+                    if (fuse_q8) break :blk false;
+                    if (down_t.info.type_ != .q4_k) break :blk false;
+                    if ((inter_dim & 255) != 0 or (hidden_dim & 31) != 0) break :blk false;
+                    if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 == null) break :blk false;
+                    if (self.dmmv.pipeline_mul_mm_q4k_full_dp4a == null or self.dmmv.pipeline_mul_mm_q4k == null) break :blk false;
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8 orelse break :blk false;
+                    const swiglu_sd = self.batched_scratch_swiglu_scale_dsum orelse break :blk false;
+                    const need_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                        @sizeOf(u32);
+                    const need_sd: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                        2 *
+                        @sizeOf(f32);
+                    break :blk swiglu_i8.size >= need_i8 and swiglu_sd.size >= need_sd;
+                };
                 const gateup_quant_phase = self.beginProfilePhase();
                 try self.dmmv.recordQuantizeActQ8_1(
                     &self.decode_cmd,
@@ -11573,26 +11620,81 @@ pub const InferenceEngine = struct {
                 self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
 
                 const gateup_matmul_phase = self.beginProfilePhase();
-                try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4a(
-                    &self.decode_cmd,
-                    self.instance.push_descriptor_fn,
-                    gate_t.gpu_buffer.handle,
-                    gate_t.gpu_buffer.size,
-                    up_t.gpu_buffer.handle,
-                    up_t.gpu_buffer.size,
-                    hidden_i8.handle,
-                    hidden_i8.size,
-                    hidden_sd.handle,
-                    hidden_sd.size,
-                    geglu_buf.handle,
-                    geglu_buf.size,
-                    inter_dim,
-                    full_cols,
-                    hidden_dim,
-                    0,
-                    0,
-                );
+                if (fuse_q8) {
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                    const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+                    try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        gate_t.gpu_buffer.handle,
+                        gate_t.gpu_buffer.size,
+                        up_t.gpu_buffer.handle,
+                        up_t.gpu_buffer.size,
+                        hidden_i8.handle,
+                        hidden_i8.size,
+                        hidden_sd.handle,
+                        hidden_sd.size,
+                        swiglu_i8.handle,
+                        swiglu_i8.size,
+                        swiglu_scale.handle,
+                        swiglu_scale.size,
+                        inter_dim,
+                        full_cols,
+                        hidden_dim,
+                        0,
+                        0,
+                        0,
+                    );
+                    dp4a_result = .q8_geglu;
+                } else if (fuse_q8_1) {
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                    const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+                    try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8_1(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        gate_t.gpu_buffer.handle,
+                        gate_t.gpu_buffer.size,
+                        up_t.gpu_buffer.handle,
+                        up_t.gpu_buffer.size,
+                        hidden_i8.handle,
+                        hidden_i8.size,
+                        hidden_sd.handle,
+                        hidden_sd.size,
+                        swiglu_i8.handle,
+                        swiglu_i8.size,
+                        swiglu_sd.handle,
+                        swiglu_sd.size,
+                        inter_dim,
+                        full_cols,
+                        hidden_dim,
+                        0,
+                        0,
+                        0,
+                    );
+                    dp4a_result = .q8_1_geglu;
+                } else {
+                    try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4a(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        gate_t.gpu_buffer.handle,
+                        gate_t.gpu_buffer.size,
+                        up_t.gpu_buffer.handle,
+                        up_t.gpu_buffer.size,
+                        hidden_i8.handle,
+                        hidden_i8.size,
+                        hidden_sd.handle,
+                        hidden_sd.size,
+                        geglu_buf.handle,
+                        geglu_buf.size,
+                        inter_dim,
+                        full_cols,
+                        hidden_dim,
+                        0,
+                        0,
+                    );
+                }
                 self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
+                dp4a_cols_out.* = full_cols;
             } else {
                 try self.dmmv.recordMulMmQ4KGateUpGegluFull(
                     &self.decode_cmd,
@@ -11661,6 +11763,9 @@ pub const InferenceEngine = struct {
                     );
                 }
             }
+            if (dp4a_full) {
+                return dp4a_result;
+            }
         } else {
             try self.dmmv.recordMulMmQ4KGateUpGeglu(
                 &self.decode_cmd,
@@ -11683,7 +11788,7 @@ pub const InferenceEngine = struct {
                 0,
             );
         }
-        return true;
+        return .f32_geglu;
     }
 
     fn dispatchGemmaDenseDownDp4aBatched(
@@ -11694,6 +11799,9 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         inter_dim: u32,
         n_tokens: u32,
+        geglu_already_q8: bool,
+        geglu_already_q8_1: bool,
+        gateup_dp4a_cols: u32,
     ) !bool {
         if (!self.gemmaDenseDownDp4aEnabled(n_tokens)) return false;
         if ((hidden_dim & 31) != 0 or (inter_dim & 255) != 0) return false;
@@ -11714,13 +11822,13 @@ pub const InferenceEngine = struct {
         if (packed_act.size < need_packed) return false;
 
         const push_fn = self.instance.push_descriptor_fn;
-        const tail_cols = n_tokens - full_cols;
         switch (down_t.info.type_) {
             .q6_k => {
                 if (self.dmmv.pipeline_mul_mm_q6k_full_dp4a == null or
-                    self.dmmv.pipeline_quantize_act_q8 == null or
                     self.dmmv.pipeline_mul_mm_q6k == null)
                     return false;
+                if (!geglu_already_q8 and self.dmmv.pipeline_quantize_act_q8 == null) return false;
+                if (geglu_already_q8_1) return error.UnsupportedConfiguration;
                 const scale = self.batched_scratch_swiglu_scale orelse return false;
                 const need_scale: vk.c.VkDeviceSize =
                     @as(vk.c.VkDeviceSize, full_cols) *
@@ -11728,25 +11836,30 @@ pub const InferenceEngine = struct {
                     @sizeOf(f32);
                 if (scale.size < need_scale) return false;
 
-                const down_quant_phase = self.beginProfilePhase();
-                try self.dmmv.recordQuantizeActQ8(
-                    &self.decode_cmd,
-                    push_fn,
-                    geglu_buf.handle,
-                    geglu_buf.size,
-                    packed_act.handle,
-                    packed_act.size,
-                    scale.handle,
-                    scale.size,
-                    full_cols,
-                    inter_dim,
-                );
-                const q8_ranges = [_]CommandBuffer.BufferRange{
-                    .{ .buffer = packed_act.handle, .size = packed_act.size },
-                    .{ .buffer = scale.handle, .size = scale.size },
-                };
-                self.decode_cmd.computeBuffersBarrier(&q8_ranges);
-                self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+                var dp4a_cols = full_cols;
+                if (geglu_already_q8 and gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
+                const dp4a_tail_cols = n_tokens - dp4a_cols;
+                if (!geglu_already_q8) {
+                    const down_quant_phase = self.beginProfilePhase();
+                    try self.dmmv.recordQuantizeActQ8(
+                        &self.decode_cmd,
+                        push_fn,
+                        geglu_buf.handle,
+                        geglu_buf.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale.handle,
+                        scale.size,
+                        dp4a_cols,
+                        inter_dim,
+                    );
+                    const q8_ranges = [_]CommandBuffer.BufferRange{
+                        .{ .buffer = packed_act.handle, .size = packed_act.size },
+                        .{ .buffer = scale.handle, .size = scale.size },
+                    };
+                    self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+                    self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+                }
 
                 const down_matmul_phase = self.beginProfilePhase();
                 try self.dmmv.recordMulMmQ6KFullDp4a(
@@ -11761,13 +11874,13 @@ pub const InferenceEngine = struct {
                     down_buf.handle,
                     down_buf.size,
                     hidden_dim,
-                    full_cols,
+                    dp4a_cols,
                     inter_dim,
                     0,
                     0,
                 );
-                if (tail_cols > 0) {
-                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
+                if (dp4a_tail_cols > 0) {
+                    if (dp4a_tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
                         try self.dmmv.recordMulMmQ6KTail8(
                             &self.decode_cmd,
                             push_fn,
@@ -11778,13 +11891,13 @@ pub const InferenceEngine = struct {
                             down_buf.handle,
                             down_buf.size,
                             hidden_dim,
-                            tail_cols,
+                            dp4a_tail_cols,
                             inter_dim,
                             inter_dim,
                             hidden_dim,
                             0,
-                            full_cols * inter_dim,
-                            full_cols * hidden_dim,
+                            dp4a_cols * inter_dim,
+                            dp4a_cols * hidden_dim,
                         );
                     } else {
                         try self.dmmv.recordMulMmQ6K(
@@ -11797,13 +11910,13 @@ pub const InferenceEngine = struct {
                             down_buf.handle,
                             down_buf.size,
                             hidden_dim,
-                            tail_cols,
+                            dp4a_tail_cols,
                             inter_dim,
                             inter_dim,
                             hidden_dim,
                             0,
-                            full_cols * inter_dim,
-                            full_cols * hidden_dim,
+                            dp4a_cols * inter_dim,
+                            dp4a_cols * hidden_dim,
                         );
                     }
                 }
@@ -11812,9 +11925,10 @@ pub const InferenceEngine = struct {
             },
             .q4_k => {
                 if (self.dmmv.pipeline_mul_mm_q4k_full_dp4a == null or
-                    self.dmmv.pipeline_quantize_act_q8_1 == null or
                     self.dmmv.pipeline_mul_mm_q4k == null)
                     return false;
+                if (!geglu_already_q8_1 and self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+                if (geglu_already_q8) return error.UnsupportedConfiguration;
                 const scale_dsum = self.batched_scratch_swiglu_scale_dsum orelse return false;
                 const need_scale_dsum: vk.c.VkDeviceSize =
                     @as(vk.c.VkDeviceSize, full_cols) *
@@ -11823,25 +11937,30 @@ pub const InferenceEngine = struct {
                     @sizeOf(f32);
                 if (scale_dsum.size < need_scale_dsum) return false;
 
-                const down_quant_phase = self.beginProfilePhase();
-                try self.dmmv.recordQuantizeActQ8_1(
-                    &self.decode_cmd,
-                    push_fn,
-                    geglu_buf.handle,
-                    geglu_buf.size,
-                    packed_act.handle,
-                    packed_act.size,
-                    scale_dsum.handle,
-                    scale_dsum.size,
-                    full_cols,
-                    inter_dim,
-                );
-                const q8_ranges = [_]CommandBuffer.BufferRange{
-                    .{ .buffer = packed_act.handle, .size = packed_act.size },
-                    .{ .buffer = scale_dsum.handle, .size = scale_dsum.size },
-                };
-                self.decode_cmd.computeBuffersBarrier(&q8_ranges);
-                self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+                var dp4a_cols = full_cols;
+                if (geglu_already_q8_1 and gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
+                const dp4a_tail_cols = n_tokens - dp4a_cols;
+                if (!geglu_already_q8_1) {
+                    const down_quant_phase = self.beginProfilePhase();
+                    try self.dmmv.recordQuantizeActQ8_1(
+                        &self.decode_cmd,
+                        push_fn,
+                        geglu_buf.handle,
+                        geglu_buf.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale_dsum.handle,
+                        scale_dsum.size,
+                        dp4a_cols,
+                        inter_dim,
+                    );
+                    const q8_ranges = [_]CommandBuffer.BufferRange{
+                        .{ .buffer = packed_act.handle, .size = packed_act.size },
+                        .{ .buffer = scale_dsum.handle, .size = scale_dsum.size },
+                    };
+                    self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+                    self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+                }
 
                 const down_matmul_phase = self.beginProfilePhase();
                 try self.dmmv.recordMulMmQ4KFullDp4a(
@@ -11856,13 +11975,13 @@ pub const InferenceEngine = struct {
                     down_buf.handle,
                     down_buf.size,
                     hidden_dim,
-                    full_cols,
+                    dp4a_cols,
                     inter_dim,
                     0,
                     0,
                 );
-                if (tail_cols > 0) {
-                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_tail8 != null) {
+                if (dp4a_tail_cols > 0) {
+                    if (dp4a_tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_tail8 != null) {
                         try self.dmmv.recordMulMmQ4KTail8(
                             &self.decode_cmd,
                             push_fn,
@@ -11873,13 +11992,13 @@ pub const InferenceEngine = struct {
                             down_buf.handle,
                             down_buf.size,
                             hidden_dim,
-                            tail_cols,
+                            dp4a_tail_cols,
                             inter_dim,
                             inter_dim,
                             hidden_dim,
                             0,
-                            full_cols * inter_dim,
-                            full_cols * hidden_dim,
+                            dp4a_cols * inter_dim,
+                            dp4a_cols * hidden_dim,
                         );
                     } else {
                         try self.dmmv.recordMulMmQ4K(
@@ -11892,13 +12011,13 @@ pub const InferenceEngine = struct {
                             down_buf.handle,
                             down_buf.size,
                             hidden_dim,
-                            tail_cols,
+                            dp4a_tail_cols,
                             inter_dim,
                             inter_dim,
                             hidden_dim,
                             0,
-                            full_cols * inter_dim,
-                            full_cols * hidden_dim,
+                            dp4a_cols * inter_dim,
+                            dp4a_cols * hidden_dim,
                         );
                     }
                 }
@@ -21273,6 +21392,7 @@ pub const InferenceEngine = struct {
         // if we are extending an existing conversation. Mirror the shape of
         // prefillBatch so pipelined prefill / decodeStep invariants hold.
         const base_token: u32 = state.position;
+        // Invariant: after batched prefill finishes, `state.position = base_token + n_tokens;`.
         const target_context_tokens = if (state.requested_context_tokens > 0)
             @max(state.requested_context_tokens, base_token +| n_tokens)
         else
@@ -21478,7 +21598,9 @@ pub const InferenceEngine = struct {
 
             // FFN: gate/up → SwiGLU/GEGLU → down → optional post-ffn norm
             // (Gemma) → residual.
-            if (!try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, n_tokens)) {
+            var gemma_gateup_dp4a_cols: u32 = 0;
+            const gemma_gateup_result = try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, n_tokens, &gemma_gateup_dp4a_cols);
+            if (gemma_gateup_result == .not_handled) {
                 try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
                 try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
                 self.decode_cmd.computeBarrier();
@@ -21487,7 +21609,10 @@ pub const InferenceEngine = struct {
                 try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
             }
             self.decode_cmd.computeBarrier();
-            if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens)) {
+            const gemma_geglu_already_q8 = gemma_gateup_result == .q8_geglu;
+            const gemma_geglu_already_q8_1 = gemma_gateup_result == .q8_1_geglu;
+            if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, gemma_geglu_already_q8, gemma_geglu_already_q8_1, gemma_gateup_dp4a_cols)) {
+                if (gemma_geglu_already_q8 or gemma_geglu_already_q8_1) return error.UnsupportedConfiguration;
                 try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
             }
             self.decode_cmd.computeBarrier();
