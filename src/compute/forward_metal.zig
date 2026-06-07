@@ -21855,9 +21855,15 @@ fn runDecodeStep(
                 profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
 
                 const next_layer_idx_u = layer_idx + 1;
+                const keep_terminal_dense_cmd_for_final =
+                    emit_logits and
+                    layer_shared_cmd != null and
+                    shared_cmd == null and
+                    next_layer_idx_u == layer_count;
                 const ends_dense_cmd_chunk = use_dense_layer_cmd and
                     layer_shared_cmd != null and
-                    (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0);
+                    (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
+                    !keep_terminal_dense_cmd_for_final;
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
                 // The fused kernel now folds an arbitrary `hidden_scale` into
                 // its in-place hidden write, so a non-unit `layer_output_scale`
@@ -21970,7 +21976,8 @@ fn runDecodeStep(
                 const next_layer = layer_idx + 1;
                 const scale_at_dense_cmd_tail = use_dense_layer_cmd and
                     !is_moe and
-                    (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0);
+                    (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) and
+                    !(emit_logits and shared_cmd == null and next_layer == layer_count);
                 dispatchScaleInPlaceOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class, !scale_at_dense_cmd_tail);
             } else {
                 var scale_cmd = try beginProfiledCommand(engine, profile);
@@ -21984,7 +21991,8 @@ fn runDecodeStep(
         }
         if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
             const next_layer = layer_idx + 1;
-            if (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) {
+            const keep_terminal_dense_cmd_for_final = emit_logits and shared_cmd == null and next_layer == layer_count;
+            if ((next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) and !keep_terminal_dense_cmd_for_final) {
                 submitPendingDenseCommand(&dense_group_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
             }
         }
@@ -22055,32 +22063,38 @@ fn runDecodeStep(
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
     } else {
-        var cmd = try beginProfiledCommand(engine, profile);
+        var final_cmd_storage: MetalCommand = undefined;
+        const cmd: *MetalCommand = if (dense_group_cmd_storage.handle != null)
+            &dense_group_cmd_storage
+        else blk: {
+            final_cmd_storage = try beginProfiledCommand(engine, profile);
+            break :blk &final_cmd_storage;
+        };
         if (cpu_lm_head) {
-            dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-            profileBarrier(&cmd, profile, .final);
-            commitAndWaitProfiled(&cmd, profile);
+            dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrier(cmd, profile, .final);
+            commitAndWaitProfiled(cmd, profile);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
         } else if (fuse_final_norm) {
-            dispatchLmHeadFusedNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            dispatchLmHeadFusedNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             // Argmax depends only on the fused LM-head output, so keep the
             // final-phase join resource-scoped instead of fencing unrelated
             // layer-tail writes still draining in the concurrent encoder.
-            profileBarrierBuffers(&cmd, profile, .final, &.{&engine.logits_buf});
-            dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(&cmd, profile);
+            commitAndWaitProfiled(cmd, profile);
         } else {
-            dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-            profileBarrier(&cmd, profile, .final);
-            dispatchLmHeadOnCmd(engine, &cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrier(&cmd, profile, .final);
-            dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
+            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(&cmd, profile);
+            commitAndWaitProfiled(cmd, profile);
         }
     }
     releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
