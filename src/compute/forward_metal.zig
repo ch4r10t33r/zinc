@@ -863,6 +863,13 @@ pub const RuntimeProfile = struct {
     full_attn_gate_dispatch_calls: u32 = 0,
     full_attn_out_dispatch_calls: u32 = 0,
     full_attn_residual_dispatch_calls: u32 = 0,
+    full_attn_qkv_packed_gate_calls: u32 = 0,
+    full_attn_qkv_dense_q4q6_fused_calls: u32 = 0,
+    full_attn_qkv_dense_q4_fused_calls: u32 = 0,
+    full_attn_qkv_dense_qk_dual_calls: u32 = 0,
+    full_attn_qkv_raw_k_as_v_calls: u32 = 0,
+    full_attn_qkv_paired_q8_calls: u32 = 0,
+    full_attn_qkv_separate_calls: u32 = 0,
     ssm_barrier_calls: u32 = 0,
     ssm_proj_norm_barrier_calls: u32 = 0,
     ssm_qkv_barrier_calls: u32 = 0,
@@ -1175,6 +1182,28 @@ fn recordFullAttnDispatchDelta(profile: ?*RuntimeProfile, phase: FullAttnBarrier
         .gate => p.full_attn_gate_dispatch_calls += delta,
         .out => p.full_attn_out_dispatch_calls += delta,
         .residual => p.full_attn_residual_dispatch_calls += delta,
+    };
+}
+
+const FullAttnQkvPath = enum {
+    packed_gate,
+    dense_q4q6_fused,
+    dense_q4_fused,
+    dense_qk_dual,
+    raw_k_as_v,
+    paired_q8,
+    separate,
+};
+
+fn recordFullAttnQkvPath(profile: ?*RuntimeProfile, path: FullAttnQkvPath) void {
+    if (profile) |p| switch (path) {
+        .packed_gate => p.full_attn_qkv_packed_gate_calls += 1,
+        .dense_q4q6_fused => p.full_attn_qkv_dense_q4q6_fused_calls += 1,
+        .dense_q4_fused => p.full_attn_qkv_dense_q4_fused_calls += 1,
+        .dense_qk_dual => p.full_attn_qkv_dense_qk_dual_calls += 1,
+        .raw_k_as_v => p.full_attn_qkv_raw_k_as_v_calls += 1,
+        .paired_q8 => p.full_attn_qkv_paired_q8_calls += 1,
+        .separate => p.full_attn_qkv_separate_calls += 1,
     };
 }
 
@@ -1760,6 +1789,26 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.full_attn_gate_dispatch_calls,
             profile.full_attn_out_dispatch_calls,
             profile.full_attn_residual_dispatch_calls,
+        });
+    }
+    const full_attn_qkv_paths =
+        profile.full_attn_qkv_packed_gate_calls +
+        profile.full_attn_qkv_dense_q4q6_fused_calls +
+        profile.full_attn_qkv_dense_q4_fused_calls +
+        profile.full_attn_qkv_dense_qk_dual_calls +
+        profile.full_attn_qkv_raw_k_as_v_calls +
+        profile.full_attn_qkv_paired_q8_calls +
+        profile.full_attn_qkv_separate_calls;
+    if (full_attn_qkv_paths > 0) {
+        log.info("  {s} attn qkv paths: packed {d} q4q6-fused {d} q4-fused {d} qk-dual {d} raw-k-as-v {d} paired-q8 {d} separate {d}", .{
+            label,
+            profile.full_attn_qkv_packed_gate_calls,
+            profile.full_attn_qkv_dense_q4q6_fused_calls,
+            profile.full_attn_qkv_dense_q4_fused_calls,
+            profile.full_attn_qkv_dense_qk_dual_calls,
+            profile.full_attn_qkv_raw_k_as_v_calls,
+            profile.full_attn_qkv_paired_q8_calls,
+            profile.full_attn_qkv_separate_calls,
         });
     }
 
@@ -7739,6 +7788,25 @@ pub const InferenceEngine = struct {
                     profile.full_attn_gate_dispatch_calls,
                     profile.full_attn_out_dispatch_calls,
                     profile.full_attn_residual_dispatch_calls,
+                });
+            }
+            const full_attn_qkv_paths =
+                profile.full_attn_qkv_packed_gate_calls +
+                profile.full_attn_qkv_dense_q4q6_fused_calls +
+                profile.full_attn_qkv_dense_q4_fused_calls +
+                profile.full_attn_qkv_dense_qk_dual_calls +
+                profile.full_attn_qkv_raw_k_as_v_calls +
+                profile.full_attn_qkv_paired_q8_calls +
+                profile.full_attn_qkv_separate_calls;
+            if (full_attn_qkv_paths > 0) {
+                log.info("  attn qkv paths/request: packed {d} q4q6-fused {d} q4-fused {d} qk-dual {d} raw-k-as-v {d} paired-q8 {d} separate {d}", .{
+                    profile.full_attn_qkv_packed_gate_calls,
+                    profile.full_attn_qkv_dense_q4q6_fused_calls,
+                    profile.full_attn_qkv_dense_q4_fused_calls,
+                    profile.full_attn_qkv_dense_qk_dual_calls,
+                    profile.full_attn_qkv_raw_k_as_v_calls,
+                    profile.full_attn_qkv_paired_q8_calls,
+                    profile.full_attn_qkv_separate_calls,
                 });
             }
             if (profile.dense_ffn_barrier_calls > 0) {
@@ -16118,13 +16186,16 @@ fn dispatchFullAttnPrepOnCmd(
 
     if (gate_mode.packed_q_gate) {
         // Packed: project full Q+gate into attn_out_buf, then deinterleave.
+        recordFullAttnQkvPath(profile, .packed_gate);
         const q_full_dim = attn.q_dim * 2;
         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
         if (can_pair_attn_kv) {
+            recordFullAttnQkvPath(profile, .paired_q8);
             dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else {
             dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            recordFullAttnQkvPath(profile, .separate);
         }
         profileFullAttnBarrierBuffers(cmd, profile, .qkv, &.{ &engine.attn_out_buf, &engine.k_buf, &engine.v_buf });
         dispatchDeinterleaveOnCmd(engine, cmd, &engine.attn_out_buf, &engine.q_buf, &engine.gate_buf, attn.head_dim, cfg.n_heads);
@@ -16152,21 +16223,27 @@ fn dispatchFullAttnPrepOnCmd(
             !attn.use_k_as_v and
             canUseDenseQ4KQKDual(engine, q_tensor, k_tensor, attn.q_dim, attn.kv_dim, hidden_dim);
         if (can_triple_qkv) {
+            recordFullAttnQkvPath(profile, .dense_q4q6_fused);
             dispatchDenseQ4KQKQ6KVOnCmd(engine, cmd, q_tensor, k_tensor, v_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, &engine.v_buf, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
         } else if (can_triple_q4_qkv) {
+            recordFullAttnQkvPath(profile, .dense_q4_fused);
             dispatchDenseQ4KQKVOnCmd(engine, cmd, q_tensor, k_tensor, v_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, &engine.v_buf, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
         } else if (can_dual_qk) {
+            recordFullAttnQkvPath(profile, .dense_qk_dual);
             dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else if (can_pair_attn_q_gate) {
+            recordFullAttnQkvPath(profile, .paired_q8);
             dispatchPairedQ8DmmvOnCmd(engine, cmd, q_tensor, lt.attn_gate.?, &engine.norm_buf, &engine.q_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             if (can_pair_attn_kv) {
+                recordFullAttnQkvPath(profile, .paired_q8);
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
                 if (!can_reuse_raw_k_as_v) {
                     dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
                 }
+                recordFullAttnQkvPath(profile, if (can_reuse_raw_k_as_v) .raw_k_as_v else .separate);
             }
         } else {
             dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
@@ -16174,12 +16251,14 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             }
             if (can_pair_attn_kv) {
+                recordFullAttnQkvPath(profile, .paired_q8);
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
                 if (!can_reuse_raw_k_as_v) {
                     dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
                 }
+                recordFullAttnQkvPath(profile, if (can_reuse_raw_k_as_v) .raw_k_as_v else .separate);
             }
         }
         profileFullAttnQkvBarrier(cmd, profile, .qkv, true, true, !can_reuse_raw_k_as_v, gate_mode.apply_attn_gate, engine);
