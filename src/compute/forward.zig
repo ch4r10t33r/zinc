@@ -2975,16 +2975,32 @@ pub const InferenceEngine = struct {
         var dense_prefill_validate_swiglu_ref: ?Buffer = null;
         var dense_prefill_validate_down_ref: ?Buffer = null;
         var dense_prefill_validate_staging: ?Buffer = null;
-        if (dense_prefill_validate_requested and
+        const dense_prefill_validate_is_gemma_dense =
+            config.architecture == .gemma and
             config.n_experts == 0 and
-            config.ssm_d_inner > 0 and
+            config.ssm_d_inner == 0;
+        const dense_prefill_validate_model_supported =
+            config.n_experts == 0 and
+            (config.ssm_d_inner > 0 or dense_prefill_validate_is_gemma_dense);
+        if (dense_prefill_validate_requested and
+            dense_prefill_validate_model_supported and
             config.n_layers > 0 and
             config.hidden_dim > 0 and
             inter_val > 0)
         {
             const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
-            const default_tokens: u32 = if (dense_prefill_validate_production_requested) 128 else 16;
-            const max_tokens_cap: u32 = if (dense_prefill_validate_production_requested) 192 else 16;
+            const default_tokens: u32 = if (dense_prefill_validate_production_requested)
+                if (dense_prefill_validate_is_gemma_dense) gemma_prefill_long_draft_prompt_min_tokens else 128
+            else if (dense_prefill_validate_is_gemma_dense)
+                32
+            else
+                16;
+            const max_tokens_cap: u32 = if (dense_prefill_validate_is_gemma_dense)
+                96
+            else if (dense_prefill_validate_production_requested)
+                192
+            else
+                16;
             const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch default_tokens else default_tokens;
             dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), max_tokens_cap);
             const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
@@ -3050,7 +3066,7 @@ pub const InferenceEngine = struct {
                 if (dense_prefill_validate_production_requested) @as([]const u8, "production DP4a replay") else @as([]const u8, "f32 intermediate replay chunks 4/8/16"),
             });
         } else if (dense_prefill_validate_requested) {
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE requested but prerequisites missing (requires dense SSM model with nonzero hidden/intermediate dims); skipping", .{});
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE requested but prerequisites missing (requires dense SSM or dense Gemma model with nonzero hidden/intermediate dims); skipping", .{});
         }
 
         var ssm_prefill_validate_enabled = false;
@@ -12505,12 +12521,13 @@ pub const InferenceEngine = struct {
 
     fn validateDensePrefillProductionChunk(self: *InferenceEngine, n_tokens: u32) !void {
         if (!self.use_qwen36_dense_prefill_validate or !self.dense_prefill_validate_production or n_tokens == 0) return;
-        if (n_tokens < 128) {
-            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=prod: production dense replay skipped, captured tokens={d} < DP4a threshold 128", .{n_tokens});
+        const cfg = self.model.config;
+        const is_gemma_dense = cfg.architecture == .gemma and cfg.n_experts == 0 and cfg.ssm_d_inner == 0;
+        const min_tokens: u32 = if (is_gemma_dense) gemma_prefill_long_draft_prompt_min_tokens else 128;
+        if (n_tokens < min_tokens) {
+            log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=prod: production dense replay skipped, captured tokens={d} < DP4a threshold {d}", .{ n_tokens, min_tokens });
             return;
         }
-
-        const cfg = self.model.config;
         if (self.dense_prefill_validate_layer >= cfg.n_layers) return;
 
         const norm_ref = self.dense_prefill_validate_norm_ref orelse return;
@@ -12526,7 +12543,11 @@ pub const InferenceEngine = struct {
         const hidden_elems: usize = @intCast(@as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim));
         if (hidden_capture_bytes * 2 > staging.size) return error.BufferTooSmall;
 
-        try self.ensureBatchedScratchCapacity(self.qwen36DensePrefillPaddedTokenCount(n_tokens));
+        const scratch_tokens = if (is_gemma_dense)
+            self.gemmaDensePrefillPaddedTokenCount(n_tokens)
+        else
+            self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        try self.ensureBatchedScratchCapacity(scratch_tokens);
         const scratch_hidden = self.batched_scratch_hidden.?;
         const scratch_norm = self.batched_scratch_norm.?;
         const scratch_gate = self.batched_scratch_gate.?;
@@ -12551,19 +12572,34 @@ pub const InferenceEngine = struct {
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
-        try self.prefillQwen36RunBatchedDenseFfnLayer(
-            self.dense_prefill_validate_layer,
-            n_tokens,
-            hidden_dim,
-            inter_dim,
-            scratch_hidden,
-            scratch_norm,
-            scratch_gate,
-            scratch_up,
-            scratch_swiglu,
-            scratch_down,
-            false,
-        );
+        if (is_gemma_dense) {
+            try self.prefillGemmaRunBatchedDenseFfnLayer(
+                self.dense_prefill_validate_layer,
+                n_tokens,
+                hidden_dim,
+                inter_dim,
+                scratch_hidden,
+                scratch_norm,
+                scratch_gate,
+                scratch_up,
+                scratch_swiglu,
+                scratch_down,
+            );
+        } else {
+            try self.prefillQwen36RunBatchedDenseFfnLayer(
+                self.dense_prefill_validate_layer,
+                n_tokens,
+                hidden_dim,
+                inter_dim,
+                scratch_hidden,
+                scratch_norm,
+                scratch_gate,
+                scratch_up,
+                scratch_swiglu,
+                scratch_down,
+                false,
+            );
+        }
 
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
@@ -12665,6 +12701,22 @@ pub const InferenceEngine = struct {
         );
         self.decode_cmd.computeBarrier();
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        if (cfg.architecture == .gemma) {
+            if (lt.post_ffw_norm) |pfn_t| {
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_capture_bytes);
+                try self.dispatchRmsNorm(
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pfn_t.gpu_buffer.handle,
+                    pfn_t.gpu_buffer.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+            }
+        }
         self.decode_cmd.computeToTransferBarrier();
 
         const pre_off: vk.c.VkDeviceSize = 0;
@@ -20258,6 +20310,131 @@ pub const InferenceEngine = struct {
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
         self.recordProfilingSample();
+    }
+
+    fn prefillGemmaRunBatchedDenseFfnLayer(
+        self: *InferenceEngine,
+        layer: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        inter_dim: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_gate: Buffer,
+        scratch_up: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+    ) !void {
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return error.UnsupportedConfiguration;
+
+        const lt = self.layer_tensors[layer];
+        const gate_t = lt.ffn_gate orelse return error.TensorNotFound;
+        const up_t = lt.ffn_up orelse return error.TensorNotFound;
+        const down_t = lt.ffn_down orelse return error.TensorNotFound;
+        const hidden_batch_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const geglu_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.decode_cmd.transferToComputeBarrier();
+
+        var gemma_gateup_dp4a_cols: u32 = 0;
+        const gemma_gateup_result = try self.dispatchGemmaGateUpGegluBatched(
+            gate_t,
+            up_t,
+            down_t,
+            scratch_norm,
+            scratch_swiglu,
+            inter_dim,
+            hidden_dim,
+            n_tokens,
+            &gemma_gateup_dp4a_cols,
+        );
+        if (gemma_gateup_result == .not_handled) {
+            try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
+            try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+            const gateup_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_gate.handle, .size = geglu_bytes },
+                .{ .buffer = scratch_up.handle, .size = geglu_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&gateup_ranges);
+            try self.dispatchFfnActivation(
+                scratch_gate.handle,
+                scratch_gate.size,
+                scratch_up.handle,
+                scratch_up.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                n_tokens * inter_dim,
+            );
+        }
+        self.barrierAfterGemmaGateUpGeglu(gemma_gateup_result, scratch_swiglu, geglu_bytes, n_tokens, gemma_gateup_dp4a_cols);
+
+        const gemma_geglu_already_q8 = gemma_gateup_result == .q8_geglu;
+        const gemma_geglu_already_q8_1 = gemma_gateup_result == .q8_1_geglu;
+        if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, gemma_geglu_already_q8, gemma_geglu_already_q8_1, gemma_gateup_dp4a_cols)) {
+            if (gemma_geglu_already_q8 or gemma_geglu_already_q8_1) return error.UnsupportedConfiguration;
+            try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+        }
+        self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
+
+        if (lt.post_ffw_norm) |pfn_t| {
+            if (self.elementwise.pipeline_rms_norm_add != null) {
+                try self.dispatchRmsNormAdd(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pfn_t.gpu_buffer.handle,
+                    pfn_t.gpu_buffer.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+            } else {
+                try self.dispatchRmsNorm(
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pfn_t.gpu_buffer.handle,
+                    pfn_t.gpu_buffer.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
+                try self.dispatchScaleAcc(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    n_tokens * hidden_dim,
+                    1.0,
+                );
+            }
+        } else {
+            try self.dispatchScaleAcc(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                n_tokens * hidden_dim,
+                1.0,
+            );
+        }
+
+        self.decode_cmd.computeToTransferBarrier();
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
     }
 
     fn a3bProductionPrefillEnabled(self: *const InferenceEngine, prompt_len: usize) bool {
