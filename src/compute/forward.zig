@@ -11324,6 +11324,17 @@ pub const InferenceEngine = struct {
         return q6_path or q4_path;
     }
 
+    fn gemmaDenseQ6RaggedTailDp4aEnabled(self: *const InferenceEngine, down_t: *const LoadedTensor, n_tokens: u32) bool {
+        if (down_t.info.type_ != .q6_k) return false;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        const tail_cols = n_tokens - full_cols;
+        if (full_cols != 64 or tail_cols == 0 or tail_cols > 8) return false;
+        return self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8 != null and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_k5376_n8 != null and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k21504_n8 != null;
+    }
+
     fn gemmaDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.use_mul_mm_proj) return false;
@@ -11661,11 +11672,13 @@ pub const InferenceEngine = struct {
         if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return .not_handled;
 
         const floor_cols = n_tokens & ~@as(u32, 31);
+        const floor_tail_cols = n_tokens - floor_cols;
+        const use_q6_ragged_tail = self.gemmaDenseQ6RaggedTailDp4aEnabled(down_t, n_tokens);
         var full_cols = floor_cols;
         if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full != null) {
             var dp4a_cols = full_cols;
             const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
-            if (padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
+            if (!use_q6_ragged_tail and padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
                 dp4a_cols = padded_cols;
             }
             const dp4a_full = blk: {
@@ -11707,15 +11720,28 @@ pub const InferenceEngine = struct {
                     if (self.dmmv.pipeline_mul_mm_q6k_full_dp4a == null or self.dmmv.pipeline_mul_mm_q6k == null) break :blk false;
                     const swiglu_i8 = self.batched_scratch_swiglu_i8 orelse break :blk false;
                     const swiglu_scale = self.batched_scratch_swiglu_scale orelse break :blk false;
+                    const q8_cols = if (use_q6_ragged_tail) n_tokens else full_cols;
+                    const need_hidden_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, q8_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                        @sizeOf(u32);
+                    const need_hidden_sd: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, q8_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                        2 *
+                        @sizeOf(f32);
                     const need_i8: vk.c.VkDeviceSize =
-                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, q8_cols) *
                         @as(vk.c.VkDeviceSize, inter_dim / 4) *
                         @sizeOf(u32);
                     const need_scale: vk.c.VkDeviceSize =
-                        @as(vk.c.VkDeviceSize, full_cols) *
+                        @as(vk.c.VkDeviceSize, q8_cols) *
                         @as(vk.c.VkDeviceSize, inter_dim / 32) *
                         @sizeOf(f32);
-                    break :blk swiglu_i8.size >= need_i8 and swiglu_scale.size >= need_scale;
+                    break :blk hidden_i8.size >= need_hidden_i8 and
+                        hidden_sd.size >= need_hidden_sd and
+                        swiglu_i8.size >= need_i8 and
+                        swiglu_scale.size >= need_scale;
                 };
                 const fuse_q8_1 = blk: {
                     if (fuse_q8) break :blk false;
@@ -11737,6 +11763,7 @@ pub const InferenceEngine = struct {
                     break :blk swiglu_i8.size >= need_i8 and swiglu_sd.size >= need_sd;
                 };
                 const gateup_quant_phase = self.beginProfilePhase();
+                const gateup_quant_cols = if (fuse_q8 and use_q6_ragged_tail) n_tokens else full_cols;
                 try self.dmmv.recordQuantizeActQ8_1(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
@@ -11746,7 +11773,7 @@ pub const InferenceEngine = struct {
                     hidden_i8.size,
                     hidden_sd.handle,
                     hidden_sd.size,
-                    full_cols,
+                    gateup_quant_cols,
                     hidden_dim,
                 );
                 const q8_ranges = [_]CommandBuffer.BufferRange{
@@ -11757,6 +11784,7 @@ pub const InferenceEngine = struct {
                 self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
 
                 const gateup_matmul_phase = self.beginProfilePhase();
+                var produced_dp4a_cols = full_cols;
                 if (fuse_q8) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_scale = self.batched_scratch_swiglu_scale.?;
@@ -11811,6 +11839,33 @@ pub const InferenceEngine = struct {
                             first_cols * (inter_dim / 4),
                             first_cols * (inter_dim / 32),
                         );
+                    }
+                    if (use_q6_ragged_tail and floor_tail_cols > 0) {
+                        try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(
+                            &self.decode_cmd,
+                            self.instance.push_descriptor_fn,
+                            gate_t.gpu_buffer.handle,
+                            gate_t.gpu_buffer.size,
+                            up_t.gpu_buffer.handle,
+                            up_t.gpu_buffer.size,
+                            hidden_i8.handle,
+                            hidden_i8.size,
+                            hidden_sd.handle,
+                            hidden_sd.size,
+                            swiglu_i8.handle,
+                            swiglu_i8.size,
+                            swiglu_scale.handle,
+                            swiglu_scale.size,
+                            inter_dim,
+                            floor_tail_cols,
+                            hidden_dim,
+                            0,
+                            full_cols * (hidden_dim / 4),
+                            full_cols * (hidden_dim / 32),
+                            full_cols * (inter_dim / 4),
+                            full_cols * (inter_dim / 32),
+                        );
+                        produced_dp4a_cols = n_tokens;
                     }
                     dp4a_result = .q8_geglu;
                 } else if (fuse_q8_1) {
@@ -11891,7 +11946,7 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
-                dp4a_cols_out.* = full_cols;
+                dp4a_cols_out.* = produced_dp4a_cols;
             } else {
                 try self.dmmv.recordMulMmQ4KGateUpGegluFull(
                     &self.decode_cmd,
@@ -11914,7 +11969,7 @@ pub const InferenceEngine = struct {
                     0,
                 );
             }
-            if (full_cols < n_tokens) {
+            if (full_cols < n_tokens and dp4a_cols_out.* < n_tokens) {
                 const tail_cols = n_tokens - full_cols;
                 if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_tail8 != null) {
                     try self.dmmv.recordMulMmQ4KGateUpGegluTail8(
@@ -12003,22 +12058,30 @@ pub const InferenceEngine = struct {
         if (!self.gemmaDenseDownDp4aEnabled(n_tokens)) return false;
         if ((hidden_dim & 31) != 0 or (inter_dim & 255) != 0) return false;
         var dp4a_cols = n_tokens & ~@as(u32, 31);
+        const q6_ragged_tail_cols: u32 = if (geglu_already_q8 and
+            gateup_dp4a_cols == n_tokens and
+            down_t.info.type_ == .q6_k and
+            self.gemmaDenseQ6RaggedTailDp4aEnabled(down_t, n_tokens))
+            n_tokens - dp4a_cols
+        else
+            0;
         const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
-        if (padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
+        if (q6_ragged_tail_cols == 0 and padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
             dp4a_cols = padded_cols;
         }
-        if (gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
+        if (q6_ragged_tail_cols == 0 and gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
         if (dp4a_cols == 0) return false;
 
+        const produced_cols = if (q6_ragged_tail_cols > 0) n_tokens else dp4a_cols;
         const need_output: vk.c.VkDeviceSize =
-            @as(vk.c.VkDeviceSize, dp4a_cols) *
+            @as(vk.c.VkDeviceSize, produced_cols) *
             @as(vk.c.VkDeviceSize, hidden_dim) *
             @sizeOf(f32);
         if (down_buf.size < need_output) return false;
 
         const packed_act = self.batched_scratch_swiglu_i8 orelse return false;
         const need_packed: vk.c.VkDeviceSize =
-            @as(vk.c.VkDeviceSize, dp4a_cols) *
+            @as(vk.c.VkDeviceSize, produced_cols) *
             @as(vk.c.VkDeviceSize, inter_dim / 4) *
             @sizeOf(u32);
         if (packed_act.size < need_packed) return false;
@@ -12033,12 +12096,12 @@ pub const InferenceEngine = struct {
                 if (geglu_already_q8_1) return error.UnsupportedConfiguration;
                 const scale = self.batched_scratch_swiglu_scale orelse return false;
                 const need_scale: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, dp4a_cols) *
+                    @as(vk.c.VkDeviceSize, produced_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 32) *
                     @sizeOf(f32);
                 if (scale.size < need_scale) return false;
 
-                const dp4a_tail_cols = if (dp4a_cols < n_tokens) n_tokens - dp4a_cols else 0;
+                const dp4a_tail_cols = if (q6_ragged_tail_cols > 0) q6_ragged_tail_cols else if (dp4a_cols < n_tokens) n_tokens - dp4a_cols else 0;
                 if (!geglu_already_q8) {
                     const down_quant_phase = self.beginProfilePhase();
                     try self.dmmv.recordQuantizeActQ8(
@@ -12080,7 +12143,27 @@ pub const InferenceEngine = struct {
                     0,
                 );
                 if (dp4a_tail_cols > 0) {
-                    if (dp4a_tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
+                    if (q6_ragged_tail_cols > 0) {
+                        try self.dmmv.recordMulMmQ6KTail8Dp4a(
+                            &self.decode_cmd,
+                            push_fn,
+                            down_t.gpu_buffer.handle,
+                            down_t.gpu_buffer.size,
+                            packed_act.handle,
+                            packed_act.size,
+                            scale.handle,
+                            scale.size,
+                            down_buf.handle,
+                            down_buf.size,
+                            hidden_dim,
+                            dp4a_tail_cols,
+                            inter_dim,
+                            0,
+                            dp4a_cols * (inter_dim / 4),
+                            dp4a_cols * (inter_dim / 32),
+                            dp4a_cols * hidden_dim,
+                        );
+                    } else if (dp4a_tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
                         try self.dmmv.recordMulMmQ6KTail8(
                             &self.decode_cmd,
                             push_fn,

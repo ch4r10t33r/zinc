@@ -203,7 +203,7 @@ void main() {
             }
         }
 
-        {
+        if (BN >= 32u) {
             const uint tile_half = tid & 1u;
             const uint k_in_tile = tile_half * 16u;
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
@@ -215,6 +215,20 @@ void main() {
                 if (tile_half == 0u) {
                     buf_b_sd[col_local] = b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)];
                 }
+            }
+        } else {
+            const uint col_local = tid >> 3;
+            const uint pack_idx = tid & 7u;
+            const uint col_global = ic * BN + col_local;
+            const bool col_ok = col_global < N;
+            const uint base_b = col_local * SPACK;
+            buf_b[base_b + pack_idx] = col_ok
+                ? b_packed[b_packed_offset + col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
+                : 0u;
+            if (pack_idx == 0u) {
+                buf_b_sd[col_local] = col_ok
+                    ? b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)]
+                    : vec2(0.0);
             }
         }
 
@@ -287,9 +301,11 @@ void main() {
         }
         // Each row group of 4 m-values maps to one packed uint at p = tiwr,
         // exactly the layout written by quantize_act_q8.comp.
-        d_packed[d_packed_offset + col_g * stride_d_packed + ir * 8u + tiwr] = packed;
-        if (tiwr == 0u) {
-            d_scale[d_scale_offset + col_g * stride_d_scale + ir] = scale;
+        if (BN >= 32u || col_g < N) {
+            d_packed[d_packed_offset + col_g * stride_d_packed + ir * 8u + tiwr] = packed;
+            if (tiwr == 0u) {
+                d_scale[d_scale_offset + col_g * stride_d_scale + ir] = scale;
+            }
         }
     }
 }

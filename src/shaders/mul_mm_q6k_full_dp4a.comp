@@ -29,13 +29,10 @@
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 32u;
-const uint BN = 32u;
 const uint BK = 32u;
 const uint TM = 4u;
-const uint TN = 4u;
 const uint WG_SIZE = 64u;
 const uint TPR_M = BM / TM; // 8
-const uint TPR_N = BN / TN; // 8
 
 const uint Q6K_BLOCK_SIZE = 256u;
 const uint Q6K_BYTES = 210u;
@@ -45,6 +42,11 @@ const uint Q6K_BYTES = 210u;
 const uint SPACK = 9u;
 
 layout(constant_id = 0) const uint SPEC_K = 0u;
+layout(constant_id = 1) const uint SPEC_BN = 32u;
+
+const uint BN = SPEC_BN;
+const uint TPR_N = WG_SIZE / TPR_M; // 8
+const uint TN = BN / TPR_N;
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -155,7 +157,7 @@ void main() {
         }
 
         // ---- load pre-quantized int8 activation half-tile ----
-        {
+        if (BN >= 32u) {
             const uint col_local = tid / 2u;
             const uint sub = tid & 1u;
             const uint k_in_tile = sub * 16u;
@@ -165,6 +167,20 @@ void main() {
             [[unroll]] for (uint p = 0u; p < 4u; p++) buf_b[base_b + p] = b_packed[src + p];
             if (sub == 0u) {
                 buf_bs[col_local] = b_scale[col_global * b_stride_scale + (k_outer >> 5)];
+            }
+        } else {
+            const uint col_local = tid >> 3;
+            const uint pack_idx = tid & 7u;
+            const uint col_global = ic * BN + col_local;
+            const bool col_ok = col_global < N;
+            const uint base_b = col_local * SPACK;
+            buf_b[base_b + pack_idx] = col_ok
+                ? b_packed[col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
+                : 0u;
+            if (pack_idx == 0u) {
+                buf_bs[col_local] = col_ok
+                    ? b_scale[col_global * b_stride_scale + (k_outer >> 5)]
+                    : 0.0;
             }
         }
 
@@ -202,7 +218,9 @@ void main() {
         [[unroll]] for (uint n = 0u; n < TN; n++) {
             const uint row_g = ir * BM + tiwr * TM + m;
             const uint col_g = ic * BN + tiwc * TN + n;
-            d_data[d_offset + col_g * stride_d + row_g] = sums[m][n];
+            if (BN >= 32u || col_g < N) {
+                d_data[d_offset + col_g * stride_d + row_g] = sums[m][n];
+            }
         }
     }
 }
