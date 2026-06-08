@@ -12188,24 +12188,46 @@ pub const InferenceEngine = struct {
                 }
 
                 const down_matmul_phase = self.beginProfilePhase();
-                try self.dmmv.recordMulMmQ6KFullDp4a(
-                    &self.decode_cmd,
-                    push_fn,
-                    down_t.gpu_buffer.handle,
-                    down_t.gpu_buffer.size,
-                    packed_act.handle,
-                    packed_act.size,
-                    scale.handle,
-                    scale.size,
-                    down_buf.handle,
-                    down_buf.size,
-                    hidden_dim,
-                    dp4a_cols,
-                    inter_dim,
-                    0,
-                    0,
-                );
-                if (dp4a_tail_cols > 0) {
+                const use_ragged72 = q6_ragged_tail_cols > 0 and
+                    self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k21504_n72 != null;
+                if (use_ragged72) {
+                    try self.dmmv.recordMulMmQ6KRagged72Dp4a(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale.handle,
+                        scale.size,
+                        down_buf.handle,
+                        down_buf.size,
+                        hidden_dim,
+                        n_tokens,
+                        inter_dim,
+                        0,
+                        0,
+                    );
+                } else {
+                    try self.dmmv.recordMulMmQ6KFullDp4a(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale.handle,
+                        scale.size,
+                        down_buf.handle,
+                        down_buf.size,
+                        hidden_dim,
+                        dp4a_cols,
+                        inter_dim,
+                        0,
+                        0,
+                    );
+                }
+                if (!use_ragged72 and dp4a_tail_cols > 0) {
                     if (q6_ragged_tail_cols > 0) {
                         try self.dmmv.recordMulMmQ6KTail8Dp4a(
                             &self.decode_cmd,

@@ -554,6 +554,8 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q6k_full_dp4a_k21504: ?Pipeline,
     /// K=21504, BN=8 sibling for Gemma 4 31B dense-down ragged 65-72 token tails.
     pipeline_mul_mm_q6k_full_dp4a_k21504_n8: ?Pipeline,
+    /// K=21504, BN=72 guarded sibling for Gemma 4 31B Q6_K dense-down 65-72 token prompts.
+    pipeline_mul_mm_q6k_full_dp4a_k21504_n72: ?Pipeline,
     /// int8 DP4a full-tile Q6_K GEMM that reads a Q8_1 activation layout
     /// (vec2 scale_dsum per 32-block, dsum unused). Used by the Qwen3.6-27B
     /// SSM wqkv prefill projection so it can share the Q8_1 quantize_act
@@ -1240,6 +1242,11 @@ pub const DmmvDispatch = struct {
             .{ .id = 0, .value = 21504 },
             .{ .id = 1, .value = 8 },
         };
+        const spec_k_21504_n72_ragged = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 21504 },
+            .{ .id = 1, .value = 72 },
+            .{ .id = 2, .value = 1 },
+        };
         const geglu_q8_k5376_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n64_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 64 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 } };
@@ -1263,6 +1270,13 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q6k_full_dp4a_k21504_n8 != null) {
             log.info("mul_mm_q6k_full_dp4a K=21504 BN=8 pipeline loaded (Gemma 4 31B dense-down ragged tail)", .{});
+        }
+        const pipeline_mul_mm_q6k_full_dp4a_k21504_n72 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_21504_n72_ragged, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a K=21504 BN=72 ragged shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a_k21504_n72 != null) {
+            log.info("mul_mm_q6k_full_dp4a K=21504 BN=72 ragged pipeline loaded (Gemma 4 31B Q6_K dense-down 65-72 token prompts)", .{});
         }
         // Q8_1-input variant of the Q6_K DP4a GEMM (vec2 scale_dsum, dsum
         // unused). Lets the Qwen3.6-27B SSM wqkv projection share a single
@@ -1554,6 +1568,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q6k_full_dp4a_k12288 = pipeline_mul_mm_q6k_full_dp4a_k12288,
             .pipeline_mul_mm_q6k_full_dp4a_k21504 = pipeline_mul_mm_q6k_full_dp4a_k21504,
             .pipeline_mul_mm_q6k_full_dp4a_k21504_n8 = pipeline_mul_mm_q6k_full_dp4a_k21504_n8,
+            .pipeline_mul_mm_q6k_full_dp4a_k21504_n72 = pipeline_mul_mm_q6k_full_dp4a_k21504_n72,
             .pipeline_mul_mm_q6k_full_dp4a_q8_1 = pipeline_mul_mm_q6k_full_dp4a_q8_1,
             .pipeline_quantize_act_q8 = pipeline_quantize_act_q8,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a,
@@ -3058,6 +3073,58 @@ pub const DmmvDispatch = struct {
             std.mem.asBytes(&push),
             M / 32,
             N / 32,
+            1,
+        );
+    }
+
+    /// Guarded BN=72 int8 DP4a Q6_K dense-down GEMM for Gemma 4 31B's
+    /// 65-72 token public prompt shape. This covers the 64-column body and
+    /// <=8-column ragged tail in one pass over the K=21504 down weights.
+    pub fn recordMulMmQ6KRagged72Dp4a(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_buf: vk.c.VkBuffer,
+        b_scale_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k_full_dp4a_k21504_n72) |*p| p else return error.PipelineNotLoaded;
+        if (K != 21504) return error.InvalidArgument;
+        if (M == 0 or (M & 31) != 0) return error.InvalidArgument;
+        if (N <= 64 or N > 72) return error.InvalidArgument;
+        const push = MulMmQ6KDp4aPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d = M,
+            .a_offset = a_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_buf, .offset = 0, .range = b_scale_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            1,
             1,
         );
     }
