@@ -112,6 +112,21 @@ pub fn main() !void {
         const out_path = args.next() orelse "/tmp/zinc_logits.bin";
         const model_path = args.next() orelse DEFAULT_MODEL;
         try logitsMode(allocator, token, out_path, model_path);
+    } else if (std.mem.eql(u8, first, "gdump")) {
+        const ids_arg = args.next() orelse "1000";
+        const out_path = args.next() orelse "/tmp/zinc_layers.bin";
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try gemmaLayerDumpMode(allocator, ids_arg, out_path, model_path);
+    } else if (std.mem.eql(u8, first, "glogits")) {
+        const ids_arg = args.next() orelse "1000";
+        const out_path = args.next() orelse "/tmp/zinc_glogits.bin";
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try gemmaLogitsMode(allocator, ids_arg, out_path, model_path);
+    } else if (std.mem.eql(u8, first, "tf")) {
+        const prompt_arg = args.next() orelse "1000";
+        const gen_arg = args.next() orelse "";
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try teacherForcedMode(allocator, prompt_arg, gen_arg, model_path);
     } else {
         const token: u32 = std.fmt.parseInt(u32, first, 10) catch 100;
         const model_path = args.next() orelse DEFAULT_MODEL;
@@ -302,12 +317,108 @@ fn logitsMode(allocator: std.mem.Allocator, token: u32, out_path: []const u8, mo
     std.debug.print("wrote {d} logits to {s}; argmax={d} ({d:.4})\n", .{ vocab, out_path, bi, bm });
 }
 
+/// Teacher-forced next-token agreement vs a reference continuation. Feeds the
+/// TRUE tokens (prompt ++ gen) and, at each generated position, checks whether
+/// ZINC's argmax equals the reference's actual next token — so a single near-tie
+/// flip costs one match instead of permanently desyncing the free-running greedy
+/// compare. This is the standard token-correctness metric and is robust to the
+/// q8_1-activation near-ties that separate ZINC's (correct) f32 forward from the
+/// llama-CUDA reference. Prints "TF_MATCH:k/N".
+fn teacherForcedMode(allocator: std.mem.Allocator, prompt_arg: []const u8, gen_arg: []const u8, model_path: []const u8) !void {
+    var buf: [512]u32 = undefined;
+    var np: usize = 0;
+    inline for (.{ prompt_arg, gen_arg }) |arg| {
+        var it = std.mem.splitScalar(u8, arg, ',');
+        while (it.next()) |s| {
+            const trimmed = std.mem.trim(u8, s, " ");
+            if (trimmed.len == 0 or np >= buf.len) continue;
+            buf[np] = std.fmt.parseInt(u32, trimmed, 10) catch continue;
+            np += 1;
+        }
+    }
+    // Count prompt tokens to know where the generated region begins.
+    var plen: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, prompt_arg, ',');
+        while (it.next()) |s| {
+            if (std.mem.trim(u8, s, " ").len != 0) plen += 1;
+        }
+    }
+    const seq = buf[0..np];
+    if (np == 0 or plen == 0 or plen >= np) return error.BadSequence;
+
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try Engine.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    // Teacher-forced: feed the TRUE token at every position; the argmax after
+    // feeding seq[i] is the prediction for seq[i+1]. Score the gen region.
+    var pos: u32 = 0;
+    var match: u32 = 0;
+    var total: u32 = 0;
+    var pred: u32 = 0;
+    while (pos < np) : (pos += 1) {
+        pred = try fwd.decodeStep(seq[pos], pos, true);
+        const next = pos + 1;
+        if (next < np and next >= plen) {
+            total += 1;
+            if (pred == seq[next]) match += 1;
+        }
+    }
+    std.debug.print("TF_MATCH:{d}/{d}\n", .{ match, total });
+}
+
+/// Prefill a prompt id list, then dump the full vocab logit vector predicting
+/// the NEXT token (i.e. logits after the last prompt token) to a raw-f32 file.
+/// Lets a pos>0 logit-fidelity comparison vs llama.cpp pinpoint whether a greedy
+/// divergence is a real bug or a near-tie fp flip.
+fn gemmaLogitsMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_path: []const u8, model_path: []const u8) !void {
+    var prompt_buf: [256]u32 = undefined;
+    var np: usize = 0;
+    var it = std.mem.splitScalar(u8, ids_arg, ',');
+    while (it.next()) |s| {
+        const trimmed = std.mem.trim(u8, s, " ");
+        if (trimmed.len == 0 or np >= prompt_buf.len) continue;
+        prompt_buf[np] = try std.fmt.parseInt(u32, trimmed, 10);
+        np += 1;
+    }
+    const prompt = prompt_buf[0..np];
+    if (np == 0) return error.EmptyPrompt;
+
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try Engine.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    var pos: u32 = 0;
+    var tok: u32 = 0;
+    for (prompt) |t| {
+        tok = try fwd.decodeStep(t, pos, true);
+        pos += 1;
+    }
+    const vocab = fwd.vocab();
+    const buf = try allocator.alloc(f32, vocab);
+    defer allocator.free(buf);
+    fwd.readLogits(buf);
+
+    const f = try std.fs.cwd().createFile(out_path, .{});
+    defer f.close();
+    try f.writeAll(std.mem.sliceAsBytes(buf));
+    std.debug.print("prefilled {d} tokens; argmax next = {d}; wrote {d} logits to {s}\n", .{ np, tok, vocab, out_path });
+}
+
 /// Per-layer residual-norm dump at pos 0 (single token).
 fn dumpMode(allocator: std.mem.Allocator, token: u32, model_path: []const u8) !void {
     var dev = try device.CudaDevice.initBest(allocator);
     defer dev.deinit();
     var model = try loader.Model.load(allocator, dev.ctx, model_path);
     defer model.deinit();
+    if (model.config.architecture == .gemma) return gemmaDumpMode(allocator, &model, token);
     var fwd = try forward.ForwardCuda.init(allocator, &model, 512);
     defer fwd.deinit();
 
@@ -333,4 +444,95 @@ fn dumpMode(allocator: std.mem.Allocator, token: u32, model_path: []const u8) !v
         fwd.readHidden(buf[0..n]);
         stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-ffn", .{L}), buf[0..n]);
     }
+}
+
+/// gemma4 per-layer residual-norm dump at pos 0 (single token). Dumps the
+/// residual stream after attention, after FFN, and after the per-layer output
+/// scale (== llama.cpp `l_out-N`), so the post-outscale norm can be diffed
+/// against a gemma4 eval-callback reference to find the first divergent layer.
+fn gemmaDumpMode(allocator: std.mem.Allocator, model: *loader.Model, token: u32) !void {
+    var fwd = try forwardgemma.ForwardGemma.init(allocator, model, 512);
+    defer fwd.deinit();
+
+    const n = fwd.d.n_embd;
+    const buf = try allocator.alloc(f32, @max(n, fwd.d.vocab));
+    defer allocator.free(buf);
+
+    std.debug.print("=== CUDA gemma4 per-layer dump, token {d}, pos 0, {d} layers ===\n", .{ token, fwd.d.n_layers });
+
+    _ = try fwd.decodeStep(token, 0, false);
+    fwd.readHidden(buf[0..n]);
+    stats("embed", buf[0..n]);
+
+    var L: u32 = 0;
+    while (L < fwd.d.n_layers) : (L += 1) {
+        var lbl: [24]u8 = undefined;
+        const tag: []const u8 = if (fwd.geom[L].is_swa) "swa" else "FUL";
+        try fwd.attentionLayerPub(L, 0);
+        fwd.readHidden(buf[0..n]);
+        stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-att-{s}", .{ L, tag }), buf[0..n]);
+        try fwd.ffnLayerPub(L);
+        fwd.readHidden(buf[0..n]);
+        stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-ffn", .{L}), buf[0..n]);
+        try fwd.layerOutScalePub(L);
+        fwd.readHidden(buf[0..n]);
+        stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-out", .{L}), buf[0..n]);
+    }
+}
+
+/// gemma4 per-layer residual-VECTOR dump at the LAST position of a prompt id
+/// list. Prefills ids[0..n-1] (full forward, populating KV at pos 0..n-2), then
+/// at the final position steps through layers, writing the post-output-scale
+/// residual (== llama.cpp `l_out-N`) of every layer to a flat f32 binary
+/// [n_layers * n_embd]. Pairs with a llama.cpp eval-callback dumping l_out's last
+/// column; cosine/maxdiff per layer pinpoints the first POSITION-dependent
+/// (rope/KV) divergence that the pos-0 norm dump cannot see.
+fn gemmaLayerDumpMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_path: []const u8, model_path: []const u8) !void {
+    var prompt_buf: [256]u32 = undefined;
+    var np: usize = 0;
+    var it = std.mem.splitScalar(u8, ids_arg, ',');
+    while (it.next()) |s| {
+        const trimmed = std.mem.trim(u8, s, " ");
+        if (trimmed.len == 0 or np >= prompt_buf.len) continue;
+        prompt_buf[np] = try std.fmt.parseInt(u32, trimmed, 10);
+        np += 1;
+    }
+    const prompt = prompt_buf[0..np];
+    if (np == 0) return error.EmptyPrompt;
+
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try forwardgemma.ForwardGemma.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    const n = fwd.d.n_embd;
+    const nl = fwd.d.n_layers;
+    const buf = try allocator.alloc(f32, @max(n, fwd.d.vocab));
+    defer allocator.free(buf);
+    const all = try allocator.alloc(f32, nl * n);
+    defer allocator.free(all);
+
+    // Prefill every prompt token except the last (full forward, KV carry).
+    var pos: u32 = 0;
+    while (pos + 1 < np) : (pos += 1) _ = try fwd.decodeStep(prompt[pos], pos, true);
+    const last_pos: u32 = @intCast(np - 1);
+
+    std.debug.print("=== gemma4 layer-vector dump @ pos {d}, {d} layers, prompt {s} ===\n", .{ last_pos, nl, ids_arg });
+    _ = try fwd.decodeStep(prompt[last_pos], last_pos, false); // embed only
+    var L: u32 = 0;
+    while (L < nl) : (L += 1) {
+        try fwd.attentionLayerPub(L, last_pos);
+        try fwd.ffnLayerPub(L);
+        try fwd.layerOutScalePub(L);
+        fwd.readHidden(all[L * n ..][0..n]);
+        var lbl: [24]u8 = undefined;
+        const tag: []const u8 = if (fwd.geom[L].is_swa) "swa" else "FUL";
+        stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-{s}", .{ L, tag }), all[L * n ..][0..n]);
+    }
+    const f = try std.fs.cwd().createFile(out_path, .{});
+    defer f.close();
+    try f.writeAll(std.mem.sliceAsBytes(all));
+    std.debug.print("wrote {d} layer vectors ({d} floats) to {s}\n", .{ nl, nl * n, out_path });
 }

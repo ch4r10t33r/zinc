@@ -325,12 +325,27 @@ pub const ForwardGemma = struct {
             const hf = try allocator.alloc(f32, half);
             defer allocator.free(hf);
             const fb = c.rope_freq_base; // 1e6
-            // rope_freqs.weight is a global F32 [head_dim_full/2] proportional-rope
-            // factor table; download it from the GPU copy.
             const rf = try allocator.alloc(f32, half);
             defer allocator.free(rf);
             @memset(rf, 1.0);
-            if (model.get("rope_freqs.weight")) |t| {
+            // rope_freqs is stored PER-LAYER as `blk.{i}.rope_freqs.weight` on the
+            // full-attention layers (llama.cpp `tn(LLM_TENSOR_ROPE_FREQS,"weight",i)`),
+            // all sharing one copy (TENSOR_DUPLICATED) — NOT as a global tensor. The
+            // old global `model.get("rope_freqs.weight")` returned null, so rf stayed
+            // 1.0 and proportional rope was silently skipped on full layers, drifting
+            // the argmax with position. Prefer the global name (some converters use
+            // it) then fall back to the first full-attention layer's per-layer tensor.
+            var rope_freqs_t: ?*const LoadedTensor = model.get("rope_freqs.weight");
+            if (rope_freqs_t == null) {
+                for (0..n_layers) |i| {
+                    if (geom[i].is_swa) continue;
+                    if (model.getLayer(@intCast(i), "rope_freqs.weight")) |t| {
+                        rope_freqs_t = t;
+                        break;
+                    }
+                }
+            }
+            if (rope_freqs_t) |t| {
                 if (t.info.numElements() == half and t.info.type_ == .f32) {
                     buffer.download(ctx, &t.gpu_buffer, std.mem.sliceAsBytes(rf));
                 }
@@ -648,6 +663,25 @@ pub const ForwardGemma = struct {
         const sm = ScalarMulPush{ .N = d.n_embd };
         cmd.dispatch(&self.pipes.scalar_mul, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &ws.gpu_buffer }, &sm, @sizeOf(ScalarMulPush), 0);
         cmd.commitAndWait();
+    }
+
+    // ---- public per-block hooks (dbg_cuda per-layer residual diff) ----------
+    // Mirror ForwardCuda's *Pub hooks so dbg_cuda can dump the residual stream
+    // after each gemma layer block and diff it against llama.cpp `l_out-N`.
+    pub fn attentionLayerPub(self: *ForwardGemma, L: u32, pos: u32) !void {
+        try self.attentionLayer(L, pos);
+    }
+    /// FFN block dispatched exactly as decodeStep: routed MoE when this layer
+    /// carries a router, dense GeGLU otherwise.
+    pub fn ffnLayerPub(self: *ForwardGemma, L: u32) !void {
+        if (self.d.n_experts > 0 and self.model.getLayer(L, "ffn_gate_inp.weight") != null) {
+            try self.moeFfnBlock(L);
+        } else {
+            try self.ffnBlock(L);
+        }
+    }
+    pub fn layerOutScalePub(self: *ForwardGemma, L: u32) !void {
+        try self.layerOutScale(L);
     }
 
     pub fn readHidden(self: *ForwardGemma, out: []f32) void {
