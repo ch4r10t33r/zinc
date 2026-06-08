@@ -226,8 +226,12 @@ const ProfilePhase = enum(u8) {
     dense_ffn_down,
     dense_ffn_gateup_quant,
     dense_ffn_gateup_matmul,
+    dense_ffn_gateup_matmul_q4,
+    dense_ffn_gateup_matmul_q6,
     dense_ffn_down_quant,
     dense_ffn_down_matmul,
+    dense_ffn_down_matmul_q4,
+    dense_ffn_down_matmul_q6,
     dense_ffn_residual_acc,
     final_tail,
     final_norm,
@@ -278,8 +282,12 @@ const ProfilePhase = enum(u8) {
             .dense_ffn_down => "dense_ffn_down",
             .dense_ffn_gateup_quant => "dense_ffn_gateup_quant",
             .dense_ffn_gateup_matmul => "dense_ffn_gateup_matmul",
+            .dense_ffn_gateup_matmul_q4 => "dense_ffn_gateup_matmul_q4",
+            .dense_ffn_gateup_matmul_q6 => "dense_ffn_gateup_matmul_q6",
             .dense_ffn_down_quant => "dense_ffn_down_quant",
             .dense_ffn_down_matmul => "dense_ffn_down_matmul",
+            .dense_ffn_down_matmul_q4 => "dense_ffn_down_matmul_q4",
+            .dense_ffn_down_matmul_q6 => "dense_ffn_down_matmul_q6",
             .dense_ffn_residual_acc => "dense_ffn_residual_acc",
             .final_tail => "tail",
             .final_norm => "tail_norm",
@@ -11843,6 +11851,11 @@ pub const InferenceEngine = struct {
                 self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
 
                 const gateup_matmul_phase = self.beginProfilePhase();
+                const gateup_matmul_profile_phase: ProfilePhase = switch (down_t.info.type_) {
+                    .q4_k => .dense_ffn_gateup_matmul_q4,
+                    .q6_k => .dense_ffn_gateup_matmul_q6,
+                    else => .dense_ffn_gateup_matmul,
+                };
                 var produced_dp4a_cols = full_cols;
                 if (fuse_q8) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
@@ -12031,7 +12044,7 @@ pub const InferenceEngine = struct {
                         0,
                     );
                 }
-                self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
+                self.endProfilePhase(gateup_matmul_profile_phase, gateup_matmul_phase);
                 dp4a_cols_out.* = produced_dp4a_cols;
             } else {
                 try self.dmmv.recordMulMmQ4KGateUpGegluFull(
@@ -12318,7 +12331,7 @@ pub const InferenceEngine = struct {
                         );
                     }
                 }
-                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                self.endProfilePhase(.dense_ffn_down_matmul_q6, down_matmul_phase);
                 return true;
             },
             .q4_k => {
@@ -12437,7 +12450,7 @@ pub const InferenceEngine = struct {
                         );
                     }
                 }
-                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                self.endProfilePhase(.dense_ffn_down_matmul_q4, down_matmul_phase);
                 return true;
             },
             else => return false,
@@ -24067,12 +24080,18 @@ pub fn generate(
             const dense_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_up)];
             const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
             const dense_gateup_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_quant)];
-            const dense_gateup_matmul_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul)];
+            const dense_gateup_matmul_generic_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul)];
+            const dense_gateup_matmul_q4_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul_q4)];
+            const dense_gateup_matmul_q6_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul_q6)];
+            const dense_gateup_matmul_ns = dense_gateup_matmul_generic_ns + dense_gateup_matmul_q4_ns + dense_gateup_matmul_q6_ns;
             const dense_down_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_quant)];
-            const dense_down_matmul_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul)];
+            const dense_down_matmul_generic_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul)];
+            const dense_down_matmul_q4_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul_q4)];
+            const dense_down_matmul_q6_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul_q6)];
+            const dense_down_matmul_ns = dense_down_matmul_generic_ns + dense_down_matmul_q4_ns + dense_down_matmul_q6_ns;
             const dense_residual_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_residual_acc)];
             log.info(
-                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} gateup_quant={d:.1} gateup_matmul={d:.1} down_quant={d:.1} down_matmul={d:.1} residual_acc={d:.1} ms",
+                "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} gateup_quant={d:.1} gateup_matmul={d:.1} (generic={d:.1} q4={d:.1} q6={d:.1}) down_quant={d:.1} down_matmul={d:.1} (generic={d:.1} q4={d:.1} q6={d:.1}) residual_acc={d:.1} ms",
                 .{
                     to_ms(dense_gateup_ns),
                     to_ms(dense_gate_ns),
@@ -24080,8 +24099,14 @@ pub fn generate(
                     to_ms(dense_down_ns),
                     to_ms(dense_gateup_quant_ns),
                     to_ms(dense_gateup_matmul_ns),
+                    to_ms(dense_gateup_matmul_generic_ns),
+                    to_ms(dense_gateup_matmul_q4_ns),
+                    to_ms(dense_gateup_matmul_q6_ns),
                     to_ms(dense_down_quant_ns),
                     to_ms(dense_down_matmul_ns),
+                    to_ms(dense_down_matmul_generic_ns),
+                    to_ms(dense_down_matmul_q4_ns),
+                    to_ms(dense_down_matmul_q6_ns),
                     to_ms(dense_residual_ns),
                 },
             );
@@ -24243,15 +24268,27 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.shared_down),
                 engine.avgProfilePhaseMs(.shared_gate_acc),
             });
-            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms gateup_quant={d:.2} ms gateup_matmul={d:.2} ms down_quant={d:.2} ms down_matmul={d:.2} ms residual_acc={d:.2} ms", .{
+            const avg_gateup_matmul_generic = engine.avgProfilePhaseMs(.dense_ffn_gateup_matmul);
+            const avg_gateup_matmul_q4 = engine.avgProfilePhaseMs(.dense_ffn_gateup_matmul_q4);
+            const avg_gateup_matmul_q6 = engine.avgProfilePhaseMs(.dense_ffn_gateup_matmul_q6);
+            const avg_down_matmul_generic = engine.avgProfilePhaseMs(.dense_ffn_down_matmul);
+            const avg_down_matmul_q4 = engine.avgProfilePhaseMs(.dense_ffn_down_matmul_q4);
+            const avg_down_matmul_q6 = engine.avgProfilePhaseMs(.dense_ffn_down_matmul_q6);
+            log.info("PROFILE: avg dense_ffn subphases gateup={d:.2} ms gate={d:.2} ms up={d:.2} ms down={d:.2} ms gateup_quant={d:.2} ms gateup_matmul={d:.2} ms (generic={d:.2} q4={d:.2} q6={d:.2}) down_quant={d:.2} ms down_matmul={d:.2} ms (generic={d:.2} q4={d:.2} q6={d:.2}) residual_acc={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.dense_ffn_gateup),
                 engine.avgProfilePhaseMs(.dense_ffn_gate),
                 engine.avgProfilePhaseMs(.dense_ffn_up),
                 engine.avgProfilePhaseMs(.dense_ffn_down),
                 engine.avgProfilePhaseMs(.dense_ffn_gateup_quant),
-                engine.avgProfilePhaseMs(.dense_ffn_gateup_matmul),
+                avg_gateup_matmul_generic + avg_gateup_matmul_q4 + avg_gateup_matmul_q6,
+                avg_gateup_matmul_generic,
+                avg_gateup_matmul_q4,
+                avg_gateup_matmul_q6,
                 engine.avgProfilePhaseMs(.dense_ffn_down_quant),
-                engine.avgProfilePhaseMs(.dense_ffn_down_matmul),
+                avg_down_matmul_generic + avg_down_matmul_q4 + avg_down_matmul_q6,
+                avg_down_matmul_generic,
+                avg_down_matmul_q4,
+                avg_down_matmul_q6,
                 engine.avgProfilePhaseMs(.dense_ffn_residual_acc),
             });
             log.info("PROFILE: avg tail subphases norm={d:.2} ms lm_head={d:.2} ms argmax={d:.2} ms copy={d:.2} ms", .{
