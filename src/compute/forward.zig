@@ -22500,17 +22500,28 @@ pub const InferenceEngine = struct {
             const ref_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
             var max_abs: f32 = 0;
             var max_idx: usize = 0;
+            var nonfinite_count: usize = 0;
             for (0..vocab) |i| {
-                const diff = @abs(ref_logits[i] - batched_snapshot[i]);
+                const ref = ref_logits[i];
+                const batched = batched_snapshot[i];
+                if (!std.math.isFinite(ref) or !std.math.isFinite(batched)) {
+                    if (nonfinite_count == 0) {
+                        max_abs = std.math.inf(f32);
+                        max_idx = i;
+                    }
+                    nonfinite_count += 1;
+                    continue;
+                }
+                const diff = @abs(ref - batched);
                 if (diff > max_abs) {
                     max_abs = diff;
                     max_idx = i;
                 }
             }
             const tol: f32 = 1e-3;
-            const level: enum { ok, exceeded } = if (max_abs > tol) .exceeded else .ok;
-            log.warn("prefillBatched validate[{s}]: last-token logits max_abs_diff={d:.6} at idx={d} (ref={d:.4} batched={d:.4}) tol={d:.6} n_tokens={d}", .{
-                @tagName(level), max_abs, max_idx, ref_logits[max_idx], batched_snapshot[max_idx], tol, n_tokens,
+            const level: enum { ok, exceeded } = if (nonfinite_count > 0 or max_abs > tol) .exceeded else .ok;
+            log.warn("prefillBatched validate[{s}]: last-token logits max_abs_diff={d:.6} at idx={d} (ref={d:.4} batched={d:.4}) nonfinite={d} tol={d:.6} n_tokens={d}", .{
+                @tagName(level), max_abs, max_idx, ref_logits[max_idx], batched_snapshot[max_idx], nonfinite_count, tol, n_tokens,
             });
         }
     }
