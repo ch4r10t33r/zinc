@@ -1,6 +1,6 @@
 # Effort 22 — CUDA gemma4 forward (catalog completeness on the 4090)
 
-> **Status:** opening · **2/5 catalog models blocked on this** · goal: `gemma4-31b` (dense) + `gemma4-26b-a4b` (MoE) generate **coherent text** via ZINC CUDA on the 4090, completing the 5/5 catalog.
+> **Status:** dense COHERENT (Cycle 1) · **1/5 still blocked (gemma4-26b MoE)** · goal: `gemma4-31b` (dense) ✅ + `gemma4-26b-a4b` (MoE) generate **coherent text** via ZINC CUDA on the 4090, completing the 5/5 catalog. Catalog now **4/5** on the 4090.
 
 Date: 2026-06-07. Pairs with the qwen35/qwen36 CUDA work (Efforts 20/21, `forward_cuda.zig`).
 
@@ -40,6 +40,34 @@ A standard transformer (no SSM) but with several gemma-specific pieces:
 - Per-layer residual diff vs llama.cpp (`l_out-N`) to pinpoint the first divergent layer (NOT just argmax — the qwen35 gate bug showed argmax can match at pos 0 while a mid-layer is wrong).
 - Token-for-token greedy vs llama.cpp on a fixed prompt before declaring coherent; then the full `validate_cuda_decode.sh` suite.
 - 4090-pinned (`GPU-e59a6fce-…`); the 26b/MoE is 16 GB (fits 24 GB).
+
+## Cycle log
+
+- **Cycle 1 (2026-06-07) — gemma4 DENSE coherent on the 4090. ✅**
+  New `src/compute/forward_cuda_gemma.zig` (`ForwardGemma`), additive kernels in
+  `kernels.cu` (`geglu`, `gemma_attention` windowed + scale, `rms_norm_noweight`,
+  `scalar_mul`), and a `main.zig` branch (`runCuda` → shared `runCudaDecode`
+  helper; qwen path unchanged). Result on `gemma-4-31B-it-Q4_K_M`, prompt "The
+  capital of France is" → **" Paris.\n\nThe capital of France is Paris.\n\nThe"** —
+  coherent, contains "Paris". Qwen35-9b re-checked through the shared decode path:
+  still coherent (no regression).
+  Key arch findings nailed this cycle (all confirmed from the GGUF + `gemma4.cpp`):
+  - gemma RMSNorm `(1+w)` offset is **baked into the GGUF weights** (attn_q_norm
+    ≈ 1.0234) → reuse the standard `rms_norm` kernel; V uses no-weight normalize.
+  - **Per-layer geometry** read from GGUF arrays: SWA layers (pattern `[T×5,F]`,
+    period 6) = head_dim 256, 16 KV heads, rope base 1e4, window 1024; full layers
+    (i%6==5) = head_dim 512, 4 KV heads, rope base 1e6 + `rope_freqs` proportional
+    factors (folded into a host-precomputed inv_freq table).
+  - **Attention scale = 1.0** (gemma4 `f_attention_scale`, no 1/sqrt(d)).
+  - **Alternative attention**: full layers omit `attn_v`; V = the raw K projection
+    (pre-norm, pre-rope), then plain per-head rms-normalize, never roped.
+  - **`layer_output_scale`** (per-layer scalar, e.g. 0.089/0.879/0.036) multiplies
+    the whole residual stream at the end of each layer — applied via `scalar_mul`.
+  - Embeddings scaled by `sqrt(n_embd)`; LM head tied to `token_embd.weight`
+    (no `output.weight`); final-logit soft-cap skipped (monotonic → argmax-safe).
+  - **NEXT:** validate per-layer-diff vs llama.cpp `l_out-N` (argmax is right but a
+    mid-layer could still drift); then wire the **gemma4 MoE (26b)** FFN
+    (fused `ffn_gate_up_exps` + shared expert + 3 extra norms) into `ForwardGemma`.
 
 ## Refs
 

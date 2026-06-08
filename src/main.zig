@@ -47,6 +47,7 @@ const gpu_detect = if (gpu.is_vulkan) @import("vulkan/gpu_detect.zig") else stru
 const cuda_device_mod = if (gpu.is_cuda) @import("cuda/device.zig") else struct {};
 const loader_cuda_mod = if (gpu.is_cuda) @import("model/loader_cuda.zig") else struct {};
 const forward_cuda_mod = if (gpu.is_cuda) @import("compute/forward_cuda.zig") else struct {};
+const forward_cuda_gemma_mod = if (gpu.is_cuda) @import("compute/forward_cuda_gemma.zig") else struct {};
 const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
 const routes_mod = @import("server/routes.zig");
@@ -129,6 +130,7 @@ comptime {
         _ = @import("cuda/command.zig");
         _ = @import("model/loader_cuda.zig");
         _ = @import("compute/forward_cuda.zig");
+        _ = @import("compute/forward_cuda_gemma.zig");
         _ = @import("model/catalog.zig");
         _ = @import("model/managed.zig");
     }
@@ -1660,7 +1662,6 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         log.err("CUDA backend currently supports prompt mode only. Pass --prompt \"...\" (server mode is not yet wired on CUDA).", .{});
         return error.ServerModeUnavailableOnThisBackend;
     }
-    const prompt = config.prompt.?;
 
     // Load the model onto the GPU (weights uploaded verbatim-quantized).
     var model = loader_cuda_mod.Model.load(allocator, device.ctx, model_path) catch |err| {
@@ -1670,7 +1671,21 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     defer model.deinit();
 
     // Build the forward state. max_ctx must cover prompt + generated tokens.
+    // gemma4 is a separate forward path (forward_cuda_gemma.zig); the
+    // qwen35/qwen36 hybrid-SSM family uses forward_cuda.zig.
     const max_ctx: u32 = if (config.context_length) |c| c else 2048;
+    if (model.config.architecture == .gemma) {
+        var fwd = forward_cuda_gemma_mod.ForwardGemma.init(allocator, &model, max_ctx) catch |err| {
+            log.err("Failed to init CUDA forward pass: {s}", .{@errorName(err)});
+            return err;
+        };
+        defer fwd.deinit();
+        log.info("CUDA gemma4 forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
+            fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
+        });
+        return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
+    }
+
     var fwd = forward_cuda_mod.ForwardCuda.init(allocator, &model, max_ctx) catch |err| {
         log.err("Failed to init CUDA forward pass: {s}", .{@errorName(err)});
         return err;
@@ -1679,6 +1694,14 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     log.info("CUDA forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
         fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
     });
+    return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
+}
+
+/// Tokenize the prompt, prefill, greedily generate, and print — shared by the
+/// qwen and gemma CUDA forward paths (`fwd` is duck-typed: needs `decodeStep`
+/// and `d.vocab`).
+fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, max_ctx: u32, allocator: std.mem.Allocator) !void {
+    const prompt = config.prompt.?;
 
     // Tokenizer is backend-agnostic — built from the GGUF metadata.
     var tokenizer = tokenizer_mod.Tokenizer.initFromGGUF(&model.gguf_file, allocator) catch |err| {

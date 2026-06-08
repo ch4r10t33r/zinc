@@ -1150,6 +1150,112 @@ extern "C" __global__ void sigmoid_mul(const float* a, const float* gate, float*
     out[idx] = a[idx] * (1.0f / (1.0f + expf(-g)));
 }
 
+// ===========================================================================
+// Gemma 4 kernels (additive — never used by the qwen35/qwen36 path).
+// ===========================================================================
+
+// ---- rms_norm_noweight (gemma V normalization) -----------------------------
+// y = x / sqrt(mean(x^2) + eps). Pure RMS normalize with NO learnable weight
+// (gemma4 applies ggml_rms_norm to V per head before the KV write). One block
+// per row of pc.N elements (grid = n_kv_heads, N = head_dim).
+extern "C" __global__ void rms_norm_noweight(const float* x, float* y, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* yt = y + (size_t)token * pc.N;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x)
+        yt[i] = xt[i] * rinv;
+}
+
+// ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
+// Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
+// carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
+// the standard rms_norm kernel.
+extern "C" __global__ void geglu(const float* gate, const float* up, float* y, SwigluPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    const float k = 0.7978845608028654f; // sqrt(2/pi)
+    float g = gate[idx];
+    float gelu = 0.5f * g * (1.0f + tanhf(k * (g + 0.044715f * g * g * g)));
+    y[idx] = gelu * up[idx];
+}
+
+// ---- scalar_mul (gemma per-layer output scale) ----------------------------
+// a[i] *= s[0]. s is a device [1] buffer (blk.N.layer_output_scale.weight).
+struct ScalarMulPush { unsigned N; };
+extern "C" __global__ void scalar_mul(float* a, const float* s, ScalarMulPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    a[idx] *= s[0];
+}
+
+// ---- gemma_attention (decode: softmax(scale*QK^T)V, GQA, sliding window) ----
+// One block per query head. Causal + optional sliding-window mask: with window
+// W>0 only the last W keys are attended (gemma4 SWA layers, W=1024). window==0
+// is full attention. No attention sink. kq_scale is gemma's f_attention_scale
+// (1.0); scale_bits==0 falls back to 1/sqrt(head_dim). KV cache layout matches
+// kv_cache_write: contiguous [seq_len, n_kv_heads, head_dim].
+struct GemmaAttnPush { unsigned head_dim, n_heads, n_kv_heads, seq_len, scale_bits, window; };
+extern "C" __global__ void gemma_attention(const float* q, const float* k, const float* v,
+                                           float* out, GemmaAttnPush pc) {
+    extern __shared__ float s_scores[];           // size = seq_len floats (dynamic)
+    __shared__ float s_m, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + (size_t)head * hd;
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    // sliding-window start: decode query is the last position (seq_len-1).
+    unsigned start = 0;
+    if (pc.window != 0u && pc.seq_len > pc.window) start = pc.seq_len - pc.window;
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) s_inv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    float inv = s_inv;
+
+    // Pass 3: out[d] = (sum_i e_i * V[i,d]) * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < pc.seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[(size_t)head * hd + d] = acc * inv;
+    }
+}
+
 // ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
 // wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
 // interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and
