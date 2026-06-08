@@ -22032,20 +22032,48 @@ pub const InferenceEngine = struct {
             // FFN: gate/up → SwiGLU/GEGLU → down → optional post-ffn norm
             // (Gemma) → residual.
             const dense_ffn_phase = self.beginProfilePhase();
+            const final_layer_last_token_ffn_only = cfg.architecture == .gemma and
+                cfg.n_experts == 0 and
+                cfg.ssm_d_inner == 0 and
+                n_tokens > 1 and
+                layer + 1 == cfg.n_layers;
+            const ffn_n_tokens: u32 = if (final_layer_last_token_ffn_only) 1 else n_tokens;
+            const single_hidden_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, hidden_dim) *
+                @sizeOf(f32);
+            const final_layer_last_hidden_offset: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, n_tokens - 1) *
+                @as(vk.c.VkDeviceSize, hidden_dim) *
+                @sizeOf(f32);
+            if (final_layer_last_token_ffn_only) {
+                const last_token_region = vk.c.VkBufferCopy{
+                    .srcOffset = final_layer_last_hidden_offset,
+                    .dstOffset = 0,
+                    .size = single_hidden_bytes,
+                };
+                self.decode_cmd.computeToTransferBarrier();
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_hidden.handle, scratch_hidden.handle, 1, &last_token_region);
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_norm.handle, scratch_norm.handle, 1, &last_token_region);
+                self.decode_cmd.transferToComputeBarrier();
+            }
             const dense_ffn_gateup_phase = self.beginProfilePhase();
             const geglu_bytes: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, n_tokens) *
+                @as(vk.c.VkDeviceSize, ffn_n_tokens) *
                 @as(vk.c.VkDeviceSize, inter_dim) *
                 @sizeOf(f32);
-            const hidden_batch_bytes: vk.c.VkDeviceSize =
+            const ffn_hidden_batch_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, ffn_n_tokens) *
+                @as(vk.c.VkDeviceSize, hidden_dim) *
+                @sizeOf(f32);
+            const all_hidden_batch_bytes: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, n_tokens) *
                 @as(vk.c.VkDeviceSize, hidden_dim) *
                 @sizeOf(f32);
             var gemma_gateup_dp4a_cols: u32 = 0;
-            const gemma_gateup_result = try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, n_tokens, &gemma_gateup_dp4a_cols);
+            const gemma_gateup_result = try self.dispatchGemmaGateUpGegluBatched(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, inter_dim, hidden_dim, ffn_n_tokens, &gemma_gateup_dp4a_cols);
             if (gemma_gateup_result == .not_handled) {
-                try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
-                try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+                try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, ffn_n_tokens);
+                try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, ffn_n_tokens);
                 const gateup_ranges = [_]CommandBuffer.BufferRange{
                     .{ .buffer = scratch_gate.handle, .size = geglu_bytes },
                     .{ .buffer = scratch_up.handle, .size = geglu_bytes },
@@ -22053,19 +22081,19 @@ pub const InferenceEngine = struct {
                 self.decode_cmd.computeBuffersBarrier(&gateup_ranges);
                 // dispatchFfnActivation picks SwiGLU / GEGLU / SwiGLU-OAI based
                 // on cfg.architecture. For Gemma this dispatches GEGLU.
-                try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
+                try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, ffn_n_tokens * inter_dim);
             }
             self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
-            self.barrierAfterGemmaGateUpGeglu(gemma_gateup_result, scratch_swiglu, geglu_bytes, n_tokens, gemma_gateup_dp4a_cols);
+            self.barrierAfterGemmaGateUpGeglu(gemma_gateup_result, scratch_swiglu, geglu_bytes, ffn_n_tokens, gemma_gateup_dp4a_cols);
             const gemma_geglu_already_q8 = gemma_gateup_result == .q8_geglu;
             const gemma_geglu_already_q8_1 = gemma_gateup_result == .q8_1_geglu;
             const dense_ffn_down_phase = self.beginProfilePhase();
-            if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, gemma_geglu_already_q8, gemma_geglu_already_q8_1, gemma_gateup_dp4a_cols)) {
+            if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, ffn_n_tokens, gemma_geglu_already_q8, gemma_geglu_already_q8_1, gemma_gateup_dp4a_cols)) {
                 if (gemma_geglu_already_q8 or gemma_geglu_already_q8_1) return error.UnsupportedConfiguration;
-                try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+                try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, ffn_n_tokens);
             }
             self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
-            self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
+            self.decode_cmd.computeBufferBarrier(scratch_down.handle, ffn_hidden_batch_bytes);
             // Fused post_ffw_norm + residual add for Gemma: one dispatch
             // instead of (rms_norm_mul in place) + barrier + (scale_accumulate).
             // Falls back to the separate ops for non-Gemma or when the fused
@@ -22083,7 +22111,7 @@ pub const InferenceEngine = struct {
                     pfn_t.gpu_buffer.handle,
                     pfn_t.gpu_buffer.size,
                     hidden_dim,
-                    n_tokens,
+                    ffn_n_tokens,
                     eps,
                 );
             } else {
@@ -22097,16 +22125,26 @@ pub const InferenceEngine = struct {
                             scratch_down.handle,
                             scratch_down.size,
                             hidden_dim,
-                            n_tokens,
+                            ffn_n_tokens,
                             eps,
                         );
-                        self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
+                        self.decode_cmd.computeBufferBarrier(scratch_down.handle, ffn_hidden_batch_bytes);
                     }
                 }
-                try self.dispatchScaleAcc(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, n_tokens * hidden_dim, 1.0);
+                try self.dispatchScaleAcc(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, ffn_n_tokens * hidden_dim, 1.0);
+            }
+            self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, ffn_hidden_batch_bytes);
+            if (final_layer_last_token_ffn_only) {
+                const last_token_region = vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = final_layer_last_hidden_offset,
+                    .size = single_hidden_bytes,
+                };
+                self.decode_cmd.computeToTransferBarrier();
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_hidden.handle, scratch_hidden.handle, 1, &last_token_region);
+                self.decode_cmd.transferToComputeBarrier();
             }
             self.endProfilePhase(.dense_ffn, dense_ffn_phase);
-            self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, hidden_batch_bytes);
 
             // Gemma 4 per-layer output scale: hidden *= scale (applied to the
             // residual stream at the end of each layer). Skipped when the
@@ -22114,7 +22152,7 @@ pub const InferenceEngine = struct {
             const layer_output_scale = self.layer_output_scales[layer_idx];
             if (layer_output_scale != 1.0) {
                 try self.dispatchScaleInPlace(scratch_hidden.handle, scratch_hidden.size, n_tokens * hidden_dim, layer_output_scale);
-                self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, hidden_batch_bytes);
+                self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, all_hidden_batch_bytes);
             }
         }
 
