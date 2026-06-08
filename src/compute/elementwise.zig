@@ -323,6 +323,22 @@ pub const QkNormRopeKvWriteBatchedPush = extern struct {
     v_norm: u32 = 0,
 };
 
+/// Batched full-attention K/V sibling used when Q must keep the precomputed
+/// RoPE frequency buffer binding. It fuses K RMS norm, K RoPE, optional V unit
+/// norm, and paged KV cache write. Q norm/RoPE stays on the existing path.
+pub const KNormRopeKvWriteBatchedPush = extern struct {
+    head_dim: u32,
+    rope_dim: u32,
+    n_k_heads: u32,
+    n_tokens: u32,
+    page_size: u32,
+    base_token: u32,
+    freq_base_bits: u32,
+    attn_scale_bits: u32,
+    eps_bits: u32,
+    v_norm: u32 = 0,
+};
+
 /// Manages element-wise fused kernel pipelines.
 pub const ElementwiseDispatch = struct {
     /// RMS NORM pipeline, or null.
@@ -448,6 +464,10 @@ pub const ElementwiseDispatch = struct {
     /// the KV page table, so this path uses rope_freq_base_swa rather than a
     /// precomputed frequency buffer.
     pipeline_qk_norm_rope_kv_write_batched: ?Pipeline,
+    /// Batched Gemma full-attention K/V sibling. Keeps the precomputed frequency
+    /// buffer binding by leaving Q norm/RoPE separate and fusing only K/V cache
+    /// production into one paged dispatch.
+    pipeline_k_norm_rope_kv_write_batched: ?Pipeline,
     /// Descriptor pool for this dispatch.
     descriptor_pool: vk.c.VkDescriptorPool,
     /// Logical device.
@@ -849,6 +869,12 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const k_norm_rope_kv_write_batched_path = std.fmt.bufPrint(&path_buf, "{s}/k_norm_rope_kv_write_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_k_norm_rope_kv_write_batched = pipeline_mod.createFromSpirvWithOptions(instance, k_norm_rope_kv_write_batched_path, 7, @sizeOf(KNormRopeKvWriteBatchedPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("k_norm_rope_kv_write_batched shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         return ElementwiseDispatch{
             .pipeline_rms_norm = pipeline_rms_norm,
             .pipeline_rms_norm_store_hidden = pipeline_rms_norm_store_hidden,
@@ -898,6 +924,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_rms_norm_dmmv_q4k_alpha_beta = pipeline_rms_norm_dmmv_q4k_alpha_beta,
             .pipeline_qk_norm_rope_kv_write = pipeline_qk_norm_rope_kv_write,
             .pipeline_qk_norm_rope_kv_write_batched = pipeline_qk_norm_rope_kv_write_batched,
+            .pipeline_k_norm_rope_kv_write_batched = pipeline_k_norm_rope_kv_write_batched,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -1427,6 +1454,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_rms_norm_dmmv_q4k_alpha_beta) |*p| p.deinit();
         if (self.pipeline_qk_norm_rope_kv_write) |*p| p.deinit();
         if (self.pipeline_qk_norm_rope_kv_write_batched) |*p| p.deinit();
+        if (self.pipeline_k_norm_rope_kv_write_batched) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }

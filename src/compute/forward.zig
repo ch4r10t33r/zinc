@@ -62,6 +62,7 @@ const RmsNormAddPush = elementwise_mod.RmsNormAddPush;
 const NormRopePush = elementwise_mod.NormRopePush;
 const QkNormRopeKvWritePush = elementwise_mod.QkNormRopeKvWritePush;
 const QkNormRopeKvWriteBatchedPush = elementwise_mod.QkNormRopeKvWriteBatchedPush;
+const KNormRopeKvWriteBatchedPush = elementwise_mod.KNormRopeKvWriteBatchedPush;
 const attn_mod = @import("attention.zig");
 const AttentionDispatch = attn_mod.AttentionDispatch;
 const FlashAttnPush = attn_mod.FlashAttnPush;
@@ -5523,6 +5524,137 @@ pub const InferenceEngine = struct {
             n_tokens,
             1,
         );
+        return true;
+    }
+
+    fn dispatchKNormRopeKvWriteBatched(
+        self: *InferenceEngine,
+        k_buf: vk.c.VkBuffer,
+        k_size: vk.c.VkDeviceSize,
+        k_weight_buf: vk.c.VkBuffer,
+        k_weight_size: vk.c.VkDeviceSize,
+        freq_buf: vk.c.VkBuffer,
+        freq_size: vk.c.VkDeviceSize,
+        page_table_buf: vk.c.VkBuffer,
+        page_table_size: vk.c.VkDeviceSize,
+        kv_k_buf: vk.c.VkBuffer,
+        kv_k_size: vk.c.VkDeviceSize,
+        v_buf: vk.c.VkBuffer,
+        v_size: vk.c.VkDeviceSize,
+        kv_v_buf: vk.c.VkBuffer,
+        kv_v_size: vk.c.VkDeviceSize,
+        head_dim: u32,
+        rope_dim: u32,
+        n_k_heads: u32,
+        n_tokens: u32,
+        page_size: u32,
+        base_token: u32,
+        freq_base: f32,
+        attn_scale: f32,
+        eps: f32,
+        v_norm: bool,
+    ) bool {
+        const pip = &(self.elementwise.pipeline_k_norm_rope_kv_write_batched orelse return false);
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (n_tokens == 0) return false;
+        const push = KNormRopeKvWriteBatchedPush{
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .n_k_heads = n_k_heads,
+            .n_tokens = n_tokens,
+            .page_size = page_size,
+            .base_token = base_token,
+            .freq_base_bits = @bitCast(freq_base),
+            .attn_scale_bits = @bitCast(attn_scale),
+            .eps_bits = @bitCast(eps),
+            .v_norm = if (v_norm) 1 else 0,
+        };
+        self.pushDispatch7(
+            pip,
+            std.mem.asBytes(&push),
+            k_buf,
+            k_size,
+            k_weight_buf,
+            k_weight_size,
+            freq_buf,
+            freq_size,
+            page_table_buf,
+            page_table_size,
+            kv_k_buf,
+            kv_k_size,
+            v_buf,
+            v_size,
+            kv_v_buf,
+            kv_v_size,
+            n_k_heads,
+            n_tokens,
+            1,
+        );
+        return true;
+    }
+
+    fn dispatchGemmaFullAttnKvFusedBatched(
+        self: *InferenceEngine,
+        layer_idx: usize,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        layer_head_dim: u32,
+        layer_rope_dim: u32,
+        layer_n_kv_heads: u32,
+        n_tokens: u32,
+        base_token: u32,
+        eps: f32,
+    ) !bool {
+        const cfg = self.model.config;
+        if (!self.use_fused_qk_kv) return false;
+        if (cfg.architecture != .gemma) return false;
+        if (cfg.rope_freq_base_swa <= 0.0) return false;
+        if (layer_head_dim < cfg.head_dim) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.elementwise.pipeline_k_norm_rope_kv_write_batched == null) return false;
+
+        const lt = self.layer_tensors[layer_idx];
+        if (lt.attn_v != null) return false;
+        const qn = lt.attn_q_norm orelse return false;
+        const kn = lt.attn_k_norm orelse return false;
+
+        const attention_head_norms_phase = self.beginProfilePhase();
+        try self.dispatchRmsNorm(scratch_q.handle, scratch_q.size, qn.gpu_buffer.handle, qn.gpu_buffer.size, scratch_q.handle, scratch_q.size, layer_head_dim, cfg.n_heads * n_tokens, eps);
+        self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
+
+        const attention_kv_write_phase = self.beginProfilePhase();
+        if (!self.dispatchKNormRopeKvWriteBatched(
+            scratch_k.handle,
+            scratch_k.size,
+            kn.gpu_buffer.handle,
+            kn.gpu_buffer.size,
+            self.rope_freq_buf.handle,
+            self.rope_freq_buf.size,
+            self.page_table_buf.handle,
+            self.page_table_buf.size,
+            self.kv_k_cache[layer_idx].handle,
+            self.kv_k_cache[layer_idx].size,
+            scratch_k.handle,
+            scratch_k.size,
+            self.kv_v_cache[layer_idx].handle,
+            self.kv_v_cache[layer_idx].size,
+            layer_head_dim,
+            layer_rope_dim,
+            layer_n_kv_heads,
+            n_tokens,
+            kv_page_size_tokens,
+            base_token,
+            0.0,
+            1.0,
+            eps,
+            true,
+        )) return error.ShaderNotLoaded;
+        self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
+
+        const attention_rope_phase = self.beginProfilePhase();
+        try self.dispatchRopeBatched(scratch_q.handle, scratch_q.size, scratch_q.handle, scratch_q.size, self.rope_freq_buf.handle, self.rope_freq_buf.size, layer_head_dim, layer_rope_dim, cfg.n_heads, base_token, n_tokens, 0.0, 1.0);
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.attention_rope, attention_rope_phase);
         return true;
     }
 
@@ -22190,25 +22322,13 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeBarrier();
             self.endProfilePhase(.attention_norm, attention_norm_phase);
 
-            // Q / K / V projections (weight read once per chunk). On Gemma's
-            // use_k_as_v layers V is the RAW K projection (pre-norm, pre-rope),
-            // unit-normed per head. Instead of a second K projection we fuse
-            // the copy with the unit-norm: dispatchRmsNorm reads scratch_k and
-            // writes scratch_v. For non-use_k_as_v Gemma layers V has its own
-            // projection; unit-norm is in place.
+            // Q/K/V projections, with Gemma full-attn layers reusing K as raw V.
             const attention_qkv_phase = self.beginProfilePhase();
             try self.dispatchGemmaQkvProjectionsBatched(q_t, k_t, v_t_opt, scratch_norm, scratch_q, scratch_k, scratch_v, layer_q_dim, layer_kv_dim, hidden_dim, n_tokens);
             self.decode_cmd.computeBarrier();
             self.endProfilePhase(.attention_qkv, attention_qkv_phase);
 
-            // Optional per-head Q/K norms (Qwen3 style). Dispatch one workgroup per
-            // (token, head) slot — rms_norm_mul handles this via group_id * head_dim.
-            // Gemma 4 also applies a plain (unit-weight) RMS norm to V per head —
-            // matches per-token runDecodeStep and forward_metal.zig. For use_k_as_v
-            // the unit-norm reads from scratch_k (raw K proj) → scratch_v, doing
-            // the K→V copy and the norm in one pass — but it must finish before
-            // K norm overwrites scratch_k, so place it AHEAD of K norm with a
-            // compute barrier between them.
+            // Per-head Q/K norms, plus Gemma's unit V norm before K is overwritten.
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
             const layer_is_swa_rope = cfg.architecture == .gemma and
                 cfg.rope_freq_base_swa > 0 and
@@ -22271,63 +22391,66 @@ pub const InferenceEngine = struct {
             }
 
             if (!fused_qk_rope_kv) {
-                const have_head_norms = apply_v_unit_norm or lt.attn_q_norm != null or lt.attn_k_norm != null;
-                const attention_head_norms_phase = if (have_head_norms) self.beginProfilePhase() else null;
-                if (apply_v_unit_norm) {
-                    const v_src_for_norm = if (use_k_as_v) scratch_k else scratch_v;
-                    try self.dispatchRmsNorm(v_src_for_norm.handle, v_src_for_norm.size, self.unit_norm_weights.handle, self.unit_norm_weights.size, scratch_v.handle, scratch_v.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
-                    if (use_k_as_v) self.decode_cmd.computeBarrier();
-                }
-                if (lt.attn_q_norm) |qn| {
-                    try self.dispatchRmsNorm(scratch_q.handle, scratch_q.size, qn.gpu_buffer.handle, qn.gpu_buffer.size, scratch_q.handle, scratch_q.size, layer_head_dim, cfg.n_heads * n_tokens, eps);
-                }
-                if (lt.attn_k_norm) |kn| {
-                    try self.dispatchRmsNorm(scratch_k.handle, scratch_k.size, kn.gpu_buffer.handle, kn.gpu_buffer.size, scratch_k.handle, scratch_k.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
-                }
-                if (lt.attn_q_norm != null or lt.attn_k_norm != null or apply_v_unit_norm) self.decode_cmd.computeBarrier();
-                if (have_head_norms) self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
+                const fused_full_kv = try self.dispatchGemmaFullAttnKvFusedBatched(layer_idx, scratch_q, scratch_k, layer_head_dim, layer_rope_dim, layer_n_kv_heads, n_tokens, base_token, eps);
+                if (!fused_full_kv) {
+                    const have_head_norms = apply_v_unit_norm or lt.attn_q_norm != null or lt.attn_k_norm != null;
+                    const attention_head_norms_phase = if (have_head_norms) self.beginProfilePhase() else null;
+                    if (apply_v_unit_norm) {
+                        const v_src_for_norm = if (use_k_as_v) scratch_k else scratch_v;
+                        try self.dispatchRmsNorm(v_src_for_norm.handle, v_src_for_norm.size, self.unit_norm_weights.handle, self.unit_norm_weights.size, scratch_v.handle, scratch_v.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
+                        if (use_k_as_v) self.decode_cmd.computeBarrier();
+                    }
+                    if (lt.attn_q_norm) |qn| {
+                        try self.dispatchRmsNorm(scratch_q.handle, scratch_q.size, qn.gpu_buffer.handle, qn.gpu_buffer.size, scratch_q.handle, scratch_q.size, layer_head_dim, cfg.n_heads * n_tokens, eps);
+                    }
+                    if (lt.attn_k_norm) |kn| {
+                        try self.dispatchRmsNorm(scratch_k.handle, scratch_k.size, kn.gpu_buffer.handle, kn.gpu_buffer.size, scratch_k.handle, scratch_k.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
+                    }
+                    if (lt.attn_q_norm != null or lt.attn_k_norm != null or apply_v_unit_norm) self.decode_cmd.computeBarrier();
+                    if (have_head_norms) self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
 
-                // Batched RoPE for Q and K. position_base = state.position so a
-                // prefix-reuse call rotates the newly-added tokens at the correct
-                // sequence positions (base_token, base_token+1, ..., base_token+N-1).
-                // Gemma 4 picks the RoPE frequency source per layer:
-                //   - Global (full-attn) layers use precomputed rope_freq_buf
-                //     with rope_freqs.weight factors pre-baked. Signal buffer
-                //     use by passing freq_base=0 (shader reads inv_freq[]).
-                //   - SWA layers use a DIFFERENT base (rope_freq_base_swa) and
-                //     compute the frequency on the fly.
-                // For non-Gemma architectures the existing behavior stands:
-                // cfg.rope_freq_base with the shipped rope_freq_buf.
-                const attention_rope_phase = self.beginProfilePhase();
-                try self.dispatchRopeBatched(scratch_q.handle, scratch_q.size, scratch_q.handle, scratch_q.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, cfg.n_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
-                try self.dispatchRopeBatched(scratch_k.handle, scratch_k.size, scratch_k.handle, scratch_k.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, layer_n_kv_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
-                self.decode_cmd.computeBarrier();
-                self.endProfilePhase(.attention_rope, attention_rope_phase);
+                    // Batched RoPE for Q and K. position_base = state.position so a
+                    // prefix-reuse call rotates the newly-added tokens at the correct
+                    // sequence positions (base_token, base_token+1, ..., base_token+N-1).
+                    // Gemma 4 picks the RoPE frequency source per layer:
+                    //   - Global (full-attn) layers use precomputed rope_freq_buf
+                    //     with rope_freqs.weight factors pre-baked. Signal buffer
+                    //     use by passing freq_base=0 (shader reads inv_freq[]).
+                    //   - SWA layers use a DIFFERENT base (rope_freq_base_swa) and
+                    //     compute the frequency on the fly.
+                    // For non-Gemma architectures the existing behavior stands:
+                    // cfg.rope_freq_base with the shipped rope_freq_buf.
+                    const attention_rope_phase = self.beginProfilePhase();
+                    try self.dispatchRopeBatched(scratch_q.handle, scratch_q.size, scratch_q.handle, scratch_q.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, cfg.n_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
+                    try self.dispatchRopeBatched(scratch_k.handle, scratch_k.size, scratch_k.handle, scratch_k.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, layer_n_kv_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
+                    self.decode_cmd.computeBarrier();
+                    self.endProfilePhase(.attention_rope, attention_rope_phase);
 
-                // Batched KV cache write: one compute dispatch writes all N tokens'
-                // K/V into their paged cache slots via the page_table_buf lookup.
-                // base_token places the write after the existing prefix. V was
-                // populated from its own projection (or from a duplicate K projection
-                // when use_k_as_v) and, for Gemma 4, unit-normed — always use scratch_v.
-                const attention_kv_write_phase = self.beginProfilePhase();
-                try self.dispatchKvCacheWriteBatched(
-                    scratch_k.handle,
-                    scratch_k.size,
-                    self.kv_k_cache[layer_idx].handle,
-                    self.kv_k_cache[layer_idx].size,
-                    scratch_v.handle,
-                    scratch_v.size,
-                    self.kv_v_cache[layer_idx].handle,
-                    self.kv_v_cache[layer_idx].size,
-                    self.page_table_buf.handle,
-                    self.page_table_buf.size,
-                    layer_kv_dim,
-                    n_tokens,
-                    kv_page_size_tokens,
-                    base_token,
-                );
-                self.decode_cmd.computeBarrier();
-                self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
+                    // Batched KV cache write: one compute dispatch writes all N tokens'
+                    // K/V into their paged cache slots via the page_table_buf lookup.
+                    // base_token places the write after the existing prefix. V was
+                    // populated from its own projection (or from a duplicate K projection
+                    // when use_k_as_v) and, for Gemma 4, unit-normed — always use scratch_v.
+                    const attention_kv_write_phase = self.beginProfilePhase();
+                    try self.dispatchKvCacheWriteBatched(
+                        scratch_k.handle,
+                        scratch_k.size,
+                        self.kv_k_cache[layer_idx].handle,
+                        self.kv_k_cache[layer_idx].size,
+                        scratch_v.handle,
+                        scratch_v.size,
+                        self.kv_v_cache[layer_idx].handle,
+                        self.kv_v_cache[layer_idx].size,
+                        self.page_table_buf.handle,
+                        self.page_table_buf.size,
+                        layer_kv_dim,
+                        n_tokens,
+                        kv_page_size_tokens,
+                        base_token,
+                    );
+                    self.decode_cmd.computeBarrier();
+                    self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
+                }
             }
 
             // Batched causal flash attention: N queries over the KV cache.

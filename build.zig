@@ -261,6 +261,7 @@ pub fn build(b: *std.Build) void {
         "rms_norm_dmmv_q4k_alpha_beta",
         "qk_norm_rope_kv_write",
         "qk_norm_rope_kv_write_batched",
+        "k_norm_rope_kv_write_batched",
         // Effort-6 GEMM port: tiled Q4_K dense GEMM (Step 1) for LM head
         // and per-expert count helper (Step 3). The MUL_MAT_ID gather
         // (mul_mm_id_q4k) and Q8_1-activation variant (mul_mmq_q4k) were
