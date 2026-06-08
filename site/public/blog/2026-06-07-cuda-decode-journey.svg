@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1724"/>
+      <stop offset="1" stop-color="#18251f"/>
+    </linearGradient>
+    <linearGradient id="zinc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38d7ff"/>
+      <stop offset="1" stop-color="#58e6a9"/>
+    </linearGradient>
+    <linearGradient id="zincmute" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2a6b86"/>
+      <stop offset="1" stop-color="#2f7a63"/>
+    </linearGradient>
+    <linearGradient id="llama" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8c98a8"/>
+      <stop offset="1" stop-color="#c2c9d4"/>
+    </linearGradient>
+    <style>
+      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .subtitle { fill: #aebdcc; font-size: 15px; }
+      .axis { fill: #8595a8; font-size: 13px; }
+      .label { fill: #e8f1f8; font-size: 17px; font-weight: 720; }
+      .sub { fill: #9fb0c0; font-size: 13px; }
+      .value { fill: #07111d; font-size: 19px; font-weight: 820; }
+      .valueOut { fill: #f6fbff; font-size: 19px; font-weight: 820; }
+      .beat { fill: #ffd86b; font-size: 14px; font-weight: 760; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">From "no device" to past llama.cpp</text>
+  <text x="56" y="94" class="subtitle">Qwen3.5-9B Q4_K_M decode, RTX 4090, same model file as llama.cpp. Each plateau had a different cause.</text>
+
+  <g transform="translate(56,132)">
+    <rect width="1088" height="540" rx="10" fill="#111c2a" stroke="#344458"/>
+
+    <g transform="translate(300,70)">
+      <!-- axis -->
+      <text x="0" y="-22" class="axis">0</text>
+      <text x="325" y="-22" class="axis">50</text>
+      <text x="650" y="-22" class="axis">100 tok/s</text>
+      <line x1="0" y1="-8" x2="0" y2="420" stroke="#263548"/>
+      <line x1="325" y1="-8" x2="325" y2="420" stroke="#263548" stroke-dasharray="4 6"/>
+      <line x1="650" y1="-8" x2="650" y2="420" stroke="#263548" stroke-dasharray="4 6"/>
+
+      <!-- llama "line to beat" at 97 -> 630.5px -->
+      <line x1="630" y1="-8" x2="630" y2="430" stroke="#ffd86b" stroke-width="2" stroke-dasharray="6 6" opacity="0.9"/>
+      <text x="636" y="446" class="beat">llama.cpp = 97 tok/s (the line to beat)</text>
+
+      <!-- bar 1: correctness-first ~22 -> 143px -->
+      <rect x="0" y="14" width="143" height="58" rx="6" fill="url(#zincmute)"/>
+      <text x="155" y="49" class="valueOut">~22</text>
+      <text x="-16" y="40" text-anchor="end" class="label">correctness-first</text>
+      <text x="-16" y="60" text-anchor="end" class="sub">~65 syncs/token, sync-bound</text>
+
+      <!-- bar 2: *_fast ~66 -> 429px, bimodal low ~22 -->
+      <rect x="0" y="114" width="429" height="58" rx="6" fill="url(#zinc)" opacity="0.55"/>
+      <rect x="0" y="114" width="143" height="58" rx="6" fill="url(#zinc)"/>
+      <line x1="143" y1="108" x2="143" y2="178" stroke="#0f1724" stroke-width="2"/>
+      <text x="441" y="149" class="valueOut">~66</text>
+      <text x="-16" y="140" text-anchor="end" class="label">*_fast matvecs wired</text>
+      <text x="-16" y="160" text-anchor="end" class="sub">bimodal ~66 / ~22, boost-starved</text>
+
+      <!-- bar 3: async ring ~104 -> 676px (crosses 630) -->
+      <rect x="0" y="214" width="676" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="640" y="249" class="value">~104</text>
+      <text x="-16" y="240" text-anchor="end" class="label">async stream / event ring</text>
+      <text x="-16" y="260" text-anchor="end" class="sub">1 submit/token, holds full clock</text>
+
+      <!-- bar 4: llama 97 -> 630px -->
+      <rect x="0" y="314" width="630" height="58" rx="6" fill="url(#llama)"/>
+      <text x="594" y="349" class="value">97</text>
+      <text x="-16" y="340" text-anchor="end" class="label">llama.cpp CUDA</text>
+      <text x="-16" y="360" text-anchor="end" class="sub">reference, same GGUF file</text>
+    </g>
+  </g>
+</svg>

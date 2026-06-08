@@ -208,6 +208,33 @@ pub const Model = struct {
     }
 };
 
+/// Inspect a GGUF model's config without uploading any weights to the GPU.
+/// mmaps the file, parses the header, extracts the `ModelConfig`, then unmaps —
+/// used by `zinc --check` to report architecture/dims on the CUDA backend.
+/// @param path Filesystem path to the GGUF model.
+/// @param allocator Owns the transient GGUF metadata (freed before returning).
+/// @returns The parsed `ModelConfig`.
+pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    const mmap_data = try std.posix.mmap(
+        null,
+        stat.size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    defer std.posix.munmap(mmap_data);
+
+    var gf = try gguf.parse(mmap_data, allocator);
+    defer gf.deinit();
+
+    return extractConfigWithLogging(&gf, false);
+}
+
 // ===========================================================================
 // Config extraction — copied verbatim from loader_metal.zig:102-294.
 // Pure GGUF metadata reads (no backend dependency): reads "{arch}.block_count",

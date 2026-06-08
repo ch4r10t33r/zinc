@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1724"/>
+      <stop offset="1" stop-color="#18251f"/>
+    </linearGradient>
+    <linearGradient id="zinc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38d7ff"/>
+      <stop offset="1" stop-color="#58e6a9"/>
+    </linearGradient>
+    <linearGradient id="zincmute" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2a6b86"/>
+      <stop offset="1" stop-color="#2f7a63"/>
+    </linearGradient>
+    <style>
+      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .subtitle { fill: #aebdcc; font-size: 15px; }
+      .axis { fill: #8595a8; font-size: 13px; }
+      .label { fill: #e8f1f8; font-size: 17px; font-weight: 720; }
+      .sub { fill: #9fb0c0; font-size: 13px; }
+      .value { fill: #07111d; font-size: 19px; font-weight: 820; }
+      .valueOut { fill: #f6fbff; font-size: 19px; font-weight: 820; }
+      .peak { fill: #ff9d6b; font-size: 14px; font-weight: 760; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">The matvecs became bandwidth-bound</text>
+  <text x="56" y="94" class="subtitle">RTX 5090, % of the 1792 GB/s memory-bandwidth peak. The naive kernel re-read each Q4_K header 256x per block.</text>
+
+  <g transform="translate(56,132)">
+    <rect width="1088" height="540" rx="10" fill="#111c2a" stroke="#344458"/>
+
+    <g transform="translate(320,70)">
+      <!-- axis 0..100% over 700px -->
+      <text x="0" y="-22" class="axis">0</text>
+      <text x="350" y="-22" class="axis">50%</text>
+      <text x="700" y="-22" class="axis">100% = 1792 GB/s</text>
+      <line x1="0" y1="-8" x2="0" y2="420" stroke="#263548"/>
+      <line x1="350" y1="-8" x2="350" y2="420" stroke="#263548" stroke-dasharray="4 6"/>
+
+      <!-- peak line at 100% -> 700px -->
+      <line x1="700" y1="-8" x2="700" y2="430" stroke="#ff9d6b" stroke-width="2" stroke-dasharray="6 6" opacity="0.9"/>
+      <text x="700" y="446" text-anchor="end" class="peak">hardware peak</text>
+
+      <!-- naive 13% -> 91px -->
+      <rect x="0" y="14" width="91" height="58" rx="6" fill="url(#zincmute)"/>
+      <text x="103" y="49" class="valueOut">~13%</text>
+      <text x="-16" y="40" text-anchor="end" class="label">naive dmmv_q4k</text>
+      <text x="-16" y="60" text-anchor="end" class="sub">header re-read per element</text>
+
+      <!-- q4k_fast 72% -> 504px -->
+      <rect x="0" y="114" width="504" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="468" y="149" class="value">72%</text>
+      <text x="-16" y="140" text-anchor="end" class="label">dmmv_q4k_fast</text>
+      <text x="-16" y="160" text-anchor="end" class="sub">header once, float4 loads</text>
+
+      <!-- q6k_fast 85% -> 595px -->
+      <rect x="0" y="214" width="595" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="559" y="249" class="value">85%</text>
+      <text x="-16" y="240" text-anchor="end" class="label">dmmv_q6k_fast</text>
+      <text x="-16" y="260" text-anchor="end" class="sub">the real Q6_K LM head</text>
+
+      <!-- autotuned 90% -> 630px -->
+      <rect x="0" y="314" width="630" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="594" y="349" class="value">90%</text>
+      <text x="-16" y="340" text-anchor="end" class="label">autotuned block=64</text>
+      <text x="-16" y="360" text-anchor="end" class="sub">1613 GB/s, Q6_K LM head</text>
+    </g>
+  </g>
+</svg>

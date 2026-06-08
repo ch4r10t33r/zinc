@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1724"/>
+      <stop offset="1" stop-color="#18251f"/>
+    </linearGradient>
+    <linearGradient id="zinc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38d7ff"/>
+      <stop offset="1" stop-color="#58e6a9"/>
+    </linearGradient>
+    <linearGradient id="cold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b6b80"/>
+      <stop offset="1" stop-color="#3a475a"/>
+    </linearGradient>
+    <style>
+      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .subtitle { fill: #aebdcc; font-size: 15px; }
+      .panelTitle { fill: #f6fbff; font-size: 20px; font-weight: 760; }
+      .small { fill: #aebdcc; font-size: 13px; }
+      .axis { fill: #8595a8; font-size: 12px; }
+      .label { fill: #e8f1f8; font-size: 15px; font-weight: 700; }
+      .big { fill: #f6fbff; font-size: 30px; font-weight: 820; }
+      .bigCold { fill: #c2ccd8; font-size: 30px; font-weight: 820; }
+      .tag { fill: #07111d; font-size: 16px; font-weight: 800; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">The bottleneck was the clock, not the kernel</text>
+  <text x="56" y="94" class="subtitle">Per-token syncs let the RTX 5090 drop its boost. Removing them fixed throughput and clock at once.</text>
+
+  <!-- LEFT PANEL: SM clock -->
+  <g transform="translate(56,132)">
+    <rect width="512" height="540" rx="10" fill="#111c2a" stroke="#344458"/>
+    <text x="28" y="44" class="panelTitle">SM clock under load</text>
+    <text x="28" y="70" class="small">Median MHz, same GPU and model.</text>
+
+    <g transform="translate(60,470)">
+      <!-- baseline -->
+      <line x1="0" y1="0" x2="400" y2="0" stroke="#263548"/>
+      <text x="-10" y="4" text-anchor="end" class="axis">0</text>
+      <text x="-10" y="-160" text-anchor="end" class="axis">1200</text>
+      <text x="-10" y="-320" text-anchor="end" class="axis">2400</text>
+      <line x1="0" y1="-160" x2="400" y2="-160" stroke="#1d2a3a" stroke-dasharray="3 6"/>
+      <line x1="0" y1="-320" x2="400" y2="-320" stroke="#1d2a3a" stroke-dasharray="3 6"/>
+
+      <!-- sync-bound decode 525 MHz -> 70px -->
+      <rect x="40" y="-70" width="120" height="70" rx="5" fill="url(#cold)"/>
+      <text x="100" y="-82" text-anchor="middle" class="bigCold">525</text>
+      <text x="100" y="26" text-anchor="middle" class="label">sync-bound</text>
+      <text x="100" y="44" text-anchor="middle" class="small">decode</text>
+
+      <!-- sustained prefill 2520 MHz -> 336px -->
+      <rect x="240" y="-336" width="120" height="336" rx="5" fill="url(#zinc)"/>
+      <text x="300" y="-348" text-anchor="middle" class="big">2520</text>
+      <text x="300" y="26" text-anchor="middle" class="label">sustained</text>
+      <text x="300" y="44" text-anchor="middle" class="small">prefill</text>
+
+      <text x="200" y="-300" text-anchor="middle" class="small" fill="#ffd86b">~4.8x</text>
+    </g>
+  </g>
+
+  <!-- RIGHT PANEL: command pattern -->
+  <g transform="translate(632,132)">
+    <rect width="512" height="540" rx="10" fill="#111c2a" stroke="#344458"/>
+    <text x="28" y="44" class="panelTitle">Commands per decode token</text>
+    <text x="28" y="70" class="small">CPU blocking, per generated token.</text>
+
+    <!-- sync-bound row: many blocking syncs -->
+    <text x="28" y="150" class="label">sync-bound: ~65 commitAndWait</text>
+    <text x="28" y="172" class="small">CPU blocks ~45 ms/token waiting on the GPU</text>
+    <g transform="translate(28,190)">
+      <!-- 24 segments to visually stand in for ~65 blocking syncs -->
+      <g fill="url(#cold)">
+        <rect x="0" y="0" width="13" height="40" rx="2"/><rect x="19" y="0" width="13" height="40" rx="2"/><rect x="38" y="0" width="13" height="40" rx="2"/><rect x="57" y="0" width="13" height="40" rx="2"/><rect x="76" y="0" width="13" height="40" rx="2"/><rect x="95" y="0" width="13" height="40" rx="2"/><rect x="114" y="0" width="13" height="40" rx="2"/><rect x="133" y="0" width="13" height="40" rx="2"/><rect x="152" y="0" width="13" height="40" rx="2"/><rect x="171" y="0" width="13" height="40" rx="2"/><rect x="190" y="0" width="13" height="40" rx="2"/><rect x="209" y="0" width="13" height="40" rx="2"/><rect x="228" y="0" width="13" height="40" rx="2"/><rect x="247" y="0" width="13" height="40" rx="2"/><rect x="266" y="0" width="13" height="40" rx="2"/><rect x="285" y="0" width="13" height="40" rx="2"/><rect x="304" y="0" width="13" height="40" rx="2"/><rect x="323" y="0" width="13" height="40" rx="2"/><rect x="342" y="0" width="13" height="40" rx="2"/><rect x="361" y="0" width="13" height="40" rx="2"/><rect x="380" y="0" width="13" height="40" rx="2"/><rect x="399" y="0" width="13" height="40" rx="2"/><rect x="418" y="0" width="13" height="40" rx="2"/><rect x="437" y="0" width="13" height="40" rx="2"/>
+      </g>
+    </g>
+
+    <!-- arrow -->
+    <text x="256" y="300" text-anchor="middle" class="big" fill="#ffd86b">65 &#8594; 1</text>
+
+    <!-- async row: one submit -->
+    <text x="28" y="372" class="label">async ring: 1 submit</text>
+    <text x="28" y="394" class="small">commitAsync onto one ordered CUstream; CPU never blocks</text>
+    <g transform="translate(28,412)">
+      <rect width="456" height="40" rx="5" fill="url(#zinc)"/>
+      <text x="228" y="26" class="tag">1 &#215; async submit / token</text>
+    </g>
+
+    <text x="28" y="500" class="small">Result: bimodal 22&#8211;66 &#8594; steady 98&#8211;104 tok/s, correctness unchanged.</text>
+  </g>
+</svg>

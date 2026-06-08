@@ -37,7 +37,9 @@ CudaCtx* cuda_init(int device_index) {
     if (!inited) { if (!cu_ok(cuInit(0), "cuInit")) return NULL; inited = 1; }
     CudaCtx* c = (CudaCtx*)calloc(1, sizeof *c);
     if (!c) { set_err("cuda_init", "oom"); return NULL; }
-    if (!cu_ok(cuDeviceGet(&c->dev, device_index), "cuDeviceGet")) { free(c); return NULL; }
+    // Silent on failure: callers (e.g. initBest) probe ascending ordinals to
+    // enumerate devices, so an out-of-range index here is expected, not an error.
+    if (cuDeviceGet(&c->dev, device_index) != CUDA_SUCCESS) { free(c); return NULL; }
     // Use the device's primary context (shared with the runtime API).
     if (!cu_ok(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "cuDevicePrimaryCtxRetain")) { free(c); return NULL; }
     if (!cu_ok(cuCtxSetCurrent(c->ctx), "cuCtxSetCurrent")) { free(c); return NULL; }

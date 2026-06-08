@@ -87,6 +87,7 @@ pub const entries = [_]CatalogEntry{
             "amd-rdna4-32gb",
             apple_silicon_profile,
             "intel-arc",
+            nvidia_cuda_profile,
         },
     },
     .{
@@ -110,6 +111,7 @@ pub const entries = [_]CatalogEntry{
             "amd-rdna4-32gb",
             apple_silicon_profile,
             "intel-arc",
+            nvidia_cuda_profile,
         },
     },
     .{
@@ -134,6 +136,7 @@ pub const entries = [_]CatalogEntry{
             "amd-rdna4-16gb",
             apple_silicon_profile,
             "intel-arc",
+            nvidia_cuda_profile,
         },
     },
     .{
@@ -157,6 +160,7 @@ pub const entries = [_]CatalogEntry{
             "amd-rdna4-32gb",
             apple_silicon_profile,
             "intel-arc",
+            nvidia_cuda_profile,
         },
     },
     .{
@@ -182,6 +186,7 @@ pub const entries = [_]CatalogEntry{
             "amd-rdna4-32gb",
             apple_silicon_profile,
             "intel-arc",
+            nvidia_cuda_profile,
         },
     },
 };
@@ -270,6 +275,16 @@ pub fn profileForGpu(config: gpu_detect.GpuConfig) []const u8 {
 /// Return the catalog profile string for Apple Silicon Metal devices.
 pub fn profileForMetal() []const u8 {
     return apple_silicon_profile;
+}
+
+/// Shared GPU profile string used for all NVIDIA (CUDA) devices.
+pub const nvidia_cuda_profile = "nvidia-cuda";
+
+/// Return the catalog profile string for NVIDIA CUDA devices. The CUDA backend
+/// does not split by VRAM tier the way Vulkan/RDNA4 does — fit is decided by the
+/// live `freeMemory()` budget — so a single profile string is sufficient.
+pub fn profileForCuda() []const u8 {
+    return nvidia_cuda_profile;
 }
 
 /// Return whether the entry has been tested on the given GPU profile.

@@ -63,10 +63,13 @@ fi
 # and the master auto-reconnects if the tailnet path flaps. Keep ControlPath short
 # and out of $TMPDIR — macOS $TMPDIR overruns the 104-char Unix-socket limit.
 CTL="/tmp/.gpumon-$(id -u)-%C"
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8
-     -o ServerAliveInterval=5 -o ServerAliveCountMax=2
+# Keepalive is deliberately lenient (60s, not 10s): when the node is busy (e.g. a
+# 35B model loaded), responses lag and a tight ServerAlive kills the mux master
+# mid-command ("broken pipe"). 60s tolerates a slow node without false drops.
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15
+     -o ServerAliveInterval=10 -o ServerAliveCountMax=6
      -o ControlMaster=auto -o ControlPersist=30 -o ControlPath="$CTL")
-SCP=(scp -o BatchMode=yes -o ConnectTimeout=8
+SCP=(scp -o BatchMode=yes -o ConnectTimeout=15
      -o ControlMaster=auto -o ControlPersist=30 -o ControlPath="$CTL")
 
 QUERY='index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit'
@@ -111,8 +114,14 @@ log_rows() {
     { print ts, h, $1, $2, $3, $4, $5, $6, $7, $8, $9 }' >>"$LOGFILE"
 }
 
-frame() {                       # one poll; echoes raw CSV, returns ssh status
-  "${SSH[@]}" "$NODE" "$REMOTE_CMD" 2>/dev/null
+frame() {                       # one poll; echoes raw CSV. Falls back to a direct
+                                # (non-mux) connection if the control master is wedged
+                                # — happens when the node is too memory-starved to
+                                # stand up a multiplexed session but plain ssh still works.
+  local out
+  out="$("${SSH[@]}" "$NODE" "$REMOTE_CMD" 2>/dev/null)"
+  [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$NODE" "$REMOTE_CMD" 2>/dev/null
 }
 
 # --- remote logging: a detached nvidia-smi logger that lives ON the node -------
