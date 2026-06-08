@@ -16,9 +16,45 @@ const std = @import("std");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 const forward = @import("compute/forward_cuda.zig");
+const forwardgemma = @import("compute/forward_cuda_gemma.zig");
 const pipeline = @import("cuda/pipeline.zig");
 const buffer = @import("cuda/buffer.zig");
 const command = @import("cuda/command.zig");
+
+/// Drives either the qwen35/qwen36 (`ForwardCuda`) or gemma4 (`ForwardGemma`)
+/// decode engine, selected from the model architecture. Both expose the same
+/// `decodeStep`/`readLogits`/`d.vocab` shape, so gen + logit validation is
+/// uniform across the whole 5-model catalog.
+const Engine = union(enum) {
+    qwen: forward.ForwardCuda,
+    gemma: forwardgemma.ForwardGemma,
+
+    fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !Engine {
+        if (model.config.architecture == .gemma)
+            return .{ .gemma = try forwardgemma.ForwardGemma.init(allocator, model, max_ctx) };
+        return .{ .qwen = try forward.ForwardCuda.init(allocator, model, max_ctx) };
+    }
+    fn deinit(self: *Engine) void {
+        switch (self.*) {
+            inline else => |*e| e.deinit(),
+        }
+    }
+    fn decodeStep(self: *Engine, token: u32, pos: u32, run_layers: bool) !u32 {
+        switch (self.*) {
+            inline else => |*e| return e.decodeStep(token, pos, run_layers),
+        }
+    }
+    fn readLogits(self: *Engine, out: []f32) void {
+        switch (self.*) {
+            inline else => |*e| e.readLogits(out),
+        }
+    }
+    fn vocab(self: *const Engine) u32 {
+        switch (self.*) {
+            inline else => |*e| return e.d.vocab,
+        }
+    }
+};
 
 const DEFAULT_MODEL = "/home/agent-zinc/workspace/Qwen3.5-9B-Q4_K_M.gguf";
 
@@ -100,7 +136,7 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     defer dev.deinit();
     var model = try loader.Model.load(allocator, dev.ctx, model_path);
     defer model.deinit();
-    var fwd = try forward.ForwardCuda.init(allocator, &model, 512);
+    var fwd = try Engine.init(allocator, &model, 512);
     defer fwd.deinit();
 
     std.debug.print("PROMPT_IDS:", .{});
@@ -244,10 +280,10 @@ fn logitsMode(allocator: std.mem.Allocator, token: u32, out_path: []const u8, mo
     defer dev.deinit();
     var model = try loader.Model.load(allocator, dev.ctx, model_path);
     defer model.deinit();
-    var fwd = try forward.ForwardCuda.init(allocator, &model, 512);
+    var fwd = try Engine.init(allocator, &model, 512);
     defer fwd.deinit();
 
-    const vocab = fwd.d.vocab;
+    const vocab = fwd.vocab();
     const buf = try allocator.alloc(f32, vocab);
     defer allocator.free(buf);
     _ = try fwd.decodeStep(token, 0, true);
