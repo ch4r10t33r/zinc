@@ -609,7 +609,8 @@ pub const ForwardCuda = struct {
             self.dmmvDispatch(&cmd, wrouter, &self.ffn_norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
             const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
             cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
-            cmd.commitAndWait();
+            cmd.commitAndWait(); // sync: the host reads the chosen expert ids next
+            self.drainPending(); // stream drained → free any async attn/ssm/prior-layer ops
         }
 
         // Download the chosen expert ids (host gather of the slot→expert map).
@@ -637,7 +638,7 @@ pub const ForwardCuda = struct {
             // weighted combine of the k slot outputs into hidden.
             const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
             cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
-            cmd.commitAndWait();
+            self.submit(cmd); // async: no host read-back until the next layer's router
         }
 
         // --- Shared expert: gate/up/SwiGLU/down, scaled by sigmoid(gate logit).
@@ -658,7 +659,7 @@ pub const ForwardCuda = struct {
             self.dmmvDispatch(&cmd, wds, &self.swiglu_buf, &self.down_buf, d.n_embd, sf, 0, 0);
             const ss = SigmoidAccPush{ .N = d.n_embd };
             cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.gate_scalar_buf }, &ss, @sizeOf(SigmoidAccPush), 0);
-            cmd.commitAndWait();
+            self.submit(cmd); // async: deferred like the dense path
         }
     }
 
@@ -683,11 +684,13 @@ pub const ForwardCuda = struct {
     /// commitAndWait drains the stream and `drainPending` frees the events. This
     /// removes the ~0.4 ms/op WSL2 CPU↔GPU sync round-trip (and the boost-
     /// starvation those idle gaps cause — see Effort 21 Cycles 7–8). MoE layers
-    /// keep the synchronous path: routing reads the expert ids back to the host
-    /// mid-block, so they cannot be deferred.
+    /// also pipeline now: only the per-layer router stays synchronous (it reads
+    /// the chosen expert ids back to the host mid-block); the routed + shared
+    /// expert commands defer like the dense path, so a MoE token drops from
+    /// ~4 syncs/layer to 1 (the router) — recovering the starved GPU boost.
     fn submit(self: *ForwardCuda, cmd: command.CudaCommand) void {
         var c = cmd;
-        if (self.d.n_experts == 0 and self.n_pending < self.pending.len) {
+        if (self.n_pending < self.pending.len) {
             c.commitAsync();
             self.pending[self.n_pending] = c;
             self.n_pending += 1;
