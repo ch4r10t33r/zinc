@@ -2629,6 +2629,9 @@ async function buildCudaCreds(args) {
     // blackholed (SYN dropped), so the llama-server bind + its health/API curls
     // must use a 127.99.x.x address. Overridable via ZINC_CUDA_LOOPBACK_HOST.
     loopbackHost: args.cudaLoopbackHost ?? process.env.ZINC_CUDA_LOOPBACK_HOST ?? "127.99.0.1",
+    // The box's zig lives at ~/zig-0.15.2/zig and is not on the non-interactive
+    // SSH PATH; use the absolute path for the build. Overridable via ZINC_CUDA_ZIG.
+    zig: process.env.ZINC_CUDA_ZIG ?? `${remoteHome}/zig-0.15.2/zig`,
     gpuUuid,
     modelRoot,
     llamaServerOverride,
@@ -2672,7 +2675,7 @@ async function prepareCuda(args, creds) {
     // CUDA kernels are NVRTC-compiled at runtime for the visible GPU's compute
     // capability, so shader precompilation is off (-Dshaders=false) and one
     // build runs on any visible NVIDIA GPU.
-    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
+    const buildArgs = [creds.zig ?? "zig", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
     if (args.cudaSync) {
       const syncedProvenance = await captureGitProvenance(ROOT);
       if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
