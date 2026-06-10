@@ -157,6 +157,53 @@ extern "C" __global__ void rms_norm_residual(const float* x, const float* w, flo
     }
 }
 
+// ---- rms_norm_rope ----------------------------------------------------------
+// Fused gemma per-head Q/K norm + RoPE: collapses the (per-head rms_norm ->
+// rope) pair into ONE launch, dropping a full head_dim write+read round-trip of
+// the normalized head. Bit-identical to the two-kernel path: same rms (weight
+// shared across heads, applied per head_dim), then NEOX partial rope from the
+// layer's inv_freq table with attn_scale=1.0 (the gemma q/k rope path always
+// uses freq_base_bits==0 / attn_scale_bits==0). One block per head; the
+// normalized head is staged in dynamic shared memory (head_dim floats) so the
+// rope pair-reads see the post-norm values regardless of x/y aliasing.
+struct RmsRopePush { unsigned head_dim; float eps; unsigned rope_dim; unsigned position; };
+
+extern "C" __global__ void rms_norm_rope(const float* x, const float* w, const float* inv_freq, float* y, RmsRopePush pc) {
+    unsigned head = blockIdx.x;
+    const float* xt = x + (size_t)head * pc.head_dim;
+    float* yt = y + (size_t)head * pc.head_dim;
+    extern __shared__ float sh[]; // pc.head_dim normalized values
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.head_dim; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.head_dim + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < pc.head_dim; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pc.position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < pc.head_dim; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
 // ---- dmmv_q4k (port of dmmv_q4k.comp) ---------------------------------------
 // y[row] = sum_k dequant(W[row][k]) * x[k], W in Q4_K. One block per output row.
 // Offsets are in BYTES (matching the Vulkan push constants); acc_mode 1 => y +=.
@@ -496,6 +543,23 @@ extern "C" __global__ void moe_weighted_acc(float* a, const float* b, const unsi
     float sum = 0.0f;
     for (unsigned j = 0; j < pc.n_used; j++) {
         float w = __uint_as_float(routing[pc.n_used + j]);
+        sum += w * b[(size_t)j * pc.src_stride + i];
+    }
+    a[i] += sum;
+}
+
+// ---- moe_weighted_acc_scaled (gemma4 batched MoE, GPU-side down scale) -------
+// Same weighted combine as moe_weighted_acc, but folds the per-expert down scale
+// (ffn_down_exps.scale[id]) into the weight GPU-side: w_j = weight_j * escale[id_j].
+// id_j = routing[j], weight_j = routing[n_used+j]. This removes the per-layer host
+// readback gemma previously used to fold the scale into the router weights, so the
+// whole batched MoE block can run async on the stream (GPU stays at boost).
+extern "C" __global__ void moe_weighted_acc_scaled(float* a, const float* b, const unsigned* routing, const float* escale, MoeAccPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pc.N) return;
+    float sum = 0.0f;
+    for (unsigned j = 0; j < pc.n_used; j++) {
+        float w = __uint_as_float(routing[pc.n_used + j]) * escale[routing[j]];
         sum += w * b[(size_t)j * pc.src_stride + i];
     }
     a[i] += sum;
