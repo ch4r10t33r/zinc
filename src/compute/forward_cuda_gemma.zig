@@ -59,6 +59,7 @@ const GemmaAttnPush = extern struct {
     scale_bits: u32,
     window: u32,
 };
+const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32 };
 const SwigluPush = extern struct { N: u32 };
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
@@ -117,6 +118,7 @@ const Derived = struct {
 const Pipelines = struct {
     rms_norm: CudaPipeline,
     rms_norm_noweight: CudaPipeline,
+    rms_norm_rope: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
@@ -129,6 +131,7 @@ const Pipelines = struct {
     // MoE (compiled unconditionally; dispatched only when n_experts>0)
     softmax_topk: CudaPipeline,
     moe_weighted_acc: CudaPipeline,
+    moe_weighted_acc_scaled: CudaPipeline, // batched MoE: folds down scale GPU-side
     mul_vec_scaled: CudaPipeline,
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
@@ -166,7 +169,7 @@ pub const ForwardGemma = struct {
     // here; the tail commitAndWait drains the stream and drainPending frees the
     // events. Sized for gemma-31b's ~180 ops/token (3 blocks × 60 layers). The
     // 26b MoE keeps the sync path (its router reads ids back mid-block).
-    pending: [256]command.CudaCommand = undefined,
+    pending: [1024]command.CudaCommand = undefined,
     n_pending: u32 = 0,
 
     // MoE scratch (only used when n_experts > 0)
@@ -250,6 +253,7 @@ pub const ForwardGemma = struct {
         var pipes: Pipelines = undefined;
         pipes.rms_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm");
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
+        pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
         pipes.dmmv[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
         pipes.dmmv[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k");
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
@@ -269,6 +273,7 @@ pub const ForwardGemma = struct {
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
         pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
+        pipes.moe_weighted_acc_scaled = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_scaled");
         pipes.mul_vec_scaled = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled");
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
@@ -490,19 +495,18 @@ pub const ForwardGemma = struct {
             self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, g.kv_dim, d.n_embd, 0, 0);
             break :blk &self.v_buf;
         } else &self.k_buf;
-        // per-head norms. V plain-normalize (no weight) is issued BEFORE the K
-        // norm because v_src may alias k_buf (the un-normed K projection). V is
-        // never roped.
+        // per-head norms. V plain-normalize (no weight) is issued BEFORE the Q/K
+        // norm+rope because v_src may alias k_buf (the un-normed K projection). V
+        // is never roped, so it stays a standalone noweight rms_norm.
         const rms_h = RmsPush{ .N = g.head_dim, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, &self.q_buf }, &rms_h, @sizeOf(RmsPush), 0);
         cmd.dispatch(&self.pipes.rms_norm_noweight, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ v_src, &self.v_buf }, &rms_h, @sizeOf(RmsPush), 0);
-        cmd.dispatch(&self.pipes.rms_norm, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, &self.k_buf }, &rms_h, @sizeOf(RmsPush), 0);
-        // RoPE q/k (NEOX) using this layer's effective inv_freq table.
+        // Q/K: per-head rms_norm fused with NEOX RoPE (this layer's inv_freq
+        // table, attn_scale 1.0) — one launch each, no normalized round-trip.
         const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
-        const rope_q = RopePush{ .stride = g.head_dim, .rope_dim = g.rope_dim, .n_heads = d.n_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
-        cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.q_buf, inv_freq }, &rope_q, @sizeOf(RopePush), 0);
-        const rope_k = RopePush{ .stride = g.head_dim, .rope_dim = g.rope_dim, .n_heads = g.n_kv_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
-        cmd.dispatch(&self.pipes.rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &self.k_buf, inv_freq }, &rope_k, @sizeOf(RopePush), 0);
+        const nr = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos };
+        const nr_sh = g.head_dim * @sizeOf(f32);
+        cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, inv_freq, &self.q_buf }, &nr, @sizeOf(RmsRopePush), nr_sh);
+        cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, inv_freq, &self.k_buf }, &nr, @sizeOf(RmsRopePush), nr_sh);
         // KV cache write at this position
         const kvw = KvWritePush{ .kv_dim = g.kv_dim, .dst_offset = pos * g.kv_dim };
         cmd.dispatch(&self.pipes.kv_cache_write, .{ ceilDiv(g.kv_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.k_buf, &self.kv_k[L], &self.v_buf, &self.kv_v[L] }, &kvw, @sizeOf(KvWritePush), 0);
@@ -585,6 +589,12 @@ pub const ForwardGemma = struct {
 
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
 
+        // Batched path (fused gate_up Q4_K + down Q5_1): one launch over all experts,
+        // ids read GPU-side, the down scale folded GPU-side in the weighted combine —
+        // so the whole block runs async with NO host readback. Other expert quants
+        // (e.g. a Q8_0 down layer) take the per-slot fallback, which reads ids back.
+        const batched = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
+
         // --- shared expert → shared_buf -------------------------------------
         {
             var cmd = try command.beginCommand(ctx);
@@ -595,7 +605,7 @@ pub const ForwardGemma = struct {
             cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
             self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.shared_buf, d.n_embd, sf, 0, 0);
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpn1.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
-            cmd.commitAndWait();
+            self.submit(cmd);
         }
 
         // --- router logits + top-k softmax (computed from attn_out) ----------
@@ -607,12 +617,18 @@ pub const ForwardGemma = struct {
             self.dmmvDispatch(&cmd, wrouter, &self.norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
             const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
             cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
-            cmd.commitAndWait();
+            if (batched) {
+                self.submit(cmd); // async: experts read ids GPU-side, scale folded GPU-side
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers ids + folds the scale next
+                self.drainPending();
+            }
         }
 
-        // Download ids+weights; fold the per-expert down scale into the weights.
-        buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
-        {
+        // Fallback only: download ids+weights and fold the per-expert down scale into
+        // the weights host-side. The batched path folds it GPU-side (moe_weighted_acc_scaled).
+        if (!batched) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
             const scales = self.down_scales[L * d.n_experts ..][0..d.n_experts];
             var j: u32 = 0;
             while (j < n_used) : (j += 1) {
@@ -620,8 +636,8 @@ pub const ForwardGemma = struct {
                 const w: f32 = @bitCast(self.host_router[n_used + j]);
                 self.host_router[n_used + j] = @bitCast(w * scales[id]);
             }
+            buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
         }
-        buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
 
         // --- routed experts → moe_out_buf -----------------------------------
         {
@@ -636,7 +652,6 @@ pub const ForwardGemma = struct {
             // experts, ids read GPU-side from router_out_buf, slot-major output.
             // The fused gate_up reuses dmmv_q4k_experts with base=gu_half for the
             // up half. Falls back to the per-slot loop for other expert quants.
-            const batched = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
             if (batched) {
                 const nrows = n_used * ef;
                 const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
@@ -749,12 +764,18 @@ pub const ForwardGemma = struct {
     /// the shared auto-ordered CUstream and stash it — the CPU never blocks per
     /// block. The stream still serializes the GPU, so cross-block buffer reuse is
     /// safe (only the ~0.4 ms WSL2 CPU↔GPU sync round-trips are removed, which
-    /// also stops the boost-starvation those idle gaps cause). MoE (n_experts>0)
-    /// stays synchronous (its router reads expert ids back to the host
-    /// mid-block); also falls back to sync if the ring fills.
+    /// also stops the boost-starvation those idle gaps cause). The batched MoE path
+    /// is async too (down scale folded GPU-side, no host id readback); the per-slot
+    /// MoE fallback keeps explicit commitAndWait around its readback. Falls back to
+    /// sync if the ring fills.
     fn submit(self: *ForwardGemma, cmd: command.CudaCommand) void {
         var c = cmd;
-        if (self.d.n_experts == 0 and self.n_pending < self.pending.len) {
+        // Async whenever the ring has room. The batched MoE path (gate_up Q4_K +
+        // down Q5_1) folds the down scale GPU-side, so it no longer reads ids back
+        // mid-block — its commands chain on the same auto-ordered stream like the
+        // dense path. The per-slot fallback still uses explicit commitAndWait around
+        // its host id readback, so it never relies on this going async.
+        if (self.n_pending < self.pending.len) {
             c.commitAsync();
             self.pending[self.n_pending] = c;
             self.n_pending += 1;
