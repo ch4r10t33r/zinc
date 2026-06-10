@@ -128,6 +128,35 @@ extern "C" __global__ void rms_norm(const float* x, const float* w, float* y, Rm
     }
 }
 
+// ---- rms_norm_residual ------------------------------------------------------
+// Fused gemma post-norm + residual add: hidden[i] += w[i] * (x[i] / rms(x)).
+// Collapses the (rms_norm -> scale_accumulate) pair used after attention and
+// the FFN in the gemma decode path (the residual scale is always 1.0 there)
+// into one launch, also dropping a full n_embd write+read round-trip of the
+// normalized vector. `hidden` is the read-write residual accumulator. One
+// block per token (decode: token=1).
+extern "C" __global__ void rms_norm_residual(const float* x, const float* w, float* hidden, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] += w[i] * (xt[i] * rinv);
+    }
+}
+
 // ---- dmmv_q4k (port of dmmv_q4k.comp) ---------------------------------------
 // y[row] = sum_k dequant(W[row][k]) * x[k], W in Q4_K. One block per output row.
 // Offsets are in BYTES (matching the Vulkan push constants); acc_mode 1 => y +=.

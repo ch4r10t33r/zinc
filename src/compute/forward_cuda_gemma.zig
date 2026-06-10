@@ -117,6 +117,7 @@ const Derived = struct {
 const Pipelines = struct {
     rms_norm: CudaPipeline,
     rms_norm_noweight: CudaPipeline,
+    rms_norm_residual: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
@@ -250,6 +251,7 @@ pub const ForwardGemma = struct {
         var pipes: Pipelines = undefined;
         pipes.rms_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm");
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
+        pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
         pipes.dmmv[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
         pipes.dmmv[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k");
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
@@ -520,10 +522,9 @@ pub const ForwardGemma = struct {
         cmd.dispatch(&self.pipes.gemma_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.attn_out_buf }, &attn, @sizeOf(GemmaAttnPush), seq_len * 4);
         // O projection → o_buf (NOT accumulated; post-norm happens first)
         self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.o_buf, d.n_embd, g.q_dim, 0, 0);
-        // post-attention norm (gemma rms) on the attention output, then residual add.
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.o_buf }, &rms, @sizeOf(RmsPush), 0);
-        const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
-        cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.o_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+        // post-attention norm (gemma rms) on the attention output, fused with the
+        // residual add into `hidden` (scale 1.0) — one launch, no o_buf round-trip.
+        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
         self.submit(cmd);
     }
 
@@ -546,10 +547,9 @@ pub const ForwardGemma = struct {
         const sg = SwigluPush{ .N = d.n_ff };
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
         self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.down_buf, d.n_embd, d.n_ff, 0, 0);
-        // post-ffn norm (gemma rms) on the FFN output, then residual add.
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.down_buf }, &rms, @sizeOf(RmsPush), 0);
-        const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
-        cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+        // post-ffn norm (gemma rms) on the FFN output, fused with the residual add
+        // into `hidden` (scale 1.0) — one launch, no down_buf round-trip.
+        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
         self.submit(cmd);
     }
 
