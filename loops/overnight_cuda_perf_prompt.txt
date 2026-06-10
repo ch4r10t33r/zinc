@@ -1,0 +1,34 @@
+You are autonomously driving ONE CUDA-backend performance improvement on the ZINC inference engine (Zig) this cycle, then stopping. Work in /Users/stepan/Workspace/zinc. Be rigorous and honest; negative results are valuable.
+
+STEP 0 — READ YOUR MEMORY FIRST:
+- /Users/stepan/.claude/projects/-Users-stepan-Workspace-zinc/memory/MEMORY.md
+- the project_zinc_cuda_backend.md it points to
+These hold the full state, box access, and CRITICAL gotchas. Honor them.
+
+STATE: The CUDA backend runs the 5-model catalog 5/5 TOKEN-CORRECT on the 4090 (origin/main 69504f03). MoE decode is batched for qwen (2.8x) and gemma-26b (~1.9x).
+
+MISSION THIS CYCLE: land exactly ONE validated perf win (or a documented negative result), then STOP.
+
+NEXT LEVERS (pick one, or continue an in-progress perf/* branch you find on origin):
+- gemma-31b DENSE decode (~8 tok/s): boost-saturated but only ~35% utilized — launch-latency/occupancy bound. Lever = KERNEL FUSION: collapse the ~6 tiny per-layer dispatches (per-head q/k/v rms norms, rope q+k, the gemma RMSNorms) into fewer/fatter kernels. Biggest open gemma lever.
+- matvec/kernel tuning, prefill, or the 5090.
+
+CRITICAL GOTCHAS (violating these wastes the whole cycle):
+1. BUILD CACHE: `rm -rf .zig-cache` is NOT enough — the zig GLOBAL cache serves STALE binaries. ALWAYS build with isolated caches and verify the binary hash CHANGED:
+   ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ~/zig-0.15.2/zig build cuda-dbg -Dbackend=cuda -Dshaders=false
+   If the hash did not change, you are measuring stale code — STOP and fix the build.
+2. gemma is BOOST-SATURATED, not sync-bound: do NOT add async / the CUstream command ring to gemma decode — it is a PROVEN regression (gemma-26b async was 16 vs batched 28). The gemma lever is FUSION (fewer/fatter kernels), not async.
+3. BOX: ssh agent-zinc per the agent-zinc memory entry. Pin the 4090 (GPU-e59a6fce-1961-bafe-927c-06c0149f2370). The operator runs 35B benchmarks in parallel on the box — use an ISOLATED working dir (e.g. ~/zinc-overnight), NEVER ~/workspace/zinc, and do not disturb their processes.
+4. BOOST NOISE: 4090 decode tok/s is boost-noisy. For a FAIR A/B, build both before/after and measure them BACK-TO-BACK (same thermal state). Never conclude a win from one boosted run.
+
+WORKFLOW THIS CYCLE:
+1. git fetch origin; create a branch off origin/main named perf/<short-name>.
+2. Implement ONE focused change.
+3. rsync the repo to an isolated box dir; build with ISOLATED caches (gotcha 1); verify hash changed.
+4. VALIDATE: scripts/validate_catalog.sh must stay 5/5 token-correct. If it breaks correctness, REVERT and document why. Do NOT commit broken code.
+5. MEASURE: scripts/perf_catalog.sh, fair A/B vs the baseline.
+6. If VALIDATED WIN (5/5 correct AND measurably faster): commit to the branch and `git push origin <branch>` (NOT main — leave for operator review). Append the result to project_zinc_cuda_backend.md memory.
+7. If NEGATIVE (no gain/regression): revert the code, but DOCUMENT the finding in memory (prevents re-trying).
+8. Clean up box scratch dirs. STOP (do not loop yourself; the outer loop will spawn the next cycle).
+
+NEVER: break catalog correctness, commit unvalidated code, push to main, disturb the parallel 5090 work, or trust a single boost-noisy measurement.
