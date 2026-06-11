@@ -684,9 +684,16 @@ pub const ForwardGemma = struct {
             const zp = ZeroPush{ .N = d.n_embd };
             cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&self.moe_out_buf}, &zp, @sizeOf(ZeroPush), 0);
             const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
-            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            if (batched) {
+                // Fold the per-expert down scale GPU-side (no host readback).
+                const wdscale = self.layer(L, "ffn_down_exps.scale"); // [n_experts] F32
+                cmd.dispatch(&self.pipes.moe_weighted_acc_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf, &wdscale.gpu_buffer }, &ma, @sizeOf(MoeAccPush), 0);
+            } else {
+                // Fallback: the down scale was already folded into the router weights host-side.
+                cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            }
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
-            cmd.commitAndWait();
+            if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
 
         // --- combine: cur = post_ffw_norm(shared + moe); hidden += cur. ------
@@ -696,7 +703,7 @@ pub const ForwardGemma = struct {
             cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.shared_buf, &self.moe_out_buf }, &acc, @sizeOf(ScaleAccPush), 0);
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpost.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
             cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.shared_buf }, &acc, @sizeOf(ScaleAccPush), 0);
-            cmd.commitAndWait();
+            if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
     }
 
