@@ -215,3 +215,39 @@ of small dispatches remain.
   dense fusions exhausted" conclusion: the Q/K-only fuse was below floor because it
   removed ONE launch, but folding V in too crosses back above the floor. Effort 23 net:
   **4 stacked dense-decode fusion wins** — ~+1.5% T1, ~+1.7% T3, ~+1.3% T4, +1.65% T5.
+- **2026-06-11 — Target 6 DONE (fold each block's INPUT norm into the PRECEDING
+  block's output norm+residual). VALIDATED WIN, branch `perf/e23-norm-boundary-fuse`
+  (stacked on T1+T3+T4+T5, commit `07477d65`), pushed (NOT main).** The dense gemma
+  layer ran FOUR single-block n_embd reductions: pre-attn `rms_norm`, post-attn
+  `rms_norm_residual`, pre-ffn `rms_norm`, post-ffn `rms_norm_residual_scale`. Key
+  observation: a post-norm-residual's output (`hidden`) is EXACTLY the input the very
+  next pre-norm reads, and BOTH are one-block (grid `{1,1,1}`, 256 threads) reductions
+  over the same n_embd vector — so the next pre-norm can run in the SAME launch, right
+  after the residual add (a `__syncthreads` makes the just-written `hidden` visible to
+  the phase-2 reduction; the intervening barriers also make reusing
+  `zinc_block_reduce_sum`'s shared scratch race-free). Two new kernels
+  `rms_norm_residual_norm` / `rms_norm_residual_scale_norm` (phase 1 = the exact
+  `rms_norm_residual[_scale]` arithmetic, phase 2 = the exact `rms_norm` arithmetic
+  re-reading `hidden` from global) fold TWO boundaries per layer: post-attn-residual +
+  pre-ffn-norm (within the layer → `ffn_norm_buf`), and post-ffn-residual + the NEXT
+  layer's pre-attn-norm (across the layer boundary → `norm_buf`, into layer L+1's
+  `attn_norm.weight`). `attentionLayer` skips its pre-attn norm for L>0 (filled by
+  ffnBlock(L-1)); only layer 0's pre-attn and the last layer's post-ffn stay
+  standalone. **Removes ~2 norm launches/layer (~119/token over 60 layers)** — the same
+  ≥2-launch magnitude as T4/T5, the resolvable regime. Gated on `d.n_experts==0` so the
+  gemma-26b MoE path (which uses `norm_buf` as router scratch) is BIT-IDENTICAL /
+  untouched. Cross-block buffer deps are safe: all commands chain on the one auto-ordered
+  CUstream. **Bit-exact:** gemma-31b 40-tok free-run **IDENTICAL** between baseline and
+  variant binaries. **Build:** isolated caches, baseline md5 `11bf6728…` → variant
+  `44728767…` (real recompile). **Correctness:** `validate_catalog` → **5/5 token-correct**
+  (qwen 3×12/12; gemma4-26b **12/12 free-run**; gemma4-31b teacher-forced 11/12 = the
+  documented near-tie, unchanged). **Perf (interleaved back-to-back A/B, 4090, warmup
+  ignored) — 3 batches ALL POSITIVE:** b1 (6×160) variant 32.50 vs 31.75 = **+2.36%**
+  (6/6); b2 (6×160) 32.29 vs 32.09 = **+0.64%** (4/6, baseline boosted hot rounds 1&4 —
+  variant still won the batch); b3 (8×200) 32.16 vs 31.74 = **+1.31%** (7/8). **Pooled 20
+  rounds: variant 32.30 vs baseline 31.85 = +1.41%, won 17/20.** Variant rock-steady
+  (32.09–33.38) while baseline swings per-process (31.47–32.94) and the variant wins even
+  when the baseline boosts hot — the T4/T5 resolvability signature, OPPOSITE the
+  sign-disagreeing rejected fusions. Stacks on T1+T3+T4+T5 (the four norms it touches are
+  distinct launches from the matvec/per-head-norm fusions). Effort 23 net: **5 stacked
+  dense-decode fusion wins** — ~+1.5% T1, ~+1.7% T3, ~+1.3% T4, +1.65% T5, +1.41% T6.
