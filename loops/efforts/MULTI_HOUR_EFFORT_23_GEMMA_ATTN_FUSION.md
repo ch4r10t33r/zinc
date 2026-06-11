@@ -93,3 +93,35 @@ of small dispatches remain.
   3 matvecs (Q/K/V), pre-ffn norm feeds 2 (gate/up); no single-consumer fold and
   the matvecs dominate. Effort 23 net: 2 stacked dense-decode fusion wins
   (~+1.5% Target 1, ~+1.7% Target 3).
+- **2026-06-11 — MoE output-scale fold (Target 3 extended to the MoE path). INCONCLUSIVE → REVERTED, not committed.**
+  Target 3 fused the per-layer output scale into the dense post-ffn norm+residual
+  but explicitly **self-skipped the MoE path** (its final `hidden` write is a
+  `scale_accumulate`, not an `rms_norm_residual`), leaving a standalone
+  `scalar_mul` (the `layer_output_scale.weight`, confirmed present on the
+  gemma4-26b layers) per MoE layer. This cycle folded that scale into the MoE
+  combine's final residual add via a new kernel `scale_accumulate_scale`
+  (`hidden = s[0]*(hidden + scale*cur)`); `layerOutScale` became a self-skipping
+  no-op (both paths now fold). Removes **60 launches + 60 command
+  submissions/token** on the gemma4-26b MoE path. **Bit-exact** (commutative
+  float multiply over the same residual-add FMA `scalar_mul` would re-load).
+  **Build:** isolated caches, md5 `43938aee…` baseline → `304b9936…` variant
+  (real recompile). **Correctness:** `validate_catalog` → **5/5 token-correct**,
+  with **gemma4-26b 12/12 free-run** (the changed path is bit-identical;
+  gemma4-31b dense unchanged, 11/12 teacher-forced near-tie).
+  **Perf — UNMEASURABLE in boost noise.** Interleaved A/B (4090, warmup ignored):
+  batch1 NGEN=160 ×8 → variant 46.60 vs 44.77 = **+4.10%** (won 5/8); batch2
+  NGEN=320 ×10 → variant 46.64 vs 46.31 = **+0.69%** (won 5/10). Pooled 18 rounds:
+  variant won **10/18 (55%, coin-flip)**, mean **+2.17%**, but the two batches
+  disagree by more than the effect and per-round swings are ±40% (e.g. b1 r2
+  baseline +36%, b1 r7 variant +42%; b2 r2 variant +49%, b2 r6 baseline +30%).
+  The 26b MoE clock-boosts erratically per fresh process regardless of NGEN, so a
+  ~1-3% signal cannot be resolved here. Per the contract ("require a measurable,
+  repeatable gain"; "never claim a win from one boosted run") this is **NOT a
+  validated win** — and unlike Target 1, the change touches ONLY the MoE path so
+  there is no clean dense component to anchor it. **Reverted** (working tree +
+  box variant tree restored to HEAD; iso caches cleared). The change is correct
+  and strictly fewer-ops (true effect ≥0, never a regression) — recoverable from
+  this log for a future **clock-locked** cycle (`nvidia-smi -lgc`, needs sudo the
+  agent lacks) that could resolve sub-5% MoE effects. Takeaway: the boost-noisy
+  26b MoE path is not A/B-measurable for small fusions on this box without pinned
+  clocks; dense-path fusions remain the only cleanly-measurable gemma lever here.
