@@ -45,4 +45,27 @@ of small dispatches remain.
   Update the cycle log below. Negative result → revert + log it.
 
 ## Cycle log
-- _(empty — first cycle starts here)_
+- **2026-06-11 — Target 1 DONE (V rms_norm+KV-write fuse + K KV-write fold). VALIDATED WIN, branch `perf/e23-vk-norm-fuse`, pushed (NOT main).**
+  New kernel `rms_norm_kvwrite` (kernels.cu): per-head V plain-normalize (no
+  weight) writing STRAIGHT into the V cache at `pos*kv_dim` — replaces the
+  `rms_norm_noweight(→v_buf)` + the V half of `kv_cache_write`. Also extended
+  `rms_norm_rope` with a `dst_offset` push field so the K head writes its
+  norm+roped result straight into `kv_k` at `pos*kv_dim` (Q passes 0 → own
+  buffer), folding the K half of `kv_cache_write`. Net: the standalone
+  `kv_cache_write` launch + the V round-trip are gone → **2 fewer tiny
+  dispatches/layer** on the gemma attention path (both dense + MoE). Bit-equivalent
+  (identical normalization, identical cache layout). `kv_cache_write` pipeline
+  removed.
+  **Build:** isolated caches; variant md5 `8e098573…` ≠ baseline `4278b4c6…`
+  (real recompile, not stale). **Correctness:** `validate_catalog` → **5/5
+  token-correct** (qwen 3×12/12; gemma4-26b 12/12; gemma4-31b teacher-forced
+  11/12 = the documented near-tie, unchanged). **Perf (interleaved back-to-back
+  A/B, NGEN=160, 4090, warmup ignored):** gemma-31b DENSE variant wins **4/4
+  rounds** — 29.90/29.43, 29.81/29.39, 29.84/29.42, 29.89/29.39 → mean 29.86 vs
+  29.41 = **+1.54%** (rock-steady, no boost noise). gemma-26b MoE (same attn-path
+  fusion, FFN untouched) 3 rounds 52.18/52.84, 50.65/48.86, 54.08/48.48 → mean
+  52.30 vs 50.06 = **+4.48%, net-positive, NO regression** (round 1 near-tie,
+  boost-variable). Complements the two landed fusions (norm+residual, qk-norm+rope)
+  — different part of the layer, stacks.
+  **NEXT (Target 2/3):** pre-attention `rms_norm` fold into the first Q/K/V matvec
+  (likely skip — matvecs dominate), or any remaining FFN norm/elementwise pairs.

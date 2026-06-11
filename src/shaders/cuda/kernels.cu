@@ -166,12 +166,15 @@ extern "C" __global__ void rms_norm_residual(const float* x, const float* w, flo
 // uses freq_base_bits==0 / attn_scale_bits==0). One block per head; the
 // normalized head is staged in dynamic shared memory (head_dim floats) so the
 // rope pair-reads see the post-norm values regardless of x/y aliasing.
-struct RmsRopePush { unsigned head_dim; float eps; unsigned rope_dim; unsigned position; };
+// `dst_offset` lets the K head write its result straight into the KV cache at
+// position*kv_dim (Q passes 0 and writes head-contiguously into its own buffer),
+// folding away the K half of the separate kv_cache_write launch.
+struct RmsRopePush { unsigned head_dim; float eps; unsigned rope_dim; unsigned position; unsigned dst_offset; };
 
 extern "C" __global__ void rms_norm_rope(const float* x, const float* w, const float* inv_freq, float* y, RmsRopePush pc) {
     unsigned head = blockIdx.x;
     const float* xt = x + (size_t)head * pc.head_dim;
-    float* yt = y + (size_t)head * pc.head_dim;
+    float* yt = y + (size_t)pc.dst_offset + (size_t)head * pc.head_dim;
     extern __shared__ float sh[]; // pc.head_dim normalized values
 
     float ss = 0.0f;
@@ -1409,6 +1412,33 @@ extern "C" __global__ void rms_norm_noweight(const float* x, float* y, RmsPush p
     float rinv = rms_inv_sh;
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x)
         yt[i] = xt[i] * rinv;
+}
+
+// ---- rms_norm_kvwrite (gemma: fuse per-head V rms_norm-noweight + V KV write) -
+// One block per KV head. Plain-normalizes V over head_dim (no weight, like
+// rms_norm_noweight) and writes the result STRAIGHT into the V cache at
+// dst_offset (= position*kv_dim), per head at dst_offset + head*head_dim.
+// Replaces the rms_norm_noweight(→v_buf) + the V half of kv_cache_write pair on
+// the gemma attention path — bit-equivalent (identical normalization, identical
+// destination layout), one launch instead of two, no v_buf round-trip.
+struct RmsKvWritePush { unsigned head_dim; float eps; unsigned dst_offset; };
+extern "C" __global__ void rms_norm_kvwrite(const float* v_src, float* v_dst, RmsKvWritePush pc) {
+    unsigned head = blockIdx.x;
+    unsigned hd = pc.head_dim;
+    const float* vh = v_src + (size_t)head * hd;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = vh[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    size_t base = (size_t)pc.dst_offset + (size_t)head * hd;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        v_dst[base + i] = vh[i] * rinv;
 }
 
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------

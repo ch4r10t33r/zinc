@@ -50,7 +50,6 @@ const RopePush = extern struct {
     freq_base_bits: u32,
     attn_scale_bits: u32,
 };
-const KvWritePush = extern struct { kv_dim: u32, dst_offset: u32 };
 const GemmaAttnPush = extern struct {
     head_dim: u32,
     n_heads: u32,
@@ -59,7 +58,8 @@ const GemmaAttnPush = extern struct {
     scale_bits: u32,
     window: u32,
 };
-const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32 };
+const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, dst_offset: u32 };
+const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 };
 const SwigluPush = extern struct { N: u32 };
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
@@ -120,10 +120,10 @@ const Pipelines = struct {
     rms_norm_noweight: CudaPipeline,
     rms_norm_residual: CudaPipeline,
     rms_norm_rope: CudaPipeline,
+    rms_norm_kvwrite: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
-    kv_cache_write: CudaPipeline,
     gemma_attention: CudaPipeline,
     geglu: CudaPipeline,
     scale_accumulate: CudaPipeline,
@@ -256,6 +256,7 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
         pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
+        pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
         pipes.dmmv[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
         pipes.dmmv[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k");
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
@@ -267,7 +268,6 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
-        pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.geglu = try pipeline.createPipeline(ctx, src.ptr, "geglu");
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
@@ -497,21 +497,25 @@ pub const ForwardGemma = struct {
             self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, g.kv_dim, d.n_embd, 0, 0);
             break :blk &self.v_buf;
         } else &self.k_buf;
-        // per-head norms. V plain-normalize (no weight) is issued BEFORE the Q/K
-        // norm+rope because v_src may alias k_buf (the un-normed K projection). V
-        // is never roped, so it stays a standalone noweight rms_norm.
-        const rms_h = RmsPush{ .N = g.head_dim, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm_noweight, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ v_src, &self.v_buf }, &rms_h, @sizeOf(RmsPush), 0);
+        // Per-head V plain-normalize (no weight) FUSED with the V KV-cache write:
+        // one launch normalizes V and writes it straight into kv_v at this
+        // position (was rms_norm_noweight→v_buf + the V half of kv_cache_write).
+        // Issued before the Q/K norm+rope because v_src may alias k_buf (the
+        // un-normed K projection on full-attention layers) — and rope no longer
+        // overwrites k_buf (K writes straight to its cache), so k_buf stays raw.
+        const kv_off = pos * g.kv_dim;
+        const rms_kvw = RmsKvWritePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .dst_offset = kv_off };
+        cmd.dispatch(&self.pipes.rms_norm_kvwrite, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ v_src, &self.kv_v[L] }, &rms_kvw, @sizeOf(RmsKvWritePush), 0);
         // Q/K: per-head rms_norm fused with NEOX RoPE (this layer's inv_freq
         // table, attn_scale 1.0) — one launch each, no normalized round-trip.
+        // Q stays in q_buf (dst_offset 0); K writes its norm+roped head straight
+        // into kv_k at this position, folding away the K half of kv_cache_write.
         const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
-        const nr = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos };
+        const nr_q = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = 0 };
+        const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
         const nr_sh = g.head_dim * @sizeOf(f32);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, inv_freq, &self.q_buf }, &nr, @sizeOf(RmsRopePush), nr_sh);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, inv_freq, &self.k_buf }, &nr, @sizeOf(RmsRopePush), nr_sh);
-        // KV cache write at this position
-        const kvw = KvWritePush{ .kv_dim = g.kv_dim, .dst_offset = pos * g.kv_dim };
-        cmd.dispatch(&self.pipes.kv_cache_write, .{ ceilDiv(g.kv_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.k_buf, &self.kv_k[L], &self.v_buf, &self.kv_v[L] }, &kvw, @sizeOf(KvWritePush), 0);
+        cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, inv_freq, &self.q_buf }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
+        cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
         // attention (scale=1.0, sliding window on SWA layers) → attn_out_buf
         const seq_len = pos + 1;
         const window: u32 = if (g.is_swa) d.sliding_window else 0;
