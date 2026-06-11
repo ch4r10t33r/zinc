@@ -157,6 +157,37 @@ extern "C" __global__ void rms_norm_residual(const float* x, const float* w, flo
     }
 }
 
+// ---- rms_norm_residual_scale ------------------------------------------------
+// rms_norm_residual that also applies the gemma per-layer output scale s[0] to
+// the whole residual stream: hidden[i] = s[0] * (hidden[i] + w[i]*x[i]/rms(x)).
+// Folds the standalone scalar_mul (blk.N.layer_output_scale.weight) into the
+// post-ffn norm+residual on the dense gemma path, removing one tiny launch + one
+// command submission per layer. Bit-identical to the two-kernel path: the
+// residual add is the same FMA producing the same f32 value scalar_mul would
+// have re-loaded, then a plain multiply by s[0].
+extern "C" __global__ void rms_norm_residual_scale(const float* x, const float* w, float* hidden, const float* s, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    float scale = s[0];
+
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] = (ht[i] + w[i] * (xt[i] * rinv)) * scale;
+    }
+}
+
 // ---- rms_norm_rope ----------------------------------------------------------
 // Fused gemma per-head Q/K norm + RoPE: collapses the (per-head rms_norm ->
 // rope) pair into ONE launch, dropping a full head_dim write+read round-trip of

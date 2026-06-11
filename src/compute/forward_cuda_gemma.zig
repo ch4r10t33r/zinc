@@ -119,6 +119,7 @@ const Pipelines = struct {
     rms_norm: CudaPipeline,
     rms_norm_noweight: CudaPipeline,
     rms_norm_residual: CudaPipeline,
+    rms_norm_residual_scale: CudaPipeline,
     rms_norm_rope: CudaPipeline,
     rms_norm_kvwrite: CudaPipeline,
     dmmv: [6]CudaPipeline,
@@ -255,6 +256,7 @@ pub const ForwardGemma = struct {
         pipes.rms_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm");
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
         pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
+        pipes.rms_norm_residual_scale = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
         pipes.dmmv[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
@@ -544,6 +546,11 @@ pub const ForwardGemma = struct {
         const wup = self.layer(L, "ffn_up.weight");
         const wdown = self.layer(L, "ffn_down.weight");
         const wpfn = self.layer(L, "post_ffw_norm.weight");
+        // gemma's per-layer output scale (optional). On the dense path it is the
+        // LAST write to `hidden` in the layer, so fold it into the post-ffn
+        // norm+residual instead of a standalone scalar_mul command (layerOutScale
+        // self-skips dense layers). Absent → plain rms_norm_residual.
+        const wlos = self.model.getLayer(L, "layer_output_scale.weight");
 
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
@@ -556,8 +563,13 @@ pub const ForwardGemma = struct {
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
         self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.down_buf, d.n_embd, d.n_ff, 0, 0);
         // post-ffn norm (gemma rms) on the FFN output, fused with the residual add
-        // into `hidden` (scale 1.0) — one launch, no down_buf round-trip.
-        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        // into `hidden` (scale 1.0) — one launch, no down_buf round-trip. When the
+        // per-layer output scale is present it is folded in here too (one launch).
+        if (wlos) |ws| {
+            cmd.dispatch(&self.pipes.rms_norm_residual_scale, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        }
         self.submit(cmd);
     }
 
@@ -712,9 +724,14 @@ pub const ForwardGemma = struct {
     }
 
     /// Multiply the residual stream by the learned per-layer output scale.
+    /// Dense layers fold this scale into the post-ffn rms_norm_residual_scale
+    /// (the layer's last `hidden` write), so this self-skips them; only the MoE
+    /// path — whose final write is a scale_accumulate — needs the standalone op.
     fn layerOutScale(self: *ForwardGemma, L: u32) !void {
         const d = self.d;
         const ctx = self.ctx;
+        const is_moe = d.n_experts > 0 and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
+        if (!is_moe) return; // dense: folded into the post-ffn norm+residual
         const ws = self.model.getLayer(L, "layer_output_scale.weight") orelse return; // optional
         var cmd = try command.beginCommand(ctx);
         const sm = ScalarMulPush{ .N = d.n_embd };
