@@ -1,6 +1,6 @@
 ---
-title: "How we made CUDA LLM decode 2.8× faster: batched MoE experts and kernel fusion in ZINC"
-seoTitle: "CUDA LLM decode optimization: batched MoE + kernel fusion (RTX 4090/5090)"
+title: "How we made CUDA LLM decode up to 5× faster: batched MoE experts and kernel fusion in ZINC"
+seoTitle: "CUDA LLM decode optimization: batched MoE + kernel fusion (RTX 4090)"
 date: "2026-06-11"
 tags:
   - zinc
@@ -30,14 +30,14 @@ keywords:
   - mixture of experts GPU kernel
   - gemma qwen CUDA tokens per second
   - GPU boost starvation decode
-description: "A diagnosis-driven tour of how ZINC's CUDA backend turned its slowest models into its fastest — batching mixture-of-experts decode and fusing gemma's attention kernels — with the benchmarks, the boost-clock gotchas, and the self-driving optimization loop that found the wins while we slept."
-seoDescription: "ZINC CUDA backend decode optimization: batched mixture-of-experts experts and gemma kernel fusion took the catalog's slowest models to its fastest on RTX 4090 and 5090, validated token-for-token against llama.cpp."
-excerpt: "A mixture-of-experts model was decoding at 9 tok/s on an RTX 4090 — slower than a dense 27B. This is how ZINC's CUDA backend diagnosed boost-clock starvation, batched its MoE experts into two GPU-side kernels (turning the catalog's slowest models into its fastest), fused gemma's attention dispatches, and kept every change token-for-token correct against llama.cpp."
+description: "A diagnosis-driven tour of how ZINC's CUDA backend turned its slowest models into front-runners — batching mixture-of-experts decode and fusing gemma's attention kernels — with the benchmarks, the boost-clock gotchas, and the self-driving optimization loop that found the wins while we slept."
+seoDescription: "ZINC CUDA backend decode optimization: batched mixture-of-experts experts and gemma kernel fusion took the catalog's slowest models to the front on the RTX 4090, validated token-for-token against llama.cpp."
+excerpt: "A mixture-of-experts model was decoding at 9 tok/s on an RTX 4090 — slower than a dense 27B. This is how ZINC's CUDA backend diagnosed boost-clock starvation, batched its MoE experts into two GPU-side kernels (turning the catalog's slowest models into front-runners that outrun the big dense ones), fused gemma's attention dispatches, and kept every change token-for-token correct against llama.cpp."
 faqs:
   - question: "Why was a mixture-of-experts model decoding slower than a dense model on the same GPU?"
     answer: "Launch overhead, not arithmetic. ZINC's MoE path read the chosen expert IDs back to the host every layer, a hard CPU-to-GPU sync, then fired a swarm of tiny per-expert matvecs too small to occupy the GPU. The SM clock bounced between about 345 and 2445 MHz, boost-starved, so a 3-billion-active-parameter MoE model decoded near 9 to 10 tok/s, below a dense 27B at 36."
   - question: "How much faster is batched MoE decode in ZINC?"
-    answer: "Batching the experts into two GPU-side kernels, one fused gate and up projection and one down projection, with expert IDs read from the router buffer instead of the host, took Qwen3.6-35B-A3B from 16 to 46 tok/s on an RTX 5090 (2.8x) and Gemma-4-26B-A4B from about 10 to 52 tok/s on an RTX 4090 (over 5x). The MoE models went from the catalog's slowest to its fastest, decoding above the dense 27B and 31B."
+    answer: "Batching the experts into two GPU-side kernels, one fused gate and up projection and one down projection, with expert IDs read from the router buffer instead of the host, took Qwen3.6-35B-A3B from about 9 to 40 tok/s and Gemma-4-26B-A4B from about 10 to 52 tok/s, both on an RTX 4090 (about 4 to 5x). The MoE models went from the catalog's slowest to decoding above the dense 27B and 31B."
   - question: "Why did not the async CUDA stream ring speed up gemma like it did qwen?"
     answer: "Because gemma was boost-saturated, not sync-starved. Its clock was already pinned near 2715 MHz, so there was no per-token sync idle to reclaim and the async ring's bookkeeping only added overhead. The async ring was the big win on the sync-starved dense qwen path, pushing decode past 104 tok/s and beating llama.cpp's 97. Diagnose the clock before picking the fix."
   - question: "What is kernel fusion and how much does it help LLM decode?"
@@ -75,7 +75,7 @@ The instinct with a slow matvec is to optimize the matvec. That instinct was wro
 
 Same symptom — low throughput — opposite cause. The starved model needs **fewer synchronizations**; the saturated model needs **fewer, fatter kernels**. Pointing either fix at the wrong model does nothing. (We proved that the embarrassing way: more on the no-op below.)
 
-## Win #1: batched MoE experts — the slowest models became the fastest
+## Win #1: batched MoE experts — the slowest models overtook the dense ones
 
 The starved MoE path was death by a thousand tiny launches. Each decode layer:
 
@@ -84,11 +84,11 @@ The starved MoE path was death by a thousand tiny launches. Each decode layer:
 
 The fix replaces the whole per-expert loop with **two batched kernels** — one launch each for the fused gate/up projection and the down projection — that sweep over *all* active experts in a single grid, reading the expert IDs **GPU-side** straight from the router output buffer. No host read-back, so the entire MoE block runs asynchronously; far fewer, far fatter launches, so the GPU stays fed.
 
-<img class="diagram-visual" src="/blog/2026-06-11-cuda-moe-batching.svg" alt="Bar chart of mixture-of-experts decode throughput before and after batched experts. Qwen3.6-35B-A3B on an RTX 5090 goes from 16 tokens per second with the per-expert host-readback loop to 46 with batched experts, a 2.8 times gain. Gemma-4-26B-A4B on an RTX 4090 goes from about 10 tokens per second to 52, better than 5 times. Both are labeled bit-equivalent and token-correct versus llama.cpp." loading="lazy" />
+<img class="diagram-visual" src="/blog/2026-06-11-cuda-moe-batching.svg" alt="Bar chart of mixture-of-experts decode throughput before and after batched experts, both on an RTX 4090. Qwen3.6-35B-A3B goes from about 9 tokens per second with the per-expert host-readback loop to about 40 with batched experts, a 4.4 times gain. Gemma-4-26B-A4B goes from about 10 tokens per second to 52, over 5 times. Both are bit-equivalent and token-correct versus llama.cpp, and both end up above the dense 27B and 31B models." loading="lazy" />
 
-On the **RTX 5090**, batching took `qwen36-35b-a3b` from **16 → 46 tok/s** — a clean **2.8×**. On the **RTX 4090**, the gemma MoE model (`gemma4-26b-a4b`) went from **~10 → ~52 tok/s**, better than **5×**. Both paths are bit-equivalent — all five catalog models still match llama.cpp token-for-token.
+On the **RTX 4090**, batching took `qwen36-35b-a3b` from **~9 → ~40 tok/s** (a **4.4×** jump) and the gemma MoE model (`gemma4-26b-a4b`) from **~10 → ~52 tok/s** (over **5×**). Both paths are bit-equivalent — all five catalog models still match llama.cpp token-for-token.
 
-Here is the part that still surprises me: **these MoE models went from the *slowest* things in the catalog to the *fastest*.** Before batching, the 3-to-4-billion-active-parameter MoE models crawled at ~10 tok/s — *below* the dense 27B (36) and 31B (30). After batching they clear **46 and 52 tok/s — above both dense models.** The whole point of MoE is that you only pay for the few experts you activate; that advantage was entirely hostage to launch overhead, and batching set it free.
+Here is the part that still surprises me: **these MoE models went from the *slowest* things in the catalog to outrunning the big dense ones.** Before batching, the 3-to-4-billion-active-parameter MoE models crawled at ~9–10 tok/s — *below* the dense 27B (36) and 31B (30). After batching they clear **40 and 52 tok/s — above both dense models.** The whole point of MoE is that you only pay for the few experts you activate; that advantage was entirely hostage to launch overhead, and batching set it free.
 
 The lesson generalizes well beyond ZINC: **MoE decode lives or dies on launch count and host round-trips, not on FLOPs.** A 3B-active model that decodes slower than a 27B dense one is almost always paying in synchronization, not arithmetic.
 
@@ -115,12 +115,10 @@ We reverted it and wrote the negative result into memory in bold: **do not async
 Decode benchmarking on a boosting GPU is a minefield, and most of our early "wins" were boost noise. The discipline that survived:
 
 - **Token-for-token correctness, every change.** `validate_catalog.sh` runs all five models against a greedy llama.cpp reference. A fused kernel must be bit-equivalent; if a single early token diverges, it reverts. (gemma-31b has one famous EOS-vs-newline near-tie where ZINC's f32 is actually *more* accurate than llama's q8 GPU reference — so the gate has a teacher-forced fallback rather than flagging the more-correct engine.)
-- **Interleaved A/B, never sequential.** We build both binaries and run them **back-to-back in the same thermal state**, alternating rounds. A win has to take the majority of rounds. One boosted run proves nothing.
+- **Interleaved A/B, never sequential.** We build both binaries and run them **back-to-back in the same thermal state**, alternating rounds. A win has to take the majority of rounds. One boosted run proves nothing — a single qwen-35b-a3b run once flashed 60 tok/s against a steady-state of 40, and only the re-runs caught it.
 - **The build-cache gotcha.** Zig's cache — *and especially its global cache* — will happily hand you a stale binary that silently measures your *old* code as a no-op. Every benchmark forces a fresh build with isolated cache dirs and **verifies the binary hash actually changed**. This one cost us a confusing afternoon before it went into the runbook.
 
-<img class="diagram-visual" src="/blog/2026-06-11-cuda-catalog-decode.svg" alt="Bar chart of decode throughput in tokens per second on an RTX 4090 for the five-model ZINC CUDA catalog after optimization. Qwen3.5-9B dense is highest near 90, gemma-4-26B mixture-of-experts about 52, Qwen3.6-35B-A3B mixture-of-experts about 46 (measured on the 5090), Qwen3.6-27B dense about 36, and gemma-4-31B dense about 30. The two mixture-of-experts models sit above the larger dense models. All five are labeled five out of five token-correct versus llama.cpp." loading="lazy" />
-
-A note on that chart: every bar is an RTX 4090 decode number except `qwen36-35b-a3b`, which is the 5090 figure from the batching benchmark — its clean 4090 pass is still queued behind the optimization loop. The shape is the point: **the MoE models now sit on top.**
+<img class="diagram-visual" src="/blog/2026-06-11-cuda-catalog-decode.svg" alt="Bar chart of decode throughput in tokens per second on an RTX 4090 for the five-model ZINC CUDA catalog after optimization. Qwen3.5-9B dense is highest near 90, Gemma-4-26B mixture-of-experts about 52, Qwen3.6-35B-A3B mixture-of-experts about 40, Qwen3.6-27B dense about 36, and Gemma-4-31B dense about 30. The two mixture-of-experts models sit above the larger dense 27B and 31B. All five are five out of five token-correct versus llama.cpp." loading="lazy" />
 
 ## The part where the loop optimizes itself
 
@@ -131,9 +129,9 @@ The gemma fusions in this post? Most were landed by that loop, across a multi-ho
 ## Takeaways for anyone optimizing LLM decode on a GPU
 
 1. **Measure the clock first.** Low tok/s has at least two causes — sync-starvation and launch-latency saturation — and they want opposite fixes. The clock trace tells you which.
-2. **MoE decode is a launch-count problem.** Batch the experts, read routing GPU-side, kill the host round-trip. Done right, your MoE models become the *fastest* in the catalog, not the slowest.
+2. **MoE decode is a launch-count problem.** Batch the experts, read routing GPU-side, kill the host round-trip. Done right, your MoE models overtake the big dense ones instead of trailing them.
 3. **Fusion is free money on a saturated path.** Collapse tiny dispatches; they don't add FLOPs, only launch latency, and the savings compound.
 4. **Async helps the starved, not the saturated.** Point it at the wrong model and you'll regress. Test, don't assume.
 5. **A boosting GPU lies.** Interleave your A/Bs, verify your binary hash, and validate correctness on every single change — or your benchmark is fiction.
 
-ZINC's CUDA backend now runs a five-model catalog **token-correct on the RTX 4090**, with the MoE models decoding several times faster than where they started — 2.8× on the 5090, better than 5× on the 4090 — and dense decode that beats llama.cpp. And the loop is still running. We'll keep posting the numbers.
+ZINC's CUDA backend now runs a five-model catalog **token-correct on the RTX 4090**, with the MoE models decoding **4–5× faster** than where they started — now ahead of the big dense models — and dense decode that beats llama.cpp. And the loop is still running. We'll keep posting the numbers.

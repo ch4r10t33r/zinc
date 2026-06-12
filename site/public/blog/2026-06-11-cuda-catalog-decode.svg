@@ -20,7 +20,6 @@
       .val { fill: #f6fbff; font-size: 18px; font-weight: 760; }
       .axis { fill: #8595a8; font-size: 13px; }
       .ok { fill: #7df0c0; font-size: 14px; font-weight: 800; }
-      .tag5090 { fill: #cfe0f0; font-size: 12px; font-weight: 700; }
     </style>
   </defs>
   <rect width="1200" height="720" fill="url(#bg)"/>
@@ -54,10 +53,8 @@
 
     <text x="364" y="346" text-anchor="end" class="lab">Qwen3.6-35B-A3B</text>
     <text x="364" y="364" text-anchor="end" class="sub">MoE &#183; batched experts</text>
-    <rect x="380" y="328" width="378" height="40" rx="6" fill="url(#zinc)"/>
-    <text x="746" y="355" text-anchor="end" class="val" fill="#0c1a16">46</text>
-    <rect x="770" y="330" width="64" height="28" rx="6" fill="#1c3344"/>
-    <text x="802" y="349" text-anchor="middle" class="tag5090">5090</text>
+    <rect x="380" y="328" width="329" height="40" rx="6" fill="url(#zinc)"/>
+    <text x="697" y="355" text-anchor="end" class="val" fill="#0c1a16">40</text>
 
     <text x="364" y="426" text-anchor="end" class="lab">Qwen3.6-27B</text>
     <text x="364" y="444" text-anchor="end" class="sub">dense</text>
@@ -70,6 +67,6 @@
     <text x="639" y="515" class="val">30</text>
   </g>
 
-  <text x="64" y="664" class="subtitle">Diagnosis-driven wins: dense paths via the async stream/event ring (qwen) and kernel fusion (gemma); MoE paths via batched experts.</text>
-  <text x="64" y="690" class="sub">All bars are RTX 4090 decode except Qwen3.6-35B-A3B (5090; its clean 4090 pass is queued behind the optimization loop).</text>
+  <text x="64" y="662" class="subtitle">Diagnosis-driven wins: dense paths via the async stream/event ring (qwen) and kernel fusion (gemma); MoE paths via batched experts.</text>
+  <text x="64" y="690" class="sub">Both MoE models decode faster than the larger dense 27B and 31B &#8212; the active-parameter advantage, unblocked by killing per-layer launch overhead.</text>
 </svg>

@@ -13,7 +13,7 @@
       <stop offset="1" stop-color="#7a8696"/>
     </linearGradient>
     <style>
-      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .title { fill: #f6fbff; font-size: 31px; font-weight: 780; }
       .subtitle { fill: #aebdcc; font-size: 16px; }
       .group { fill: #cfe8f5; font-size: 18px; font-weight: 700; }
       .lab { fill: #c2cdda; font-size: 15px; }
@@ -23,45 +23,46 @@
     </style>
   </defs>
   <rect width="1200" height="720" fill="url(#bg)"/>
-  <text x="64" y="66" class="title">Batched MoE experts: the slowest models became the fastest</text>
-  <text x="64" y="96" class="subtitle">Mixture-of-experts decode, before &#8594; after batching. Bit-equivalent &#183; token-correct vs llama.cpp. Bars = tokens/sec.</text>
+  <text x="64" y="66" class="title">Batched MoE experts: the slowest models overtook the dense ones</text>
+  <text x="64" y="96" class="subtitle">Mixture-of-experts decode on the RTX 4090, before &#8594; after batching. Bit-equivalent &#183; token-correct vs llama.cpp. Bars = tokens/sec.</text>
 
-  <!-- gridlines 0..50 (scale 14.04 px/tok from x=380) -->
+  <!-- gridlines 0..50 (scale 13.85 px/tok from x=380) -->
   <g class="axis">
-    <line x1="380" y1="140" x2="380" y2="630" stroke="#243244" stroke-width="1"/>
-    <line x1="520" y1="140" x2="520" y2="630" stroke="#1c2838" stroke-width="1"/>
-    <line x1="661" y1="140" x2="661" y2="630" stroke="#1c2838" stroke-width="1"/>
-    <line x1="801" y1="140" x2="801" y2="630" stroke="#1c2838" stroke-width="1"/>
-    <line x1="942" y1="140" x2="942" y2="630" stroke="#1c2838" stroke-width="1"/>
-    <line x1="1082" y1="140" x2="1082" y2="630" stroke="#1c2838" stroke-width="1"/>
-    <text x="380" y="652" text-anchor="middle">0</text>
-    <text x="520" y="652" text-anchor="middle">10</text>
-    <text x="661" y="652" text-anchor="middle">20</text>
-    <text x="801" y="652" text-anchor="middle">30</text>
-    <text x="942" y="652" text-anchor="middle">40</text>
-    <text x="1082" y="652" text-anchor="middle">50</text>
+    <line x1="380" y1="140" x2="380" y2="620" stroke="#243244" stroke-width="1"/>
+    <line x1="518" y1="140" x2="518" y2="620" stroke="#1c2838" stroke-width="1"/>
+    <line x1="657" y1="140" x2="657" y2="620" stroke="#1c2838" stroke-width="1"/>
+    <line x1="795" y1="140" x2="795" y2="620" stroke="#1c2838" stroke-width="1"/>
+    <line x1="934" y1="140" x2="934" y2="620" stroke="#1c2838" stroke-width="1"/>
+    <line x1="1072" y1="140" x2="1072" y2="620" stroke="#1c2838" stroke-width="1"/>
+    <text x="380" y="642" text-anchor="middle">0</text>
+    <text x="518" y="642" text-anchor="middle">10</text>
+    <text x="657" y="642" text-anchor="middle">20</text>
+    <text x="795" y="642" text-anchor="middle">30</text>
+    <text x="934" y="642" text-anchor="middle">40</text>
+    <text x="1072" y="642" text-anchor="middle">50</text>
   </g>
 
-  <!-- Group 1: Qwen3.6-35B-A3B (RTX 5090) -->
-  <text x="64" y="186" class="group">Qwen3.6-35B-A3B &#183; RTX 5090</text>
-  <text x="364" y="222" text-anchor="end" class="lab">per-expert loop (host readback)</text>
-  <rect x="380" y="202" width="225" height="32" rx="6" fill="url(#before)"/>
-  <text x="617" y="225" class="val">16</text>
-  <text x="364" y="270" text-anchor="end" class="lab">batched experts (GPU-side IDs)</text>
-  <rect x="380" y="250" width="646" height="32" rx="6" fill="url(#zinc)"/>
-  <text x="996" y="273" text-anchor="end" class="val" fill="#0c1a16">46</text>
-  <rect x="1042" y="251" width="64" height="30" rx="6" fill="#7df0c0"/>
-  <text x="1074" y="273" text-anchor="middle" class="tag">2.8&#215;</text>
+  <!-- Group 1: Qwen3.6-35B-A3B (RTX 4090) -->
+  <text x="64" y="184" class="group">Qwen3.6-35B-A3B &#183; 3B active</text>
+  <text x="364" y="220" text-anchor="end" class="lab">per-expert loop (host readback)</text>
+  <rect x="380" y="200" width="125" height="32" rx="6" fill="url(#before)"/>
+  <text x="517" y="223" class="val">~9</text>
+  <text x="364" y="268" text-anchor="end" class="lab">batched experts (GPU-side IDs)</text>
+  <rect x="380" y="248" width="554" height="32" rx="6" fill="url(#zinc)"/>
+  <text x="888" y="271" text-anchor="end" class="val" fill="#0c1a16">40</text>
+  <rect x="950" y="249" width="64" height="30" rx="6" fill="#7df0c0"/>
+  <text x="982" y="271" text-anchor="middle" class="tag">4.4&#215;</text>
 
   <!-- Group 2: gemma-4-26B-A4B (RTX 4090) -->
-  <text x="64" y="376" class="group">gemma-4-26B-A4B &#183; RTX 4090</text>
-  <text x="364" y="412" text-anchor="end" class="lab">sync per-expert loop</text>
-  <rect x="380" y="392" width="140" height="32" rx="6" fill="url(#before)"/>
-  <text x="532" y="415" class="val">~10</text>
-  <text x="364" y="460" text-anchor="end" class="lab">batched experts</text>
-  <rect x="380" y="440" width="730" height="32" rx="6" fill="url(#zinc)"/>
-  <text x="1080" y="463" text-anchor="end" class="val" fill="#0c1a16">52</text>
-  <rect x="380" y="510" width="730" height="2" fill="#243244"/>
+  <text x="64" y="374" class="group">gemma-4-26B-A4B &#183; 4B active</text>
+  <text x="364" y="410" text-anchor="end" class="lab">per-expert loop (host readback)</text>
+  <rect x="380" y="390" width="138" height="32" rx="6" fill="url(#before)"/>
+  <text x="530" y="413" class="val">~10</text>
+  <text x="364" y="458" text-anchor="end" class="lab">batched experts</text>
+  <rect x="380" y="438" width="720" height="32" rx="6" fill="url(#zinc)"/>
+  <text x="1088" y="461" text-anchor="end" class="val" fill="#0c1a16">52</text>
+  <rect x="1108" y="439" width="60" height="30" rx="6" fill="#2f7a63"/>
+  <text x="1138" y="461" text-anchor="middle" class="tag" fill="#eafff6">5.2&#215;</text>
 
   <text x="64" y="556" class="group" fill="#7df0c0">&#8593; Both now decode faster than the dense 27B (36) and 31B (30) models.</text>
   <text x="64" y="694" class="subtitle">The fix is launch-count, not FLOPs: one batched launch over all active experts, expert IDs read GPU-side from the router buffer &#8212; no per-layer CPU&#8596;GPU round-trip.</text>
