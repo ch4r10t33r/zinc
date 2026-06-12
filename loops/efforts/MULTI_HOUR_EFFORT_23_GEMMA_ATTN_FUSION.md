@@ -375,3 +375,23 @@ of small dispatches remain.
   sudo the agent lacks). Box hygiene: cleared `/tmp/lc-* /tmp/gc-* /tmp/cuda-dbg-*`; the
   reusable `~/zinc-e23` rsync tree sits at the T5-era commit with the already-banked T6
   uncommitted in it (harmless — the build helper rsyncs fresh from the Mac repo each cycle).
+- **2026-06-11 — CLOSE re-confirmed (no code change). Fresh cycle, independent live
+  re-verification of the structural blocker.** Cycle-start state: working tree clean except
+  the parallel 5090's `site/src/data/zinc-performance.json` (untouched); NO uncommitted
+  fusion pre-staged; no in-progress `perf/*` branch (the current branch
+  `perf/e23-norm-boundary-fuse` already contains all 5 stacked wins T1→T6 + docs). Per the
+  recoverable-fusion notes, the ONLY way to bank a new increment here is to A/B-resolve a
+  below-floor/MoE fusion under **pinned clocks**, so I re-tested the clock wall LIVE on the
+  4090 (dev 1): `nvidia-smi -i 1 -lgc 2400,2400` → "The current user does not have permission
+  to change clocks for GPU 00000000:70:00.0"; `sudo -n true` → "sudo: a password is required";
+  clocks idle 210 MHz / max 3105 MHz, persistence Enabled but unpinnable. The blocker is
+  **structural** (no sudo on this WSL2 box per `~/AGENTS.md`), confirmed unchanged. No new
+  ≥2-launch, parallelism-preserving, bit-exact DENSE fusion exists (enumeration settled the
+  prior two cycles); the recoverable below-floor (V-triple dense) and MoE (shared/routed
+  gate/up duals) fusions remain unvalidatable here. Implementing one would only reproduce a
+  foregone INCONCLUSIVE→revert and burn box time — explicitly out of scope per the contract
+  ("measurable, repeatable gain"). **No code change; nothing committed; no box scratch created
+  (only nvidia-smi queries run). Effort 23 stays CLOSED** — net delivered remains the 5 stacked
+  validated dense wins (T1 +1.54%, T3 +1.66%, T4 +1.30%, T5 +1.65%, T6 +1.41%), each on its own
+  pushed `perf/e23-*` branch, none merged to main. Banking the recoverable fusions needs a
+  future clock-locked session (sudo the agent lacks).
