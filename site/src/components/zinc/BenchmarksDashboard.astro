@@ -668,33 +668,6 @@ const jsonLd = {
     </div>
   </section>
 
-  <section class="coverage-panel" aria-label="Benchmark coverage">
-    <div>
-      <p class="eyebrow">Coverage</p>
-      <h2>All compared model rows are grouped by hardware target.</h2>
-      <p>
-        RDNA stays first because it is the default target. The full published dataset has six unique models; Metal has the six-model local comparison set, while RDNA and Intel show the canonical models that were available and valid on those nodes for this run.
-      </p>
-    </div>
-    <div class="coverage-grid">
-      {targets.map((target) => (
-        <a href={`#${target.id}`} class:list={['coverage-card', { partial: isPartialTarget(target) }]} data-bench-coverage-target={target.id}>
-          <span>
-            {target.label}
-            {isPartialTarget(target) && <em>partial</em>}
-          </span>
-          <strong>{target.summary?.compared_models ?? 0}</strong>
-          <small>
-            {successfulCount(target)}/{benchmarkedCount(target)} complete
-            {isPartialTarget(target) && ` · ${failedCount(target)} failed`}
-            {' · '}
-            {formatShortDate(target.generated_at)}
-          </small>
-        </a>
-      ))}
-    </div>
-  </section>
-
   <nav class="target-tabs" aria-label="Benchmark targets" role="tablist">
     {targets.map((target, index) => (
       <button
@@ -1280,7 +1253,6 @@ const jsonLd = {
   <script is:inline>
     function initBenchmarksDashboard() {
       const targetTabs = Array.from(document.querySelectorAll('[data-bench-target-tab]'));
-      const coverageLinks = Array.from(document.querySelectorAll('[data-bench-coverage-target]'));
       const targetPanels = Array.from(document.querySelectorAll('[data-bench-target-panel]'));
       const scenarioTabs = Array.from(document.querySelectorAll('[data-bench-scenario-target]'));
       const scenarioPanels = Array.from(document.querySelectorAll('[data-bench-scenario-panel]'));
@@ -1319,15 +1291,6 @@ const jsonLd = {
       for (const tab of targetTabs) {
         tab.addEventListener('click', () => {
           const targetId = tab.dataset.benchTargetTab || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
-          setActiveTarget(targetId);
-          history.replaceState(null, '', `#${targetId}`);
-        });
-      }
-
-      for (const link of coverageLinks) {
-        link.addEventListener('click', (event) => {
-          event.preventDefault();
-          const targetId = link.dataset.benchCoverageTarget || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
           setActiveTarget(targetId);
           history.replaceState(null, '', `#${targetId}`);
         });
