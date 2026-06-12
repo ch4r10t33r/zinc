@@ -291,3 +291,48 @@ of small dispatches remain.
   parallelism; fusing same-input matvecs into ONE block (vs T4/dual's two parallel
   blocks) is a different, worse trade at decode. The T4 dual-matvec (2 parallel
   blocks/pair, separate geglu) remains the right shape for the FFN gate/up pair.
+- **2026-06-11 — Attention Q/K/V triple matvec fuse (extend T4 dual → triple,
+  fold the standalone V matvec in). INCONCLUSIVE (sign-disagreeing, below floor)
+  → REVERTED, not committed.** Found uncommitted in the working tree at cycle
+  start (a prior loop cycle wrote it, never validated). After T4 the SWA attention
+  path runs the Q/K pair as ONE `dmmv_q4k_fast_dual` launch (over `q_dim+kv_dim`
+  blocks) then a SEPARATE standalone V matvec. This folds V into the same launch:
+  new kernel `dmmv_q4k_fast_triple` over `M0+M1+M2` blocks (block `<M0`→Q→y0,
+  `<M0+M1`→K→y1, else V→y2). V is Q4_K **or** Q6_K (gemma-31b Q4_K_M mixes them
+  across SWA layers) — one `v_q6k` push flag selects the branch; the per-row
+  compute reuses the shared `zinc_dmmv_q4k_fast_sum` / a newly-factored
+  `zinc_dmmv_q6k_fast_sum` device helper (same blockDim 64 as the standalone fast
+  path — confirmed `dmmvDispatch` dispatches `dmmv_fast` at blockDim 64 → identical
+  summation order → **bit-identical**). Gated on Q&K both-Q4_K + V∈{Q4_K,Q6_K} +
+  Wv present (SWA layers); full-attention layers (V = raw K projection, no Wv) and
+  the unfused fallback keep the T4 dual. Removes the standalone V launch on the
+  ~50 SWA layers of the 31b (~50/token). **PRESERVES parallelism** (Q/K/V still get
+  their own blocks — `M0+M1+M2` blocks total, NOT the FFN-fuse's into-one-block
+  serialization), so unlike the FFN fuse this is the "good shape" (true effect ≥0).
+  **Bit-exact:** `validate_catalog` → **5/5 token-correct** (qwen 3×12/12;
+  gemma4-26b 12/12; gemma4-31b teacher-forced 11/12 = the documented near-tie,
+  unchanged). **Build:** isolated caches, baseline md5 `9520eb3b…` → variant
+  `ab01de92…` (real recompile). **Perf — UNMEASURABLE in boost noise.** Interleaved
+  A/B (4090, warmup ignored), THREE batches that **DISAGREE IN SIGN**: b1 (6×160)
+  variant 32.49 vs baseline 32.62 = **−0.40%** (won 3/6, baseline hot rounds 33.47
+  & 33.23); b2 (8×160) 32.57 vs 32.46 = **+0.33%** (won 5/8, baseline hot rounds
+  33.58 & 32.71); b3 (8×200) 32.20 vs 32.03 = **+0.56%** (won 8/8 but baseline ran
+  in a cool low-boost regime, margins 0.05–0.36). **Pooled 22 rounds: variant 32.41
+  vs baseline 32.35 = +0.19%** (within the ±1% noise floor). Same coin-flip
+  signature as the rejected Q/K-only norm+rope and MoE output-scale folds — the
+  VARIANT is rock-steady across all batches (~32.4) while the BASELINE swings
+  per-process and its occasional hot rounds flip the batch sign. **Root cause:** the
+  triple removes only ONE launch per SWA layer (~50/token) — HALF the magnitude of
+  the resolvable T4/T5/T6 wins (each ~2 launches/layer, ~120/token), so the saving
+  sits below this box's per-process boost-noise floor. Per the contract
+  ("measurable, repeatable gain"; "never claim a win from one boosted run") this is
+  **NOT a validated win** → **reverted** (working tree + box variant tree restored
+  to HEAD; iso caches + binaries cleared). **Unlike the FFN fuse**, this one
+  preserves parallelism and is strictly fewer-ops (true effect ≥0, never a
+  regression) — **recoverable from this log for a future clock-locked cycle**
+  (`nvidia-smi -lgc`, needs sudo the agent lacks) that could resolve sub-1% effects.
+  **Lesson re-confirmed (T5):** a single-launch removal that doesn't cost
+  parallelism is correct-and-free but still below floor here; only ≥2-launch fusions
+  (T4/T5/T6) clear the ±1% boost noise on this box without locked clocks. The T4
+  dual remains the right shape for the attention matvecs; folding V to a triple is a
+  free-but-unmeasurable extra that wants pinned clocks to bank.
