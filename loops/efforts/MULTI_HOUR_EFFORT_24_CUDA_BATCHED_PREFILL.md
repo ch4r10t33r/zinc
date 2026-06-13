@@ -408,3 +408,41 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   +6% — cache the dequant'd weights in fp16 once (kill per-GEMM dequant) and/or keep activations fp16 across
   the layer (kill the f32↔fp16 recast per GEMM); OR token-GROUPED routed experts (gather by expert =
   memory-traffic win, harder byte-identity).
+- **2026-06-13 — Cycle 12: TC GEMM reads a PRE-CONVERTED fp16 activation (halve the dominant A read) — +18% over f32 batched / +8% over cycle-11 plain TC, byte-identical to plain TC.**
+  Took cycle 11's own NEXT item: the +6% plain-TC gain was small because `gemm_q4k_tc` re-reads the f32
+  activation A from global ONCE PER OUTPUT M-BLOCK (grid.x = M/64), so the f32 A traffic is ~(M/64)× the
+  weight traffic and dominates the memory-bound dense GEMM. This cycle pre-converts A to fp16 ONCE per GEMM
+  (`f32_to_f16`) and feeds a half-width A to the TC kernel — halving + de-duplicating the dominant read.
+  ADDITIVE (decodeStep/per-token path/dense+MoE batched f32 paths/cycle-11 plain TC all untouched):
+    - 2 ADDITIVE kernels (kernels.cu): `f32_to_f16` (element-wise `y[i]=__float2half(x[i])`) and
+      `gemm_q4k_tc_f16a` — IDENTICAL to `gemm_q4k_tc` (same Q4_K dequant, same wmma 16×16×16 schedule, same
+      Cs store / guarded copy) EXCEPT A arrives already fp16 (no per-load `__float2half`). The downcast uses
+      the SAME `__float2half` the plain TC kernel applied in shared → the staged half bits are identical →
+      `gemm_q4k_tc_f16a`'s output is BYTE-FOR-BYTE `gemm_q4k_tc`'s (confirmed empirically below), only the
+      global A read is halved + read once not once-per-M-block.
+    - `gemm_q4k_tc_f16a` + `f32_to_f16` pipelines + `BatchScratch.act_f16` ([T, max activation] halves) +
+      `F32ToF16Push`. `gemmDispatch`: when `use_tc` and Q4_K (idx 0), pre-convert A → `act_f16` then dispatch
+      `gemm_q4k_tc_f16a` (cycle-12 default). `x_offset == 0` on the batched GEMM path (contiguous [T,K]) so the
+      whole [T·K] tile converts at offset 0; `act_f16` reuse across a layer's GEMMs is safe (stream-ordered).
+    - A/B knob `ZINC_BATCHED_TC_PLAIN` (additive bool): forces cycle-11 `gemm_q4k_tc` (f32-A re-read) so the
+      f16-A memory-traffic win is measurable in isolation. Off → the f16-A path. Both gated under `ZINC_BATCHED_TC`.
+  Built clean on the 4090 box (fresh source rsync, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0,
+  bin md5 33e6e1a1 ≠ cycle 11's 602a6918; NVRTC compiled the 2 new kernels at runtime). GATE — its own
+  tolerance gate CLEARED (TC is fp16 → token-correctness, not GEN byte-identity vs f32):
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (f16-A TC path direct vs llama.cpp, 4090): **5/5 PASS**
+      — qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all **12/12**; gemma4-31b the SAME documented near-tie as
+      the f32/plain-TC path (free-run 2/12, teacher-forced 11/12) → the f16-A pre-convert introduced **NO new
+      divergence**.
+    - f16-A == plain-TC byte-identity (the WIP's core claim): direct ABBA (gemma-31b, 250-tok) P=plain-TC
+      F=f16a-TC → GEN_IDS IDENTICAL on every run → `gemm_q4k_tc_f16a` is byte-for-byte `gemm_q4k_tc`, as
+      designed. Default path (`ZINC_BATCHED_TC` unset) is the unchanged f32 batched GEMM.
+    - Perf (ABBA, gemma-31b 250-tok, 4090): plain-TC ~147.9 t/s → **f16-A TC ~159.6 t/s (+7.9%** over cycle-11
+      plain TC); and batched-no-TC ~137.2 → **f16-A TC ~161.5 (+17.7%** over the f32 batched path — UP from
+      cycle 11's plain-TC +6%). Per-token baseline ~32 t/s → f16-A TC is **~5×** the per-token prefill.
+  The f16-A path roughly TRIPLES cycle 11's TC win (+6%→+18% over f32) by attacking the activation read
+  traffic that made the GEMM memory-bound — exactly what the cycle-11 NEXT note predicted. Committed to
+  perf/e24-batched-prefill, pushed (NOT main). Opt-in (off by default) → cannot regress production or the
+  proven byte-identical batched gate. NEXT (cycle 13): cache the dequant'd Q4_K weights in fp16 ONCE per layer
+  (kill the per-GEMM Q4_K dequant — the other half of the TC GEMM's traffic) and/or keep activations fp16
+  across the whole layer (avoid the per-GEMM f32→fp16 recast); OR token-GROUPED routed experts (gather by
+  expert = memory-traffic win beyond launch batching, harder byte-identity).

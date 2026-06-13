@@ -72,6 +72,7 @@ const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 
 const RmsRopeBatchPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, base_position: u32, src_stride: u32, dst_stride: u32 };
 const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride: u32, dst_stride: u32 };
 const SwigluPush = extern struct { N: u32 };
+const F32ToF16Push = extern struct { N: u32 }; // cycle 12: activation downcast for the TC f16-A GEMM
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
 const ArgmaxPush = extern struct { N: u32 };
@@ -183,6 +184,11 @@ const Pipelines = struct {
     // dense prefill GEMMs' +2.2× lever, opt-in via ZINC_BATCHED_TC (NOT byte-
     // identical → its own token-correctness gate, never the default path).
     gemm_q4k_tc: CudaPipeline,
+    // Effort 24 cycle 12: TC Q4_K GEMM reading a PRE-CONVERTED fp16 activation
+    // (f32_to_f16 downcasts the activation once → halves the dominant f32-A read
+    // traffic). Output byte-identical to gemm_q4k_tc. Opt-in with the TC path.
+    gemm_q4k_tc_f16a: CudaPipeline,
+    f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
 };
 
 /// Per-prompt batched activation scratch (Effort 24 batched prefill). Allocated
@@ -216,6 +222,9 @@ const BatchScratch = struct {
     geglu_e: CudaBuffer, // [T, n_used*ef] GeGLU(gate,up)
     down_e: CudaBuffer, // [T, n_used*n_embd] routed down projection (slot-major per token)
     moe_out_e: CudaBuffer, // [T, n_embd] routed-expert weighted sum (post_ffw_norm_2), cycle 9
+    // Effort 24 cycle 12: fp16 activation scratch for the TC f16-A GEMM path
+    // ([T, ff_buf_max] halves; sized to the largest activation; TC opt-in only).
+    act_f16: CudaBuffer,
 };
 
 pub const ForwardGemma = struct {
@@ -277,6 +286,7 @@ pub const ForwardGemma = struct {
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
     // the proven byte-identical path is unchanged. NOT byte-identical when on.
     use_tc: bool = false,
+    use_tc_plain: bool = false, // cycle 12 A/B: force cycle-11 plain TC (no f16-A pre-convert)
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -384,6 +394,8 @@ pub const ForwardGemma = struct {
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
         pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
+        pipes.gemm_q4k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a");
+        pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -629,6 +641,11 @@ pub const ForwardGemma = struct {
         // Read once here so gemmDispatch can pick the kernel per weight without a
         // getenv per launch. Off by default → the byte-identical path is unchanged.
         self.use_tc = std.posix.getenv("ZINC_BATCHED_TC") != null;
+        // Cycle 12 A/B knob: ZINC_BATCHED_TC_PLAIN forces the cycle-11 plain TC
+        // GEMM (f32 activation re-read per M-block) instead of the cycle-12 f16-A
+        // path (activation pre-converted to fp16 once). Lets us measure the f16-A
+        // memory-traffic win in isolation. Unset → the f16-A path (cycle 12 default).
+        self.use_tc_plain = std.posix.getenv("ZINC_BATCHED_TC_PLAIN") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -854,9 +871,28 @@ pub const ForwardGemma = struct {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             // Cycle 11: when ZINC_BATCHED_TC is set, Q4_K GEMMs (idx 0 — the bulk of
             // the dense FLOPs: gate/up + attn Q/K/V/O) run on the fp16 tensor cores.
-            // Same GemmPush / grid / block; gemm_q4k_tc uses static shared only.
-            const pipe = if (self.use_tc and idx == 0) &self.pipes.gemm_q4k_tc else &self.pipes.gemm[idx];
-            cmd.dispatch(pipe, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            if (self.use_tc and idx == 0 and self.use_tc_plain) {
+                // Cycle 11 plain TC (A/B baseline): the kernel re-reads f32 A from
+                // global once per output M-block. Same GemmPush/grid/block.
+                cmd.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+                return;
+            }
+            if (self.use_tc and idx == 0) {
+                // Cycle 12: pre-convert the f32 activation [T,K] to fp16 ONCE
+                // (f32_to_f16) so the TC GEMM reads half-width A — the TC kernel
+                // otherwise re-reads f32 A once per output M-block, and that f32
+                // activation traffic (~7× the Q4_K weight traffic for a 64×64 tile)
+                // is what makes the dense GEMM memory-bound. The downcast uses the
+                // SAME __float2half the TC kernel applied in shared → byte-for-byte
+                // identical output, just half the dominant A read traffic.
+                const a16 = &self.batch.?.act_f16;
+                const cvt = F32ToF16Push{ .N = T * K };
+                cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                return;
+            }
+            // Same GemmPush / grid / block; gemm uses static shared only.
+            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             return;
         }
         // Fallback: loop the per-token matvec over the token-major buffers.
@@ -907,13 +943,17 @@ pub const ForwardGemma = struct {
             .geglu_e = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_ff) * f4),
             .down_e = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_embd) * f4),
             .moe_out_e = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            // fp16 activation scratch: T × largest-activation halves (2 bytes each).
+            // TC Q4_K GEMMs read A with K ∈ {n_embd (gate/up,Q/K/V), q_dim (O)};
+            // size to the max of those and ff for headroom.
+            .act_f16 = try buffer.createBuffer(ctx, T * @max(ff, @max(d.q_dim_max, d.n_embd)) * @sizeOf(u16)),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.act_f16 }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;

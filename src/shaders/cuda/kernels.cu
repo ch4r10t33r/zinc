@@ -1744,6 +1744,111 @@ extern "C" __global__ void gemm_q4k_tc(const unsigned* a_u32, const float* A, fl
     }
 }
 
+// ---- f32_to_f16 — element-wise activation downcast (Effort 24 cycle 12) -------
+// y[i] = __float2half(x[i]). Used to pre-convert a GEMM's f32 activation tile to
+// fp16 ONCE before gemm_q4k_tc_f16a reads it. The TC GEMM otherwise re-reads the
+// f32 activation from global once per output M-block (blockIdx.x) — for a 64x64
+// tile that f32 activation traffic is ~7x the Q4_K weight traffic and dominates
+// the memory-bound dense GEMM. Pre-converting halves it. Uses the SAME
+// __float2half the TC kernel applies in shared, so the staged half bits are
+// IDENTICAL → gemm_q4k_tc_f16a's output is byte-for-byte gemm_q4k_tc's.
+struct F32ToF16Push { unsigned N; };
+extern "C" __global__ void f32_to_f16(const float* x, half* y, F32ToF16Push pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    y[idx] = __float2half(x[idx]);
+}
+
+// ---- gemm_q4k_tc_f16a — tensor-core Q4_K GEMM with a PRE-CONVERTED fp16 A -----
+// Identical to gemm_q4k_tc in every respect (same Q4_K dequant, same wmma 16x16x16
+// fragment schedule, same Cs store / guarded copy) EXCEPT the activation A arrives
+// already in fp16 (from f32_to_f16) and is staged into shared with no per-load
+// __float2half. The staged half bits match gemm_q4k_tc's (which casts the same f32
+// with __float2half), so Y is byte-for-byte identical to gemm_q4k_tc — only the
+// global activation read traffic is halved (and read once, not once per M-block).
+extern "C" __global__ void gemm_q4k_tc_f16a(const unsigned* a_u32, const half* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ half Ws[BM*BK];   // m-major: Ws[r*BK + k]  (matrix_a row-major M×K)
+    __shared__ half As[BK*BT];   // k-major: As[k*BT + t]  (matrix_b row-major K×N)
+    __shared__ float Cs[BT*BM];  // token-major out tile: Cs[t*BM + m]
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 8;          // Q4_K superblocks per row (256 elems = 36 u32)
+    unsigned nchunk = pc.K >> 5;       // K/32 sub-blocks
+    unsigned tid = threadIdx.x;
+    unsigned a0 = (pc.a_offset >> 2);
+    const half* Abase = A + (pc.x_offset >> 1);   // x_offset in bytes → half elems
+    unsigned warp = tid >> 5;          // 0..7
+    unsigned fm = warp >> 2;           // 0..1  (M-block pair base: fm, fm+2)
+    unsigned ft = warp & 3u;           // 0..3  (T-block)
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u;
+        // dequant W sub-block (64 rows x 32 elems) into Ws (m-major) — identical
+        // Q4_K unpack to gemm_q4k_tc, then cast to half.
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
+            unsigned r = idx >> 5, l = idx & 31u;      // row 0..63, elem 0..31
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
+                unsigned dd = a_u32[blk];
+                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                unsigned char qb = qs[(sb8 >> 1) * 32u + l];
+                unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        // stage A sub-block (64 tokens x 32 elems) into As (k-major) — A is
+        // already fp16, so no per-load __float2half (the only change vs gemm_q4k_tc).
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned tok = t0 + t;
+            As[l * BT + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + c * 32u + l] : __float2half(0.0f);
+        }
+        __syncthreads();
+        // two wmma k-steps over the 32-wide sub-block.
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[(fm * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fm + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+        }
+        __syncthreads();
+    }
+    // store both fragments (out[m][t]) col-major into the token-major Cs tile.
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + fm * 16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fm + 2u) * 16u], c1, BM, wmma::mem_col_major);
+    __syncthreads();
+    // guarded copy Cs -> Y[T,M] (16 elems/thread over the 64x64 tile).
+    #pragma unroll
+    for (int u = 0; u < 16; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;   // 0..4095
+        unsigned t = idx >> 6, m = idx & 63u;      // token 0..63, row 0..63
+        unsigned tok = t0 + t, row = m0 + m;
+        if (row < pc.M && tok < pc.T) {
+            unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+            if (pc.acc_mode != 0u) Y[yi] += Cs[t * BM + m]; else Y[yi] = Cs[t * BM + m];
+        }
+    }
+}
+
 // ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
 // ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
 struct SigmoidMulPush { unsigned N; };
