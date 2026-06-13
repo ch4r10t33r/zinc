@@ -5181,7 +5181,10 @@ fn runGemma4MoeLayer(
     for (state.hidden, state.branch, state.down) |*h, attn, ffn| h.* = attn + ffn;
 }
 
-const direct_router_row_range_max_rows: u32 = 128;
+// Cover the full Qwen 3.6 expert router on the tracked M1 decode slice. The
+// CS staging/output BOs still bound this at runtime; 256 rows is 1 KiB of
+// output and ~288 KiB of Q4_0 weights at K=2048.
+const direct_router_row_range_max_rows: u32 = 256;
 const direct_router_row_range_tolerance: f32 = 0.01;
 const direct_router_parallel64_rows: u32 = 64;
 const direct_router_parallel64_half_rows: u32 = direct_router_parallel64_rows / 2;
@@ -5190,7 +5193,7 @@ fn directRouterRowRangeOpName(tensor_type: gguf.GGMLType, used_parallel64: bool)
     return switch (tensor_type) {
         .f32 => "router_f32_row_range",
         .q8_0 => if (used_parallel64) "router_q8_0_row_range_parallel64" else "router_q8_0_row_range",
-        .q4_0 => "router_q4_0_row_range",
+        .q4_0 => if (used_parallel64) "router_q4_0_row_range_parallel64" else "router_q4_0_row_range",
         else => "router_unsupported_row_range",
     };
 }
@@ -5217,8 +5220,32 @@ const DirectRouterDispatchResult = struct {
     chunks: u32 = 1,
 };
 
+fn canUseDirectRouterParallel64(tensor_type: gguf.GGMLType, rows: u32) bool {
+    if (rows < direct_router_parallel64_rows or rows % direct_router_parallel64_rows != 0) return false;
+    return switch (tensor_type) {
+        .q4_0, .q8_0 => true,
+        else => false,
+    };
+}
+
 fn canUseDirectRouterQ8_0Parallel64(rows: u32) bool {
-    return rows >= direct_router_parallel64_rows and rows % direct_router_parallel64_rows == 0;
+    return canUseDirectRouterParallel64(.q8_0, rows);
+}
+
+fn canUseDirectRouterQ4_0Parallel64(rows: u32) bool {
+    return canUseDirectRouterParallel64(.q4_0, rows);
+}
+
+fn directRouterCoverageName(full_coverage: bool) []const u8 {
+    return if (full_coverage) "full" else "prefix";
+}
+
+fn directRouterRowsForSlice(n_experts: u32) u32 {
+    return @min(n_experts, direct_router_row_range_max_rows);
+}
+
+fn directRouterCanOverwriteAllLogits(n_experts: u32, rows: u32) bool {
+    return rows == n_experts and rows != 0;
 }
 
 fn dispatchDirectRouterRowRange(
@@ -5263,6 +5290,13 @@ fn dispatchDirectRouterRowRange(
             return .{};
         },
         .q4_0 => {
+            if (canUseDirectRouterQ4_0Parallel64(rows)) {
+                try boundary.dmmvQ4_0RowRangeParallelChunks(input, weights, rows, cols, output);
+                return .{
+                    .used_parallel64 = true,
+                    .chunks = rows / direct_router_parallel64_rows,
+                };
+            }
             try boundary.dmmvQ4_0RowRange(input, weights, rows, cols, output);
             return .{};
         },
@@ -5285,19 +5319,15 @@ fn consumeDirectRouterRowRange(
     if (!directRouterSupportsRowRange(router_w.type_, cols)) return;
     if (!canDotDirect(router_w.type_, cols)) return;
 
-    const rows = @min(cfg.n_experts, direct_router_row_range_max_rows);
+    const rows = directRouterRowsForSlice(cfg.n_experts);
     const rows_usize: usize = @intCast(rows);
-    if (rows == 0 or state.row_scratch.len < rows_usize * 2 or state.router_logits.len < rows_usize) return;
+    if (rows == 0 or state.row_scratch.len < rows_usize or state.router_logits.len < rows_usize) return;
     const row_bytes = directRouterRowBytes(router_w.type_, cols);
     if (row_bytes == 0) return;
     const total_bytes = @as(usize, rows) * row_bytes;
     if (router_w.raw.len < total_bytes) return;
 
     const gpu_logits = state.row_scratch[0..rows_usize];
-    const cpu_logits = state.row_scratch[rows_usize..][0..rows_usize];
-    matvecRawDirectSerial(router_w.raw, router_w.type_, state.ffn_norm, null, 0, rows, cpu_logits) catch {
-        return;
-    };
     const dispatch_result = dispatchDirectRouterRowRange(
         tracking.boundary,
         router_w.type_,
@@ -5319,7 +5349,7 @@ fn consumeDirectRouterRowRange(
             log.warn("M1 AMDGPU CS direct router row-range produced non-finite row {d}; router logits remain host-computed", .{i});
             return;
         }
-        const delta = @abs(gpu_value - cpu_logits[i]);
+        const delta = @abs(gpu_value - state.router_logits[i]);
         if (delta > max_abs_delta) {
             max_abs_delta = delta;
             max_row = @intCast(i);
@@ -5336,6 +5366,7 @@ fn consumeDirectRouterRowRange(
 
     @memcpy(state.router_logits[0..rows_usize], gpu_logits);
     state.direct_router_row_range_done = true;
+    const full_coverage = directRouterCanOverwriteAllLogits(cfg.n_experts, rows);
     tracking.ops.* += dispatch_result.chunks;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -5343,11 +5374,13 @@ fn consumeDirectRouterRowRange(
     if (tracking.phase == .decode) {
         if (tracking.decode_model_slices) |slices| slices.* += dispatch_result.chunks;
     }
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase={s} rows={d} cols={d} chunks={d} max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase={s} coverage={s} rows={d} experts={d} cols={d} chunks={d} max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
         tracking.ops.*,
         directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64),
         directComputePhaseName(tracking.phase),
+        directRouterCoverageName(full_coverage),
         rows,
+        cfg.n_experts,
         cols,
         dispatch_result.chunks,
         max_abs_delta,
@@ -8984,14 +9017,26 @@ test "direct LM-head Q4_0 selected source identifies GPU scores" {
     try std.testing.expect(!directLmHeadQ4_0SelectedSourceHasGpuScore("cpu_rows"));
 }
 
-test "direct router row-range names parallel Q8_0 chunks" {
+test "direct router row-range names full parallel chunks" {
+    try std.testing.expectEqual(@as(u32, 128), directRouterRowsForSlice(128));
+    try std.testing.expectEqual(@as(u32, direct_router_row_range_max_rows), directRouterRowsForSlice(512));
+    try std.testing.expect(directRouterCanOverwriteAllLogits(256, 256));
+    try std.testing.expect(!directRouterCanOverwriteAllLogits(512, direct_router_row_range_max_rows));
+    try std.testing.expectEqualStrings("full", directRouterCoverageName(true));
+    try std.testing.expectEqualStrings("prefix", directRouterCoverageName(false));
+
     try std.testing.expect(!canUseDirectRouterQ8_0Parallel64(0));
     try std.testing.expect(!canUseDirectRouterQ8_0Parallel64(32));
     try std.testing.expect(canUseDirectRouterQ8_0Parallel64(64));
     try std.testing.expect(canUseDirectRouterQ8_0Parallel64(128));
     try std.testing.expect(!canUseDirectRouterQ8_0Parallel64(96));
+    try std.testing.expect(!canUseDirectRouterQ4_0Parallel64(32));
+    try std.testing.expect(canUseDirectRouterQ4_0Parallel64(64));
+    try std.testing.expect(canUseDirectRouterQ4_0Parallel64(256));
     try std.testing.expectEqualStrings("router_q8_0_row_range", directRouterRowRangeOpName(.q8_0, false));
     try std.testing.expectEqualStrings("router_q8_0_row_range_parallel64", directRouterRowRangeOpName(.q8_0, true));
+    try std.testing.expectEqualStrings("router_q4_0_row_range", directRouterRowRangeOpName(.q4_0, false));
+    try std.testing.expectEqualStrings("router_q4_0_row_range_parallel64", directRouterRowRangeOpName(.q4_0, true));
     try std.testing.expectEqualStrings("router_f32_row_range", directRouterRowRangeOpName(.f32, true));
 }
 
