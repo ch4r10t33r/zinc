@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1724"/>
+      <stop offset="1" stop-color="#18251f"/>
+    </linearGradient>
+    <linearGradient id="zinc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38d7ff"/>
+      <stop offset="1" stop-color="#58e6a9"/>
+    </linearGradient>
+    <linearGradient id="zincmute" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#274056"/>
+      <stop offset="1" stop-color="#2b4a44"/>
+    </linearGradient>
+    <style>
+      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .subtitle { fill: #aebdcc; font-size: 15px; }
+      .axis { fill: #8595a8; font-size: 13px; }
+      .label { fill: #e8f1f8; font-size: 17px; font-weight: 720; }
+      .sub { fill: #9fb0c0; font-size: 13px; }
+      .gain { fill: #ffd86b; font-size: 18px; font-weight: 820; }
+      .moe { fill: #58e6a9; font-size: 12px; font-weight: 760; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">Four bottlenecks, four fixes</text>
+  <text x="56" y="94" class="subtitle">RTX 5090 decode, tok/s. Muted bar = before; bright = the gain after each model's distinct bottleneck fell.</text>
+
+  <g transform="translate(56,132)">
+    <rect width="1088" height="540" rx="10" fill="#111c2a" stroke="#344458"/>
+
+    <g transform="translate(290,70)">
+      <!-- axis 0..120 tok/s over 680px (5.667 px/tok) -->
+      <text x="0" y="-22" class="axis">0</text>
+      <text x="283" y="-22" class="axis">50</text>
+      <text x="567" y="-22" class="axis">100 tok/s</text>
+      <line x1="0" y1="-8" x2="0" y2="420" stroke="#263548"/>
+      <line x1="283" y1="-8" x2="283" y2="420" stroke="#263548" stroke-dasharray="4 6"/>
+      <line x1="567" y1="-8" x2="567" y2="420" stroke="#263548" stroke-dasharray="4 6"/>
+
+      <!-- Gemma-4-26B MoE: 8.3 -> 40.4 (47 -> 229px) -->
+      <rect x="0" y="14" width="47" height="58" rx="6" fill="url(#zincmute)"/>
+      <rect x="47" y="14" width="182" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="241" y="49" class="gain">4.9&#215;</text>
+      <text x="-16" y="40" text-anchor="end" class="label">Gemma-4-26B <tspan class="moe">MoE</tspan></text>
+      <text x="-16" y="60" text-anchor="end" class="sub">8.3 &#8594; 40.4 · per-expert dispatch</text>
+
+      <!-- Qwen3.6-35B-A3B MoE: 16.3 -> 37.4 (92 -> 212px) -->
+      <rect x="0" y="114" width="92" height="58" rx="6" fill="url(#zincmute)"/>
+      <rect x="92" y="114" width="120" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="224" y="149" class="gain">2.3&#215;</text>
+      <text x="-16" y="140" text-anchor="end" class="label">Qwen3.6-35B-A3B <tspan class="moe">MoE</tspan></text>
+      <text x="-16" y="160" text-anchor="end" class="sub">16.3 &#8594; 37.4 · router readback</text>
+
+      <!-- Qwen3.5-9B dense: 92 -> 118 (521 -> 669px) -->
+      <rect x="0" y="214" width="521" height="58" rx="6" fill="url(#zincmute)"/>
+      <rect x="521" y="214" width="148" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="681" y="249" class="gain">1.3&#215;</text>
+      <text x="-16" y="240" text-anchor="end" class="label">Qwen3.5-9B <tspan class="sub">dense</tspan></text>
+      <text x="-16" y="260" text-anchor="end" class="sub">92 &#8594; 118 · sync-bound boost</text>
+
+      <!-- Gemma-4-31B dense: 34 -> 39 (193 -> 221px) -->
+      <rect x="0" y="314" width="193" height="58" rx="6" fill="url(#zincmute)"/>
+      <rect x="193" y="314" width="28" height="58" rx="6" fill="url(#zinc)"/>
+      <text x="233" y="349" class="gain">1.15&#215;</text>
+      <text x="-16" y="340" text-anchor="end" class="label">Gemma-4-31B <tspan class="sub">dense</tspan></text>
+      <text x="-16" y="360" text-anchor="end" class="sub">34 &#8594; 39 · launch-latency (fusion)</text>
+    </g>
+  </g>
+</svg>
