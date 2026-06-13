@@ -164,8 +164,8 @@ const Pipelines = struct {
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
-    // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K weights).
-    gemm: [3]CudaPipeline,
+    // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K / Q8_0 weights).
+    gemm: [4]CudaPipeline,
 };
 
 /// Per-prompt batched activation scratch (Effort 24 batched prefill). Allocated
@@ -187,6 +187,7 @@ const BatchScratch = struct {
     up: CudaBuffer, // [T, ff_buf_max]
     geglu: CudaBuffer, // [T, ff_buf_max]
     down: CudaBuffer, // [T, n_embd]
+    shared: CudaBuffer, // [T, n_embd] gemma4-MoE shared-expert output (post_ffw_norm_1)
 };
 
 pub const ForwardGemma = struct {
@@ -342,6 +343,7 @@ pub const ForwardGemma = struct {
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
+        pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -608,23 +610,34 @@ pub const ForwardGemma = struct {
             // mirror the per-token path's `n_experts>0 && ffn_gate_inp present` test.
             const layer_is_moe = moe and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
             if (layer_is_moe) {
-                // Phase-2 cycle 1: routed-expert FFN per token (full batched-expert
-                // routing is a later cycle). The FFN is position-independent, so
-                // looping the single-token moeFfnBlock + layerOutScale over each
-                // token's hidden slice is OUTPUT-IDENTICAL to the per-token path.
+                // Phase-2 cycle 2: the Q8_0 shared-expert FFN is now BATCHED over
+                // all T tokens (gemm_q8_0_tiled_v2 reads each ~17.8 MB/token shared
+                // weight ONCE for the whole prompt) → b.shared. The routed experts +
+                // combine still loop per token (token-grouped routing is a later
+                // cycle); each token reads its precomputed shared output from
+                // b.shared. Both pieces are OUTPUT-IDENTICAL to the per-token path
+                // (sharedExpertBatched makes the same dmmv→GEMM swap as the proven
+                // dense ffnBlockBatched; moeRoutedCombine is moeFfnBlock minus its
+                // shared sub-block, same kernels/pushes).
+                try self.sharedExpertBatched(L, T, b);
                 const saved_hidden = self.hidden;
+                const saved_shared = self.shared_buf;
                 var t: u32 = 0;
                 while (t < T) : (t += 1) {
-                    // Point self.hidden at this token's slice of the batched stream.
-                    // The launch captures the raw device ptr (cuLaunchKernel), so the
-                    // alias wrapper is safe to free once moeFfnBlock has recorded its
-                    // dispatches — the slice's device memory lives on in b.hidden.
+                    // Point self.hidden / self.shared_buf at this token's slices of
+                    // the batched streams. The launch captures the raw device ptr
+                    // (cuLaunchKernel), so the alias wrappers are safe to free once
+                    // moeRoutedCombine has recorded its dispatches — the slices' device
+                    // memory lives on in b.hidden / b.shared.
                     self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
-                    try self.moeFfnBlock(L);
+                    self.shared_buf = try buffer.aliasBuffer(&b.shared, t * d.n_embd * f4, d.n_embd * f4);
+                    try self.moeRoutedCombine(L);
                     try self.layerOutScale(L); // MoE's final write is scale_accumulate → standalone scale
                     buffer.freeBuffer(&self.hidden);
+                    buffer.freeBuffer(&self.shared_buf);
                 }
                 self.hidden = saved_hidden;
+                self.shared_buf = saved_shared;
             } else {
                 try self.ffnBlockBatched(L, T, b);
                 // dense layer_output_scale is folded into the post-ffn norm+residual.
@@ -768,6 +781,7 @@ pub const ForwardGemma = struct {
             .q4_k => 0,
             .q5_k => 1,
             .q6_k => 2,
+            .q8_0 => 3,
             else => null,
         };
         if (gi) |idx| {
@@ -812,13 +826,14 @@ pub const ForwardGemma = struct {
             .up = try buffer.createBuffer(ctx, T * ff * f4),
             .geglu = try buffer.createBuffer(ctx, T * ff * f4),
             .down = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .shared = try buffer.createBuffer(ctx, T * d.n_embd * f4),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -1060,6 +1075,150 @@ pub const ForwardGemma = struct {
                 cmd.dispatch(&self.pipes.moe_weighted_acc_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf, &wdscale.gpu_buffer }, &ma, @sizeOf(MoeAccPush), 0);
             } else {
                 // Fallback: the down scale was already folded into the router weights host-side.
+                cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            }
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
+            if (batched) self.submit(cmd) else cmd.commitAndWait();
+        }
+
+        // --- combine: cur = post_ffw_norm(shared + moe); hidden += cur. ------
+        {
+            var cmd = try command.beginCommand(ctx);
+            const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
+            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.shared_buf, &self.moe_out_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpost.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
+            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.shared_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            if (batched) self.submit(cmd) else cmd.commitAndWait();
+        }
+    }
+
+    /// Batched gemma4-MoE shared-expert FFN over all T tokens → b.shared[T,n_embd].
+    /// Pre-norm + gate/up/down projections via GEMM (the Q8_0 shared weights now
+    /// take gemm_q8_0_tiled_v2, read ONCE for all T tokens), element-wise GeGLU
+    /// across [T, sf], then post_ffw_norm_1. Mirrors the shared-expert sub-block of
+    /// `moeFfnBlock` op-for-op — the only change is the per-token dmmv → batched
+    /// GEMM swap, the same one the proven dense `ffnBlockBatched` makes (token-level
+    /// output-identical). The per-token `moeRoutedCombine` then reads b.shared[t].
+    fn sharedExpertBatched(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const sf = d.shexp_ff; // shared-expert intermediate (2112)
+        const wfn = self.layer(L, "ffn_norm.weight");
+        const wgate = self.layer(L, "ffn_gate.weight");
+        const wup = self.layer(L, "ffn_up.weight");
+        const wdown = self.layer(L, "ffn_down.weight");
+        const wpn1 = self.layer(L, "post_ffw_norm_1.weight");
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wgate, &b.ffn_norm, &b.gate, sf, d.n_embd, T);
+        self.gemmDispatch(&cmd, wup, &b.ffn_norm, &b.up, sf, d.n_embd, T);
+        const sg = SwigluPush{ .N = T * sf };
+        cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.geglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wdown, &b.geglu, &b.shared, d.n_embd, sf, T);
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.shared, &wpn1.gpu_buffer, &b.shared }, &rms, @sizeOf(RmsPush), 0);
+        cmd.commitAndWait();
+    }
+
+    /// gemma4-MoE routed-expert FFN + combine for ONE token, reading a pre-computed
+    /// shared-expert output from `self.shared_buf`. This is exactly `moeFfnBlock`
+    /// MINUS its shared-expert sub-block (now computed once for all T tokens by
+    /// `sharedExpertBatched`): router top-k, routed experts, and the
+    /// post_ffw_norm(shared+moe)+residual combine, all on `self.hidden` /
+    /// `self.shared_buf` (aliased by the caller to this token's batched slices).
+    /// The router/routed/combine kernels + push constants are identical to
+    /// moeFfnBlock, so the per-token math is byte-for-byte the per-token path's.
+    fn moeRoutedCombine(self: *ForwardGemma, L: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // routed-expert intermediate (704)
+
+        const wpre2 = self.layer(L, "pre_ffw_norm_2.weight");
+        const wpn2 = self.layer(L, "post_ffw_norm_2.weight");
+        const wpost = self.layer(L, "post_ffw_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
+        const wrscale = self.layer(L, "ffn_gate_inp.scale"); // [n_embd] F32
+        const wgu = self.layer(L, "ffn_gate_up_exps.weight"); // [n_embd, 2*ef, n_experts]
+        const wde = self.layer(L, "ffn_down_exps.weight"); // [ef, n_embd, n_experts]
+
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        const batched = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
+
+        // --- router logits + top-k softmax (computed from this token's hidden) ---
+        {
+            var cmd = try command.beginCommand(ctx);
+            cmd.dispatch(&self.pipes.rms_norm_noweight, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const mv = MulVecPush{ .N = d.n_embd, .scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d.n_embd))) };
+            cmd.dispatch(&self.pipes.mul_vec_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.norm_buf, &wrscale.gpu_buffer }, &mv, @sizeOf(MulVecPush), 0);
+            self.dmmvDispatch(&cmd, wrouter, &self.norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            if (batched) {
+                self.submit(cmd); // async: experts read ids GPU-side, scale folded GPU-side
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers ids + folds the scale next
+                self.drainPending();
+            }
+        }
+
+        // Fallback only: download ids+weights and fold the per-expert down scale into
+        // the weights host-side. The batched path folds it GPU-side (moe_weighted_acc_scaled).
+        if (!batched) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
+            const scales = self.down_scales[L * d.n_experts ..][0..d.n_experts];
+            var j: u32 = 0;
+            while (j < n_used) : (j += 1) {
+                const id = self.host_router[j];
+                const w: f32 = @bitCast(self.host_router[n_used + j]);
+                self.host_router[n_used + j] = @bitCast(w * scales[id]);
+            }
+            buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
+        }
+
+        // --- routed experts → moe_out_buf -----------------------------------
+        {
+            const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
+            const gu_full = gu_half * 2; // 2*ef rows per expert
+            const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+
+            var cmd = try command.beginCommand(ctx);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            if (batched) {
+                const nrows = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sgb = SwigluPush{ .N = nrows };
+                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
+                cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router[j];
+                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
+                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
+                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
+                }
+            }
+            const zp = ZeroPush{ .N = d.n_embd };
+            cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&self.moe_out_buf}, &zp, @sizeOf(ZeroPush), 0);
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            if (batched) {
+                const wdscale = self.layer(L, "ffn_down_exps.scale"); // [n_experts] F32
+                cmd.dispatch(&self.pipes.moe_weighted_acc_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf, &wdscale.gpu_buffer }, &ma, @sizeOf(MoeAccPush), 0);
+            } else {
                 cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
             }
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);

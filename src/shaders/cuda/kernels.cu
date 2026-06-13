@@ -1409,6 +1409,53 @@ extern "C" __global__ void gemm_q5k_tiled_v2(const unsigned char* a, const float
             if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
 }
 
+// ---- gemm_q8_0_tiled_v2 — register-blocked prefill GEMM for Q8_0 weights -----
+// Mirror of gemm_q4k_tiled_v2 (64x64 tile, 256 threads, 4x4 register micro-tile,
+// BK=32) with Q8_0 dequant in the stage-to-shared step. Q8_0 block = 34 B/32
+// elems: f16 d [0..1], 32 int8 qs [2..33]; value = d * q (matches dmmv_q8_0's
+// d*(float)q so the batched gemma4-MoE shared-expert FFN stays output-identical
+// to the per-token path). Byte-addressed -> param `const unsigned char* a`,
+// pc.a_offset is BYTES. BK=32 == one Q8_0 block, so chunk c maps to block c.
+extern "C" __global__ void gemm_q8_0_tiled_v2(const unsigned char* a, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float Ws[BK*BM]; __shared__ float As[BK*BT];
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT, bpr=pc.K>>5, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x, tx=tid&15u, ty=tid>>4;
+    const float* Abase=A+(pc.x_offset>>2);
+    float acc[4][4];
+    #pragma unroll
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]=0.0f;
+    for(unsigned c=0;c<nchunk;c++){
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, r=idx>>5, l=idx&31u, row=m0+r; float wv=0.0f;
+            if(row<pc.M){ const unsigned char* blk=a+pc.a_offset+(size_t)row*bpr*34u+(size_t)c*34u;
+                float d=zinc_half_to_float((unsigned short)((unsigned)blk[0]|((unsigned)blk[1]<<8)));
+                signed char q=(signed char)blk[2u+l];
+                wv=d*(float)q; }
+            Ws[l*BM+r]=wv; }
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, t=idx>>5, l=idx&31u, tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?Abase[(size_t)tok*pc.K+c*32u+l]:0.0f; }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned kk=0;kk<BK;kk++){ float wr[4],ar[4];
+            #pragma unroll
+            for(int i=0;i<4;i++) wr[i]=Ws[kk*BM+ty*4u+(unsigned)i];
+            #pragma unroll
+            for(int j=0;j<4;j++) ar[j]=As[kk*BT+tx*4u+(unsigned)j];
+            #pragma unroll
+            for(int i=0;i<4;i++)
+                #pragma unroll
+                for(int j=0;j<4;j++) acc[i][j]+=wr[i]*ar[j]; }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int i=0;i<4;i++){ unsigned row=m0+ty*4u+(unsigned)i;
+        #pragma unroll
+        for(int j=0;j<4;j++){ unsigned tok=t0+tx*4u+(unsigned)j;
+            if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
+}
+
 // ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
 // ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
 struct SigmoidMulPush { unsigned N; };

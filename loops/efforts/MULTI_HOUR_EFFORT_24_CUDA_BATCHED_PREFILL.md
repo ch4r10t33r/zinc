@@ -190,3 +190,37 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   blocked on validation. NEXT (cycle 6): full batched-expert MoE FFN (route/group T tokens by expert —
   the remaining MoE per-token cost, to turn the noisy ±17% into a real MoE win), or NVRTC `-I` fp16
   tensor-core GEMM (+2.2× on the dense GEMMs — note: NOT byte-identical, would need its own tolerance gate).
+- **2026-06-13 — Cycle 6: batched Q8_0 shared-expert FFN for gemma-26b MoE prefill (Phase 2 cycle 2) — output-identical + faster (the real MoE FFN win).**
+  Cycle 4/5 batched only the MoE model's ATTENTION (the routed-expert FFN was still fully per-token), so
+  gemma-26b's gain was attention-only and swung ±17% on boost (+14% cycle 4, −17% cycle 5 = noise). This
+  cycle attacks the FFN: the gemma-26b shared-expert (the dense FFN every token runs alongside the routed
+  experts) is **Q8_0** (gate/up/down) — ~17.8 MB/token of weight reads that the per-token loop re-read T
+  times. Added an ADDITIVE Q8_0 prefill GEMM and batched the whole shared expert over all T tokens (weights
+  read ONCE). Changes (all additive; decodeStep/moeFfnBlock/dense path untouched):
+    - `gemm_q8_0_tiled_v2` (kernels.cu): bit-faithful twin of `gemm_q4k_tiled_v2` (64×64 tile, 256 thr, 4×4
+      micro-tile, BK=32 = one Q8_0 block) with Q8_0 dequant `value = d*(float)q` matching dmmv_q8_0. Byte-
+      addressed, pc.a_offset in BYTES. NVRTC-compiled at runtime (confirmed: "compiled gemma4 kernel pipelines").
+    - `gemm: [3]→[4]` + `pipes.gemm[3]=gemm_q8_0_tiled_v2` + `gemmDispatch` `.q8_0 => 3`. gemma-31b dense has
+      NO Q8_0 in the batched path (all Q4_K/Q6_K) → the proven dense path is byte-for-byte unchanged.
+    - `BatchScratch.shared` ([T,n_embd]) + `sharedExpertBatched(L,T,b)`: batched pre-norm + gate/up/down GEMM
+      (Q8_0→gemm_q8_0) + GeGLU[T,sf] + post_ffw_norm_1 → b.shared (same dmmv→GEMM swap the proven dense
+      `ffnBlockBatched` makes). `moeRoutedCombine(L)`: `moeFfnBlock` MINUS its shared sub-block (router top-k +
+      routed experts + post_ffw_norm(shared+moe)+residual), per token, reading b.shared[t] via a `self.shared_buf`
+      alias (same per-token alias pattern as `self.hidden`). prefillBatched MoE branch now: sharedExpertBatched
+      ONCE/layer, then loop T × (moeRoutedCombine + layerOutScale). Per-token submits drop 5→4 (shared no longer
+      per-token) → fits the async ring at T=250.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0,
+  bin md5 11ac3da1 ≠ cycle 5's f5025990). GATE — FULLY CLEARED:
+    - Direct A/B (varied non-collapsed prompt, GEN 228,228,228,228,49,50,3236,608,…): gemma-26b prefill
+      **38.47 → 82.00 t/s (+113%)**, GEN_IDS byte-IDENTICAL.
+    - `prefill_catalog ZINC_AB=batched` (ABBA x2, 250-tok): ALL 5 GEN_IDS byte-identical —
+      **gemma4-26b 42.61 → 81.52 t/s (+91%)** (was the noisy +14%/−17% attention-only), gemma4-31b dense
+      31.03 → 132.81 t/s (+328%, NO regression), qwen ±0–4% (per-token fallback, noise).
+    - `validate_catalog` plain **5/5**; `ZINC_BATCHED=1 validate_catalog` **5/5** — gemma4-26b MoE batched
+      free-runs **12/12** DIRECT vs llama.cpp (the batched shared-expert path is token-correct); gemma4-31b
+      the documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged — dense path untouched).
+  The noisy ±17% MoE swing is now a SOLID +91% (ABBA), correct both ways. Committed to perf/e24-batched-prefill,
+  pushed (NOT main). NEXT (cycle 7): full token-GROUPED routed experts (route/group T tokens by expert so each
+  active expert's Q4_K/Q5_1 weights — ~28 MB/token, the remaining per-token FFN cost — are read once per group,
+  not once per token; needs a gather/scatter + variable-group GEMM, harder for byte-identity), or NVRTC `-I`
+  fp16 tensor-core GEMM (+2.2× dense, NOT byte-identical → own tolerance gate).
