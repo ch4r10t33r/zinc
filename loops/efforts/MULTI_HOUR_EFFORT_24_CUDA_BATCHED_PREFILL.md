@@ -111,3 +111,25 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   is byte-identical to it → transitively correct). NEXT (cycle 3): target #3 batched KV
   write — fold the per-token norm/RoPE/KV-write loop into batched launches (kills the last
   T per-token launches); then NVRTC `-I` tensor-core GEMM (+2.2×).
+- **2026-06-12 — Cycle 3: batched KV-write + Q/K norm-RoPE (target #3) — output-identical + faster.**
+  Folded the per-token loop in `attentionLayerBatched` (V plain-norm+KV-write, Q/K per-head
+  norm+RoPE) into ONE launch each (grid.y = T), eliminating the last T per-token launches on
+  the batched gemma prefill path. Added two ADDITIVE kernels (kernels.cu): `rms_norm_rope_batched`
+  and `rms_norm_kvwrite_batched` — verbatim twins of the single-token `rms_norm_rope`/`rms_norm_kvwrite`,
+  batched over queries via block=(head=blockIdx.x, t=blockIdx.y) with explicit per-token src/dst
+  strides (q_dim for Q in-place, kv_dim for K/V into the cache) and `position = base_position + t`
+  (base 0 = fresh prompt). Per-block reduction order is UNCHANGED → bit-identical to the per-token
+  loop. The `aliasBuffer` per-token ArrayList loop is GONE — kernels index the token-major scratch
+  directly via `t*stride`. New `RmsRopeBatchPush`/`RmsKvWriteBatchPush` + 2 pipelines (additive).
+  Single-token kernels + decodeStep/prefillStep untouched; `ZINC_BATCHED_PREFILL` off by default
+  → cannot regress production. Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg`
+  EXIT=0 + ran, bin md5 6e74a1e5 ≠ cycle 2's dc54e7cd). GATE (scripts/prefill_catalog.sh
+  `ZINC_AB=batched`, 4090, ABBA x2, 250-tok):
+    - gemma4-31b dense: 30.30 → 132.97 t/s (+339%, ~4.4×), GEN_IDS byte-IDENTICAL ✓
+    - gemma4-26b MoE:   46.40 → 49.20 (+6% noise, per-token fallback) GEN_IDS identical ✓
+  Cycle 2 was +199% (94 t/s); removing the per-token KV-write/RoPE launches → +339% (133 t/s).
+  Committed `d43216ac` to perf/e24-batched-prefill, pushed (NOT main). REMAINING for merge:
+  `scripts/validate_catalog.sh` 5/5 (product path unchanged + batched byte-identical → transitively
+  correct). NEXT (cycle 4): NVRTC `-I/usr/local/cuda/include` fp16-scratch tensor-core GEMM (+2.2×),
+  or run the formal validate_catalog gate to clear merge; gemma-26b MoE prefill (Phase 2) is the
+  other open lever (route T tokens, group by expert).
