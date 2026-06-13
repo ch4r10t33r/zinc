@@ -68,6 +68,9 @@ const GemmaAttnBatchPush = extern struct {
 };
 const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, dst_offset: u32 };
 const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 };
+// Batched-prefill twins (grid.y = T): explicit per-token src/dst strides.
+const RmsRopeBatchPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, base_position: u32, src_stride: u32, dst_stride: u32 };
+const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride: u32, dst_stride: u32 };
 const SwigluPush = extern struct { N: u32 };
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
@@ -142,6 +145,8 @@ const Pipelines = struct {
     rms_norm_residual_scale: CudaPipeline,
     rms_norm_rope: CudaPipeline,
     rms_norm_kvwrite: CudaPipeline,
+    rms_norm_rope_batched: CudaPipeline,
+    rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
@@ -307,6 +312,8 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_residual_scale = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
+        pipes.rms_norm_rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_batched");
+        pipes.rms_norm_kvwrite_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite_batched");
         pipes.dmmv[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
         pipes.dmmv[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k");
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
@@ -660,39 +667,23 @@ pub const ForwardGemma = struct {
         self.gemmDispatch(&cmd, wk, &b.norm, &b.k, g.kv_dim, d.n_embd, T);
         if (wv_opt) |wv| self.gemmDispatch(&cmd, wv, &b.norm, &b.v, g.kv_dim, d.n_embd, T);
 
-        // Per-token: V normalize+KV-write, Q/K per-head norm+RoPE, causal softmax.
-        // Aliases into the token-major scratch reuse the single-token kernels;
-        // collected and freed after the command completes (kept live for the GPU).
+        // Batched (grid.y = T) V normalize+KV-write and Q/K per-head norm+RoPE:
+        // ONE launch each over all T tokens (token t at sequence position t),
+        // replacing the per-token loop. Each (head,t) block does exactly the
+        // single-token kernel's math (per-block reduction order unchanged), so
+        // this is bit-identical to the per-token launches. No aliasing needed —
+        // the kernels index the token-major scratch directly via t*stride.
         const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
         const nr_sh = g.head_dim * f4;
-        var aliases: std.ArrayList(CudaBuffer) = .{};
-        defer {
-            for (aliases.items) |*al| buffer.freeBuffer(al);
-            aliases.deinit(self.allocator);
-        }
-        var t: u32 = 0;
-        while (t < T) : (t += 1) {
-            const pos = t; // fresh prompt: batch token t is at sequence position t
-            const q_off = t * g.q_dim * f4;
-            const kv_off_t = t * g.kv_dim * f4;
-            var q_sl = try buffer.aliasBuffer(&b.q, q_off, g.q_dim * f4);
-            try aliases.append(self.allocator, q_sl);
-            var k_sl = try buffer.aliasBuffer(&b.k, kv_off_t, g.kv_dim * f4);
-            try aliases.append(self.allocator, k_sl);
-            const v_base = if (wv_opt != null) &b.v else &b.k;
-            var v_sl = try buffer.aliasBuffer(v_base, kv_off_t, g.kv_dim * f4);
-            try aliases.append(self.allocator, v_sl);
-
-            const kv_off = pos * g.kv_dim; // element offset into the KV cache
-            // V per-head plain-normalize fused with the V KV-cache write.
-            const rms_kvw = RmsKvWritePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .dst_offset = kv_off };
-            cmd.dispatch(&self.pipes.rms_norm_kvwrite, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &v_sl, &self.kv_v[L] }, &rms_kvw, @sizeOf(RmsKvWritePush), 0);
-            // Q/K per-head rms_norm fused with NEOX RoPE; K writes into kv_k.
-            const nr_q = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = 0 };
-            const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
-            cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_sl, &wqn.gpu_buffer, inv_freq, &q_sl }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
-            cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &k_sl, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
-        }
+        const v_base = if (wv_opt != null) &b.v else &b.k;
+        // V per-head plain-normalize fused with the V KV-cache write.
+        const kvw = RmsKvWriteBatchPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .src_stride = g.kv_dim, .dst_stride = g.kv_dim };
+        cmd.dispatch(&self.pipes.rms_norm_kvwrite_batched, .{ g.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ v_base, &self.kv_v[L] }, &kvw, @sizeOf(RmsKvWriteBatchPush), 0);
+        // Q/K per-head rms_norm fused with NEOX RoPE; K writes into kv_k.
+        const nr_q = RmsRopeBatchPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .base_position = 0, .src_stride = g.q_dim, .dst_stride = g.q_dim };
+        const nr_k = RmsRopeBatchPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .base_position = 0, .src_stride = g.kv_dim, .dst_stride = g.kv_dim };
+        cmd.dispatch(&self.pipes.rms_norm_rope_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &wqn.gpu_buffer, inv_freq, &b.q }, &nr_q, @sizeOf(RmsRopeBatchPush), nr_sh);
+        cmd.dispatch(&self.pipes.rms_norm_rope_batched, .{ g.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopeBatchPush), nr_sh);
 
         // Single batched causal (sliding-window on SWA) softmax attention over all
         // T queries: grid=(n_head, T). Reads RoPE'd Q from b.q (token-major) and the

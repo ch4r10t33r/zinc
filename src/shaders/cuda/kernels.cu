@@ -1472,6 +1472,78 @@ extern "C" __global__ void rms_norm_kvwrite(const float* v_src, float* v_dst, Rm
         v_dst[base + i] = vh[i] * rinv;
 }
 
+// ---- rms_norm_rope_batched (Effort 24: batched-prefill twin of rms_norm_rope) -
+// Identical per-(head,token) math to rms_norm_rope, batched over T prompt
+// queries: block=(head=blockIdx.x, t=blockIdx.y). Token t sits at sequence
+// position base_position+t; src/dst token strides are explicit (q_dim for Q
+// in-place, kv_dim for K writing straight into the KV cache). Replaces the T
+// per-token rms_norm_rope launches with ONE launch (grid.y=T); per-block
+// reduction order is unchanged, so the result is bit-identical.
+struct RmsRopeBatchPush { unsigned head_dim; float eps; unsigned rope_dim; unsigned base_position; unsigned src_stride; unsigned dst_stride; };
+extern "C" __global__ void rms_norm_rope_batched(const float* x, const float* w, const float* inv_freq, float* y, RmsRopeBatchPush pc) {
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;
+    const float* xt = x + (size_t)t * pc.src_stride + (size_t)head * pc.head_dim;
+    float* yt = y + (size_t)t * pc.dst_stride + (size_t)head * pc.head_dim;
+    extern __shared__ float sh[]; // pc.head_dim normalized values
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.head_dim; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.head_dim + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < pc.head_dim; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    unsigned position = pc.base_position + t;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < pc.head_dim; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
+// ---- rms_norm_kvwrite_batched (Effort 24: batched twin of rms_norm_kvwrite) ---
+// Batched over T prompt tokens: block=(head=blockIdx.x, t=blockIdx.y). Per-token
+// V source/dest strides are explicit (kv_dim both ways: token-major [T,kv_dim]
+// source, position-major [seq,n_kv_head,head_dim] dest). One launch (grid.y=T)
+// replaces the T per-token rms_norm_kvwrite launches; bit-identical math.
+struct RmsKvWriteBatchPush { unsigned head_dim; float eps; unsigned src_stride; unsigned dst_stride; };
+extern "C" __global__ void rms_norm_kvwrite_batched(const float* v_src, float* v_dst, RmsKvWriteBatchPush pc) {
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    const float* vh = v_src + (size_t)t * pc.src_stride + (size_t)head * hd;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = vh[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    size_t base = (size_t)t * pc.dst_stride + (size_t)head * hd;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        v_dst[base + i] = vh[i] * rinv;
+}
+
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
 // Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
 // carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
