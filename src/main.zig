@@ -1745,11 +1745,24 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     var pos: u32 = 0;
     var next_tok: u32 = 0;
     var prefill_timer = try std.time.Timer.start();
-    while (pos < prompt_tokens.len) : (pos += 1) {
-        if (pos + 1 < prompt_tokens.len) {
-            try fwd.prefillStep(prompt_tokens[pos], pos);
-        } else {
-            next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
+    // Effort 24: ZINC_BATCHED_PREFILL routes the whole prompt through the batched
+    // GEMM prefill (gemma dense only; the method internally falls back for MoE).
+    // Gated at comptime so the qwen forward (no prefillBatched) still compiles.
+    var used_batched = false;
+    if (comptime @hasDecl(@TypeOf(fwd.*), "prefillBatched")) {
+        if (std.posix.getenv("ZINC_BATCHED_PREFILL") != null and prompt_tokens.len > 1) {
+            next_tok = try fwd.prefillBatched(prompt_tokens);
+            pos = @intCast(prompt_tokens.len);
+            used_batched = true;
+        }
+    }
+    if (!used_batched) {
+        while (pos < prompt_tokens.len) : (pos += 1) {
+            if (pos + 1 < prompt_tokens.len) {
+                try fwd.prefillStep(prompt_tokens[pos], pos);
+            } else {
+                next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
+            }
         }
     }
     const prefill_ms = @as(f64, @floatFromInt(prefill_timer.read())) / 1_000_000.0;

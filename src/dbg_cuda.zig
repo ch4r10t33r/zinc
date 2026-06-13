@@ -49,6 +49,16 @@ const Engine = union(enum) {
             inline else => |*e| try e.prefillStep(token, pos),
         }
     }
+    /// Effort 24: batched-GEMM prefill (gemma only). Returns the last token's
+    /// argmax. error.Unsupported on the qwen forward so the caller falls back.
+    fn prefillBatched(self: *Engine, tokens: []const u32) !u32 {
+        switch (self.*) {
+            inline else => |*e| {
+                if (comptime @hasDecl(@TypeOf(e.*), "prefillBatched")) return e.prefillBatched(tokens);
+                return error.Unsupported;
+            },
+        }
+    }
     fn readLogits(self: *Engine, out: []f32) void {
         switch (self.*) {
             inline else => |*e| e.readLogits(out),
@@ -168,21 +178,35 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     // need no logits, so ZINC_PREFILL_SKIP=1 runs them via prefillStep (skips
     // the LM head, bit-identical generation) to A/B the head-skip prefill win.
     const pf_skip = std.posix.getenv("ZINC_PREFILL_SKIP") != null;
+    // Effort 24: ZINC_BATCHED_PREFILL routes the whole prompt through the batched
+    // GEMM prefill (gemma dense). Used by scripts/prefill_catalog.sh to A/B the
+    // batched-vs-per-token GEN_IDS (must be byte-identical — the gate).
+    const pf_batched = std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
     var pos: u32 = 0;
     var tok: u32 = 0;
     var pf_timer = try std.time.Timer.start();
-    for (prompt, 0..) |t, i| {
-        if (pf_skip and i + 1 < prompt.len) {
-            try fwd.prefillStep(t, pos);
-        } else {
-            tok = try fwd.decodeStep(t, pos, true);
+    var pf_used_batched = false;
+    if (pf_batched and prompt.len > 1) {
+        if (fwd.prefillBatched(prompt)) |first| {
+            tok = first;
+            pos = @intCast(prompt.len);
+            pf_used_batched = true;
+        } else |_| {} // unsupported (qwen) → fall back to the per-token loop
+    }
+    if (!pf_used_batched) {
+        for (prompt, 0..) |t, i| {
+            if (pf_skip and i + 1 < prompt.len) {
+                try fwd.prefillStep(t, pos);
+            } else {
+                tok = try fwd.decodeStep(t, pos, true);
+            }
+            pos += 1;
         }
-        pos += 1;
     }
     const pf_ns = pf_timer.read();
     if (prompt.len > 1) {
         const pf_secs = @as(f64, @floatFromInt(pf_ns)) / 1e9;
-        std.debug.print("PREFILL: {d} tokens in {d:.3}s = {d:.2} tok/s (skip={})\n", .{ prompt.len, pf_secs, @as(f64, @floatFromInt(prompt.len)) / pf_secs, pf_skip });
+        std.debug.print("PREFILL: {d} tokens in {d:.3}s = {d:.2} tok/s (skip={} batched={})\n", .{ prompt.len, pf_secs, @as(f64, @floatFromInt(prompt.len)) / pf_secs, pf_skip, pf_used_batched });
     }
 
     std.debug.print("GEN_IDS:{d}", .{tok});

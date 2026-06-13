@@ -60,4 +60,26 @@ gemma-31b prefill ~15-35 → ~90-200 tok/s (5.9× on the GEMM-able majority;
 attention is a smaller FLOP share). Stacks on the head-skip's +4%.
 
 ## CYCLE LOG
-- (none yet)
+- **2026-06-12 — Cycle 1: batched dense-gemma prefill skeleton COMPLETE + output-identical + faster.**
+  Wired the validated `gemm_q4k/q5k/q6k_tiled_v2` GEMMs into a new additive
+  `ForwardGemma.prefillBatched(tokens) !u32` (forward_cuda_gemma.zig): token-major
+  `BatchScratch` (lazy, sized to T), `gemmDispatch` (Q4_K/Q5_K/Q6_K → tiled_v2 GEMM;
+  q8_0/f32 → per-token dmmv fallback), `attentionLayerBatched` (batched pre-norm +
+  Q/K/V/O GEMMs; per-head V-norm/KV-write, Q/K norm+RoPE, causal softmax LOOPED per
+  token via `aliasBuffer` into the token-major scratch — reuses the single-token
+  kernels, zero new kernels), `ffnBlockBatched` (batched pre-norm + gate/up/down
+  GEMMs + element-wise GeGLU over [T,n_ff] + fused post-ffn norm/residual/scale).
+  Tail (rms_norm+LM head+argmax) on the last token only. MoE (n_experts>0) falls
+  back to the per-token path. Toggle `ZINC_BATCHED_PREFILL` wired in BOTH main.zig
+  (product) and dbg_cuda.zig gen-path (gate harness) + `Engine.prefillBatched`.
+  Built clean on the 4090 box (`zig build cuda-dbg`, fresh `.zig-cache`, EXIT=0,
+  bin 45251da3). Direct A/B (dbg_cuda gen, GEN_IDS = the gate):
+    - gemma-31b T=80:  29.30→53.13 t/s (+81%),  GEN_IDS byte-IDENTICAL ✓
+    - gemma-31b T=200: 32.20→75.05 t/s (+133%), GEN_IDS byte-IDENTICAL ✓ (multi-tile T>128)
+    - gemma-26b MoE T=60: GEN_IDS identical (per-token fallback, as designed) ✓
+  GATE STATUS: GEN_IDS byte-identical on direct A/B (strong). REMAINING for merge:
+  (1) extend scripts/prefill_catalog.sh to ABBA-counterbalance the batched A/B,
+  (2) scripts/validate_catalog.sh 5/5. Committed to perf/e24-batched-prefill (WIP,
+  toggle off by default → cannot regress production). NEXT: target #2 batched
+  causal-attention kernel (replace the per-token attention loop — the remaining
+  per-token launch overhead) for a bigger T, then run the formal gate.

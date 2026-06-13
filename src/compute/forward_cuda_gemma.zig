@@ -71,6 +71,18 @@ const MulVecPush = extern struct { N: u32, scale: f32 };
 const ZeroPush = extern struct { N: u32 };
 // Batched MoE expert matvec (one launch over all experts; ids read GPU-side).
 const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32 = 0 };
+// Batched prefill GEMM (Effort 24): Y[T,M] = A[T,K]·W[M,K]^T over all T prompt
+// tokens at once (the gemm_*_tiled_v2 kernels). Must byte-match `struct GemmPush`
+// in kernels.cu. Offsets are in BYTES (the kernels shift them internally).
+const GemmPush = extern struct {
+    M: u32,
+    K: u32,
+    T: u32,
+    a_offset: u32 = 0,
+    x_offset: u32 = 0,
+    y_offset: u32 = 0,
+    acc_mode: u32 = 0,
+};
 
 fn dmmvIdx(t: gguf.GGMLType) usize {
     return switch (t) {
@@ -138,6 +150,29 @@ const Pipelines = struct {
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
+    // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K weights).
+    gemm: [3]CudaPipeline,
+};
+
+/// Per-prompt batched activation scratch (Effort 24 batched prefill). Allocated
+/// lazily on the first `prefillBatched` call, sized to the prompt length T, and
+/// laid out token-major ([T, dim] contiguous) so the gemm_*_tiled_v2 kernels can
+/// read each weight once for all T tokens. Independent of the single-token decode
+/// scratch (`hidden`/`q_buf`/… on ForwardGemma) — additive, never aliases it.
+const BatchScratch = struct {
+    t_cap: u32,
+    hidden: CudaBuffer, // [T, n_embd] residual stream
+    norm: CudaBuffer, // [T, n_embd] pre-attn / pre-ffn norm output
+    q: CudaBuffer, // [T, q_dim_max]
+    k: CudaBuffer, // [T, kv_dim_max]
+    v: CudaBuffer, // [T, kv_dim_max]
+    attn_out: CudaBuffer, // [T, q_dim_max]
+    o: CudaBuffer, // [T, n_embd] O-projection
+    ffn_norm: CudaBuffer, // [T, n_embd]
+    gate: CudaBuffer, // [T, ff_buf_max]
+    up: CudaBuffer, // [T, ff_buf_max]
+    geglu: CudaBuffer, // [T, ff_buf_max]
+    down: CudaBuffer, // [T, n_embd]
 };
 
 pub const ForwardGemma = struct {
@@ -190,6 +225,10 @@ pub const ForwardGemma = struct {
     // KV cache per layer (sized by that layer's kv_dim)
     kv_k: []CudaBuffer,
     kv_v: []CudaBuffer,
+
+    // Effort 24: lazily-allocated batched-prefill scratch (null until the first
+    // ZINC_BATCHED_PREFILL run; freed in deinit).
+    batch: ?BatchScratch = null,
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -282,6 +321,10 @@ pub const ForwardGemma = struct {
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
+        // Effort 24: batched-prefill GEMMs (Q4_K / Q5_K / Q6_K).
+        pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
+        pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
+        pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -410,11 +453,14 @@ pub const ForwardGemma = struct {
         a.free(self.host_embed);
         a.free(self.host_router);
         a.free(self.down_scales);
+        self.freeBatch();
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
+                for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
                 pipeline.freePipeline(&@field(self.pipes, f.name));
             }
@@ -495,6 +541,264 @@ pub const ForwardGemma = struct {
             try self.layerOutScale(L);
         }
         self.waitPending(); // drain async layer ops; no logits for prompt-internal tokens
+    }
+
+    // ---- Effort 24: batched-GEMM prefill ------------------------------------
+
+    /// Batched dense-gemma prefill: process ALL T prompt tokens at once, reading
+    /// each weight ONCE for all tokens via the gemm_*_tiled_v2 register-blocked
+    /// GEMMs (5.9× over the per-token matvec). Returns the last token's argmax
+    /// (= the first generated token), exactly like running prefillStep on tokens
+    /// [0..T-1] then decodeStep on the last. ADDITIVE: builds its own token-major
+    /// scratch and never touches the single-token decode path.
+    ///
+    /// Phase-1 scope is the DENSE gemma-31b (n_experts==0). The 26b MoE prefill
+    /// (route T tokens, group by expert) is Phase 2 — it falls back to the
+    /// per-token path here so the toggle is safe to leave on for any gemma model.
+    ///
+    /// Norms / RoPE / per-head Q·K·V normalize / attention are LOOPED per token
+    /// (each reusing the validated single-token kernels via buffer aliases into
+    /// the token-major scratch) — the GEMM-able projections + FFN are the win;
+    /// a batched-causal-attention kernel is the next target.
+    pub fn prefillBatched(self: *ForwardGemma, tokens: []const u32) !u32 {
+        const d = self.d;
+        const ctx = self.ctx;
+        const T: u32 = @intCast(tokens.len);
+
+        // MoE (gemma-26b-a4b) is out of Phase-1 scope: run the per-token path so
+        // the env toggle never silently corrupts the routed-expert prefill.
+        if (d.n_experts > 0) {
+            var pos: u32 = 0;
+            while (pos + 1 < T) : (pos += 1) try self.prefillStep(tokens[pos], pos);
+            return self.decodeStep(tokens[T - 1], T - 1, true);
+        }
+
+        const b = try self.ensureBatch(T);
+
+        // EMBED all T tokens into hidden [T, n_embd] (dequant row, scale, upload).
+        const embd_scale = std.math.sqrt(@as(f32, @floatFromInt(d.n_embd)));
+        const host = try self.allocator.alloc(f32, T * d.n_embd);
+        defer self.allocator.free(host);
+        for (0..T) |t| {
+            const row = host[t * d.n_embd ..][0..d.n_embd];
+            self.model.dequantEmbeddingRow(tokens[t], row);
+            for (row) |*v| v.* *= embd_scale;
+        }
+        buffer.upload(ctx, &b.hidden, std.mem.sliceAsBytes(host));
+
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            try self.attentionLayerBatched(L, T, b);
+            try self.ffnBlockBatched(L, T, b);
+            // dense layer_output_scale is folded into the post-ffn norm+residual.
+        }
+
+        // TAIL on the last token only: rms_norm → LM head → argmax. Reuse the
+        // single-token decode scratch (norm_buf/logits_buf/argmax_buf) on the
+        // last token's slice of the batched hidden stream.
+        const last = T - 1;
+        const f4 = @sizeOf(f32);
+        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
+        const lm_head = self.model.get("output.weight") orelse self.model.get("token_embd.weight") orelse return error.MissingTensor;
+        var hid_last = try buffer.aliasBuffer(&b.hidden, last * d.n_embd * f4, d.n_embd * f4);
+        defer buffer.freeBuffer(&hid_last);
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hid_last, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+        const lm_idx = dmmvIdx(lm_head.info.type_);
+        if (lm_idx < 4) {
+            cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        }
+        const am = ArgmaxPush{ .N = d.vocab };
+        cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
+        cmd.commitAndWait();
+
+        var tok: u32 = 0;
+        buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        return tok;
+    }
+
+    /// Batched attention block: pre-norm + Q/K/V projections + O projection via
+    /// GEMM over all T tokens; per-head Q·K·V normalize, RoPE, KV write and the
+    /// causal softmax LOOPED per token (reusing the single-token kernels through
+    /// token-major aliases). Mirrors `attentionLayer` op-for-op so the output is
+    /// the same residual stream, batched. One stream-ordered command per layer.
+    fn attentionLayerBatched(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const g = self.geom[L];
+        const f4 = @sizeOf(f32);
+        const wan = self.layer(L, "attn_norm.weight");
+        const wq = self.layer(L, "attn_q.weight");
+        const wk = self.layer(L, "attn_k.weight");
+        const wv_opt = self.model.getLayer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wpan = self.layer(L, "post_attention_norm.weight");
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        // Batched pre-attention norm: one block per token.
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
+        // Batched Q/K projections; V from Wv (SWA layers) else the raw K projection.
+        self.gemmDispatch(&cmd, wq, &b.norm, &b.q, g.q_dim, d.n_embd, T);
+        self.gemmDispatch(&cmd, wk, &b.norm, &b.k, g.kv_dim, d.n_embd, T);
+        if (wv_opt) |wv| self.gemmDispatch(&cmd, wv, &b.norm, &b.v, g.kv_dim, d.n_embd, T);
+
+        // Per-token: V normalize+KV-write, Q/K per-head norm+RoPE, causal softmax.
+        // Aliases into the token-major scratch reuse the single-token kernels;
+        // collected and freed after the command completes (kept live for the GPU).
+        const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
+        const nr_sh = g.head_dim * f4;
+        var aliases: std.ArrayList(CudaBuffer) = .{};
+        defer {
+            for (aliases.items) |*al| buffer.freeBuffer(al);
+            aliases.deinit(self.allocator);
+        }
+        var t: u32 = 0;
+        while (t < T) : (t += 1) {
+            const pos = t; // fresh prompt: batch token t is at sequence position t
+            const q_off = t * g.q_dim * f4;
+            const kv_off_t = t * g.kv_dim * f4;
+            var q_sl = try buffer.aliasBuffer(&b.q, q_off, g.q_dim * f4);
+            try aliases.append(self.allocator, q_sl);
+            var k_sl = try buffer.aliasBuffer(&b.k, kv_off_t, g.kv_dim * f4);
+            try aliases.append(self.allocator, k_sl);
+            const v_base = if (wv_opt != null) &b.v else &b.k;
+            var v_sl = try buffer.aliasBuffer(v_base, kv_off_t, g.kv_dim * f4);
+            try aliases.append(self.allocator, v_sl);
+            var ao_sl = try buffer.aliasBuffer(&b.attn_out, q_off, g.q_dim * f4);
+            try aliases.append(self.allocator, ao_sl);
+
+            const kv_off = pos * g.kv_dim; // element offset into the KV cache
+            // V per-head plain-normalize fused with the V KV-cache write.
+            const rms_kvw = RmsKvWritePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .dst_offset = kv_off };
+            cmd.dispatch(&self.pipes.rms_norm_kvwrite, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &v_sl, &self.kv_v[L] }, &rms_kvw, @sizeOf(RmsKvWritePush), 0);
+            // Q/K per-head rms_norm fused with NEOX RoPE; K writes into kv_k.
+            const nr_q = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = 0 };
+            const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
+            cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_sl, &wqn.gpu_buffer, inv_freq, &q_sl }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
+            cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &k_sl, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
+            // Causal (sliding-window on SWA) softmax attention for this query.
+            const seq_len = pos + 1;
+            const window: u32 = if (g.is_swa) d.sliding_window else 0;
+            const attn = GemmaAttnPush{
+                .head_dim = g.head_dim,
+                .n_heads = d.n_head,
+                .n_kv_heads = g.n_kv_head,
+                .seq_len = seq_len,
+                .scale_bits = @bitCast(@as(f32, 1.0)),
+                .window = window,
+            };
+            cmd.dispatch(&self.pipes.gemma_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_sl, &self.kv_k[L], &self.kv_v[L], &ao_sl }, &attn, @sizeOf(GemmaAttnPush), seq_len * 4);
+        }
+
+        // Batched O projection then the fused post-attention norm + residual add.
+        self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, T);
+        cmd.dispatch(&self.pipes.rms_norm_residual, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.o, &wpan.gpu_buffer, &b.hidden }, &rms, @sizeOf(RmsPush), 0);
+        cmd.commitAndWait();
+    }
+
+    /// Batched dense GeGLU FFN block: pre-norm + gate/up/down projections via
+    /// GEMM over all T tokens, element-wise GeGLU across [T, n_ff], and the fused
+    /// post-ffn norm + residual (folding the per-layer output scale when present).
+    /// Mirrors `ffnBlock`, batched.
+    fn ffnBlockBatched(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wfn = self.layer(L, "ffn_norm.weight");
+        const wgate = self.layer(L, "ffn_gate.weight");
+        const wup = self.layer(L, "ffn_up.weight");
+        const wdown = self.layer(L, "ffn_down.weight");
+        const wpfn = self.layer(L, "post_ffw_norm.weight");
+        const wlos = self.model.getLayer(L, "layer_output_scale.weight");
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wgate, &b.ffn_norm, &b.gate, d.n_ff, d.n_embd, T);
+        self.gemmDispatch(&cmd, wup, &b.ffn_norm, &b.up, d.n_ff, d.n_embd, T);
+        // GeGLU is element-wise over the whole [T, n_ff] tile.
+        const sg = SwigluPush{ .N = T * d.n_ff };
+        cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.geglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wdown, &b.geglu, &b.down, d.n_embd, d.n_ff, T);
+        if (wlos) |ws| {
+            cmd.dispatch(&self.pipes.rms_norm_residual_scale, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.down, &wpfn.gpu_buffer, &b.hidden, &ws.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.rms_norm_residual, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.down, &wpfn.gpu_buffer, &b.hidden }, &rms, @sizeOf(RmsPush), 0);
+        }
+        cmd.commitAndWait();
+    }
+
+    /// Batched prefill GEMM dispatch: Y[T,M] = A[T,K]·W[M,K]^T. Q4_K/Q5_K/Q6_K
+    /// weights take the register-blocked gemm_*_tiled_v2 tile; any other quant
+    /// (q8_0/f32) falls back to a per-token dmmv loop (correctness-first). Buffers
+    /// are token-major [T,K] (x) and [T,M] (y), contiguous (a_offset/x/y == 0).
+    fn gemmDispatch(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
+        const gi: ?usize = switch (w.info.type_) {
+            .q4_k => 0,
+            .q5_k => 1,
+            .q6_k => 2,
+            else => null,
+        };
+        if (gi) |idx| {
+            const push = GemmPush{ .M = M, .K = K, .T = T };
+            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            return;
+        }
+        // Fallback: loop the per-token matvec over the token-major buffers.
+        const didx = dmmvIdx(w.info.type_);
+        var t: u32 = 0;
+        while (t < T) : (t += 1) {
+            const push = DmmvPush{ .M = M, .K = K, .x_offset = t * K * 4, .y_offset = t * M * 4 };
+            if (didx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[didx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+            }
+        }
+    }
+
+    /// Allocate (or reuse) the token-major batched scratch for T tokens.
+    fn ensureBatch(self: *ForwardGemma, T: u32) !*BatchScratch {
+        if (self.batch) |*bb| {
+            if (bb.t_cap >= T) return bb;
+            self.freeBatch();
+        }
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const ff = d.ff_buf_max;
+        self.batch = BatchScratch{
+            .t_cap = T,
+            .hidden = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .norm = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .q = try buffer.createBuffer(ctx, T * d.q_dim_max * f4),
+            .k = try buffer.createBuffer(ctx, T * d.kv_dim_max * f4),
+            .v = try buffer.createBuffer(ctx, T * d.kv_dim_max * f4),
+            .attn_out = try buffer.createBuffer(ctx, T * d.q_dim_max * f4),
+            .o = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .ffn_norm = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .gate = try buffer.createBuffer(ctx, T * ff * f4),
+            .up = try buffer.createBuffer(ctx, T * ff * f4),
+            .geglu = try buffer.createBuffer(ctx, T * ff * f4),
+            .down = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+        };
+        return &self.batch.?;
+    }
+
+    fn freeBatch(self: *ForwardGemma) void {
+        if (self.batch) |*bb| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down }) |buf| {
+                buffer.freeBuffer(buf);
+            }
+            self.batch = null;
+        }
     }
 
     // ---- per-block builders -------------------------------------------------
