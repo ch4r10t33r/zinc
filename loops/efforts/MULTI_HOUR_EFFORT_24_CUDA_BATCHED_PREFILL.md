@@ -705,3 +705,34 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   producers EMIT fp16 directly so the per-GEMM f32→fp16 recast launch is dropped ENTIRELY, not just shared within a group;
   touches the shared rms_norm/geglu kernels so less additive, needs its own byte/tolerance gate); OR a larger-T sweep
   (`scripts/grouped_sweep.sh`, T≫250) to see if cycle 18's grouped-expert L2 win clears the boost floor.
+- **2026-06-13 — Cycle 20: LARGE-T characterization sweep — KILLED the grouped-expert lever (all T) + UNCOVERED the real prefill win: the TC dense path is ~+20-30%, not the logged "+6%".**
+  A DIAGNOSTIC cycle (no compute change): built HEAD clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg
+  -Dbackend=cuda -Dshaders=false` EXIT=0 + ran, bin md5 bb6e77c1), then ran the two open large-T sweeps from cycle 19's
+  NEXT to decide which opt-in path (if any) clears the box's ±10% boost floor and merits a default flip.
+    1. **Grouped routed experts (`scripts/grouped_sweep.sh`, gemma-26b MoE, ABBA x2, T={250,750,1500}) — DEAD at all T.**
+       GEN_IDS BYTE-IDENTICAL to the cycle-8 `_batched` default at every T (incl. **T=1500** → the batched MoE prefill has
+       NO large-T capacity/correctness bug — a useful verification), but perf **−11.4% (T=250), −16.4% (T=750), +1.4%
+       (T=1500)** → the cycle-18 L2-reuse hypothesis is now FALSIFIED at large T too (the counting-sort + scattered output
+       writes cost more than any L2 residency win; at high block concurrency grid.y ordering barely controls L2 timing).
+       The grouped lever is conclusively dead — stays opt-in, cycle-8 `_batched` remains the proven default.
+    2. **fp16 tensor-core dense GEMM (new `scripts/tc_sweep.sh`, gemma-31b dense, f32 vs `ZINC_BATCHED_TC`) — the REAL,
+       above-floor win, badly understated in the log.** ABBA x2: **T=750 f32 138.1 → TC 178.8 = +29.5%** (ranges
+       NON-overlapping A∈[135.7,140.6] B∈[170.6,187.0]); **T=1500 f32 143.9 → TC 171.7 = +19.3%** (NON-overlapping
+       A∈[141.9,145.9] B∈[163.9,179.5]); a separate ABBA x1 even showed **T=250 +23.9%** (f32 134.2 → TC 166.3). GEN_IDS
+       matched f32 at every T (no large-T divergence). So the TC dense path is a ROBUST ~+20-30% prefill win across
+       T=250-1500 — NOT the "+6%, memory-bound footnote" the cycle-11 log records. Root cause of the discrepancy: cycle
+       11's +6% measured the ORIGINAL m64 TC kernel; cycles 12 (fp16-A) + 15 (lowsmem, +9-12%) substantially improved the
+       default TC path AFTERWARD, but the headline gain was never re-measured. The win has been ~4-5× larger than logged
+       for several cycles. (On the gemma-26b MoE model TC is only +6.5%/+16.7% with heavily OVERLAPPING ranges — TC there
+       touches only the smaller dense-attention GEMMs while the MoE FFN + boost noise dominate; dense is the clean signal.)
+  TC stays OPT-IN: it is fp16 → token-correct within tolerance (this cycle re-confirmed `ZINC_BATCHED=1 ZINC_BATCHED_TC=1
+  validate_catalog` **5/5** on the fresh build — qwen 12/12, gemma-26b 12/12, gemma-31b the documented near-tie), NOT
+  byte-identical to f32, so it CANNOT be the strict-byte-identity merge default. But it IS the recommended FAST prefill
+  path for realistic (long) prompts. ADDITIVE: new `scripts/tc_sweep.sh` (reproducible T-sweep, mirrors grouped/sharea_sweep;
+  records the result inline); no `.zig`/`.cu` change → the compute path is byte-for-byte cycle 19. Committed to
+  perf/e24-batched-prefill, pushed (NOT main; origin/main unchanged, branch 0 behind → no rebase). NEXT (cycle 21): since
+  TC is the dominant lever, push it further — the heavier activation-fp16 half (norm/GeGLU producers EMIT fp16 so the TC
+  path drops the per-GEMM f32→fp16 recast ENTIRELY across the layer; touches shared kernels, own tolerance gate) is now
+  well-motivated (it shaves the TC path's remaining f32 overhead at large T); OR a flash-style batched attention kernel —
+  the grouped sweep showed dense/MoE throughput PEAKS at T≈750 and DROPS by T=1500, the signature of O(T²) attention
+  overtaking the O(T) GEMMs, so the unoptimized 3-pass `gemma_attention_batched` is the next large-T bottleneck.
