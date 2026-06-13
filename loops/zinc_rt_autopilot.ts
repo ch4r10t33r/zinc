@@ -440,7 +440,33 @@ type BuildSummary = {
   output: string;
   /** True if the build.zig recognized the -Dbackend flag (only false at M0). */
   flagRecognized: boolean;
+  /** True when SSH/rsync failed before the remote build could reliably run. */
+  remoteInfrastructureFailure: boolean;
 };
+
+export function isRemoteInfrastructureFailure(output: string): boolean {
+  const text = output.trim();
+  if (!text) return false;
+  return [
+    /ssh:\s+connect to host .*:\s+Network is down/i,
+    /ssh:\s+connect to host .*:\s+Network is unreachable/i,
+    /ssh:\s+connect to host .*:\s+No route to host/i,
+    /ssh:\s+connect to host .*:\s+Connection (?:timed out|refused|reset by peer)/i,
+    /ssh:\s+connect to host .*:\s+Operation timed out/i,
+    /ssh:\s+connect to host .*:\s+Operation not permitted/i,
+    /Could not resolve hostname/i,
+    /kex_exchange_identification:.*(?:Connection closed|Connection reset by peer)/i,
+    /Connection closed by .* port \d+/i,
+    /rsync:\s+connection unexpectedly closed/i,
+    /rsync error:.*code 255/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+function remoteStageError(stage: string, output: string): string {
+  return isRemoteInfrastructureFailure(output)
+    ? `remote infrastructure failure during ${stage}`
+    : `${stage} failed`;
+}
 
 async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary> {
   console.log(clr("2", `  build -Dbackend=${backend}...`));
@@ -458,7 +484,8 @@ async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary>
   );
   const combined = stdout + (stderr ? `\n${stderr}` : "");
   const exitMatch = combined.match(/__EXIT__=(\d+)/);
-  const exitCode = exitMatch ? parseInt(exitMatch[1], 10) : 1;
+  const remoteInfrastructureFailure = exitMatch == null && isRemoteInfrastructureFailure(combined);
+  const exitCode = exitMatch ? parseInt(exitMatch[1], 10) : remoteInfrastructureFailure ? 255 : 1;
   // build.zig that doesn't know -Dbackend can print "invalid option:
   // -Dbackend", "unknown option 'backend'", or similar depending on Zig.
   const backendFlagMissing =
@@ -472,7 +499,7 @@ async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary>
     await sshSafe(`cd ${REMOTE_ZINC_DIR} && cp -f ./zig-out/bin/zinc ${backend === "vulkan" ? REMOTE_VULKAN_BIN : REMOTE_ZINC_RT_BIN}`, 10_000);
   }
 
-  return { exitCode, output: combined.slice(-6000), flagRecognized };
+  return { exitCode, output: combined.slice(-6000), flagRecognized, remoteInfrastructureFailure };
 }
 
 async function remoteTest(comparisonTarget: ComparisonTarget): Promise<{ passed: boolean; output: string }> {
@@ -604,7 +631,9 @@ async function benchmarkBinary(
     tokensGenerated: lastTokensGenerated,
     bandwidthUtil: lastBwUtil,
     effectiveBW: lastEffBW,
-    error: lastExit !== 0 ? `Last run exit ${lastExit}` : null,
+    error: lastExit !== 0
+      ? remoteStageError("benchmark run", lastOutput)
+      : null,
     backendFlagRecognized: true,
   };
 }
@@ -741,7 +770,9 @@ async function benchmarkLlama(
     tokensGenerated: lastTokensGenerated,
     bandwidthUtil: null,
     effectiveBW: null,
-    error: lastExit !== 0 ? `Last run exit ${lastExit}` : null,
+    error: lastExit !== 0
+      ? remoteStageError("llama benchmark run", lastOutput)
+      : null,
     backendFlagRecognized: true,
   };
 }
@@ -757,6 +788,7 @@ async function fullAB(
   if (comparisonTarget === "vulkan") {
     const vkBuild = await remoteBuild("vulkan");
     if (vkBuild.exitCode !== 0) {
+      const error = remoteStageError("vulkan build", vkBuild.output);
       vulkan = {
         decodeTps: null,
         prefillTps: null,
@@ -771,10 +803,10 @@ async function fullAB(
         tokensGenerated: 0,
         bandwidthUtil: null,
         effectiveBW: null,
-        error: "vulkan build failed",
+        error,
         backendFlagRecognized: true,
       };
-      console.log(clr("1;31", "  ❌ vulkan build failed — A/B incomplete"));
+      console.log(clr("1;31", `  ❌ ${error} — A/B incomplete`));
     } else {
       vulkan = await benchmarkBinary(
         REMOTE_VULKAN_BIN,
@@ -816,6 +848,7 @@ async function fullAB(
       backendFlagRecognized: false,
     };
   } else if (rtBuild.exitCode !== 0) {
+    const error = remoteStageError("zinc_rt build", rtBuild.output);
     zinc_rt = {
       decodeTps: null,
       prefillTps: null,
@@ -830,10 +863,10 @@ async function fullAB(
       tokensGenerated: 0,
       bandwidthUtil: null,
       effectiveBW: null,
-      error: "zinc_rt build failed",
+      error,
       backendFlagRecognized: true,
     };
-    console.log(clr("1;31", "  ❌ zinc_rt build failed"));
+    console.log(clr("1;31", `  ❌ ${error}`));
   } else {
     // Use ZINC_RT_TIER if set, else let auto-detect pick (T2 on 6.16+, T1 on older)
     const tier = process.env.ZINC_RT_TIER ?? ENV.ZINC_RT_TIER ?? "";
@@ -1668,6 +1701,17 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
   return lines.length > 0 ? lines.map((line) => `  ${line}`).join("\n") : "  (none detected)";
 }
 
+function hasRemoteInfrastructureFailure(ab: ABBenchmark): boolean {
+  return [
+    ab.vulkan.buildOutput,
+    ab.vulkan.runOutput,
+    ab.vulkan.error ?? "",
+    ab.zinc_rt.buildOutput,
+    ab.zinc_rt.runOutput,
+    ab.zinc_rt.error ?? "",
+  ].some(isRemoteInfrastructureFailure);
+}
+
 function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string {
   const trunc = (s: string, max: number) =>
     s && s.length > max ? s.slice(0, max) + "…" : s;
@@ -1715,6 +1759,8 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
   let milestoneHint = "";
   if (!before.zinc_rt.backendFlagRecognized) {
     milestoneHint = `**Current milestone: PRE-M0.** \`build.zig\` does not yet accept \`-Dbackend=zinc_rt\`. Your first job is to add that build option. See §6.2 of \`docs/ZINC_RT_DESIGN.md\` — under the new tree layout, the build needs to wire \`src/zinc_rt/\` and route \`src/gpu/interface.zig\` based on the selected backend. For now, \`src/zinc_rt/\` may be empty — that is fine; the build can produce a binary that errors out at runtime saying "ZINC_RT not yet implemented". The point of this step is to make the build flag exist so subsequent cycles can fill in the implementation.`;
+  } else if (hasRemoteInfrastructureFailure(before)) {
+    milestoneHint = `**Current blocker: remote infrastructure, not ZINC_RT code.** The benchmark did not reliably reach the remote build/run gate; SSH/rsync reported a network or transport failure. Do not treat this as a Zig compilation failure. First rerun after the RDNA node is reachable. If local builds pass and the remote still shows only SSH transport errors, report the infrastructure blocker rather than changing runtime code.`;
   } else if (before.zinc_rt.buildExitCode !== 0) {
     milestoneHint = `**Current milestone: M0 (T-CPU bring-up).** Build flag works but compilation fails. Fix the build errors shown below. T-CPU (\`src/zinc_rt/ring/cpu.zig\`) is the first tier to land — a pure Zig implementation of the IR, used as the validation oracle. It does not need to be fast; it needs to be correct and to build.`;
   } else if (before.zinc_rt.runExitCode !== 0 && before.zinc_rt.runExitCode !== null) {
@@ -2049,6 +2095,7 @@ function summariseAB(label: string, ab: ABBenchmark): string {
 type VerificationFailure = {
   kind: string;
   output: string;
+  repairable: boolean;
 };
 
 type VerificationAttempt = {
@@ -2062,19 +2109,39 @@ function failureOutputTail(output: string): string {
   return text ? text.slice(-5000) : "(no output captured)";
 }
 
+function verificationFailure(kind: string, output: string): VerificationFailure {
+  return {
+    kind,
+    output: failureOutputTail(output),
+    repairable: !isRemoteInfrastructureFailure(output),
+  };
+}
+
 function detectRepairableVerificationFailure(after: ABBenchmark): VerificationFailure | null {
   const baseline = comparisonTargetLabel(after.comparisonTarget);
   if (after.vulkan.buildExitCode !== 0) {
-    return { kind: `${baseline} build failed`, output: failureOutputTail(after.vulkan.buildOutput) };
+    return verificationFailure(
+      remoteStageError(`${baseline} build`, after.vulkan.buildOutput),
+      after.vulkan.buildOutput,
+    );
   }
   if (after.zinc_rt.backendFlagRecognized && after.zinc_rt.buildExitCode !== 0) {
-    return { kind: "zinc_rt build failed", output: failureOutputTail(after.zinc_rt.buildOutput) };
+    return verificationFailure(
+      remoteStageError("zinc_rt build", after.zinc_rt.buildOutput),
+      after.zinc_rt.buildOutput,
+    );
   }
   if (after.vulkan.runExitCode !== null && after.vulkan.runExitCode !== 0) {
-    return { kind: `${baseline} benchmark run failed`, output: failureOutputTail(after.vulkan.runOutput) };
+    return verificationFailure(
+      remoteStageError(`${baseline} benchmark run`, after.vulkan.runOutput),
+      after.vulkan.runOutput,
+    );
   }
   if (after.zinc_rt.runExitCode !== null && after.zinc_rt.runExitCode !== 0) {
-    return { kind: "zinc_rt benchmark run failed", output: failureOutputTail(after.zinc_rt.runOutput) };
+    return verificationFailure(
+      remoteStageError("zinc_rt benchmark run", after.zinc_rt.runOutput),
+      after.zinc_rt.runOutput,
+    );
   }
   return null;
 }
@@ -2095,6 +2162,7 @@ async function verifyCandidate(
       const failure = {
         kind: "remote zig build test failed",
         output: failureOutputTail(testRes.output),
+        repairable: true,
       };
       return {
         after: before,
@@ -2108,11 +2176,14 @@ async function verifyCandidate(
 
     const failure = detectRepairableVerificationFailure(after);
     if (failure) {
-      console.log(clr("1;31", `  ❌ ${failure.kind} — repair pass required before rollback`));
+      const action = failure.repairable
+        ? "repair pass required before rollback"
+        : "not repairable by agent";
+      console.log(clr("1;31", `  ❌ ${failure.kind} — ${action}`));
       return {
         after,
         verificationError: `${failure.kind} after agent's changes`,
-        repairFailure: failure,
+        repairFailure: failure.repairable ? failure : null,
       };
     }
 
