@@ -5550,6 +5550,134 @@ fn canConsumeDirectMoeGateUpQ4_0Param(state: *const ScalarDecodeState, param: *c
         canConsumeDirectMoeGateUpQ4_0Slot(state);
 }
 
+const DirectMoeGateUpQ4_0Candidate = struct {
+    param: *MoeExpertWorker,
+    expert_slot: usize,
+};
+
+fn consumeDirectMoeGateUpQ4_0TwoRoutedSlots(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    params: []MoeExpertWorker,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (state.direct_moe_gate_up_row_range_count + 2 > direct_moe_gate_up_q4_0_max_expert_slots) return false;
+
+    const range_rows = direct_moe_gate_up_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    var candidates: [2]DirectMoeGateUpQ4_0Candidate = undefined;
+    var candidate_count: usize = 0;
+    for (params, 0..) |*param, i| {
+        if (candidate_count == candidates.len) break;
+        if (param.is_shared) continue;
+        if (param.gate_type != .q4_0 or param.up_type != .q4_0) continue;
+        if (param.intermediate_dim < range_rows or param.gate.len < range_len or param.up.len < range_len) continue;
+        const cols_for_param: u32 = @intCast(param.ffn_norm.len);
+        if (cols_for_param == 0 or cols_for_param % 32 != 0) continue;
+        const row_bytes_for_param = rowBytesForType(.q4_0, cols_for_param);
+        const range_bytes_for_param = range_len * row_bytes_for_param;
+        if (row_bytes_for_param == 0 or param.gate_raw.len < range_bytes_for_param or param.up_raw.len < range_bytes_for_param) continue;
+        candidates[candidate_count] = .{ .param = param, .expert_slot = i };
+        candidate_count += 1;
+    }
+    if (candidate_count != candidates.len) return false;
+
+    const first = candidates[0].param;
+    const second = candidates[1].param;
+    const cols: u32 = @intCast(first.ffn_norm.len);
+    if (cols == 0 or cols % 32 != 0 or second.ffn_norm.len != first.ffn_norm.len) return false;
+    if (first.ffn_norm.ptr != second.ffn_norm.ptr) return false;
+    if (state.row_scratch.len < range_len * 4) return false;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = range_len * row_bytes;
+    const gpu_rows = state.row_scratch[0 .. range_len * 4];
+    tracking.boundary.dmmvQ4_0FourRowRangesParallel64(
+        first.ffn_norm,
+        first.gate_raw[0..range_bytes],
+        first.up_raw[0..range_bytes],
+        second.gate_raw[0..range_bytes],
+        second.up_raw[0..range_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot row ranges unavailable ({s}); retrying per-slot slices", .{@errorName(err)});
+        return false;
+    };
+
+    var max_gate_delta: f32 = 0.0;
+    var max_up_delta: f32 = 0.0;
+    var max_gate_slot: usize = candidates[0].expert_slot;
+    var max_up_slot: usize = candidates[0].expert_slot;
+    var max_gate_row: u32 = 0;
+    var max_up_row: u32 = 0;
+    for (candidates, 0..) |candidate, ci| {
+        const param = candidate.param;
+        const base = ci * range_len * 2;
+        const gate_gpu = gpu_rows[base..][0..range_len];
+        const up_gpu = gpu_rows[base + range_len ..][0..range_len];
+        for (0..range_len) |i| {
+            if (!std.math.isFinite(gate_gpu[i]) or !std.math.isFinite(up_gpu[i])) {
+                log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot row ranges produced non-finite expert_slot={d} row={d}; retrying per-slot slices", .{ candidate.expert_slot, i });
+                return false;
+            }
+            const gate_delta = @abs(gate_gpu[i] - param.gate[i]);
+            const up_delta = @abs(up_gpu[i] - param.up[i]);
+            if (gate_delta > max_gate_delta) {
+                max_gate_delta = gate_delta;
+                max_gate_slot = candidate.expert_slot;
+                max_gate_row = @intCast(i);
+            }
+            if (up_delta > max_up_delta) {
+                max_up_delta = up_delta;
+                max_up_slot = candidate.expert_slot;
+                max_up_row = @intCast(i);
+            }
+        }
+    }
+    if (max_gate_delta > direct_moe_gate_up_q4_0_tolerance or max_up_delta > direct_moe_gate_up_q4_0_tolerance) {
+        log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot row ranges mismatch: gate_delta={d:.6} gate_slot={d} gate_row={d} up_delta={d:.6} up_slot={d} up_row={d}; retrying per-slot slices", .{
+            max_gate_delta,
+            max_gate_slot,
+            max_gate_row,
+            max_up_delta,
+            max_up_slot,
+            max_up_row,
+        });
+        return false;
+    }
+
+    for (candidates, 0..) |candidate, ci| {
+        const param = candidate.param;
+        const base = ci * range_len * 2;
+        @memcpy(param.gate[0..range_len], gpu_rows[base..][0..range_len]);
+        @memcpy(param.up[0..range_len], gpu_rows[base + range_len ..][0..range_len]);
+    }
+    state.direct_moe_gate_up_row_range_count += 2;
+    tracking.ops.* += 4;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 4;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_gate_up_q4_0_two_slots_parallel64 phase=decode expert_slot_a={d} expert_id_a={d} expert_slot_b={d} expert_id_b={d} rows_per_projection={d} cols={d} chunks=4 max_gate_delta={d:.6} max_gate_slot={d} max_gate_row={d} max_up_delta={d:.6} max_up_slot={d} max_up_row={d} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        candidates[0].expert_slot,
+        first.expert_id,
+        candidates[1].expert_slot,
+        second.expert_id,
+        range_rows,
+        cols,
+        max_gate_delta,
+        max_gate_slot,
+        max_gate_row,
+        max_up_delta,
+        max_up_slot,
+        max_up_row,
+    });
+    return true;
+}
+
 fn consumeDirectMoeGateUpQ4_0Rows(
     state: *ScalarDecodeState,
     maybe_tracking: ?DirectComputeTracking,
@@ -5818,6 +5946,7 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
     };
     matvecFused(pool, gate_up[0 .. params.len * 2], ffn_norm, input_sum32) catch return false;
     if (direct_compute_tracking != null) {
+        _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlots(state, direct_compute_tracking, params);
         for (params, 0..) |*param, i| {
             if (!canConsumeDirectMoeGateUpQ4_0Param(state, param)) continue;
             consumeDirectMoeGateUpQ4_0Rows(state, direct_compute_tracking, param, i);

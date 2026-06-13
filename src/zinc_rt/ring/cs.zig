@@ -2072,6 +2072,131 @@ pub const TokenBoundary = struct {
         for (0..rows) |i| output[i] = @bitCast(output_words[i]);
     }
 
+    /// Dispatch four 64-row Q4_0 DMMV ranges that share one input vector in one CS submission.
+    ///
+    /// This is the batched companion to `dmmvQ4_0TwoRowRangesParallel64` for
+    /// decode-phase MoE gate/up validation across two routed experts. The
+    /// output slice receives A, B, C, D ranges in order.
+    pub fn dmmvQ4_0FourRowRangesParallel64(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_a_q4_0: []const u8,
+        weights_b_q4_0: []const u8,
+        weights_c_q4_0: []const u8,
+        weights_d_q4_0: []const u8,
+        cols: u32,
+        output: []f32,
+    ) !void {
+        const rows_per_range: u32 = 64;
+        const rows: u32 = rows_per_range * 4;
+        if (cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols or output.len < rows) return error.ShapeMismatch;
+
+        const row_bytes: usize = (@as(usize, cols) / 32) * 18;
+        const range_bytes = @as(usize, rows_per_range) * row_bytes;
+        const weights_bytes = range_bytes * 4;
+        if (weights_a_q4_0.len < range_bytes or
+            weights_b_q4_0.len < range_bytes or
+            weights_c_q4_0.len < range_bytes or
+            weights_d_q4_0.len < range_bytes)
+        {
+            return error.ShapeMismatch;
+        }
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
+        if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+        if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
+
+        @memcpy(self.input_map[0..input_bytes.len], input_bytes);
+        @memcpy(self.input_map[weight_off..][0..range_bytes], weights_a_q4_0[0..range_bytes]);
+        @memcpy(self.input_map[weight_off + range_bytes ..][0..range_bytes], weights_b_q4_0[0..range_bytes]);
+        @memcpy(self.input_map[weight_off + range_bytes * 2 ..][0..range_bytes], weights_c_q4_0[0..range_bytes]);
+        @memcpy(self.input_map[weight_off + range_bytes * 3 ..][0..range_bytes], weights_d_q4_0[0..range_bytes]);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (0..rows) |i| output_words[i] = 0x7fc0_0000;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_B300 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_range_parallel;
+        const pgm_lo: u32 = @truncate(pgm_va >> 8);
+        const pgm_hi: u32 = @truncate(pgm_va >> 40);
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_vgpr16_value,
+            compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 64, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+        });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const weight_va = self.input_va + @as(u64, weight_off);
+        var row_start: u32 = 0;
+        while (row_start < rows) : (row_start += rows_per_range) {
+            const out_va = self.output_va + @as(u64, row_start) * @sizeOf(f32);
+            const chunk_weight_va = weight_va + @as(u64, row_start) * @as(u64, row_bytes);
+            try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+                in_lo,
+                in_hi,
+                @truncate(out_va),
+                @truncate(out_va >> 32),
+                @truncate(chunk_weight_va),
+                @truncate(chunk_weight_va >> 32),
+                cols,
+                rows_per_range,
+            });
+            try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+        }
+        try self.builder.releaseMemSignal(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+        for (0..rows) |i| output[i] = @bitCast(output_words[i]);
+    }
+
     /// Dispatch Q4_0 DMMV for two arbitrary model rows staged back-to-back.
     ///
     /// The caller supplies two individual source-format rows, which are packed
