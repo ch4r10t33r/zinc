@@ -5273,6 +5273,7 @@ const MoeSharedParams = struct {
 };
 
 const direct_moe_gate_up_q4_0_tolerance: f32 = 0.05;
+const direct_moe_gate_up_q4_0_range_rows: u32 = 64;
 
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
@@ -5431,6 +5432,92 @@ fn consumeDirectMoeGateUpQ4_0Rows(
 
     const row_bytes = rowBytesForType(.q4_0, cols);
     if (row_bytes == 0 or param.gate_raw.len < row_bytes or param.up_raw.len < row_bytes) return;
+
+    const range_rows = direct_moe_gate_up_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    const range_bytes = range_len * row_bytes;
+    if (param.intermediate_dim >= range_rows and
+        state.row_scratch.len >= range_len * 2 and
+        param.gate.len >= range_len and
+        param.up.len >= range_len and
+        param.gate_raw.len >= range_bytes and
+        param.up_raw.len >= range_bytes)
+    {
+        const gpu_rows = state.row_scratch[0 .. range_len * 2];
+        var range_dispatched = true;
+        tracking.boundary.dmmvQ4_0TwoRowRangesParallel64(
+            param.ffn_norm,
+            param.gate_raw[0..range_bytes],
+            param.up_raw[0..range_bytes],
+            cols,
+            gpu_rows,
+        ) catch |err| {
+            log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 row ranges unavailable ({s}); retrying two-row slice", .{@errorName(err)});
+            range_dispatched = false;
+        };
+
+        var range_ok = true;
+        var max_gate_delta: f32 = 0.0;
+        var max_up_delta: f32 = 0.0;
+        var max_gate_row: u32 = 0;
+        var max_up_row: u32 = 0;
+        if (range_dispatched) {
+            for (0..range_len) |i| {
+                const gate_gpu = gpu_rows[i];
+                const up_gpu = gpu_rows[range_len + i];
+                if (!std.math.isFinite(gate_gpu) or !std.math.isFinite(up_gpu)) {
+                    log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 row ranges produced non-finite row {d}; retrying two-row slice", .{i});
+                    range_ok = false;
+                    break;
+                }
+                const gate_delta = @abs(gate_gpu - param.gate[i]);
+                const up_delta = @abs(up_gpu - param.up[i]);
+                if (gate_delta > max_gate_delta) {
+                    max_gate_delta = gate_delta;
+                    max_gate_row = @intCast(i);
+                }
+                if (up_delta > max_up_delta) {
+                    max_up_delta = up_delta;
+                    max_up_row = @intCast(i);
+                }
+            }
+        } else {
+            range_ok = false;
+        }
+        if (range_ok and (max_gate_delta > direct_moe_gate_up_q4_0_tolerance or max_up_delta > direct_moe_gate_up_q4_0_tolerance)) {
+            log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 row ranges mismatch: expert_slot={d} expert_id={d} gate_delta={d:.6} gate_row={d} up_delta={d:.6} up_row={d}; retrying two-row slice", .{
+                expert_slot,
+                param.expert_id,
+                max_gate_delta,
+                max_gate_row,
+                max_up_delta,
+                max_up_row,
+            });
+            range_ok = false;
+        }
+        if (range_ok) {
+            @memcpy(param.gate[0..range_len], gpu_rows[0..range_len]);
+            @memcpy(param.up[0..range_len], gpu_rows[range_len..][0..range_len]);
+            state.direct_moe_gate_up_row_range_done = true;
+            tracking.ops.* += 2;
+            mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+            tracking.consumed.* = true;
+            tracking.real_model_slice.* = true;
+            if (tracking.decode_model_slices) |slices| slices.* += 2;
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_gate_up_q4_0_row_ranges_parallel64 phase=decode expert_slot={d} expert_id={d} rows_per_projection={d} cols={d} chunks=2 max_gate_delta={d:.6} max_gate_row={d} max_up_delta={d:.6} max_up_row={d} consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                expert_slot,
+                param.expert_id,
+                range_rows,
+                cols,
+                max_gate_delta,
+                max_gate_row,
+                max_up_delta,
+                max_up_row,
+            });
+            return;
+        }
+    }
 
     const gpu_rows = state.row_scratch[0..2];
     tracking.boundary.dmmvQ4_0TwoRows(
