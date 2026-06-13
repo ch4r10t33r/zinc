@@ -2294,9 +2294,9 @@ fn consumeDirectLogitsArgmaxRowRange(
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
 // Use a bounded direct LM-head prefix by default so an exercised decode token
 // can be selected from GPU-produced Q4_0 row scores while the remaining rows
-// still use the host-assisted fallback. This is four 64-row chunks submitted
+// still use the host-assisted fallback. This is eight 64-row chunks submitted
 // in one CS batch, not a widened single-wave dispatch.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 256;
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 512;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
@@ -9015,6 +9015,15 @@ test "direct LM-head Q4_0 selected source identifies GPU scores" {
     try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_prefix"));
     try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_selected_window"));
     try std.testing.expect(!directLmHeadQ4_0SelectedSourceHasGpuScore("cpu_rows"));
+}
+
+test "direct LM-head Q4_0 prefix stays chunk-aligned and bounded" {
+    try std.testing.expect(direct_lm_head_q4_0_argmax_prefix_rows >= direct_lm_head_q4_0_parallel_chunk_rows);
+    try std.testing.expectEqual(@as(u32, 0), direct_lm_head_q4_0_argmax_prefix_rows % direct_lm_head_q4_0_parallel_chunk_rows);
+
+    const qwen_hidden_dim: u32 = 2048;
+    const row_bytes = rowBytesForType(.q4_0, qwen_hidden_dim);
+    try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
 }
 
 test "direct router row-range names full parallel chunks" {
