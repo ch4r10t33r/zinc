@@ -1378,7 +1378,7 @@ const ScalarDecodeState = struct {
     direct_ssm_beta_q8_row_range_failed_mask: u128 = 0,
     direct_ssm_beta_q8_row_range_successes: u32 = 0,
     direct_ssm_beta_q8_row_range_slice_successes: u32 = 0,
-    direct_moe_gate_up_row_range_done: bool = false,
+    direct_moe_gate_up_row_range_count: u32 = 0,
     pool: ?*std.Thread.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
 
@@ -1526,6 +1526,7 @@ const ScalarDecodeState = struct {
         self.direct_ssm_beta_q8_row_range_done_mask = 0;
         self.direct_ssm_alpha_q8_row_range_slice_successes = 0;
         self.direct_ssm_beta_q8_row_range_slice_successes = 0;
+        self.direct_moe_gate_up_row_range_count = 0;
     }
 };
 
@@ -5274,6 +5275,7 @@ const MoeSharedParams = struct {
 
 const direct_moe_gate_up_q4_0_tolerance: f32 = 0.05;
 const direct_moe_gate_up_q4_0_range_rows: u32 = 64;
+const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
 
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
@@ -5413,6 +5415,10 @@ fn runMoeExpertsParallel(
     return true;
 }
 
+fn canConsumeDirectMoeGateUpQ4_0Slot(state: *const ScalarDecodeState) bool {
+    return state.direct_moe_gate_up_row_range_count < direct_moe_gate_up_q4_0_max_expert_slots;
+}
+
 fn consumeDirectMoeGateUpQ4_0Rows(
     state: *ScalarDecodeState,
     maybe_tracking: ?DirectComputeTracking,
@@ -5421,7 +5427,7 @@ fn consumeDirectMoeGateUpQ4_0Rows(
 ) void {
     const tracking = maybe_tracking orelse return;
     if (tracking.phase != .decode) return;
-    if (state.direct_moe_gate_up_row_range_done) return;
+    if (!canConsumeDirectMoeGateUpQ4_0Slot(state)) return;
     if (param.is_shared) return;
     if (param.gate_type != .q4_0 or param.up_type != .q4_0) return;
     if (param.intermediate_dim == 0 or param.gate.len == 0 or param.up.len == 0) return;
@@ -5498,7 +5504,7 @@ fn consumeDirectMoeGateUpQ4_0Rows(
         if (range_ok) {
             @memcpy(param.gate[0..range_len], gpu_rows[0..range_len]);
             @memcpy(param.up[0..range_len], gpu_rows[range_len..][0..range_len]);
-            state.direct_moe_gate_up_row_range_done = true;
+            state.direct_moe_gate_up_row_range_count += 1;
             tracking.ops.* += 2;
             mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
             tracking.consumed.* = true;
@@ -5552,7 +5558,7 @@ fn consumeDirectMoeGateUpQ4_0Rows(
 
     param.gate[0] = gpu_gate;
     param.up[0] = gpu_up;
-    state.direct_moe_gate_up_row_range_done = true;
+    state.direct_moe_gate_up_row_range_count += 1;
     tracking.ops.* += 2;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -5661,7 +5667,12 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
         break :sums null;
     };
     matvecFused(pool, gate_up[0 .. params.len * 2], ffn_norm, input_sum32) catch return false;
-    consumeDirectMoeGateUpQ4_0Rows(state, direct_compute_tracking, &params[0], 0);
+    if (direct_compute_tracking != null) {
+        for (params, 0..) |*param, i| {
+            if (!canConsumeDirectMoeGateUpQ4_0Slot(state)) break;
+            consumeDirectMoeGateUpQ4_0Rows(state, direct_compute_tracking, param, i);
+        }
+    }
 
     var down: [moe_expert_parallel_max_workers]MultiInputFusedSegment = undefined;
     for (params, 0..) |*param, i| {
@@ -8607,6 +8618,8 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     state.direct_ssm_alpha_q8_row_range_slice_successes = 2;
     state.direct_ssm_beta_q8_row_range_slice_successes = 2;
     state.direct_ssm_q8_row_range_trust_after_successes = 1;
+    state.direct_moe_gate_up_row_range_count = direct_moe_gate_up_q4_0_max_expert_slots;
+    try std.testing.expect(!canConsumeDirectMoeGateUpQ4_0Slot(&state));
 
     try std.testing.expect(canTrustDirectSsmRowRangeWithoutOracle(&state, .f32));
     try std.testing.expect(canTrustDirectSsmRowRangeWithoutOracle(&state, .q8_0));
@@ -8621,6 +8634,8 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u32, 8), state.direct_ssm_beta_q8_row_range_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_alpha_q8_row_range_slice_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_beta_q8_row_range_slice_successes);
+    try std.testing.expectEqual(@as(u32, 0), state.direct_moe_gate_up_row_range_count);
+    try std.testing.expect(canConsumeDirectMoeGateUpQ4_0Slot(&state));
 
     state.direct_ssm_alpha_q8_row_range_failed_mask = 0;
     state.direct_ssm_beta_q8_row_range_failed_mask = 0;
