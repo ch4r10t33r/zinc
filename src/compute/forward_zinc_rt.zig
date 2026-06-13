@@ -3487,7 +3487,7 @@ fn runSsmLayer(
 
 const direct_ssm_qkv_gate_q4_0_tolerance: f32 = 0.05;
 const direct_ssm_qkv_gate_q4_0_range_rows: u32 = 64;
-const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 3;
+const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 4;
 
 fn consumeDirectSsmQkvGateQ4_0RowRange(
     model: *const Model,
