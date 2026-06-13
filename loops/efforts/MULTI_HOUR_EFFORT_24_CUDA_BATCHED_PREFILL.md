@@ -261,3 +261,44 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   from b.router_table, expert-major grouped GEMM so each expert's weight is read once per group not once per
   token; needs gather/scatter, harder for byte-identity), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own
   tolerance gate). b.router_table is now the device-side foundation a grouped-expert pass consumes.
+- **2026-06-13 — Cycle 8: token-batched routed-expert matvecs for gemma-26b MoE prefill (Phase 2 cycle 4) — output-identical + faster (the last big per-token FFN cost).**
+  Cycle 7 batched the router; the routed gate/up/down expert matvecs themselves were STILL looped per
+  token (~36 MB/token: Q4_K gate_up + Q5_1 down). This cycle batches them over all T prompt tokens in
+  single launches (grid.y = T) instead of T separate single-token launches. NOT token-grouped (no
+  gather/scatter) — each (token t, expert-slot e, row) block reads token t's own router row, input slice,
+  and output slice, so the per-block dequant + reduction is byte-for-byte the single-token kernel; only
+  the launch dimension is batched. Changes (all additive; decodeStep/moeFfnBlock/dense path untouched):
+    - 2 ADDITIVE kernels (kernels.cu): `dmmv_q4k_experts_batched` / `dmmv_q5_1_experts_batched` — bit-faithful
+      twins of `dmmv_q4k_experts`/`dmmv_q5_1_experts` (same dequant + `zinc_block_reduce_sum` order) with
+      per-token src/dst strides (`x_tok_stride`/`y_tok_stride`) + `routing_stride` so block=(g=blockIdx.x →
+      slot·M+row, t=blockIdx.y) reads ids from `b.router_table[t*2·n_used + e]`. New `ExpertsBatchPush`
+      (per-token strides appended to `ExpertsPush`) + 2 pipelines.
+    - `BatchScratch.{moe_norm_e, gate_e, up_e, geglu_e, down_e}` ([T, …] slot-major, size 1 on dense).
+    - `moeRoutedExpertsBatched(L,T,b)`: batched pre_ffw_norm_2 → b.moe_norm_e, gate (base 0) + up (base
+      gu_half) Q4_K expert matvecs → b.gate_e/up_e, GeGLU over [T, n_used·ef] → b.geglu_e, Q5_1 down →
+      b.down_e [T, n_used·n_embd] slot-major. Async on the shared stream; push params mirror the per-token
+      `dmmv_*_experts` dispatches exactly. The unscaled down output (down scale folded at accumulate via
+      moe_weighted_acc_scaled, unchanged) → bit-identical.
+    - `moeRoutedCombine(L, prerouted, preexperts)`: when preexperts, SKIP pre_ffw_norm_2 + the expert
+      matvecs + GeGLU (done batched) and read this token's b.down_e slice via the `self.down_buf` alias →
+      only the zero+weighted-accumulate + post_ffw_norm_2 + scale_accumulate + post_ffw_norm + residual
+      combine remain per token. `pre` (Q4_K gate_up + Q5_1 down) ⟹ batched ⟹ scaled accumulate, consistent.
+    prefillBatched MoE branch now: sharedExpertBatched + routerBatched + moeRoutedExpertsBatched ONCE/layer,
+    then loop T × (moeRoutedCombine(prerouted, preexperts) + layerOutScale) — the per-token loop is now just
+    the lightweight accumulate/combine tail. Host-readback fallback keeps its full per-token path.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false`
+  EXIT=0, bin md5 d14f13bc ≠ cycle 7's 0a080dd5; NVRTC compiled the 2 new kernels at runtime). GATE — FULLY CLEARED:
+    - `prefill_catalog ZINC_AB=batched` (ABBA x2, 250-tok, 4090): GEN_IDS byte-identical —
+      **gemma4-26b MoE 39.72 → 135.16 t/s (+240%)** (UP from cycle 7's 103.92 — batching the routed-expert
+      matvecs is the last big FFN lever), gemma4-31b dense 30.47 → 137.96 t/s (+353%, NO regression —
+      dense flow untouched).
+    - `ZINC_BATCHED=1 validate_catalog` (DIRECT batched gate, 4090): **5/5 PASS** — gemma4-26b MoE batched
+      free-runs **12/12** DIRECT vs llama.cpp (the batched routed-expert prefill path is token-correct);
+      gemma4-31b the documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged); qwen 12/12
+      (per-token fallback intact → product decode path unregressed).
+  Committed `3b1afc78` to perf/e24-batched-prefill, pushed (NOT main). The gemma-26b MoE prefill FFN is now
+  FULLY batched (shared expert + router + routed experts); the only remaining per-token work is the cheap
+  accumulate/combine tail. NEXT (cycle 9): either token-GROUPED routed experts (gather tokens by expert so
+  each expert's weight is read once per group not once per token — a memory-traffic win beyond launch
+  batching, but needs gather/scatter and is harder for byte-identity), batch the per-token accumulate/combine
+  tail too (kills the last T launches/layer), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own tolerance gate).
