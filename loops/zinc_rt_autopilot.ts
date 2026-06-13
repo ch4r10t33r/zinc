@@ -199,8 +199,13 @@ const RATIO_IMPROVEMENT_KEEP = 0.01; // +1% ratio
 const ABS_TPS_IMPROVEMENT_KEEP = 0.5; // or +0.5 tok/s, whichever is larger
 const MIGRATE_REL_TPS_IMPROVEMENT_KEEP = 0.02; // M0 accepts smaller real gains
 const MIGRATE_MIN_ABS_TPS_IMPROVEMENT_KEEP = 0.15;
+const MIGRATE_RECOVERY_REL_TPS_IMPROVEMENT_KEEP = 0.01;
+const MIGRATE_RECOVERY_MIN_ABS_TPS_IMPROVEMENT_KEEP = 0.25;
 const FOUNDATION_MAX_TPS_REGRESSION = 0.03; // validation keeps may be flat, not slower
 const DECODE_MODEL_SLICE_MAX_TPS_REGRESSION = 0.10;
+const INCREMENTAL_DECODE_SLICE_MAX_REL_TPS_DROP = 0.003;
+const INCREMENTAL_DECODE_SLICE_MAX_ABS_TPS_DROP = 0.08;
+const INCREMENTAL_DECODE_SLICE_MAX_BEST_TPS_DROP = 0.20;
 const SHORTCUT_FREE_MAX_TPS_REGRESSION = 0.20;
 const HARD_PIVOT_STALL_CYCLES = 8;
 const AGENT_TIMEOUT_MS = 3_600_000; // 1h — M0 layer-lowering cycles can be substantial
@@ -1518,16 +1523,68 @@ function foundationPerformanceEnvelopeOk(before: ABBenchmark, after: ABBenchmark
   return afterRt >= beforeRt * (1 - FOUNDATION_MAX_TPS_REGRESSION);
 }
 
-function migrationEvidenceEnvelopeOk(before: ABBenchmark, after: ABBenchmark, maxRegression: number): boolean {
+function migrationEvidenceQualityOk(before: ABBenchmark, after: ABBenchmark): boolean {
   if (after.zinc_rt.buildExitCode !== 0 || after.zinc_rt.runExitCode !== 0) return false;
   if (after.zinc_rt.garbageOutput) return false;
   if (before.vulkan.coherentText && !after.vulkan.coherentText) return false;
   if (before.zinc_rt.coherentText && !after.zinc_rt.coherentText) return false;
+  return true;
+}
 
+function migrationEvidenceEnvelopeOk(before: ABBenchmark, after: ABBenchmark, maxRegression: number): boolean {
+  if (!migrationEvidenceQualityOk(before, after)) return false;
   const beforeRt = before.zinc_rt.decodeTps;
   const afterRt = after.zinc_rt.decodeTps;
   if (beforeRt == null || afterRt == null) return true;
   return afterRt >= beforeRt * (1 - maxRegression);
+}
+
+function incrementalDecodeSliceEnvelopeOk(
+  before: ABBenchmark,
+  after: ABBenchmark,
+  migrateBestRt: number | null,
+): boolean {
+  if (!migrationEvidenceQualityOk(before, after)) return false;
+
+  const beforeRt = before.zinc_rt.decodeTps;
+  const afterRt = after.zinc_rt.decodeTps;
+  if (beforeRt == null || afterRt == null) return true;
+
+  const cycleDrop = Math.max(
+    INCREMENTAL_DECODE_SLICE_MAX_ABS_TPS_DROP,
+    beforeRt * INCREMENTAL_DECODE_SLICE_MAX_REL_TPS_DROP,
+  );
+  if (afterRt + cycleDrop < beforeRt) return false;
+
+  if (migrateBestRt != null) {
+    const bestDrop = Math.max(
+      INCREMENTAL_DECODE_SLICE_MAX_BEST_TPS_DROP,
+      migrateBestRt * INCREMENTAL_DECODE_SLICE_MAX_REL_TPS_DROP,
+    );
+    if (afterRt + bestDrop < migrateBestRt) return false;
+  }
+
+  return true;
+}
+
+function hasMigratePerformanceRecovery(before: ABBenchmark, after: ABBenchmark, migrateBestRt: number | null): boolean {
+  if (migrateBestRt == null) return false;
+  if (!migrationEvidenceQualityOk(before, after)) return false;
+  if (!hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput)) return false;
+  if (isZincRtBenchmarkShortcut(after.zinc_rt.runOutput)) return false;
+
+  const beforeRt = before.zinc_rt.decodeTps;
+  const afterRt = after.zinc_rt.decodeTps;
+  if (beforeRt == null || afterRt == null) return false;
+
+  const recoveryGap = migrateBestRt - beforeRt;
+  if (recoveryGap < Math.max(0.5, migrateBestRt * 0.015)) return false;
+
+  const requiredGain = Math.max(
+    MIGRATE_RECOVERY_MIN_ABS_TPS_IMPROVEMENT_KEEP,
+    beforeRt * MIGRATE_RECOVERY_REL_TPS_IMPROVEMENT_KEEP,
+  );
+  return afterRt >= beforeRt + requiredGain;
 }
 
 function hasShortcutFreeMeasurementProgress(before: ABBenchmark, after: ABBenchmark): boolean {
@@ -1570,11 +1627,22 @@ export function decideMigrateKeep(before: ABBenchmark, after: ABBenchmark, migra
   ) {
     return { keep: true, reason: "new benchmark-visible M1 validation signal" };
   }
-  if (
-    hasNewDirectDecodeModelSliceSignal(before, after) &&
-    migrationEvidenceEnvelopeOk(before, after, DECODE_MODEL_SLICE_MAX_TPS_REGRESSION)
-  ) {
-    return { keep: true, reason: "new consumed decode-phase direct model-slice signal" };
+  if (hasMigratePerformanceRecovery(before, after, migrateBestRt)) {
+    return { keep: true, reason: `migrate performance recovery ${before.zinc_rt.decodeTps?.toFixed(2)} → ${after.zinc_rt.decodeTps?.toFixed(2)} tok/s` };
+  }
+  if (hasNewDirectDecodeModelSliceSignal(before, after)) {
+    const hadDecodeSlice = hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput);
+    const envelopeOk = hadDecodeSlice
+      ? incrementalDecodeSliceEnvelopeOk(before, after, migrateBestRt)
+      : migrationEvidenceEnvelopeOk(before, after, DECODE_MODEL_SLICE_MAX_TPS_REGRESSION);
+    if (envelopeOk) {
+      return {
+        keep: true,
+        reason: hadDecodeSlice
+          ? "new consumed decode-phase direct model-slice signal within performance envelope"
+          : "new consumed decode-phase direct model-slice signal",
+      };
+    }
   }
   if (
     hasNewDirectModelSliceSignal(before, after) &&
@@ -1665,6 +1733,8 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
   ).length;
   const t2Failures = state.failedApproaches.filter((f) => /t2|umq|userq/i.test(f)).length;
   const bestRt = bestZincRtTpsOfState(state);
+  const currentRt = before.zinc_rt.decodeTps;
+  const directDecodeSlices = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
 
   if (mode === "cpu_after_admission") {
     lines.push("- Execution gap: direct queue admission is working, but generated tokens still come from `execution_tier=t_cpu_after_admission` / `forward_zinc_rt M0 T-CPU`.");
@@ -1696,6 +1766,16 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
 
   if (bestRt != null && before.zinc_rt.decodeTps != null && mode !== "direct") {
     lines.push(`- Keep-threshold gap: best CPU-fallback zinc_rt sample is ${bestRt.toFixed(1)} tok/s; current sample is ${before.zinc_rt.decodeTps.toFixed(1)} tok/s. Treat smaller moves as noise unless they beat the best checkpoint by a material margin.`);
+  }
+
+  if (
+    bestRt != null &&
+    currentRt != null &&
+    directDecodeSlices > 0 &&
+    isShortcutFreeZincRtOutput(before.zinc_rt.runOutput) &&
+    currentRt < bestRt - Math.max(0.5, bestRt * 0.015)
+  ) {
+    lines.push(`- Performance recovery gap: this run already has ${directDecodeSlices} consumed decode model slices and shortcut-free output, but throughput is ${currentRt.toFixed(1)} tok/s vs best ${bestRt.toFixed(1)}. Stop widening coverage by default; recover tok/s by reducing low-yield slice overhead, batching expensive slice submissions, or narrowing debug/validation coverage while keeping a real consumed decode slice.`);
   }
 
   return lines.length > 0 ? lines.map((line) => `  ${line}`).join("\n") : "  (none detected)";
@@ -1754,6 +1834,14 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
   const bestRatio = bestRatioOfState(state);
   const bestRt = bestZincRtTpsOfState(state);
   const gapAnalysis = buildGapAnalysis(state, before);
+  const currentRt = before.zinc_rt.decodeTps;
+  const directDecodeSlices = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const performanceRecoveryMode =
+    bestRt != null &&
+    currentRt != null &&
+    directDecodeSlices > 0 &&
+    isShortcutFreeZincRtOutput(before.zinc_rt.runOutput) &&
+    currentRt < bestRt - Math.max(0.5, bestRt * 0.015);
 
   // Decide milestone hint based on observable state
   let milestoneHint = "";
@@ -1997,6 +2085,19 @@ Next useful work must do one of these:
       "- Another preflight/admission probe unless the before/after output changes from failed/missing to passed and no prior kept cycle already exposes that class of signal.",
       "",
     ] : []),
+    ...(performanceRecoveryMode ? [
+      "## Performance Recovery Mode",
+      "",
+      `The current tree already exposes ${directDecodeSlices} consumed decode model slices and shortcut-free output, but zinc_rt is ${currentRt.toFixed(1)} tok/s versus the best kept checkpoint at ${bestRt!.toFixed(1)} tok/s.`,
+      "",
+      "This cycle should recover measured tok/s while preserving at least one real consumed decode slice. Prefer:",
+      "- removing or narrowing low-yield validation/coverage that added many tiny direct slices;",
+      "- batching expensive direct-slice submissions only when the benchmark-visible tok/s improves;",
+      "- making broad coverage optional behind a debug/env flag if the production default is slower.",
+      "",
+      "Do not widen router/SSM/attention/LM-head coverage just to increase `direct_decode_model_slices`; the harness will reject incremental slice-only changes that fall materially below the best tok/s checkpoint.",
+      "",
+    ] : []),
     "## Rules",
     "",
     `1. Make ONE focused change toward beating ${baselineLabel}. ${phase === "migrate" ? "Correctness/coherent output > tok/s — fix the broken path first." : "Tok/s > everything else."}`,
@@ -2004,6 +2105,7 @@ Next useful work must do one of these:
       "   MIGRATE progress must be exercised by the current benchmark or by a new harness-visible validation gate.",
       "   Do not add standalone future packet/building-block code unless this cycle also wires it into executed forward progress or a failing/passing validation gate.",
       "   If the verified graph is not lowered, prefer lowering the smallest real executed slice over adding another verifier.",
+      "   After shortcut-free consumed decode slices already exist, incremental coverage is keepable only if tok/s stays close to the best checkpoint or improves from the current sample.",
     ] : []),
     "2. Before printing the final `@@@` markers, self-verify changed files on the remote. Run repo-root `.env` + rsync + the exact build gates:",
     "   `set -a; source .env; set +a`",
