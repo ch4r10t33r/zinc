@@ -32,6 +32,35 @@ set -a; source .env; set +a
 export ZINC_RDNA_NODE=rdna2
 ```
 
+## Agent environment (opencode on the macOS host) — READ BEFORE ANY SHELL COMMAND
+
+This effort is driven by `opencode run` (GLM-5.2). The agent process runs on
+the **macOS host**, not on the RDNA2 node. That changes a few things the
+generic cycle rules get wrong:
+
+- **No `timeout` / `gtimeout` on macOS.** Do not wrap commands in `timeout`;
+  it is `command not found` here and wastes a turn. Use the shell tool's own
+  per-command `timeout` parameter instead (see next bullet).
+- **opencode's shell tool kills any command at 30 s by default.** Builds,
+  rsync, shader compiles, and `ssh ... zig build` all exceed that. When you
+  invoke the shell tool for ANY of those, pass a larger per-command timeout
+  (e.g. 300000 ms); otherwise the command is terminated mid-run and you get
+  misleading partial output. Long one-shot diagnostics belong in a backgrounded
+  `nohup ... &` that you then poll, not a single foreground shell call.
+- **The model GGUF lives ONLY on the remote node**
+  (`$ZINC_RDNA2_REMOTE_MODEL`). Do NOT run `strings`/`grep`/`cat`/`stat` on
+  local `*.gguf` paths — there is no local copy; those commands return empty
+  and waste turns. Inspect the model via `ssh` instead.
+- **The controller does the authoritative remote sync + shader compile + build
+  + 3-sample benchmark + coherence sweep AFTER you return.** So your in-cycle
+  build obligation is just a sanity check: a LOCAL `zig build
+  -Doptimize=ReleaseFast` (macOS skips GPU/shader work, ~10-30 s) to catch
+  syntax/type errors is sufficient. You do NOT need to run the full remote
+  build inline; if you do, background it and raise the shell-tool timeout.
+- Editing is LOCAL (this worktree). The controller rsyncs to the node. Keep
+  edits confined to `src/`, `build.zig`, shaders, and docs; the controller
+  only reverts those paths.
+
 ## llama.cpp hardware ceiling on THIS node (measured 2026-06-13)
 
 llama.cpp is installed at `/root/llama.cpp/build-vulkan/bin/`. Build 9a532ae,
