@@ -8550,7 +8550,12 @@ pub const InferenceEngine = struct {
     fn defaultQwen35Dense9bQueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
         if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return 1;
         if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return 1;
-        if (prompt_len <= 40) return (prompt_len + 1) / 2;
+        // The public M4 raw-completion prompt band is short enough that the
+        // async-leading chunk mostly buys an extra command-buffer boundary.
+        // Keep the layer-0 batched SSM/FFN precompute, but record the remaining
+        // token-major graph as one final command so the harness can measure the
+        // submit/wait cost separately from kernel throughput.
+        if (prompt_len <= 40) return prompt_len;
         return 16;
     }
 
@@ -32708,19 +32713,16 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!isQwen35Dense9bFullAttnKvQ6kTarget(qwen35_27b_cfg, "blk.3.attn_k.weight", 1024, 4096));
 
     const qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 36, null);
-    try std.testing.expectEqual(@as(usize, 18), qwen_base);
-    try std.testing.expectEqual(@as(usize, 18), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 18), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 18, qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 36), qwen_base);
+    try std.testing.expectEqual(@as(usize, 36), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
 
     const nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 33, null);
-    try std.testing.expectEqual(@as(usize, 17), nearby_qwen_base);
-    try std.testing.expectEqual(@as(usize, 17), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 17, nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 33), nearby_qwen_base);
+    try std.testing.expectEqual(@as(usize, 33), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
 
     const upper_nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 40, null);
-    try std.testing.expectEqual(@as(usize, 20), upper_nearby_qwen_base);
-    try std.testing.expectEqual(@as(usize, 20), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 20), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 20, upper_nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 40), upper_nearby_qwen_base);
+    try std.testing.expectEqual(@as(usize, 40), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
 
     const outside_balanced_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 41, null);
     try std.testing.expectEqual(@as(usize, 16), outside_balanced_qwen_base);
