@@ -15,11 +15,16 @@
 # pick — that is expected, not a regression. Treat a FULL-match drop or a fidelity
 # collapse (r below ~0.99, top-5 overlap < 5) as a real regression.
 #
-# Run on the box, from the zinc repo, AFTER a build. Pinned to the 4090 by UUID
-# (nvidia-smi ignores CUDA_VISIBLE_DEVICES; index is unreliable). Override via env.
-#   ZINC_GPU ZINC_MODEL LLAMA_CPP ZIG  — see defaults below.
+# Run on the box, from the zinc repo, AFTER a build. Provide the target CUDA
+# device through ZINC_GPU; keep machine-specific UUIDs in .env or the shell
+# environment.
+#   ZINC_GPU ZINC_MODEL LLAMA_CPP ZIG  - see defaults below.
 set -u
-GPU=${ZINC_GPU:-GPU-e59a6fce-1961-bafe-927c-06c0149f2370}        # RTX 4090
+GPU=${ZINC_GPU:-}
+if [ -z "$GPU" ]; then
+  echo "missing ZINC_GPU; set it to the CUDA_VISIBLE_DEVICES selector for this host" >&2
+  exit 2
+fi
 M=${ZINC_MODEL:-$HOME/workspace/Qwen3.5-9B-Q4_K_M.gguf}
 LCPP=${LLAMA_CPP:-$HOME/workspace/llama.cpp}
 ZIG=${ZIG:-$HOME/zig-0.15.2/zig}

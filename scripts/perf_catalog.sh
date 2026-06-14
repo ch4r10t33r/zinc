@@ -11,11 +11,13 @@
 # compute capability, so ONE build runs on either GPU — we just flip
 # CUDA_VISIBLE_DEVICES per GPU. 5090 = sm_120 (Blackwell), 4090 = sm_89 (Ada).
 #
-# Run on the box from ~/workspace/zinc. GPUs are pinned by UUID (index / CVD
-# integer are unreliable for the WSL2 passthrough).
+# Run on the box from ~/workspace/zinc. GPU UUIDs are supplied through the
+# environment; do not commit machine-specific UUIDs.
 #
 # Env overrides:
 #   ZINC_GPUS    space list of targets to test   (default: "5090 4090")
+#   ZINC_GPU_5090 CUDA_VISIBLE_DEVICES value for the 5090 target
+#   ZINC_GPU_4090 CUDA_VISIBLE_DEVICES value for the 4090 target
 #   ZINC_MODELS  catalog gguf dir                 (default: ~/workspace/models)
 #   ZINC_NGEN    greedy tokens per run            (default: 160)
 #   ZINC_RUNS    runs per model (report best)     (default: 2)
@@ -23,10 +25,11 @@
 #   ZINC_ONLY    space list of model names to run (default: all)
 set -u
 
-# --- GPU registry: name -> UUID (pin by UUID; nvidia-smi index is unstable) ---
+# --- GPU registry: name -> CUDA_VISIBLE_DEVICES selector.
+# Keep actual UUIDs in .env or the shell environment, not in tracked files.
 declare -A GPU_UUID=(
-  [5090]=GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350
-  [4090]=GPU-e59a6fce-1961-bafe-927c-06c0149f2370
+  [5090]="${ZINC_GPU_5090:-}"
+  [4090]="${ZINC_GPU_4090:-}"
 )
 declare -A GPU_DESC=(
   [5090]="sm_120 Blackwell, 32 GB, 1792 GB/s"
@@ -90,7 +93,7 @@ run_one_gpu() {
 
 for gpu in $GPUS; do
   uuid="${GPU_UUID[$gpu]:-}"
-  [ -n "$uuid" ] || { echo "unknown GPU '$gpu' (known: ${!GPU_UUID[*]})"; continue; }
+  [ -n "$uuid" ] || { echo "missing selector for GPU '$gpu'; set ZINC_GPU_${gpu}=<cuda-visible-device>"; continue; }
   run_one_gpu "$gpu" "$uuid"
 done
 

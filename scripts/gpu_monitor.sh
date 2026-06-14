@@ -3,7 +3,8 @@
 # gpu_monitor.sh — live utilisation / temperature monitor for the remote CUDA node.
 #
 # Polls `nvidia-smi` on a remote CUDA node over a multiplexed SSH connection
-# and renders a refreshing dashboard. Node defaults to the `agent-zinc` SSH alias.
+# and renders a refreshing dashboard. The node name must come from GPU_NODE or
+# --node so public checkouts do not carry private SSH aliases.
 #
 # Usage:
 #   scripts/gpu_monitor.sh                 # live dashboard, refresh every 2s
@@ -20,11 +21,11 @@
 #   scripts/gpu_monitor.sh --remote-log stop     # stop the logger (CSV stays on the node)
 #
 # Env:
-#   GPU_NODE   ssh host/alias to poll (default: agent-zinc)
+#   GPU_NODE   ssh host/alias to poll
 #
 set -euo pipefail
 
-NODE="${GPU_NODE:-agent-zinc}"
+NODE="${GPU_NODE:-}"
 INTERVAL=2
 ONCE=0
 LOGFILE=""
@@ -50,6 +51,11 @@ while [[ $# -gt 0 ]]; do
     *)             echo "unknown arg: $1" >&2; usage 1 ;;
   esac
 done
+
+if [[ -z "$NODE" ]]; then
+  echo "missing GPU node; set GPU_NODE=<ssh-host-or-alias> or pass --node" >&2
+  exit 2
+fi
 
 # Colour palette (empty when disabled / not a TTY).
 if [[ "$USE_COLOR" == 1 && -t 1 ]]; then

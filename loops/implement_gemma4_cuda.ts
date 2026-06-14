@@ -8,11 +8,11 @@
  * coherent text on the 4090 — completing the 5/5 catalog. See the plan in
  * `loops/efforts/MULTI_HOUR_EFFORT_22_CUDA_GEMMA4.md`.
  *
- * The CUDA toolchain + GPUs live on the remote "agent-zinc" box (the Mac can't
- * build CUDA), so each cycle:
- *   1. rsync local src/ → box
+ * The CUDA toolchain + GPUs live on a remote Linux box (the Mac can't build
+ * CUDA), so each cycle:
+ *   1. rsync local src/ -> box
  *   2. build the CUDA zinc exe ON THE BOX (zig build -Dbackend=cuda)
- *   3. run the target gemma4 model ON THE BOX (zinc -m <gguf> --prompt …)
+ *   3. run the target gemma4 model ON THE BOX (zinc -m <gguf> --prompt ...)
  *   4. analyze: build error? unsupported-arch? incoherent? coherent (≈ reference)?
  *   5. spawn ONE Claude agent to make a single focused implementation step
  *      (it edits files locally; the loop owns the canonical build/run/validate)
@@ -28,11 +28,11 @@
  *   bun loops/implement_gemma4_cuda.ts --cycles 30
  *   bun loops/implement_gemma4_cuda.ts --dry-run       # sync+build+run only, no agent
  *
- * Env (defaults match the agent-zinc box; see memory `agent-zinc-access`):
- *   ZINC_SSH        ssh target            (agent-zinc@100.67.129.14)
- *   ZINC_SSH_PORT   ssh port              (2222)
- *   ZINC_SSH_KEY    identity file         (~/.ssh/id_ed25519_agent-zinc)
- *   ZINC_GPU        4090 UUID             (GPU-e59a6fce-1961-bafe-927c-06c0149f2370)
+ * Env:
+ *   ZINC_SSH        ssh target            (<user>@<host>, required)
+ *   ZINC_SSH_PORT   ssh port              (22)
+ *   ZINC_SSH_KEY    identity file         (~/.ssh/id_ed25519)
+ *   ZINC_GPU        CUDA_VISIBLE_DEVICES  (0)
  *   ZINC_BOX_REPO   repo path on box      (workspace/zinc)
  *   ZINC_GEMMA      gemma4 gguf on box    (workspace/models/gemma-4-31B-it-Q4_K_M.gguf)
  *   ZINC_GEMMA_MOE  gemma4 MoE gguf       (workspace/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf)
@@ -45,10 +45,10 @@ import { resolve } from "node:path";
 
 // ── config ───────────────────────────────────────────────────────────
 const REPO_ROOT = resolve(import.meta.dir, "..");
-const SSH_TARGET = process.env.ZINC_SSH ?? "agent-zinc@100.67.129.14";
-const SSH_PORT = process.env.ZINC_SSH_PORT ?? "2222";
-const SSH_KEY = process.env.ZINC_SSH_KEY ?? `${process.env.HOME}/.ssh/id_ed25519_agent-zinc`;
-const GPU = process.env.ZINC_GPU ?? "GPU-e59a6fce-1961-bafe-927c-06c0149f2370";
+const SSH_TARGET = requireEnv("ZINC_SSH", "<user>@<host>");
+const SSH_PORT = process.env.ZINC_SSH_PORT ?? "22";
+const SSH_KEY = process.env.ZINC_SSH_KEY ?? `${process.env.HOME}/.ssh/id_ed25519`;
+const GPU = process.env.ZINC_GPU ?? "0";
 const BOX_REPO = process.env.ZINC_BOX_REPO ?? "workspace/zinc";
 const GEMMA = process.env.ZINC_GEMMA ?? "workspace/models/gemma-4-31B-it-Q4_K_M.gguf";
 const GEMMA_MOE = process.env.ZINC_GEMMA_MOE ?? "workspace/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf";
@@ -57,6 +57,13 @@ const PROMPT = process.env.ZINC_PROMPT ?? "The capital of France is";
 const EFFORT_FILE = "loops/efforts/MULTI_HOUR_EFFORT_22_CUDA_GEMMA4.md";
 const CLAUDE_EFFORT = process.env.ZINC_CLAUDE_EFFORT ?? "high";
 const SEP = "─".repeat(72);
+
+function requireEnv(name: string, example: string): string {
+  const value = process.env[name];
+  if (value && value.trim() !== "") return value;
+  console.error(`Missing ${name}; set ${name}=${example} in your environment or .env.`);
+  process.exit(2);
+}
 
 const SSH = ["-i", SSH_KEY, "-p", SSH_PORT, "-o", "IdentitiesOnly=yes",
   "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30"];

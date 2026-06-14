@@ -263,7 +263,9 @@ main.zig
 - Changes to GGUF parsing that could break existing model loading
 
 ### Never
-- Commit `.env`, credentials, or private IPs/ports
+- Commit `.env`, credentials, private IPs, private hostnames, SSH aliases, private ports, GPU UUIDs, device serials, or host-specific usernames in paths
+- Hard-code remote endpoints or machine selectors in scripts, docs, prompts, tests, or generated artifacts; use `.env`, environment variables (`ZINC_HOST`, `ZINC_USER`, `ZINC_PORT`, `ZINC_GPU`, `ZINC_GPU_4090`, etc.), and placeholders such as `<host>` or `<cuda-device>` instead
+- Treat loopback (`127.0.0.1`, `localhost`, `0.0.0.0`) or public project/service URLs as leaks, but do re-check any non-loopback address or private-looking hostname before committing
 - Modify `.spv` binaries directly — always recompile from `.comp` source
 - Add runtime dependencies beyond Vulkan and system libc
 - Use wave32 without benchmarking against wave64 first

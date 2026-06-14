@@ -17,12 +17,15 @@
 # a regression — a real bug found 2026-06-12 when a naive B-then-S harness
 # showed gemma "-11%" for a strictly-fewer-ops change.
 #
-# Companion to scripts/perf_catalog.sh (decode). Run on the box from an ISOLATED
-# checkout (never ~/workspace/zinc — parallel research). GPUs pinned by UUID.
+# Companion to scripts/perf_catalog.sh (decode). Run on the box from an isolated
+# checkout. GPU selectors are supplied through the environment; do not commit
+# machine-specific UUIDs.
 # `dbg_cuda gen` prints "PREFILL: T tokens in Xs = Y tok/s" and "GEN_IDS:...".
 #
 # Env overrides:
 #   ZINC_GPUS    space list of targets   (default "4090")
+#   ZINC_GPU_4090 CUDA_VISIBLE_DEVICES value for the 4090 target
+#   ZINC_GPU_5090 CUDA_VISIBLE_DEVICES value for the 5090 target
 #   ZINC_MODELS  catalog gguf dir        (default ~/workspace/models)
 #   ZINC_PROMPT  synthetic prompt length (default 250)
 #   ZINC_NGEN    gen tokens for GEN_IDS  (default 8)
@@ -37,8 +40,8 @@
 set -u
 
 declare -A GPU_UUID=(
-  [5090]=GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350
-  [4090]=GPU-e59a6fce-1961-bafe-927c-06c0149f2370
+  [5090]="${ZINC_GPU_5090:-}"
+  [4090]="${ZINC_GPU_4090:-}"
 )
 GPUS=${ZINC_GPUS:-"4090"}
 ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
@@ -101,7 +104,7 @@ run_one() { # $1 = B|S -> echoes "<tok/s>|<GEN_IDS line>"
 
 fails=0
 for gpu in $GPUS; do
-  uuid="${GPU_UUID[$gpu]:-}"; [ -n "$uuid" ] || { echo "unknown GPU '$gpu'"; continue; }
+  uuid="${GPU_UUID[$gpu]:-}"; [ -n "$uuid" ] || { echo "missing selector for GPU '$gpu'; set ZINC_GPU_${gpu}=<cuda-visible-device>"; continue; }
   export CUDA_VISIBLE_DEVICES="$uuid"
   printf '\n=== RTX %s prefill tok/s  |  %s-tok prompt, %s vs baseline (ABBA x%s) ===\n' "$gpu" "$PROMPT_LEN" "$S_LABEL" "$ROUNDS"
   printf '  %-15s %10s %10s %7s   %s\n' "model" "baseline" "$S_LABEL" "gain" "correctness"

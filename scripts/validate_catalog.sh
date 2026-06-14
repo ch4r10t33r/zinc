@@ -11,11 +11,16 @@
 # union). Complements scripts/validate_cuda_decode.sh (the qwen35-9b deep gate:
 # 9 tokens + multi-prompt + logit fidelity).
 #
-# Run on the box from the repo, AFTER a build. 4090-pinned (UUID; index/CVD are
-# unreliable for nvidia-smi). Override via env: ZINC_GPU ZINC_MODELS LLAMA_CPP
-# ZIG ZINC_PROMPT ZINC_NGEN ZINC_MINMATCH.
+# Run on the box from the repo, AFTER a build. Provide the target CUDA device
+# through ZINC_GPU; keep machine-specific UUIDs in .env or the shell environment.
+# Override via env: ZINC_GPU ZINC_MODELS LLAMA_CPP ZIG ZINC_PROMPT ZINC_NGEN
+# ZINC_MINMATCH.
 set -u
-GPU=${ZINC_GPU:-GPU-e59a6fce-1961-bafe-927c-06c0149f2370}
+GPU=${ZINC_GPU:-}
+if [ -z "$GPU" ]; then
+  echo "missing ZINC_GPU; set it to the CUDA_VISIBLE_DEVICES selector for this host" >&2
+  exit 2
+fi
 LCPP=${LLAMA_CPP:-$HOME/workspace/llama.cpp}
 ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
 MD=${ZINC_MODELS:-$HOME/workspace/models}

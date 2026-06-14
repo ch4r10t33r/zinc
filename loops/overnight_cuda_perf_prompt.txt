@@ -18,7 +18,7 @@ CRITICAL GOTCHAS (violating these wastes the whole cycle):
    ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ~/zig-0.15.2/zig build cuda-dbg -Dbackend=cuda -Dshaders=false
    If the hash did not change, you are measuring stale code — STOP and fix the build.
 2. gemma is BOOST-SATURATED, not sync-bound: do NOT add async / the CUstream command ring to gemma decode — it is a PROVEN regression (gemma-26b async was 16 vs batched 28). The gemma lever is FUSION (fewer/fatter kernels), not async.
-3. BOX: ssh agent-zinc per the agent-zinc memory entry. Pin the 4090 (GPU-e59a6fce-1961-bafe-927c-06c0149f2370). The operator runs 35B benchmarks in parallel on the box — use an ISOLATED working dir (e.g. ~/zinc-overnight), NEVER ~/workspace/zinc, and do not disturb their processes.
+3. BOX: use the SSH host and CUDA selector from untracked environment variables or private memory. The operator may run 35B benchmarks in parallel on the box; use an isolated working dir (e.g. ~/zinc-overnight), never the shared checkout, and do not disturb their processes.
 4. BOOST NOISE: 4090 decode tok/s is boost-noisy. For a FAIR A/B, build both before/after and measure them BACK-TO-BACK (same thermal state). Never conclude a win from one boosted run.
 
 WORKFLOW THIS CYCLE:

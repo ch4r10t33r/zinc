@@ -2587,10 +2587,9 @@ async function runRdnaTarget(args) {
 // ---------------------------------------------------------------------------
 // CUDA target (NVIDIA, e.g. RTX 5090). Mirrors the rdna path: SSH to the node,
 // sync the tree, build -Dbackend=cuda, then run the ZINC CLI vs llama.cpp across
-// the four-scenario matrix. The GPU is pinned by UUID via CUDA_VISIBLE_DEVICES
-// (nvidia-smi indices are unreliable on the WSL2 passthrough), so no Vulkan
-// device flag is used. Host/port/user come from env (ZINC_CUDA_* / ZINC_HOST),
-// never committed — see docs/BENCHMARKING.md.
+// the four-scenario matrix. The GPU is pinned through CUDA_VISIBLE_DEVICES, so
+// no Vulkan device flag is used. Host/port/user/GPU selector come from env
+// (ZINC_CUDA_* / ZINC_HOST), never committed — see docs/BENCHMARKING.md.
 // ---------------------------------------------------------------------------
 function cudaEnvValue(dotEnv, args, suffix, ...fallbackKeys) {
   const envMap = args?.envMap ?? process.env;
@@ -2608,8 +2607,10 @@ async function buildCudaCreds(args) {
     throw new Error("CUDA benchmarking needs ZINC_CUDA_HOST/ZINC_CUDA_USER (or ZINC_HOST/ZINC_USER) in the environment or .env");
   }
   const gpuUuid = args.cudaGpuUuid
-    ?? cudaEnvValue(dotEnv, args, "GPU_UUID", "ZINC_CUDA_GPU_UUID", "ZINC_CUDA_GPU")
-    ?? "GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350"; // RTX 5090 on the reference node; override with --cuda-gpu
+    ?? cudaEnvValue(dotEnv, args, "GPU_UUID", "ZINC_CUDA_GPU_UUID", "ZINC_CUDA_GPU");
+  if (!gpuUuid) {
+    throw new Error("CUDA benchmarking needs --cuda-gpu or ZINC_CUDA_GPU_UUID/ZINC_CUDA_GPU in the environment or .env");
+  }
   const remoteHome = remoteHomeForUser(user);
   const workdir = args.cudaWorkdir ?? cudaEnvValue(dotEnv, args, "WORKDIR", "ZINC_CUDA_WORKDIR") ?? `${remoteHome}/zinc-bench-cuda`;
   const modelRoot = args.cudaModelRoot ?? cudaEnvValue(dotEnv, args, "MODEL_ROOT", "ZINC_CUDA_MODEL_ROOT") ?? `${remoteHome}/workspace/models`;
