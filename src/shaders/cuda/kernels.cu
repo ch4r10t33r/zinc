@@ -2055,6 +2055,37 @@ extern "C" __global__ void dequant_q4k_to_f16(const unsigned* a_u32, half* Wf16,
     Wf16[i] = __float2half(d * (float)sc * (float)nib - dmin * (float)mn);
 }
 
+// ---- dequant_q6k_to_f16 (Effort 26 cycle 10: full-weight Q6_K -> fp16) --------
+// Q6_K analog of dequant_q4k_to_f16: dequant a Q6_K weight W[M,K] (row-major,
+// 256-elem superblocks = 210 BYTES each) to a dense fp16 buffer Wf16[M,K] so the
+// prefill GEMM can run on cuBLAS fp16 tensor cores (the gemma-31b ffn_down is
+// Q6_K — ~1/7 of the dense GEMM that still ran on the hand TC kernel). Per-element
+// unpack identical to gemm_q6k_tc_f16a / gemm_q6k_tiled_v2 (q = 6-bit, val =
+// d*sc*(q-32)), then __float2half → the cuBLAS path's fp16 W bits match the TC
+// kernel's staged W bits exactly. Q6_K is BYTE-addressed → `const unsigned char*
+// a`, a_offset is BYTES. One thread per (row,col) element.
+struct DequantQ6KPush { unsigned M, K, a_offset; };
+extern "C" __global__ void dequant_q6k_to_f16(const unsigned char* a, half* Wf16, DequantQ6KPush pc) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)pc.M * pc.K;
+    if (i >= total) return;
+    unsigned row = (unsigned)(i / pc.K), e = (unsigned)(i % pc.K);
+    unsigned bpr = pc.K >> 8;           // Q6_K superblocks per row
+    unsigned within = e & 255u, sb = e >> 8;
+    const unsigned char* blk = a + pc.a_offset + (size_t)row * bpr * 210u + (size_t)sb * 210u;
+    float d = zinc_half_to_float((unsigned short)((unsigned)blk[208] | ((unsigned)blk[209] << 8)));
+    unsigned half_ = within >> 7, wh = within & 127u, ll = wh & 31u, group = wh >> 5;
+    const unsigned char* ql = blk + (size_t)half_ * 64u;
+    const unsigned char* qh = blk + 128u + (size_t)half_ * 32u;
+    const signed char* sc = (const signed char*)(blk + 192u + (size_t)half_ * 8u);
+    unsigned is = ll >> 4, qhb = qh[ll], q, sci;
+    if (group == 0u) { q = (ql[ll] & 0xFu) | (((qhb >> 0) & 3u) << 4); sci = is + 0u; }
+    else if (group == 1u) { q = (ql[ll + 32u] & 0xFu) | (((qhb >> 2) & 3u) << 4); sci = is + 2u; }
+    else if (group == 2u) { q = (ql[ll] >> 4) | (((qhb >> 4) & 3u) << 4); sci = is + 4u; }
+    else { q = (ql[ll + 32u] >> 4) | (((qhb >> 6) & 3u) << 4); sci = is + 6u; }
+    Wf16[i] = __float2half(d * (float)sc[sci] * ((float)q - 32.0f));
+}
+
 // ---- rms_norm_f16 (Effort 24 cycle 21: emit the fp16 norm DIRECTLY for the TC path) ----
 // Byte-for-byte f32_to_f16(rms_norm(x,w)): computes the SAME f32 normalized value
 // w[i]*(x[i]*rinv) with the SAME reduction order as rms_norm, then __float2half-stores
