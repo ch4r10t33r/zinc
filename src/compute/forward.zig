@@ -3402,7 +3402,18 @@ pub const InferenceEngine = struct {
     }
 
     fn beginProfilePhase(self: *InferenceEngine) ?u32 {
-        return self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        // BOTTOM_OF_PIPE (not TOP_OF_PIPE) ensures the begin timestamp is
+        // written only after all prior GPU work in the command buffer has
+        // completed. With TOP_OF_PIPE the timestamp is written at recording
+        // time — before preceding dispatches finish — which inflates every
+        // child phase's duration to include the prior sibling's execution.
+        // This made nested phases (e.g. ssm_proj parent vs its norm_ab/qkv/z
+        // children) sum to more than the parent. Using BOTTOM_OF_PIPE for
+        // both begin and end gives accurate per-phase elapsed time. The
+        // initial total marker (timestamps[0]) is still written explicitly
+        // with TOP_OF_PIPE in each prefill/decode path, so the overall
+        // last - first total remains correct.
+        return self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
 
     fn endProfilePhase(self: *InferenceEngine, phase: ProfilePhase, start_query: ?u32) void {
