@@ -3612,6 +3612,23 @@ const GemmPush = extern struct {
     flags: u32 = 0,
 };
 
+/// Push constants for `gemm_q4k_gate_up_swiglu.metal`.
+const GemmGateUpPush = extern struct {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    ne12: i32,
+    _pad0: u32 = 0,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    ne0: i32,
+    ne1: i32,
+    src0_off: u32,
+    src1_off: u32,
+};
+
 /// Push constants for `gemm_f32_small.metal`.
 const GemmF32SmallPush = extern struct {
     M: u32,
@@ -6031,6 +6048,7 @@ pub const InferenceEngine = struct {
 
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
     gemm_q4k_pipe: MetalPipeline,
+    gemm_q4k_gate_up_swiglu_pipe: MetalPipeline,
     gemm_q5k_pipe: MetalPipeline,
     gemm_q6k_pipe: MetalPipeline,
     gemm_q8_0_pipe: MetalPipeline,
@@ -6879,6 +6897,7 @@ pub const InferenceEngine = struct {
         self.argmax_chunks_pipe = try loadShaderPipeline(ctx, "argmax_chunks");
         self.argmax_pairs_pipe = try loadShaderPipeline(ctx, "argmax_pairs");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
+        self.gemm_q4k_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "gemm_q4k_gate_up_swiglu");
         self.gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
         self.gemm_q8_0_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
@@ -7828,6 +7847,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.argmax_chunks_pipe);
         metal_pipeline.freePipeline(&self.argmax_pairs_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q4k_gate_up_swiglu_pipe);
         metal_pipeline.freePipeline(&self.gemm_q5k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q8_0_pipe);
@@ -15173,6 +15193,60 @@ fn dispatchGemmQ4KAccOnCmd(
     dispatchGemmQ4KOnCmdWithFlags(engine, cmd, weight, input, output, M, K, N, 1);
 }
 
+fn canUseQwen35Dense9bPrefillGateUpSwiGLUGemm(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+    N: u32,
+) bool {
+    return engine.in_prefill_phase and
+        defaultQwen35Dense9bQueuedPrefillEnabled(engine.config) and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        N > 1 and
+        K % 256 == 0 and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        isQwen35Dense9bGateUpQ4kTarget(engine.config, gate.info.name, M, K) and
+        isQwen35Dense9bGateUpQ4kTarget(engine.config, up.info.name, M, K) and
+        engine.gemm_q4k_gate_up_swiglu_pipe.handle != null and
+        engine.gemm_q4k_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 128;
+}
+
+fn dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 256 == 0);
+    const push = GemmGateUpPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 256) * 144,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = tensorPageOffset(engine.model, gate),
+        .src1_off = tensorPageOffset(engine.model, up),
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q4k_gate_up_swiglu_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmGateUpPush), 0, 16384);
+}
+
 /// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
 /// shape as Q4_K/Q6_K, with Q5_K's 176-byte blocks.
 fn dispatchGemmQ5KOnCmd(
@@ -20527,24 +20601,41 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
     const down_t = lt.ffn_down orelse return error.MissingTensor;
 
     // Adapt llama.cpp `ggml_metal_op_mul_mat`: once layer-0 SSM has already
-    // materialized N prompt FFN-norm rows, run dense FFN as three batched
-    // matmuls instead of replaying N decode-shaped matvec triples.
+    // materialized N prompt FFN-norm rows, run dense FFN as batched matmuls
+    // instead of replaying N decode-shaped matvec triples.
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_swiglu_buf, inter_dim, hidden_dim, n_tokens);
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, up_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_up_buf, inter_dim, hidden_dim, n_tokens);
-
-    profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
-        &engine.qwen35_dense_prefill_swiglu_buf,
-        &engine.qwen35_dense_prefill_up_buf,
-    });
-    {
-        const push = SwiGLUPush{ .n = inter_dim };
-        const bufs = [_]*const MetalBuffer{
+    if (canUseQwen35Dense9bPrefillGateUpSwiGLUGemm(engine, gate_t, up_t, inter_dim, hidden_dim, n_tokens)) {
+        // Same producer/consumer fusion llama.cpp applies at the graph level,
+        // but specialized for this dense prompt prefix: gate and up consume the
+        // same normalized rows, and the only consumer is SwiGLU.
+        dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
+            engine,
+            cmd,
+            gate_t,
+            up_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
             &engine.qwen35_dense_prefill_swiglu_buf,
+            inter_dim,
+            hidden_dim,
+            n_tokens,
+        );
+    } else {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_swiglu_buf, inter_dim, hidden_dim, n_tokens);
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, up_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_up_buf, inter_dim, hidden_dim, n_tokens);
+
+        profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
             &engine.qwen35_dense_prefill_swiglu_buf,
             &engine.qwen35_dense_prefill_up_buf,
-        };
-        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        });
+        {
+            const push = SwiGLUPush{ .n = inter_dim };
+            const bufs = [_]*const MetalBuffer{
+                &engine.qwen35_dense_prefill_swiglu_buf,
+                &engine.qwen35_dense_prefill_swiglu_buf,
+                &engine.qwen35_dense_prefill_up_buf,
+            };
+            cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        }
     }
 
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
@@ -34201,6 +34292,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_k17408_pipe);
     var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
     defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
+    var gemm_q4k_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "gemm_q4k_gate_up_swiglu");
+    defer metal_pipeline.freePipeline(&gemm_q4k_gate_up_swiglu_pipe);
 
     var dmmv_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
     defer metal_pipeline.freePipeline(&dmmv_pipe_k2048);
@@ -34375,6 +34468,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_k17408_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_swiglu_k4096_pipe.handle != null);
     try std.testing.expect(gemm_q5k_pipe.handle != null);
+    try std.testing.expect(gemm_q4k_gate_up_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);
