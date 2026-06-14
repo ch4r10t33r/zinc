@@ -1561,6 +1561,8 @@ const DirectComputeTracking = struct {
 // projections validate each row range against the CPU oracle; paired Q8_0
 // projections can use trust-after-success after the first passing pair.
 const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_router_decode_enabled_default = true;
+const direct_router_decode_cadence_default: u32 = 32;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
@@ -1576,10 +1578,38 @@ fn directDecodeModelSliceCadence() u32 {
     return directDecodeModelSliceCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"));
 }
 
+fn directRouterDecodeEnabledForEnv(raw_override: ?[]const u8) bool {
+    const raw = raw_override orelse return direct_router_decode_enabled_default;
+    if (raw.len == 0) return direct_router_decode_enabled_default;
+    if (std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
+    if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return true;
+    return direct_router_decode_enabled_default;
+}
+
+fn directRouterDecodeEnabled() bool {
+    return directRouterDecodeEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_DECODE"));
+}
+
+fn directRouterDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
+    const raw = raw_override orelse return direct_router_decode_cadence_default;
+    return std.fmt.parseInt(u32, raw, 10) catch direct_router_decode_cadence_default;
+}
+
+fn directRouterDecodeCadence() u32 {
+    return directRouterDecodeCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_DECODE_CADENCE"));
+}
+
 fn shouldTrackDirectDecodeModelSlice(generated_len: usize, cadence: u32) bool {
     if (generated_len == 0) return false;
     if (generated_len == 1) return true;
     if (cadence == 0) return false;
+    return generated_len % cadence == 0;
+}
+
+fn shouldTrackDirectRouterDecode(generated_len: usize, full_slice_tracked: bool, enabled: bool, cadence: u32) bool {
+    if (!enabled or full_slice_tracked) return false;
+    if (generated_len == 0) return false;
+    if (cadence == 0) return true;
     return generated_len % cadence == 0;
 }
 
@@ -1734,11 +1764,22 @@ fn generateScalarHybrid(
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
+    const direct_router_decode_enabled = directRouterDecodeEnabled();
+    const direct_router_decode_cadence = directRouterDecodeCadence();
     if (token_boundary != null) {
         if (direct_decode_slice_cadence == 0) {
             log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token only", .{});
         } else {
             log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+        }
+        if (direct_router_decode_enabled) {
+            if (direct_router_decode_cadence == 0) {
+                log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed per decode token", .{});
+            } else {
+                log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed every {d} decode tokens", .{direct_router_decode_cadence});
+            }
+        } else {
+            log.info("M1 AMDGPU CS direct router execution disabled by ZINC_RT_DIRECT_ROUTER_DECODE", .{});
         }
         log.info("M1 AMDGPU CS direct SSM F32/Q8_0 row-range budget: {d} successes per tracked decode slice per alpha/beta kind; trust_after_successes={d}", .{
             state.direct_ssm_q8_row_range_max_successes,
@@ -1786,6 +1827,7 @@ fn generateScalarHybrid(
             &consumed_gpu_model_value,
             selection_out,
             direct_compute_tracking,
+            null,
         );
         if (selection_out != null) {
             const gpu_token = directComputeArgmaxTop2(token_boundary, selection) catch |err| blk: {
@@ -1826,7 +1868,8 @@ fn generateScalarHybrid(
     }
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        const direct_decode_tracking: ?DirectComputeTracking = if (shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence) and token_boundary != null)
+        const track_full_decode_slice = shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
+        const direct_decode_tracking: ?DirectComputeTracking = if (track_full_decode_slice and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
                 .ops = &direct_compute_ops,
@@ -1839,7 +1882,31 @@ fn generateScalarHybrid(
             }
         else
             null;
-        try scalarEvalToken(model, &state, next_token, position, &next_token, direct_final_norm_weight0, &consumed_gpu_model_value, null, direct_decode_tracking);
+        const direct_router_tracking: ?DirectComputeTracking = if (shouldTrackDirectRouterDecode(generated.items.len, track_full_decode_slice, direct_router_decode_enabled, direct_router_decode_cadence) and token_boundary != null)
+            .{
+                .boundary = token_boundary.?,
+                .ops = &direct_compute_ops,
+                .kind = &direct_compute_kind,
+                .consumed = &consumed_gpu_compute_value,
+                .real_model_slice = &real_model_slice,
+                .phase = .decode,
+                .decode_model_slices = &direct_decode_model_slices,
+                .selected_token = null,
+            }
+        else
+            null;
+        try scalarEvalToken(
+            model,
+            &state,
+            next_token,
+            position,
+            &next_token,
+            direct_final_norm_weight0,
+            &consumed_gpu_model_value,
+            null,
+            direct_decode_tracking,
+            direct_router_tracking,
+        );
         try generated.append(allocator, next_token);
     }
     const decode_end = std.time.nanoTimestamp();
@@ -3070,8 +3137,9 @@ fn scalarEvalToken(
     consumed_gpu_model_value: *bool,
     selection_out: ?*ArgmaxTop2Result,
     direct_compute_tracking: ?DirectComputeTracking,
+    direct_router_tracking: ?DirectComputeTracking,
 ) !void {
-    if (direct_compute_tracking) |tracking| {
+    if (direct_compute_tracking orelse direct_router_tracking) |tracking| {
         if (tracking.phase == .decode) state.beginDirectDecodeSlice();
     }
 
@@ -3103,7 +3171,7 @@ fn scalarEvalToken(
         if (lt.ffn_gate_up_exps != null and cfg.is_gemma) {
             try runGemma4MoeLayer(model, state, lt);
         } else if (lt.ffn_gate_exps != null) {
-            try runMoeLayer(model, state, lt, direct_compute_tracking);
+            try runMoeLayer(model, state, lt, direct_compute_tracking, direct_router_tracking);
         } else {
             try runDenseFfnLayer(model, state, lt);
         }
@@ -4969,6 +5037,7 @@ fn runMoeLayer(
     state: *ScalarDecodeState,
     lt: LayerTensors,
     direct_compute_tracking: ?DirectComputeTracking,
+    direct_router_tracking: ?DirectComputeTracking,
 ) !void {
     const cfg = model.config;
     // Gemma 4 MoE routes the expert input through pre_ffw_norm_2 instead of
@@ -5009,7 +5078,8 @@ fn runMoeLayer(
         }
         if (!routed_top1) {
             if (route_experts) {
-                if (consumeDirectRouterRowRangePrimary(model, state, lt, direct_compute_tracking, n_used)) {
+                const router_primary_tracking = direct_compute_tracking orelse direct_router_tracking;
+                if (consumeDirectRouterRowRangePrimary(model, state, lt, router_primary_tracking, n_used)) {
                     routed_experts_ready = true;
                     try matvecTensor(state.pool, model, shared_gate_inp, state.ffn_norm, 1, state.row_scratch, shared_gate_scalar[0..]);
                 } else {
@@ -5037,7 +5107,8 @@ fn runMoeLayer(
             }
         }
         if (!routed_top1 and route_experts) {
-            if (consumeDirectRouterRowRangePrimary(model, state, lt, direct_compute_tracking, n_used)) {
+            const router_primary_tracking = direct_compute_tracking orelse direct_router_tracking;
+            if (consumeDirectRouterRowRangePrimary(model, state, lt, router_primary_tracking, n_used)) {
                 routed_experts_ready = true;
             } else {
                 try matvecTensor(state.pool, model, lt.ffn_gate_inp.?, state.ffn_norm, cfg.n_experts, state.row_scratch, state.router_logits);
@@ -9175,6 +9246,22 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
     try std.testing.expectEqual(@as(u32, direct_decode_model_slice_cadence_default), directDecodeModelSliceCadenceForEnv("bad"));
+    try std.testing.expect(directRouterDecodeEnabledForEnv(null));
+    try std.testing.expect(directRouterDecodeEnabledForEnv("1"));
+    try std.testing.expect(directRouterDecodeEnabledForEnv("true"));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv("0"));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv("false"));
+    try std.testing.expect(directRouterDecodeEnabledForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, direct_router_decode_cadence_default), directRouterDecodeCadenceForEnv(null));
+    try std.testing.expectEqual(@as(u32, 16), directRouterDecodeCadenceForEnv("16"));
+    try std.testing.expectEqual(@as(u32, 0), directRouterDecodeCadenceForEnv("0"));
+    try std.testing.expectEqual(@as(u32, direct_router_decode_cadence_default), directRouterDecodeCadenceForEnv("bad"));
+    try std.testing.expect(!shouldTrackDirectRouterDecode(0, false, true, 32));
+    try std.testing.expect(!shouldTrackDirectRouterDecode(32, true, true, 32));
+    try std.testing.expect(!shouldTrackDirectRouterDecode(32, false, false, 32));
+    try std.testing.expect(!shouldTrackDirectRouterDecode(31, false, true, 32));
+    try std.testing.expect(shouldTrackDirectRouterDecode(32, false, true, 32));
+    try std.testing.expect(shouldTrackDirectRouterDecode(7, false, true, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 8));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 8));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(7, 8));
