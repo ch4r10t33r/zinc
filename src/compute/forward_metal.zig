@@ -8353,8 +8353,21 @@ pub const InferenceEngine = struct {
         return 4;
     }
 
+    fn defaultQwen35Dense9bQueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
+        if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return 1;
+        if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return 1;
+        return 16;
+    }
+
+    fn defaultQueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
+        if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
+            return defaultQwen35Dense9bQueuedTokenMajorAsyncChunkTokens(cfg, prompt_len);
+        }
+        return defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg, prompt_len);
+    }
+
     fn queuedTokenMajorAsyncChunkTokensFromRequest(cfg: ModelConfig, prompt_len: usize, requested: ?u32) usize {
-        const default_chunk = defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg, prompt_len);
+        const default_chunk = defaultQueuedTokenMajorAsyncChunkTokens(cfg, prompt_len);
         const value = requested orelse return default_chunk;
         if (value <= 1 or prompt_len <= 2) return 1;
         return @min(@as(usize, @intCast(value)), @min(prompt_len - 1, @as(usize, 16)));
@@ -8376,6 +8389,14 @@ pub const InferenceEngine = struct {
             if (token_idx == 0) return 1;
             if (token_idx == 1) return 5;
 
+            const remaining = prompt_len - token_idx;
+            if (remaining <= base_chunk) return remaining;
+            const tail = remaining - base_chunk;
+            if (tail > 0 and tail < 4) {
+                return base_chunk - (4 - tail);
+            }
+        }
+        if (!has_override and defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and prompt_len >= qwen_ssm_projection_prefill_min_tokens and base_chunk == 16) {
             const remaining = prompt_len - token_idx;
             if (remaining <= base_chunk) return remaining;
             const tail = remaining - base_chunk;
@@ -32132,6 +32153,17 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, true, false, 30, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, false, false, 31, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_27b_cfg, true, false, 63, 64));
+
+    const qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 36, null);
+    try std.testing.expectEqual(@as(usize, 16), qwen_base);
+    try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 16, qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 4), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 32, qwen_base, false));
+
+    const nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 33, null);
+    try std.testing.expectEqual(@as(usize, 16), nearby_qwen_base);
+    try std.testing.expectEqual(@as(usize, 13), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 16, nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 4), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 29, nearby_qwen_base, false));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
