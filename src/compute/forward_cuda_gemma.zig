@@ -75,6 +75,7 @@ const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride:
 const RmsRopeQkvPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, n_head: u32, n_kv_head: u32, kv_offset: u32 };
 const SwigluPush = extern struct { N: u32 };
 const F32ToF16Push = extern struct { N: u32 }; // cycle 12: activation downcast for the TC f16-A GEMM
+const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 }; // e26 c9: Q4_K weight → fp16 for the cuBLAS prefill GEMM
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
 const ArgmaxPush = extern struct { N: u32 };
@@ -243,6 +244,7 @@ const Pipelines = struct {
     // the m128/m64/lowsmem kernels (same wmma math; phases only reorder writes).
     gemm_q4k_tc_f16a_m128_lowsmem: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
+    dequant_q4k_to_f16: CudaPipeline, // e26 c9: full Q4_K weight → fp16 for the cuBLAS prefill GEMM
     // Cycle 21: fp16-EMITTING producers for the TC path — write the normalized /
     // GeGLU activation directly as half into act_f16 (byte-for-byte f32_to_f16 of
     // their f32 twins), dropping the per-GEMM recast launch entirely.
@@ -285,6 +287,10 @@ const BatchScratch = struct {
     // Effort 24 cycle 12: fp16 activation scratch for the TC f16-A GEMM path
     // ([T, ff_buf_max] halves; sized to the largest activation; TC opt-in only).
     act_f16: CudaBuffer,
+    // Effort 26 cycle 9: fp16 dense-weight scratch for the cuBLAS prefill GEMM
+    // (dequant Q4_K [M,K] → here, then cublasGemmEx). Sized to the largest dense
+    // Q4_K weight (max(ff,q_dim,n_embd)·max(n_embd,q_dim) halves). cuBLAS opt-in.
+    w_f16: CudaBuffer,
 };
 
 pub const ForwardGemma = struct {
@@ -346,6 +352,8 @@ pub const ForwardGemma = struct {
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
     // the proven byte-identical path is unchanged. NOT byte-identical when on.
     use_tc: bool = false,
+    use_cublas: bool = false, // e26 c9: dense Q4_K prefill GEMMs via cuBLAS fp16 TC (dequant W→fp16 + cublasGemmEx). DEFAULT-ON (opt out ZINC_BATCHED_CUBLAS=0/off); supersedes the use_tc Q4_K (idx==0) branch when T >= cublas_min_t.
+    cublas_min_t: u32 = 128, // e26 c9: only route Q4_K GEMMs through cuBLAS when the token batch T >= this (the dequant→fp16 round-trip is a fixed per-weight cost; cuBLAS wins +76% @T=512 / +15% @T=128 but is break-even @T=64). Below it, fall back to gemm_q4k_tc.
     use_tc_plain: bool = false, // cycle 12 A/B: force cycle-11 plain TC (no f16-A pre-convert)
     use_tc_q6: bool = true, // cycle 13 A/B: ZINC_BATCHED_TC_NOQ6 forces Q6_K back to f32 TC-off
     use_tc_m128: bool = false, // cycle 14 A/B: ZINC_BATCHED_TC_M128 opts into the wider 128x64 Q4_K TC kernel (NEGATIVE: -11.8%, off by default)
@@ -476,6 +484,7 @@ pub const ForwardGemma = struct {
         pipes.gemm_q6k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a_lowsmem");
         pipes.gemm_q4k_tc_f16a_m128_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128_lowsmem");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
+        pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
         pipes.rms_norm_f16 = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_f16");
         pipes.geglu_f16 = try pipeline.createPipeline(ctx, src.ptr, "geglu_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
@@ -731,6 +740,13 @@ pub const ForwardGemma = struct {
         // ZINC_BATCHED_TC=0/off/false/no (the A/B kill-switch back to the
         // f32 register-tiled GEMM).
         self.use_tc = tcDefaultOn();
+        // Effort 26 cycle 9: dense Q4_K prefill GEMMs run on cuBLAS fp16 tensor
+        // cores (dequant W→fp16 + cublasGemmEx). DEFAULT-ON (opt out
+        // ZINC_BATCHED_CUBLAS=0/off/false/no) — validated catalog 5/5 token-correct
+        // and +76% on gemma-31b dense prefill @T=512 (the effort's #1 gap row),
+        // neutral on gemma-26b. Gated on T >= cublas_min_t in gemmDispatchA so
+        // short prompts keep the proven gemm_q4k_tc path.
+        self.use_cublas = cublasDefaultOn();
         // Cycle 12 A/B knob: ZINC_BATCHED_TC_PLAIN forces the cycle-11 plain TC
         // GEMM (f32 activation re-read per M-block) instead of the cycle-12 f16-A
         // path (activation pre-converted to fp16 once). Lets us measure the f16-A
@@ -1063,6 +1079,28 @@ pub const ForwardGemma = struct {
         };
         if (gi) |idx| {
             const push = GemmPush{ .M = M, .K = K, .T = T };
+            // Effort 26 cycle 9: dense Q4_K GEMM (idx 0) on cuBLAS fp16 tensor
+            // cores — ~6× gemm_q4k_tc in isolation. (1) dequant the Q4_K weight
+            // [M,K] → fp16 (b.w_f16); (2) downcast the f32 activation [T,K] → fp16
+            // (b.act_f16) once; (3) cublasGemmEx fp16→fp32. All three run on the
+            // ctx stream (dequant/convert via cmd, cuBLAS via cublasSetStream) so
+            // they are correctly ordered. fp16-rounded → token-correctness gate
+            // (same as the TC path), NOT byte-identical. Gated on T >= cublas_min_t:
+            // the full-weight dequant→fp16 round-trip is a fixed per-GEMM cost, so
+            // cuBLAS only wins once it amortizes over enough tokens (+76% @T=512,
+            // +15% @T=128, break-even @T=64) — below that, fall through to gemm_q4k_tc.
+            if (idx == 0 and self.use_cublas and T >= self.cublas_min_t) {
+                const b = &self.batch.?;
+                const dq = DequantQ4KPush{ .M = M, .K = K };
+                cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
+                const a16 = &b.act_f16;
+                if (!(a_preconv and (self.use_tc_sharea or self.use_tc_normf16))) {
+                    const cvt = F32ToF16Push{ .N = T * K };
+                    cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                }
+                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, a16.handle, y.handle);
+                return;
+            }
             // Cycle 11: when ZINC_BATCHED_TC is set, Q4_K GEMMs (idx 0 — the bulk of
             // the dense FLOPs: gate/up + attn Q/K/V/O) run on the fp16 tensor cores.
             if (self.use_tc and idx == 0 and self.use_tc_plain) {
@@ -1187,13 +1225,16 @@ pub const ForwardGemma = struct {
             // TC Q4_K GEMMs read A with K ∈ {n_embd (gate/up,Q/K/V), q_dim (O)};
             // size to the max of those and ff for headroom.
             .act_f16 = try buffer.createBuffer(ctx, T * @max(ff, @max(d.q_dim_max, d.n_embd)) * @sizeOf(u16)),
+            // Largest dense Q4_K weight: gate/up (ff·n_embd), O (n_embd·q_dim),
+            // Q (q_dim·n_embd). max(M)·max(K) is a safe upper bound on M·K.
+            .w_f16 = try buffer.createBuffer(ctx, @max(ff, @max(d.q_dim_max, d.n_embd)) * @max(d.n_embd, d.q_dim_max) * @sizeOf(u16)),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16 }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16, &bb.w_f16 }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -1957,6 +1998,21 @@ fn ceilDiv(a: u32, b: u32) u32 {
 /// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
 fn tcDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 26 cycle 9: the cuBLAS dense Q4_K prefill GEMM is default-ON (opt out
+// ZINC_BATCHED_CUBLAS=0/off/false/no). It is +76% on gemma-31b dense prefill at
+// T=512 (the effort's #1 gap row) and neutral on gemma-26b (whose FLOPs are in
+// the experts, not the small dense attn-proj GEMMs cuBLAS touches). The win is
+// T-dependent (the full-weight dequant→fp16 round-trip is a fixed cost amortized
+// over T tokens): +76% @T=512, +15% @T=128, break-even @T=64 — so the dispatch
+// gates cuBLAS on T >= cublas_min_t (128) and falls back to the proven gemm_q4k_tc
+// path for short prompts. qwen (no batched gemma path) and all decode are
+// untouched (prefill-only path).
+fn cublasDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }

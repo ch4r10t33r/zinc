@@ -58,6 +58,11 @@ fn configureCudaModule(
     module.addLibraryPath(.{ .cwd_relative = "/usr/lib/wsl/lib" });
     module.linkSystemLibrary("cuda", .{}); // CUDA Driver API
     module.linkSystemLibrary("nvrtc", .{}); // runtime kernel compilation
+    // Effort 26 cycle 9: cuBLAS for the prefill dense Q4_K GEMM (dequant→fp16 +
+    // cublasGemmEx fp16 TC, ~6× the hand-written gemm_q4k_tc). Opt-in via
+    // ZINC_BATCHED_CUBLAS at runtime; the handle is created in cuda_init.
+    module.linkSystemLibrary("cublas", .{});
+    module.linkSystemLibrary("cudart", .{}); // cublas runtime dependency
 }
 
 fn resolveBunExe(b: *std.Build) []const u8 {

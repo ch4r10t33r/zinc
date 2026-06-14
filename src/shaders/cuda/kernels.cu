@@ -2027,6 +2027,34 @@ extern "C" __global__ void f32_to_f16(const float* x, half* y, F32ToF16Push pc) 
     y[idx] = __float2half(x[idx]);
 }
 
+// ---- dequant_q4k_to_f16 (Effort 26 cycle 9: full-weight Q4_K -> fp16) ---------
+// Dequant a Q4_K weight W[M,K] (row-major, 256-elem superblocks = 36 u32/row-blk)
+// to a dense fp16 buffer Wf16[M,K] (row-major), so the prefill GEMM can run on
+// cuBLAS fp16 tensor cores. Same per-element unpack as gemm_q4k_tc's Ws stage
+// (d*sc*nib - dmin*mn, then __float2half) → the cuBLAS path's fp16 W bits match
+// the hand kernel's staged W bits exactly; only the multiply backend changes.
+// One thread per (row,col) element. a_offset is in BYTES (matches GemmPush).
+struct DequantQ4KPush { unsigned M, K, a_offset; };
+extern "C" __global__ void dequant_q4k_to_f16(const unsigned* a_u32, half* Wf16, DequantQ4KPush pc) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)pc.M * pc.K;
+    if (i >= total) return;
+    unsigned row = (unsigned)(i / pc.K), k = (unsigned)(i % pc.K);
+    unsigned a0 = pc.a_offset >> 2;
+    unsigned bpr = pc.K >> 8;          // superblocks per row
+    unsigned sb = k >> 8, within = k & 255u, sb8 = within >> 5, l = within & 31u;
+    unsigned blk = a0 + row * bpr * 36u + sb * 36u;
+    unsigned dd = a_u32[blk];
+    float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+    float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+    const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+    const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+    unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+    unsigned char qb = qs[(sb8 >> 1) * 32u + l];
+    unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
+    Wf16[i] = __float2half(d * (float)sc * (float)nib - dmin * (float)mn);
+}
+
 // ---- rms_norm_f16 (Effort 24 cycle 21: emit the fp16 norm DIRECTLY for the TC path) ----
 // Byte-for-byte f32_to_f16(rms_norm(x,w)): computes the SAME f32 normalized value
 // w[i]*(x[i]*rinv) with the SAME reduction order as rms_norm, then __float2half-stores

@@ -109,6 +109,14 @@ void cuda_commit_async(CudaCmd* cmd);
 void cuda_wait(CudaCmd* cmd);
 void cuda_release_completed(CudaCmd* cmd);
 
+// ---- cuBLAS prefill GEMM (Effort 26 cycle 9) ---------------------------------
+// Y[N,M] (token-major, row-major [T=N, M]) = A[N,K]·W[M,K]^T, fp16 inputs, fp32
+// accumulate. W and A are fp16 device buffers (W dequant'd from Q4_K, A downcast
+// from f32 by the caller's kernels on the SAME ctx stream — cuBLAS runs on that
+// stream so it is correctly ordered after them). Y is an fp32 device buffer.
+void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
+                       CudaBuf* W, CudaBuf* A, CudaBuf* Y);
+
 // ---- CUDA Graphs (decode replay, Effort 25) ----------------------------------
 // Capture the per-decode-step kernel chain once and replay it as a SINGLE graph
 // launch, collapsing the ~480 per-kernel launches + inter-kernel GPU bubbles of

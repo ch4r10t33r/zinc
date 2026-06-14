@@ -102,6 +102,10 @@ for i in "${!NAMES[@]}"; do
   # Effort 24 cycle 21: opt into normf16 (norm/GeGLU producers emit fp16 directly into
   # act_f16; byte-identical to the per-GEMM-recast TC path → validates that path is token-correct).
   [ "${ZINC_BATCHED_TC_NORMF16:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC_NORMF16=1"
+  # Effort 26 cycle 9: opt into the cuBLAS dense Q4_K prefill GEMM (dequant W→fp16
+  # + cublasGemmEx). NOT byte-identical (fp16 rounding) → this token-correctness
+  # check vs llama.cpp IS its gate.
+  [ "${ZINC_BATCHED_CUBLAS:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_CUBLAS=1"
   zgen=$(env CUDA_VISIBLE_DEVICES=$GPU $zbatch "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
   IFS=',' read -ra L <<< "$lgen"; IFS=',' read -ra Z <<< "$zgen"
   match=0; for j in "${!L[@]}"; do [ "${L[$j]}" = "${Z[$j]:-x}" ] && match=$((match+1)) || break; done

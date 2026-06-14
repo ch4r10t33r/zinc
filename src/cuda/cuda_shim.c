@@ -5,13 +5,15 @@
 #include "cuda_shim.h"
 #include <cuda.h>
 #include <nvrtc.h>
+#include <cublas_v2.h>
+#include <cuda_runtime_api.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_DISPATCH_BUFS 32
 
-struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; };
+struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; cublasHandle_t cublas; };
 struct CudaBuf { CUdeviceptr dptr; size_t size; void* host; int owns; int owns_host; };
 struct CudaPipe { CUmodule mod; CUfunction fn; };
 struct CudaCmd { CUstream stream; CUevent event; };
@@ -44,13 +46,41 @@ CudaCtx* cuda_init(int device_index) {
     if (!cu_ok(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "cuDevicePrimaryCtxRetain")) { free(c); return NULL; }
     if (!cu_ok(cuCtxSetCurrent(c->ctx), "cuCtxSetCurrent")) { free(c); return NULL; }
     if (!cu_ok(cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")) { free(c); return NULL; }
+    // Effort 26 cycle 9: cuBLAS handle for the prefill dense Q4_K GEMM (created
+    // lazily-safe here; binds to the current primary context). Non-fatal on
+    // failure — the cuBLAS prefill path is opt-in and falls back if absent.
+    if (cublasCreate(&c->cublas) == CUBLAS_STATUS_SUCCESS) {
+        cublasSetStream(c->cublas, c->stream);
+        cublasSetMathMode(c->cublas, CUBLAS_TENSOR_OP_MATH);
+    } else {
+        c->cublas = NULL;
+    }
     return c;
 }
 void cuda_destroy(CudaCtx* c) {
     if (!c) return;
+    if (c->cublas) cublasDestroy(c->cublas);
     if (c->stream) cuStreamDestroy(c->stream);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev);
     free(c);
+}
+// Effort 26 cycle 9 — dense prefill Q4_K GEMM via cuBLAS fp16 tensor cores.
+// Computes Y[N,M] (token-major row-major) = A[N,K]·W[M,K]^T. In cuBLAS's
+// column-major terms: C(M×N) = op(W)·op(A) with op(W)=T (W is row-major M×K =
+// col-major K×M, lda=K) and op(A)=N (A is row-major N×K = col-major K×N, ldb=K);
+// C is col-major M×N (ldc=M) = row-major N×M = the token-major Y. fp16 in, fp32
+// accumulate/out — matches gemm_q4k_tc's fp16-multiply / fp32-accumulate.
+void cuda_cublas_hgemm(CudaCtx* c, unsigned M, unsigned N, unsigned K,
+                       CudaBuf* W, CudaBuf* A, CudaBuf* Y) {
+    if (!c || !c->cublas) { set_err("cuda_cublas_hgemm", "no cublas handle"); return; }
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(
+        c->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)N, (int)K,
+        &alpha, (const void*)W->dptr, CUDA_R_16F, (int)K,
+        (const void*)A->dptr, CUDA_R_16F, (int)K,
+        &beta, (void*)Y->dptr, CUDA_R_32F, (int)M,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (s != CUBLAS_STATUS_SUCCESS) set_err("cuda_cublas_hgemm", "cublasGemmEx failed");
 }
 static int dev_attr(CUdevice d, CUdevice_attribute a) {
     int v = 0; cuDeviceGetAttribute(&v, a, d); return v;
