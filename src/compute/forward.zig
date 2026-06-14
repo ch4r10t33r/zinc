@@ -16518,7 +16518,13 @@ pub const InferenceEngine = struct {
         // picks Q8_0 for Q6_K-down or Q8_1 for Q4_K-down, never both).
         swiglu_already_q8_1: bool,
         gateup_dp4a_cols: u32,
-    ) !void {
+        // When non-null, the generic Q6_K full-tile down path writes the GEMM
+        // result directly into this buffer with accumulation (d[idx] += result),
+        // fusing the dense-FFN residual add and eliminating the standalone
+        // barrier + scale_accumulate dispatch. Returns true when the residual
+        // was fused so the caller can skip the separate scale_acc.
+        accum_target: ?Buffer,
+    ) !bool {
         // Threshold comes from qwenDenseFfnDp4aEnabled(): the 27B path keeps
         // its measured 128-token floor, while Qwen3.5 9B is allowed at the
         // 64-token long-draft shape. Tiny prompts still fall back via
@@ -16638,7 +16644,7 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
-                return;
+                return false;
             }
         }
         // Q4_K-down DP4a (effort-15 cycle-19). fuse_q8 only fires when down is
@@ -16767,12 +16773,50 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
-                return;
+                return false;
+            }
+        }
+        // Fused-residual Q6_K full-tile path: when an accumulate target is
+        // provided, the GEMM writes directly into the hidden buffer with
+        // d[idx] += result, eliminating the standalone barrier +
+        // scale_accumulate dispatch. Only applies to 32-aligned full tiles
+        // on the generic Q6_K path (no ragged tail, no DP4a).
+        if (accum_target) |target| {
+            if (down_t.info.type_ == .q6_k and
+                (hidden_dim & 31) == 0 and
+                (n_tokens & 31) == 0 and
+                (inter_dim & 255) == 0 and
+                self.use_qwen36_q6_prefill_mul_mm and
+                self.isQwenDenseHybridLayerMajorPrefillModel() and
+                self.dmmv.pipeline_mul_mm_q6k_full_down_acc != null)
+            {
+                const down_matmul_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ6KFullDownAcc(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    target.handle,
+                    target.size,
+                    hidden_dim,
+                    n_tokens,
+                    inter_dim,
+                    inter_dim,
+                    hidden_dim,
+                    0,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                return true;
             }
         }
         const down_matmul_phase = self.beginProfilePhase();
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
         self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+        return false;
     }
 
     /// SSM wqkv projection (Q6_K/Q5_K, K=hidden_dim, M=conv_channels) for Qwen dense-hybrid
@@ -20646,18 +20690,23 @@ pub const InferenceEngine = struct {
         }
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
-        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu, dp4a_result == .q8_1_swiglu, dp4a_gateup_cols);
-        const dense_ffn_residual_phase = self.beginProfilePhase();
-        self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
-        try self.dispatchScaleAcc(
-            scratch_hidden.handle,
-            scratch_hidden.size,
-            scratch_down.handle,
-            scratch_down.size,
-            n_tokens * hidden_dim,
-            1.0,
-        );
-        self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
+        const fused_residual = try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu, dp4a_result == .q8_1_swiglu, dp4a_gateup_cols, scratch_hidden);
+        if (!fused_residual) {
+            const dense_ffn_residual_phase = self.beginProfilePhase();
+            self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
+            try self.dispatchScaleAcc(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                n_tokens * hidden_dim,
+                1.0,
+            );
+            self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
+        } else {
+            const dense_ffn_residual_phase = self.beginProfilePhase();
+            self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
+        }
         self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
         self.endProfilePhase(.dense_ffn, dense_ffn_phase);
         const layer_output_scale = self.layer_output_scales[layer];
