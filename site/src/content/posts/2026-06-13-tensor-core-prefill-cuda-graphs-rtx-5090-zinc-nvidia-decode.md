@@ -1,6 +1,6 @@
 ---
-title: "A day later: tensor-core prefill, CUDA graphs, and the catalog re-measured on RTX 5090"
-seoTitle: "RTX 5090: Tensor-Core Prefill & CUDA Graphs in ZINC"
+title: "A day later: batched prefill, CUDA graphs, and the catalog re-measured on RTX 5090"
+seoTitle: "RTX 5090: Batched Prefill & CUDA Graphs in ZINC"
 date: "2026-06-13"
 tags:
   - zinc
@@ -33,8 +33,8 @@ keywords:
   - GPU-side embedding lookup
   - local LLM RTX 5090 benchmark
 faqs:
-  - question: "How much faster is prefill in ZINC's CUDA backend after wiring tensor cores?"
-    answer: "On the RTX 5090, catalog prefill roughly doubled on average (31 to 71 tok/s). The largest jump is the Gemma-4-26B Mixture-of-Experts model at 8.3 to 106 tok/s — about 12.8x over its own prior number — from batching the routed-expert GEMMs across all prompt tokens and routing the dense matmuls through an fp16 wmma tensor-core kernel. On dense Qwen prefill ZINC now edges ahead of llama.cpp (Qwen3.6-27B: 47.8 vs 28.8 tok/s)."
+  - question: "How much faster is prefill in ZINC's CUDA backend now, and was it the tensor cores?"
+    answer: "On the RTX 5090, catalog prefill roughly doubled on average (31 to 71 tok/s), with the largest jump on the Gemma-4-26B Mixture-of-Experts model at 8.3 to 106 tok/s — about 12.8x. It was not the tensor cores: that came from batching the routed-expert and dense GEMMs across all prompt tokens at once instead of a per-token, per-expert dispatch. The fp16 wmma tensor-core kernels now compile but stay opt-in, because prefill is launch-bound (the GPU sits near 10 percent utilization), so a faster matmul is an end-to-end wash until CUDA graphs cut the per-launch overhead. On dense Qwen prefill ZINC now edges ahead of llama.cpp (Qwen3.6-27B: 47.8 vs 28.8 tok/s)."
   - question: "What do CUDA graphs do for LLM decode?"
     answer: "Decode issues a long chain of tiny kernels per token — on a 60-layer model, hundreds of launches whose per-launch overhead and inter-kernel bubbles dominate when each kernel is small. A CUDA graph captures that whole per-token chain once and replays it as a single submission, so the driver stops paying launch cost per kernel. In ZINC it is an opt-in mode worth about 8 to 12 percent on the small dense Qwen3.5-9B, and it is size-gated: the win shrinks to nothing on larger models where each matvec is big enough to hide the launch bubble, and it cannot capture the mixed-quantization MoE path at all yet."
   - question: "Does moving the per-token embedding lookup onto the GPU speed up decode?"
@@ -44,7 +44,7 @@ faqs:
   - question: "Why were the published benchmark numbers so much lower than the current ones?"
     answer: "The published catalog snapshot was a correctness-first build from before the optimization work landed — no batched MoE experts, no kernel fusion, no tensor-core prefill. This post is the first full re-measurement after merging two parallel optimization lines, so the dashboard now reflects the engine as it actually runs rather than as it first booted. The merge was gated on a 5-of-5 token-for-token correctness check against llama.cpp before any number was trusted."
 excerpt: "Yesterday's post ended with a to-do list: wire the tensor-core prefill, move the per-token glue onto the GPU, fuse more of Gemma. A day later the list is mostly shipped — and a lever that wasn't even on it, CUDA graphs. The honest scorecard: prefill roughly doubled (Gemma-26B MoE 8 to 106 tok/s), the catalog decode average went from 51 to 70 percent of llama.cpp, ZINC now beats llama on dense Qwen prefill — and one of the 'wins' measured as a perfectly correct no-op that taught us where the real next lever is."
-seoDescription: "A day of NVIDIA work on ZINC's CUDA backend: fp16 tensor-core prefill wired (Gemma-26B MoE prefill 12.8x), CUDA-graph decode replay, full Gemma attention fusion, and a full RTX 5090 catalog re-measurement vs llama.cpp — with an honest null result on GPU-side embedding."
+seoDescription: "A day of NVIDIA work on ZINC's CUDA backend: batched prefill (Gemma-26B MoE prefill 12.8x), why fp16 tensor cores are an end-to-end wash until CUDA graphs land (prefill is launch-bound at ~10% util), CUDA-graph decode replay, full Gemma attention fusion, and an honest null result on GPU-side embedding — re-measured on RTX 5090 vs llama.cpp."
 draft: false
 ---
 
@@ -96,11 +96,13 @@ Two honest framings on top of that. The win: prefill roughly doubled on average 
 
 ## What actually landed
 
-### Tensor-core prefill — the wiring job that wasn't subtle
+### Prefill — batching shipped the jump; tensor cores were a red herring
 
-Yesterday's post measured an fp16 `wmma` prefill GEMM at ~2.2x the fp32 register-blocked kernel and called shipping it "a one-line change away" — the one line being NVRTC's missing `-I/usr/local/cuda/include`, without which the fp16 headers wouldn't compile in-tree. That flag landed, and with it the whole batched-prefill path went default-on: dequantize each weight matrix to an fp16 scratch buffer once, run a pure `wmma` GEMM over **all prompt tokens at once** (`Y[T,M] = A[T,K]·W[M,K]ᵀ`) instead of a per-token matvec, and for the MoE models batch the routed-expert matmuls across tokens with a GPU-side work list.
+Yesterday's post measured an fp16 `wmma` prefill GEMM at ~2.2x the fp32 register-blocked kernel, blocked only on NVRTC's missing `-I/usr/local/cuda/include`. That flag landed, so the tensor-core kernels compile in-tree now — but the prefill jump did **not** come from them. It came from **batching**.
 
-The MoE prefill is where batching compounds hardest — Gemma-4-26B went **8.3 → 106 tok/s**, because the old path was paying per-token *and* per-expert dispatch on a model with 128 experts. The dense Qwen prefill already skipped the wasted LM-head matvec on prompt-internal tokens (only the last prompt token's logits seed generation), and with the tiled GEMM on top it now clears llama.cpp: **47.8 vs 28.8 tok/s on the 27B**. Gemma prefill moved a lot in relative terms and remains far from llama's 380–414 tok/s — a tuned-kernel gap, not a wiring one, and the next prefill chapter.
+What went default-on is the batched (not tensor-core) path: one register-tiled GEMM over **all prompt tokens at once** (`Y[T,M] = A[T,K]·W[M,K]ᵀ`) instead of a per-token matvec, and for the MoE models the routed-expert matmuls batched across tokens with a GPU-side work list. Gemma-4-26B went **8.3 → 106 tok/s** because the old path paid per-token *and* per-expert dispatch on a 128-expert model; batching collapses both. Dense Qwen prefill already skipped the wasted LM-head matvec on prompt-internal tokens, and with the tiled GEMM it now clears llama.cpp (**47.8 vs 28.8 tok/s on the 27B**).
+
+The fp16 `wmma` tensor-core GEMM is ~2.2x faster *in isolation* — and it stays **opt-in, off by default, because end-to-end it's a wash.** Profiling a batched gemma-31B prefill shows why: the GPU sits at **~10% utilization**. Prefill is **launch-bound**, not compute-bound — idle between kernels across a ~960-launch-per-prompt chain, not crunching the GEMM. A faster matmul can't speed up a GPU that's mostly idle, which is also why gemma prefill is still 0.15x of llama's tuned number: the gap is launch overhead, not the math. The real prefill lever is the one that won decode — **CUDA graphs over the prefill chain** — and that effort is now running. Tensor cores will matter once the GPU is busy; first it has to stop being idle.
 
 ### CUDA graphs — the structural answer to launch latency
 
