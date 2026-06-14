@@ -23,14 +23,17 @@
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-# Worktree-local .env (gitignored) — present in the runnable worktree, not in a
-# fresh clone. Optional; the loop also reads process env directly.
+# Capture a caller-provided node override BEFORE sourcing .env. .env on this
+# repo sets ZINC_RDNA_NODE=rdna1 (the global default / autopilot node), which
+# would silently send this RDNA2 effort to the wrong GPU. An explicit caller
+# export must win; .env only fills in credentials + the fallback node.
+_caller_node="${ZINC_RDNA_NODE:-}"
 if [ -f "$REPO/.env" ]; then
   set -a
   . "$REPO/.env"
   set +a
 fi
-export ZINC_RDNA_NODE="${ZINC_RDNA_NODE:-rdna2}"
+export ZINC_RDNA_NODE="${_caller_node:-${ZINC_RDNA_NODE:-rdna2}}"
 
 EFFORT="${1:-25}"
 AGENT="${2:-opencode}"
