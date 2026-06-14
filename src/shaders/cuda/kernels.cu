@@ -667,6 +667,43 @@ extern "C" __global__ void argmax(const float* logits, unsigned* token_id, Argma
     }
 }
 
+// ---- embed_lookup_q4k (Effort 25 cycle 5: GPU-side embedding dequant) -------
+// Dequantize one Q4_K row of token_embd.weight (the row for token `tok[0]`) into
+// out[0..K], replacing the per-token CPU dequant + full-row H2D with a GPU
+// dispatch reading the token id from a tiny device buffer (so it captures as the
+// decode graph's first node). Bit-identical math to the CPU `dequantRow` Q4_K
+// path: 144-byte superblocks, d/dmin f16, 12 scale bytes, 128 quant bytes;
+// per 256-block output order [g0_lo32, g0_hi32, g1_lo32, ...], value =
+// (d*sc) * nibble - (dmin*m), scale sub-index = 2*group + half (low/high nibble).
+// Grid: one block per superblock (K/256). Block: 256 threads, one output each.
+struct EmbedPush { unsigned K; unsigned vocab; };
+
+extern "C" __global__ void embed_lookup_q4k(const unsigned char* W,
+                                            const unsigned* tok, float* out,
+                                            EmbedPush pc) {
+    unsigned t = tok[0];
+    unsigned vmax = pc.vocab ? pc.vocab - 1u : 0u;
+    if (t > vmax) t = vmax;
+    unsigned nsb = pc.K >> 8;          // superblocks per row (K / 256)
+    unsigned sb = blockIdx.x;
+    if (sb >= nsb) return;
+    const unsigned char* blk = W + ((size_t)t * nsb + sb) * 144u;
+    float d = zinc_half_to_float(*(const unsigned short*)(blk + 0));
+    float dmin = zinc_half_to_float(*(const unsigned short*)(blk + 2));
+    const unsigned char* scales = blk + 4;
+    const unsigned char* qs = blk + 16;
+    unsigned idx = threadIdx.x;        // 0..255 output element within the superblock
+    if (idx >= 256u) return;
+    unsigned g = idx >> 6;             // group 0..3 (each 64 outputs)
+    unsigned h = (idx >> 5) & 1u;      // 0 = low nibble half, 1 = high nibble half
+    unsigned l = idx & 31u;
+    unsigned char sc, m;
+    zinc_q4k_scale_min((int)(2u * g + h), scales, &sc, &m);
+    unsigned char qb = qs[g * 32u + l];
+    unsigned nib = (h == 0u) ? (qb & 0xFu) : (unsigned)(qb >> 4);
+    out[sb * 256u + idx] = (d * (float)sc) * (float)nib - (dmin * (float)m);
+}
+
 // ---- moe_weighted_acc (port of moe_weighted_acc.comp) -----------------------
 // a[i] += sum_j weight_j * b[j*src_stride + i]. Weights from the softmax_topk
 // routing buffer (routing[n_used .. 2*n_used-1], as float bits).

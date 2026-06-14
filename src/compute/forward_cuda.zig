@@ -86,6 +86,7 @@ const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
 const ArgmaxPush = extern struct { N: u32 };
+const EmbedPush = extern struct { K: u32, vocab: u32 };
 // MoE router/combine kernels (byte-match kernels.cu).
 const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
@@ -186,6 +187,7 @@ const Pipelines = struct {
     ssm_gated_norm: CudaPipeline,
     swiglu: CudaPipeline,
     argmax: CudaPipeline,
+    embed_q4k: CudaPipeline, // GPU-side Q4_K embedding-row dequant (Effort 25 c5)
     // MoE (qwen2_moe). Compiled unconditionally; only dispatched when n_experts>0.
     softmax_topk: CudaPipeline,
     moe_weighted_acc: CudaPipeline,
@@ -220,6 +222,7 @@ pub const ForwardCuda = struct {
     down_buf: CudaBuffer, // ssm beta [dt_rank]; MoE: slot-major down outputs [n_used*n_embd]
     logits_buf: CudaBuffer,
     argmax_buf: CudaBuffer, // u32 x1
+    tok_in_buf: CudaBuffer, // u32 x1: device token id, source for the GPU embed lookup
     // async decode command ring (dense path): commitAsync'd layer commands are
     // stashed here and freed after the tail commitAndWait drains the shared
     // CUstream. Defaults so the init literal need not list them.
@@ -232,12 +235,19 @@ pub const ForwardCuda = struct {
     // recording, switching `submit`/attention to a no-sync capture path.
     graph: ?*shim.CudaGraph = null,
     capturing: bool = false,
+    // GPU-side embedding (Effort 25 cycle 5): when the token_embd tensor is Q4_K,
+    // dequant the token's row on-GPU (reading the id from `tok_in_buf`) instead of
+    // a per-token CPU dequant + full-row H2D. `embed_weight` points at the resident
+    // token_embd.weight device buffer; null/false → fall back to the CPU path.
+    embed_weight: ?*const CudaBuffer = null,
+    embed_gpu: bool = false,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
     gate_scalar_buf: CudaBuffer, // [1] f32 shared-expert sigmoid gate logit
     host_embed: []f32, // PINNED: async embed H2D source (graph-capturable)
     host_tok: []u32, // PINNED: async argmax D2H dest (graph-capturable), len 1
+    host_tok_in: []u32, // PINNED: token-id H2D source for the GPU embed lookup, len 1
     host_router_ids: []u32, // [n_experts_used] downloaded expert ids
 
     // constant buffers
@@ -294,12 +304,13 @@ pub const ForwardCuda = struct {
         pipes.ssm_gated_norm = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm");
         pipes.swiglu = try pipeline.createPipeline(ctx, src.ptr, "swiglu");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
+        pipes.embed_q4k = try pipeline.createPipeline(ctx, src.ptr, "embed_lookup_q4k");
         pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{25});
+        log.info("nvrtc: compiled {d} kernel pipelines", .{26});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -332,11 +343,13 @@ pub const ForwardCuda = struct {
             .down_buf = try buffer.createBuffer(ctx, down_elems * f4),
             .logits_buf = try buffer.createBuffer(ctx, d.vocab * f4),
             .argmax_buf = try buffer.createBuffer(ctx, @sizeOf(u32)),
+            .tok_in_buf = try buffer.createBuffer(ctx, @sizeOf(u32)),
             .router_logits_buf = try buffer.createBuffer(ctx, router_logits_elems * f4),
             .router_out_buf = try buffer.createBuffer(ctx, router_out_elems * @sizeOf(u32)),
             .gate_scalar_buf = try buffer.createBuffer(ctx, f4),
             .host_embed = try buffer.allocHost(f32, d.n_embd),
             .host_tok = try buffer.allocHost(u32, 1),
+            .host_tok_in = try buffer.allocHost(u32, 1),
             .host_router_ids = try allocator.alloc(u32, @max(@as(u32, 1), d.n_experts_used)),
             .inv_freq = try buffer.createBuffer(ctx, (d.rope_dim / 2) * f4),
             .sinks = try buffer.createBuffer(ctx, d.n_layers * d.n_head * f4),
@@ -346,6 +359,15 @@ pub const ForwardCuda = struct {
             .ssm_state = try allocator.alloc(CudaBuffer, d.n_layers),
             .conv_off = try allocator.alloc(u32, d.n_layers),
         };
+
+        // GPU-side embed: enable only when token_embd.weight is Q4_K and the row
+        // length is a whole number of 256-superblocks (always true for these
+        // dense qwen models). Other quants (e.g. the 35B MoE's Q8_0) keep the CPU
+        // dequant path. The device buffer pointer is stable for the model's life.
+        if (model.get("token_embd.weight")) |t| {
+            self.embed_weight = &t.gpu_buffer;
+            self.embed_gpu = (t.info.type_ == .q4_k) and (d.n_embd % 256 == 0);
+        }
 
         // Per-layer KV / SSM state, sized only for the layer type. We still
         // allocate a tiny stub for the "wrong" type so deinit is uniform.
@@ -403,7 +425,7 @@ pub const ForwardCuda = struct {
     pub fn deinit(self: *ForwardCuda) void {
         const a = self.allocator;
         if (self.graph) |g| shim.cuda_graph_free(g);
-        inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
+        inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.tok_in_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
         for (self.kv_k) |*b| buffer.freeBuffer(b);
@@ -417,6 +439,7 @@ pub const ForwardCuda = struct {
         a.free(self.conv_off);
         buffer.freeHost(self.host_embed);
         buffer.freeHost(self.host_tok);
+        buffer.freeHost(self.host_tok_in);
         a.free(self.host_router_ids);
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
@@ -437,23 +460,36 @@ pub const ForwardCuda = struct {
         const d = self.d;
         const ctx = self.ctx;
 
-        // EMBED: CPU-dequant the token_embd row into the PINNED host_embed buffer.
+        // EMBED. GPU path (Q4_K token_embd): stage the token id into the tiny pinned
+        // host_tok_in and dequant its row on-GPU into `hidden` (no per-token CPU
+        // dequant; H2D shrinks from a full n_embd row to 4 bytes). CPU fallback:
+        // dequant the row into the pinned host_embed and upload it.
         const use_graph = run_layers and self.graph != null;
-        self.model.dequantEmbeddingRow(token, self.host_embed);
-        // Non-graph path uploads (sync) here. The graph path defers the H2D into
-        // decodeStepGraph so it is CAPTURED as the graph's first node (riding the
-        // single graph launch instead of a separate sync) — host_embed is pinned.
-        if (!use_graph) buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        if (self.embed_gpu) {
+            self.host_tok_in[0] = token;
+        } else {
+            self.model.dequantEmbeddingRow(token, self.host_embed);
+            // Non-graph path uploads (sync) here. The graph path defers the H2D into
+            // decodeStepGraph so it is CAPTURED as the graph's first node — pinned.
+            if (!use_graph) buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        }
 
         // TAIL tensors (resolved up-front so the graph and async paths share them).
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
 
-        // CUDA-graph replay path: capture the full dense per-step chain (embed H2D
-        // + layers + tail + argmax D2H) and launch it as one graph. Bit-identical
+        // CUDA-graph replay path: capture the full dense per-step chain (embed +
+        // layers + tail + argmax D2H) and launch it as one graph. Bit-identical
         // to the async chain (same kernels, same order, same single stream).
         if (use_graph) {
             return try self.decodeStepGraph(pos, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
+        }
+
+        // Non-graph GPU embed: tiny token H2D, then the embed dispatch leads the
+        // stream (ordered before the layer ops; drained by the tail commitAndWait).
+        if (self.embed_gpu) {
+            buffer.upload(ctx, &self.tok_in_buf, std.mem.sliceAsBytes(self.host_tok_in));
+            try self.recordEmbed();
         }
 
         if (run_layers) {
@@ -492,9 +528,16 @@ pub const ForwardCuda = struct {
 
         self.capturing = true;
         _ = shim.cuda_graph_begin(ctx);
-        // EMBED H2D as the graph's first node (pinned host_embed → truly async,
-        // captures cleanly). Folds the per-token upload sync into the graph launch.
-        buffer.uploadAsync(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        // EMBED as the graph's first node(s). GPU path: a 4-byte token-id H2D then
+        // the embed_lookup dispatch dequants the row into `hidden` on-device (the
+        // per-token CPU dequant is gone entirely). CPU fallback: H2D the pre-
+        // dequantized pinned host_embed row. Either way it rides the one launch.
+        if (self.embed_gpu) {
+            buffer.uploadAsync(ctx, &self.tok_in_buf, std.mem.sliceAsBytes(self.host_tok_in));
+            try self.recordEmbed();
+        } else {
+            buffer.uploadAsync(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        }
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (isFullAttn(L, d.full_attn_interval)) {
@@ -518,6 +561,19 @@ pub const ForwardCuda = struct {
         _ = shim.cuda_graph_end_launch(ctx, self.graph.?);
 
         return self.host_tok[0];
+    }
+
+    /// Dispatch the GPU-side embedding lookup (Q4_K): dequant the token's row
+    /// (id in `tok_in_buf`) into `hidden`. Routed through `submit` so it captures
+    /// cleanly as the graph's first compute node and otherwise rides the async
+    /// ring. One block per 256-superblock, 256 threads (one output each).
+    fn recordEmbed(self: *ForwardCuda) !void {
+        const d = self.d;
+        var cmd = try command.beginCommand(self.ctx);
+        const push = EmbedPush{ .K = d.n_embd, .vocab = d.vocab };
+        const nsb = d.n_embd / 256;
+        cmd.dispatch(&self.pipes.embed_q4k, .{ nsb, 1, 1 }, .{ 256, 1, 1 }, &.{ self.embed_weight.?, &self.tok_in_buf, &self.hidden }, &push, @sizeOf(EmbedPush), 0);
+        self.submit(cmd);
     }
 
     /// Record the decode tail (final rms_norm → LM head matvec → argmax) onto

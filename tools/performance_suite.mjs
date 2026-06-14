@@ -3169,6 +3169,14 @@ async function main() {
     const merged = mergeArtifacts(existing, incoming, {
       preserveMissingPhases: args.phase !== "all",
     });
+    // Guard: never publish host/network info into the public site data. Scan for
+    // ACTUAL host indicators (hostnames, tailscale IPs, tailnet domains) — not a
+    // bare :port, which false-positives on numeric metric values (e.g. a decode_ms
+    // of 2222.06 serializes as ":2222" in compact JSON).
+    const leak = JSON.stringify(merged).match(/puffalo|tailbe7bef|agent-zinc|127\.99\.\d+\.\d+|\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\.ts\.net/g);
+    if (leak) {
+      throw new Error(`Refusing to write site data: host/network info present (${[...new Set(leak)].join(", ")}). Sanitize the artifact before publishing.`);
+    }
     await writeJson(args.siteData, merged);
   }
 
