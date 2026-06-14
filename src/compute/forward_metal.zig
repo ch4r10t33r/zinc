@@ -1676,6 +1676,12 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_materialized_ssm_layers: u32 = 0,
     qwen35_dense_prefill_materialized_full_attn_layers: u32 = 0,
     qwen35_dense_prefill_materialized_dense_ffn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_replay_layers: u32 = 0,
+    qwen35_dense_prefill_replay_ssm_layers: u32 = 0,
+    qwen35_dense_prefill_replay_full_attn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_dense_ffn_layers: u32 = 0,
+    qwen35_dense_prefill_token_major_replay_steps: u32 = 0,
     qwen35_dense_prefill_first_token_major_layer: u32 = 0,
     qwen35_dense_prefill_first_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .none,
     shared_expert_bytes: u64 = 0,
@@ -2828,6 +2834,19 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             profile.qwen35_dense_prefill_materialized_ssm_layers,
             profile.qwen35_dense_prefill_materialized_full_attn_layers,
             profile.qwen35_dense_prefill_materialized_dense_ffn_layers,
+        });
+        log.info("  {s} qwen35-9b token-major replay: steps {d} queued_chunks {d} final_chunk {d} replay_layers {d} ssm/full_attn/dense {d}/{d}/{d} replay_layer_tokens {d} ({d:.1}% of target) ideal_layer_major_layers {d}", .{
+            label,
+            profile.qwen35_dense_prefill_token_major_replay_steps,
+            profile.queued_prefill_chunks,
+            profile.queued_prefill_final_chunk_tokens,
+            profile.qwen35_dense_prefill_replay_layers,
+            profile.qwen35_dense_prefill_replay_ssm_layers,
+            profile.qwen35_dense_prefill_replay_full_attn_layers,
+            profile.qwen35_dense_prefill_replay_dense_ffn_layers,
+            profile.qwen35_dense_prefill_replay_layer_tokens,
+            pctOf(@as(u64, target_layer_tokens), @as(u64, profile.qwen35_dense_prefill_replay_layer_tokens)),
+            profile.qwen35_dense_prefill_replay_layers,
         });
     }
 }
@@ -4934,17 +4953,36 @@ fn recordQwen35Dense9bLayerMajorPrefillProfile(
             materialized_ssm_layers += 1;
         }
     }
+    var replay_ssm_layers: u32 = 0;
+    var replay_full_attn_layers: u32 = 0;
+    for (@as(usize, @intCast(clamped_layers))..@as(usize, @intCast(target_layers))) |layer_idx| {
+        if (isFullAttentionLayer(cfg, layer_idx)) {
+            replay_full_attn_layers += 1;
+        } else if (cfg.ssm_d_inner != 0) {
+            replay_ssm_layers += 1;
+        }
+    }
+    const target_layer_tokens = prompt_tokens *| target_layers;
+    const materialized_layer_tokens = clamped_tokens *| clamped_layers;
+    const replay_layer_tokens = target_layer_tokens -| materialized_layer_tokens;
+    const replay_layers = target_layers -| clamped_layers;
 
     p.qwen35_dense_prefill_requests +|= 1;
     p.qwen35_dense_prefill_prompt_tokens +|= prompt_tokens;
     p.qwen35_dense_prefill_target_layers = target_layers;
-    p.qwen35_dense_prefill_target_layer_tokens +|= prompt_tokens *| target_layers;
+    p.qwen35_dense_prefill_target_layer_tokens +|= target_layer_tokens;
     p.qwen35_dense_prefill_materialized_tokens +|= clamped_tokens;
     p.qwen35_dense_prefill_materialized_layers +|= clamped_layers;
-    p.qwen35_dense_prefill_materialized_layer_tokens +|= clamped_tokens *| clamped_layers;
+    p.qwen35_dense_prefill_materialized_layer_tokens +|= materialized_layer_tokens;
     p.qwen35_dense_prefill_materialized_ssm_layers +|= materialized_ssm_layers;
     p.qwen35_dense_prefill_materialized_full_attn_layers +|= materialized_full_attn_layers;
     p.qwen35_dense_prefill_materialized_dense_ffn_layers +|= clamped_layers;
+    p.qwen35_dense_prefill_replay_layer_tokens +|= replay_layer_tokens;
+    p.qwen35_dense_prefill_replay_layers +|= replay_layers;
+    p.qwen35_dense_prefill_replay_ssm_layers +|= replay_ssm_layers;
+    p.qwen35_dense_prefill_replay_full_attn_layers +|= replay_full_attn_layers;
+    p.qwen35_dense_prefill_replay_dense_ffn_layers +|= replay_layers;
+    p.qwen35_dense_prefill_token_major_replay_steps +|= if (replay_layer_tokens > 0) prompt_tokens else 0;
     p.qwen35_dense_prefill_first_token_major_layer = if (clamped_layers < target_layers) clamped_layers else target_layers;
     p.qwen35_dense_prefill_first_fallback_reason = if (clamped_layers >= target_layers) .complete else fallback_reason;
 }
@@ -33528,6 +33566,12 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expectEqual(@as(u32, 144), profile.qwen35_dense_prefill_materialized_layer_tokens);
     try std.testing.expectEqual(@as(u32, 3), profile.qwen35_dense_prefill_materialized_ssm_layers);
     try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_materialized_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 1008), profile.qwen35_dense_prefill_replay_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_layers);
+    try std.testing.expectEqual(@as(u32, 21), profile.qwen35_dense_prefill_replay_ssm_layers);
+    try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_dense_ffn_layers);
+    try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_token_major_replay_steps);
     try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_first_token_major_layer);
     try std.testing.expectEqualStrings("full-attn-boundary", qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason));
 }
