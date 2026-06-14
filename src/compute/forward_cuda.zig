@@ -413,23 +413,36 @@ pub const ForwardCuda = struct {
             buffer.upload(ctx, &self.sinks, std.mem.sliceAsBytes(sk));
         }
 
-        // CUDA-graph decode replay (opt-in via ZINC_CUDA_GRAPH). The dense path
-        // (n_experts==0) is always capturable. The MoE path is capturable ONLY when
-        // every layer takes the batched async expert path (Effort-27 C1): that path
-        // reads expert ids GPU-side with NO host readback, so the whole MoE step is
-        // a static stream. Before C1's q5k/q6k experts kernels, mixed-quant layers
-        // fell to a per-slot fallback that synced + read ids back mid-block (illegal
-        // during capture) — which is why Effort-25 C4 found the catalog MoE non-
-        // capturable. With all-quant batched experts, the 35b-a3b now qualifies.
-        if (std.posix.getenv("ZINC_CUDA_GRAPH") != null) {
+        // CUDA-graph decode replay. Capturable MoE (Effort-27 C2: qwen36-35b-a3b
+        // decode +62%, output token-identical to non-graph) is DEFAULT-ON; opt out
+        // with ZINC_CUDA_GRAPH=0/off/false/no. The dense path (n_experts==0) stays
+        // opt-IN via a truthy ZINC_CUDA_GRAPH (Effort-25 left it that way: +8-12% on
+        // 9b, neutral on 27b). The MoE path is capturable ONLY when every layer takes
+        // the batched async expert path (Effort-27 C1): it reads expert ids GPU-side
+        // with NO host readback, so the whole MoE step is a static stream. Before C1's
+        // q5k/q6k experts kernels, mixed-quant layers fell to a per-slot fallback that
+        // synced + read ids back mid-block (illegal during capture) — why Effort-25 C4
+        // found the catalog MoE non-capturable. Non-capturable MoE runs the async
+        // per-step path (self.graph stays null).
+        const graph_env = std.posix.getenv("ZINC_CUDA_GRAPH");
+        var graph_off = false;
+        var graph_optin = false;
+        if (graph_env) |e| {
+            graph_off = std.mem.eql(u8, e, "0") or std.ascii.eqlIgnoreCase(e, "off") or
+                std.ascii.eqlIgnoreCase(e, "false") or std.ascii.eqlIgnoreCase(e, "no");
+            graph_optin = !graph_off;
+        }
+        if (!graph_off) {
             if (d.n_experts == 0) {
-                self.graph = shim.cuda_graph_create();
-                log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+                if (graph_optin) {
+                    self.graph = shim.cuda_graph_create();
+                    log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+                }
             } else if (self.moeGraphCapturable()) {
                 self.graph = shim.cuda_graph_create();
-                log.info("ZINC_CUDA_GRAPH: MoE decode (all-batched experts) will replay via a captured CUDA graph", .{});
+                log.info("CUDA graph: capturable MoE decode default-on (opt out ZINC_CUDA_GRAPH=0)", .{});
             } else {
-                log.info("ZINC_CUDA_GRAPH: MoE has a non-batched expert layer (per-slot fallback) — graph disabled", .{});
+                log.info("CUDA graph: MoE has a non-batched expert layer (per-slot fallback) — graph disabled", .{});
             }
         }
 
