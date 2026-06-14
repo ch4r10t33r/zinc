@@ -964,9 +964,12 @@ pub const TokenBoundary = struct {
         errdefer freeContext(file, ctx_id);
 
         const ib_bo_size: usize = 64 * 1024;
-        const input_bo_size: usize = 2 * 1024 * 1024;
+        // The M1 LM-head verifier can now stage the whole default 4096-row
+        // Q4_0 cap (about 4.5 MiB at K=2048) so one tracked decode token can
+        // consume a fully GPU-produced capped LM-head argmax.
+        const input_bo_size: usize = 6 * 1024 * 1024;
         const page_size: usize = 4096;
-        const output_bo_size: usize = 8 * 1024;
+        const output_bo_size: usize = 32 * 1024;
         const ib_va: u64 = 0x1_0200_0000;
         const input_va: u64 = ib_va + ib_bo_size;
         const output_va: u64 = input_va + input_bo_size;

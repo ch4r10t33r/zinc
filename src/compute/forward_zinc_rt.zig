@@ -2398,14 +2398,13 @@ fn consumeDirectLogitsArgmaxRowRange(
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
-// Use a bounded direct LM-head prefix by default so an exercised decode token
-// can be selected from GPU-produced Q4_0 row scores while the remaining rows
-// still use the host-assisted fallback. At Qwen's K=2048 Q4_0 row size, 1344
-// rows fit under the direct CS input cap and the 8 KiB output scratch.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 1344;
+// Cover the full default capped LM-head row scan on tracked direct slices.
+// At Qwen's K=2048 Q4_0 row size, 4096 rows are about 4.5 MiB of staged
+// weights and produce 16 KiB of logits, fitting the direct CS scratch BOs.
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 4096;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
-const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
+const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 5 * 1024 * 1024;
 
 fn offsetScoredToken(token: ScoredToken, offset: u32) ScoredToken {
     return .{
@@ -2440,6 +2439,18 @@ fn directLmHeadQ4_0SelectedWindow(
     return .{ .start = start, .rows = rows };
 }
 
+fn directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows: u32, row_bytes: usize, scratch_rows: u32) u32 {
+    if (row_bytes == 0) return 0;
+    const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
+    var rows: u32 = @min(lm_head_rows, direct_lm_head_q4_0_argmax_prefix_rows);
+    rows = @min(rows, max_rows_by_input);
+    rows = @min(rows, scratch_rows);
+    if (rows >= direct_lm_head_q4_0_parallel_chunk_rows) {
+        rows -= rows % direct_lm_head_q4_0_parallel_chunk_rows;
+    }
+    return rows;
+}
+
 fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     state: *ScalarDecodeState,
     maybe_tracking: ?DirectComputeTracking,
@@ -2454,9 +2465,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     if (row_bytes == 0) return null;
     const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
     const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
-    var gpu_rows = @min(lm_head_rows, direct_lm_head_q4_0_argmax_prefix_rows);
-    gpu_rows = @min(gpu_rows, max_rows_by_input);
-    gpu_rows = @min(gpu_rows, scratch_rows);
+    const gpu_rows = directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows, row_bytes, scratch_rows);
     if (gpu_rows == 0) return null;
 
     const gpu_rows_usize: usize = @intCast(gpu_rows);
@@ -9542,6 +9551,16 @@ test "direct LM-head Q4_0 prefix stays chunk-aligned and bounded" {
     const qwen_hidden_dim: u32 = 2048;
     const row_bytes = rowBytesForType(.q4_0, qwen_hidden_dim);
     try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
+    try std.testing.expectEqual(
+        @as(u32, 4096),
+        directLmHeadQ4_0ArgmaxPrefixRows(4096, row_bytes, 4096),
+    );
+
+    const larger_hidden_row_bytes = rowBytesForType(.q4_0, 4096);
+    const clipped_rows = directLmHeadQ4_0ArgmaxPrefixRows(4096, larger_hidden_row_bytes, 4096);
+    try std.testing.expect(clipped_rows < 4096);
+    try std.testing.expect(clipped_rows >= direct_lm_head_q4_0_parallel_chunk_rows);
+    try std.testing.expectEqual(@as(u32, 0), clipped_rows % direct_lm_head_q4_0_parallel_chunk_rows);
 }
 
 test "direct router row-range names full parallel chunks" {
