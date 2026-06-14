@@ -32,7 +32,12 @@ pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_prefill_min_tokens: usize = 32;
-const qwen35_dense9b_prefill_prefix_layers: usize = 8;
+// Materialize the full dense Qwen3.5 9B prompt graph when the exact-shape
+// layer-major recorders all pass. This adapts llama.cpp
+// `ggml_metal_graph_compute`: enqueue the prompt-sized graph once, then let
+// token-major replay advance positions and compute only the requested tail
+// logits instead of replaying already-materialized layers.
+const qwen35_dense9b_prefill_prefix_layers: usize = 32;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 // llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
 // matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
@@ -33396,7 +33401,7 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     };
 
     try std.testing.expect(defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_9b_cfg));
-    try std.testing.expectEqual(@as(usize, 8), qwen35_dense9b_prefill_prefix_layers);
+    try std.testing.expectEqual(@as(usize, 32), qwen35_dense9b_prefill_prefix_layers);
     try std.testing.expect(isFullAttentionLayer(qwen35_9b_cfg, 3));
     try std.testing.expect(isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 1));
     try std.testing.expect(defaultQwenSsmPrefillProjectionEnabled(qwen35_9b_cfg));
