@@ -5988,6 +5988,7 @@ const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
 const direct_moe_down_q4_0_tolerance: f32 = 0.05;
 const direct_moe_down_q4_0_range_rows: u32 = 64;
 const direct_moe_down_q4_0_max_expert_slots: u32 = 4;
+const direct_moe_down_q4_0_trust_after_successes: u32 = 1;
 
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
@@ -6572,6 +6573,20 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
             .rows = param.hidden_dim,
             .out = param.down,
         };
+        const direct_prefix_rows = consumeDirectMoeDownQ4_0PrefixBeforeCpuTail(
+            state,
+            direct_compute_tracking,
+            param,
+            i,
+            down_input_sum32,
+        );
+        if (direct_prefix_rows != 0 and direct_prefix_rows < down[i].rows) {
+            const row_bytes = rowBytesForType(.q4_0, param.intermediate_dim);
+            const prefix_bytes = @as(usize, direct_prefix_rows) * row_bytes;
+            down[i].raw = param.down_raw[prefix_bytes..];
+            down[i].rows -= direct_prefix_rows;
+            down[i].out = param.down[direct_prefix_rows..];
+        }
     }
     matvecMultiInputFused(pool, down[0..params.len]) catch return false;
     if (direct_compute_tracking != null) {
@@ -6596,6 +6611,161 @@ fn canConsumeDirectMoeDownQ4_0Param(state: *const ScalarDecodeState, param: *con
         canConsumeDirectSharedMoeDownQ4_0Slot(state)
     else
         canConsumeDirectMoeDownQ4_0Slot(state);
+}
+
+fn consumeDirectMoeDownQ4_0PrefixBeforeCpuTail(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    param: *MoeExpertWorker,
+    expert_slot: usize,
+    input_sum32: ?[]const f32,
+) u32 {
+    const tracking = maybe_tracking orelse return 0;
+    if (tracking.phase != .decode) return 0;
+    if (!canConsumeDirectMoeDownQ4_0Param(state, param)) return 0;
+    if (param.down_type != .q4_0) return 0;
+    if (param.hidden_dim < direct_moe_down_q4_0_range_rows) return 0;
+    if (param.intermediate_dim == 0 or param.swiglu_out.len < param.intermediate_dim) return 0;
+
+    const cols = param.intermediate_dim;
+    if (cols == 0 or cols % 32 != 0) return 0;
+    const cols_usize: usize = @intCast(cols);
+
+    const range_rows = direct_moe_down_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    if (state.row_scratch.len < range_len * 2 or param.down.len < range_len) return 0;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = range_len * row_bytes;
+    if (row_bytes == 0 or param.down_raw.len < range_bytes) return 0;
+
+    const gpu_rows = state.row_scratch[0..range_len];
+    tracking.boundary.dmmvQ4_0RowRangeParallel(
+        param.swiglu_out[0..cols_usize],
+        param.down_raw[0..range_bytes],
+        range_rows,
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        if (param.is_shared) {
+            log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 prefix-before-tail unavailable ({s}); shared down projection remains host-computed", .{@errorName(err)});
+        } else {
+            log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 prefix-before-tail unavailable ({s}); down projection remains host-computed", .{@errorName(err)});
+        }
+        return 0;
+    };
+
+    for (0..range_len) |i| {
+        if (!std.math.isFinite(gpu_rows[i])) {
+            if (param.is_shared) {
+                log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 prefix-before-tail produced non-finite row {d}; shared down projection remains host-computed", .{i});
+            } else {
+                log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 prefix-before-tail produced non-finite row {d}; down projection remains host-computed", .{i});
+            }
+            return 0;
+        }
+    }
+
+    const trusted_no_oracle = state.direct_moe_down_row_range_count >= direct_moe_down_q4_0_trust_after_successes;
+    var max_down_delta: f32 = 0.0;
+    var max_down_row: u32 = 0;
+    if (!trusted_no_oracle) {
+        const cpu_rows = state.row_scratch[range_len .. range_len * 2];
+        matvecRawDirectSerial(
+            param.down_raw,
+            .q4_0,
+            param.swiglu_out[0..cols_usize],
+            input_sum32,
+            0,
+            range_rows,
+            cpu_rows,
+        ) catch {
+            if (param.is_shared) {
+                log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 prefix-before-tail CPU oracle failed; shared down projection remains host-computed", .{});
+            } else {
+                log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 prefix-before-tail CPU oracle failed; down projection remains host-computed", .{});
+            }
+            return 0;
+        };
+        for (0..range_len) |i| {
+            const delta = @abs(gpu_rows[i] - cpu_rows[i]);
+            if (delta > max_down_delta) {
+                max_down_delta = delta;
+                max_down_row = @intCast(i);
+            }
+        }
+        if (max_down_delta > direct_moe_down_q4_0_tolerance) {
+            if (param.is_shared) {
+                log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 prefix-before-tail mismatch: expert_slot={d} down_delta={d:.6} down_row={d}; shared down projection remains host-computed", .{
+                    expert_slot,
+                    max_down_delta,
+                    max_down_row,
+                });
+            } else {
+                log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 prefix-before-tail mismatch: expert_slot={d} expert_id={d} down_delta={d:.6} down_row={d}; down projection remains host-computed", .{
+                    expert_slot,
+                    param.expert_id,
+                    max_down_delta,
+                    max_down_row,
+                });
+            }
+            return 0;
+        }
+    }
+
+    @memcpy(param.down[0..range_len], gpu_rows);
+    if (param.is_shared) {
+        state.direct_shared_moe_down_row_range_done = true;
+    } else {
+        state.direct_moe_down_row_range_count += 1;
+    }
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 1;
+    if (param.is_shared) {
+        if (trusted_no_oracle) {
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_shared_down_q4_0_prefix_before_cpu_tail phase=decode expert_slot={d} rows={d} cols={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                expert_slot,
+                range_rows,
+                cols,
+                direct_moe_down_q4_0_trust_after_successes,
+            });
+        } else {
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_shared_down_q4_0_prefix_before_cpu_tail phase=decode expert_slot={d} rows={d} cols={d} max_down_delta={d:.6} max_down_row={d} consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                expert_slot,
+                range_rows,
+                cols,
+                max_down_delta,
+                max_down_row,
+            });
+        }
+    } else {
+        if (trusted_no_oracle) {
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode expert_slot={d} expert_id={d} rows={d} cols={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                expert_slot,
+                param.expert_id,
+                range_rows,
+                cols,
+                direct_moe_down_q4_0_trust_after_successes,
+            });
+        } else {
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode expert_slot={d} expert_id={d} rows={d} cols={d} max_down_delta={d:.6} max_down_row={d} consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                expert_slot,
+                param.expert_id,
+                range_rows,
+                cols,
+                max_down_delta,
+                max_down_row,
+            });
+        }
+    }
+    return range_rows;
 }
 
 fn consumeDirectMoeDownQ4_0Rows(
