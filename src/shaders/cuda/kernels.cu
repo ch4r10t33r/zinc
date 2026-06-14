@@ -3025,6 +3025,93 @@ extern "C" __global__ void rms_norm_rope_qkv(
         yt[i] = sh[i];
 }
 
+// ---- rms_norm_rope_qkv_seq (Effort 28 1c: batched DECODE per-seq norm/rope) --
+// Batched twin of rms_norm_rope_qkv: collapses the per-row decode loop into ONE
+// launch over B independent sequences. grid = (n_head + 2*n_kv_head, B). Row b is
+// sequence b at its OWN position positions[b] writing its OWN KV slot slots[b].
+//   q_in/k_in/v_in are token-major [B, q_dim] / [B, kv_dim] (this step's activations)
+//   q_out is token-major [B, q_dim] (in place); k_out/v_out are the slot KV buffers
+//   [n_slots*slot_ctx, kv_dim] — row b writes at (slot*slot_ctx + pos)*kv_dim.
+// Per-(head,b) block arithmetic is COPIED verbatim from rms_norm_rope_qkv (with
+// pc.position -> positions[b]), so it is bit-identical to the per-row launches.
+// No cross-block hazard: K writes slot KV, V writes slot KV, Q writes q_out per
+// (b,head) — disjoint regions; q_in==q_out is consumed into shared before write.
+struct RmsRopeQkvSeqPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned slot_ctx;
+};
+extern "C" __global__ void rms_norm_rope_qkv_seq(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out,
+    const unsigned* positions, const unsigned* slots, RmsRopeQkvSeqPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned b  = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim  = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    unsigned pos  = positions[b];
+    unsigned slot = slots[b];
+    size_t kv_base = ((size_t)slot * pc.slot_ctx + pos) * kv_dim;  // slot KV write pos
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    bool do_rope;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)b * q_dim + (size_t)head * hd;
+        yt = q_out + (size_t)b * q_dim + (size_t)head * hd;
+        w = wq; do_rope = true;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = k_out + kv_base + (size_t)head * hd;
+        w = wk; do_rope = true;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = v_out + kv_base + (size_t)head * hd;
+        w = nullptr; do_rope = false;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    if (!do_rope) { // V: plain normalize, no weight (matches rms_norm_kvwrite)
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            yt[i] = xt[i] * rinv;
+        return;
+    }
+
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pos * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
 // Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
 // carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
@@ -3198,6 +3285,77 @@ extern "C" __global__ void gemma_attention_batched(const float* q, const float* 
         for (unsigned i = start; i < seq_len; i++)
             acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
         out[((size_t)t * pc.n_heads + head) * hd + d] = acc * inv;
+    }
+}
+
+// ---- gemma_attention_batched_seq (Effort 28 1c: batched request DECODE) ------
+// Batched twin of gemma_attention for DECODE: B independent sequences, each at
+// its OWN position over its OWN KV slot, in ONE launch. block (head=blockIdx.x,
+// b=blockIdx.y) computes attention for sequence b's single decode query, head h,
+// causally masked to its slot's keys [0..positions[b]] with the same optional
+// sliding-window mask. Q is token-major [B, n_heads, head_dim] (b.q, post
+// norm+RoPE). K/V are the slot KV buffers [n_slots*slot_ctx, n_kv_heads, head_dim];
+// sequence b reads slot slots[b] at base (slot*slot_ctx)*kv_dim. out is token-major
+// [B, n_heads, head_dim]. Math/reduction order are byte-for-byte identical to
+// gemma_attention against an aliased slot with seq_len=positions[b]+1 → the
+// batched output equals the per-row looped form bit-for-bit.
+struct GemmaAttnSlotPush { unsigned head_dim, n_heads, n_kv_heads, slot_ctx, scale_bits, window; };
+extern "C" __global__ void gemma_attention_batched_seq(
+    const float* q, const float* k, const float* v, float* out,
+    const unsigned* positions, const unsigned* slots, GemmaAttnSlotPush pc) {
+    extern __shared__ float s_scores[];           // size = max(seq_len) floats
+    __shared__ float s_m, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned pos = positions[b];
+    unsigned slot = slots[b];
+    unsigned seq_len = pos + 1u;                   // causal: attend keys [0..pos]
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;   // seq b, head h
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    unsigned start = 0;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) s_inv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    float inv = s_inv;
+
+    // Pass 3: out[b,head,d] = (sum_i e_i * V[i,d]) * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < seq_len; i++)
+            acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[((size_t)b * pc.n_heads + head) * hd + d] = acc * inv;
     }
 }
 
