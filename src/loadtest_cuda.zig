@@ -18,7 +18,7 @@ const std = @import("std");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 
-const DEFAULT_MODEL = "/home/agent-zinc/workspace/models/Qwen3.5-9B-Q4_K_M.gguf";
+const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 
 /// Load a GGUF onto the GPU via loader_cuda and print a structured report.
 /// @returns Propagates loader errors (init/open/parse/upload) so the build step

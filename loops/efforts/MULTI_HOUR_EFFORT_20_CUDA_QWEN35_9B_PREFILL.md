@@ -47,7 +47,7 @@ Per `docs/cuda-backend.md` milestones, adapted to the dense 9B:
 - Prompts: public Long-Coding-Plan scenarios — core (≈36 prompt toks), context-medium (≈174), context-long (≈322); raw mode, deterministic.
 - Metric: prefill tok/s = prompt_tokens / prefill_time, **median of N warm reps**. Characterize cold/warm clock-ramp on each GPU first (CUDA analog of the Metal cold/warm regime).
 - Correctness gate: **token-for-token** match vs Metal/Vulkan reference on the same prompt *before* any tok/s is recorded.
-- Devices: report **4090 (sm_89)** and **5090 (sm_120)** separately; **pin by UUID** — 4090 `GPU-e59a6fce-1961-bafe-927c-06c0149f2370`, 5090 `GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350` (device *index* is unreliable on this box; `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES`).
+- Devices: report **4090 (sm_89)** and **5090 (sm_120)** separately; pin by CUDA selector values supplied through untracked env vars such as `ZINC_GPU_4090` and `ZINC_GPU_5090`. Do not commit machine-specific GPU UUIDs or host aliases.
 
 ## Cycle log
 

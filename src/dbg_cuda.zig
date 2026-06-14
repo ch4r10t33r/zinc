@@ -71,7 +71,7 @@ const Engine = union(enum) {
     }
 };
 
-const DEFAULT_MODEL = "/home/agent-zinc/workspace/Qwen3.5-9B-Q4_K_M.gguf";
+const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 
 /// Effort 25: batched-GEMM prefill is the DEFAULT for gemma (matches main.zig).
 /// True unless ZINC_BATCHED_PREFILL is explicitly off (0/off/false/no). qwen has

@@ -20,7 +20,7 @@ const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 const forward = @import("compute/forward_cuda.zig");
 
-const DEFAULT_MODEL = "/home/agent-zinc/workspace/models/Qwen3.5-9B-Q4_K_M.gguf";
+const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 
 const Milestone = enum { v0, v1, v2 };
 
