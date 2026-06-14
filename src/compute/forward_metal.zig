@@ -1695,6 +1695,14 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_next_replay_prompt_tokens: u32 = 0,
     qwen35_dense_prefill_next_replay_projection_bytes: u64 = 0,
     qwen35_dense_prefill_next_replay_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_run_layers: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_stop_layer: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_stop_kind: Qwen35Dense9bPrefillLayerKind = .none,
+    qwen35_dense_prefill_next_replay_run_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_run_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_following_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_following_dense_ffn_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_projection_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_dense_ffn_bytes: u64 = 0,
     qwen35_dense_prefill_materialized_dispatch_calls: u32 = 0,
@@ -2865,6 +2873,9 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             pctOf(@as(u64, target_layer_tokens), @as(u64, profile.qwen35_dense_prefill_replay_layer_tokens)),
             profile.qwen35_dense_prefill_replay_layers,
         });
+        const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
+        const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
+        const replay_record_ns = profile.queued_prefill_async_record_ns +| profile.queued_prefill_final_record_ns;
         if (profile.qwen35_dense_prefill_next_replay_layer_kind != .none) {
             log.info("  {s} qwen35-9b layer-major next replay blocker: layer {d} kind {s} reason {s} prompt_tokens {d} next_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB remaining_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
                 label,
@@ -2878,9 +2889,28 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_dense_ffn_bytes),
             });
         }
-        const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
-        const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
-        const replay_record_ns = profile.queued_prefill_async_record_ns +| profile.queued_prefill_final_record_ns;
+        if (profile.qwen35_dense_prefill_next_replay_run_layers > 0) {
+            const run_layer_tokens = profile.qwen35_dense_prefill_next_replay_run_layer_tokens;
+            const replay_layer_tokens_f = @as(f64, @floatFromInt(@max(profile.qwen35_dense_prefill_replay_layer_tokens, 1)));
+            const run_layer_tokens_f = @as(f64, @floatFromInt(run_layer_tokens));
+            const run_dispatch_est = @as(f64, @floatFromInt(replay_dispatch_calls)) * run_layer_tokens_f / replay_layer_tokens_f;
+            const run_barrier_est = @as(f64, @floatFromInt(replay_barrier_calls)) * run_layer_tokens_f / replay_layer_tokens_f;
+            log.info("  {s} qwen35-9b next replay run cost: start {d} kind {s} layers {d} layer_tokens {d} stop_layer {d} stop_kind {s} token_major_est dispatch {d:.1} barriers {d:.1} run_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB following_layer projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_next_replay_layer,
+                qwen35Dense9bPrefillLayerKindName(profile.qwen35_dense_prefill_next_replay_layer_kind),
+                profile.qwen35_dense_prefill_next_replay_run_layers,
+                run_layer_tokens,
+                profile.qwen35_dense_prefill_next_replay_run_stop_layer,
+                qwen35Dense9bPrefillLayerKindName(profile.qwen35_dense_prefill_next_replay_run_stop_kind),
+                run_dispatch_est,
+                run_barrier_est,
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_run_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_run_dense_ffn_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes),
+            });
+        }
         if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0 or replay_dispatch_calls > 0) {
             log.info("  {s} qwen35-9b prefill work split: layer-major dispatch {d} barriers {d} resource_entries {d} record {d:.2} ms | token-major replay dispatch {d} barriers {d} record {d:.2} ms replay/layer_dispatch {d:.1}x", .{
                 label,
@@ -5050,6 +5080,44 @@ const Qwen35Dense9bLayerMajorReplayBytes = struct {
     dense_ffn: u64 = 0,
 };
 
+const Qwen35Dense9bNextReplayRun = struct {
+    kind: Qwen35Dense9bPrefillLayerKind = .none,
+    start_layer: u32 = 0,
+    layers: u32 = 0,
+    stop_layer: u32 = 0,
+    stop_kind: Qwen35Dense9bPrefillLayerKind = .none,
+};
+
+fn qwen35Dense9bPrefillLayerKindFor(cfg: ModelConfig, layer_idx: usize) Qwen35Dense9bPrefillLayerKind {
+    const n_layers: usize = @intCast(cfg.n_layers);
+    if (layer_idx >= n_layers) return .none;
+    if (isFullAttentionLayer(cfg, layer_idx)) return .full_attn;
+    if (cfg.ssm_d_inner != 0) return .ssm;
+    return .none;
+}
+
+fn qwen35Dense9bNextReplayRun(cfg: ModelConfig, first_replay_layer: u32) Qwen35Dense9bNextReplayRun {
+    if (first_replay_layer >= cfg.n_layers) return .{};
+
+    const start_layer: usize = @intCast(first_replay_layer);
+    const first_kind = qwen35Dense9bPrefillLayerKindFor(cfg, start_layer);
+    if (first_kind == .none) return .{};
+
+    var stop_layer = start_layer;
+    const n_layers: usize = @intCast(cfg.n_layers);
+    while (stop_layer < n_layers and qwen35Dense9bPrefillLayerKindFor(cfg, stop_layer) == first_kind) {
+        stop_layer += 1;
+    }
+
+    return .{
+        .kind = first_kind,
+        .start_layer = first_replay_layer,
+        .layers = saturatingU32FromUsize(stop_layer - start_layer),
+        .stop_layer = saturatingU32FromUsize(stop_layer),
+        .stop_kind = if (stop_layer < n_layers) qwen35Dense9bPrefillLayerKindFor(cfg, stop_layer) else .none,
+    };
+}
+
 fn qwen35Dense9bLayerMajorReplayBytes(engine: *const InferenceEngine, layer_idx: usize) Qwen35Dense9bLayerMajorReplayBytes {
     const cfg = engine.config;
     if (layer_idx >= engine.layer_tensors.len) return .{};
@@ -5097,6 +5165,22 @@ fn recordQwen35Dense9bLayerMajorNextReplayProfile(
     const prompt_multiplier = @as(u64, prompt_tokens);
     const first_layer: usize = @intCast(first_replay_layer);
     const next_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, first_layer);
+    const next_run = qwen35Dense9bNextReplayRun(cfg, first_replay_layer);
+    const next_run_end = first_layer + @as(usize, @intCast(next_run.layers));
+    var run_projection: u64 = 0;
+    var run_dense_ffn: u64 = 0;
+    if (next_run.layers > 0) {
+        for (first_layer..next_run_end) |layer_idx| {
+            const layer_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, layer_idx);
+            run_projection +|= layer_bytes.projection *| prompt_multiplier;
+            run_dense_ffn +|= layer_bytes.dense_ffn *| prompt_multiplier;
+        }
+    }
+    const n_layers: usize = @intCast(cfg.n_layers);
+    const following_bytes = if (next_run.stop_kind != .none and next_run_end < n_layers)
+        qwen35Dense9bLayerMajorReplayBytes(engine, next_run_end)
+    else
+        Qwen35Dense9bLayerMajorReplayBytes{};
     var remaining_projection: u64 = 0;
     var remaining_dense_ffn: u64 = 0;
     for (first_layer..@as(usize, @intCast(cfg.n_layers))) |layer_idx| {
@@ -5110,6 +5194,14 @@ fn recordQwen35Dense9bLayerMajorNextReplayProfile(
     p.qwen35_dense_prefill_next_replay_prompt_tokens = prompt_tokens;
     p.qwen35_dense_prefill_next_replay_projection_bytes = next_bytes.projection *| prompt_multiplier;
     p.qwen35_dense_prefill_next_replay_dense_ffn_bytes = next_bytes.dense_ffn *| prompt_multiplier;
+    p.qwen35_dense_prefill_next_replay_run_layers = next_run.layers;
+    p.qwen35_dense_prefill_next_replay_run_layer_tokens = prompt_tokens *| next_run.layers;
+    p.qwen35_dense_prefill_next_replay_run_stop_layer = next_run.stop_layer;
+    p.qwen35_dense_prefill_next_replay_run_stop_kind = next_run.stop_kind;
+    p.qwen35_dense_prefill_next_replay_run_projection_bytes = run_projection;
+    p.qwen35_dense_prefill_next_replay_run_dense_ffn_bytes = run_dense_ffn;
+    p.qwen35_dense_prefill_next_replay_following_projection_bytes = following_bytes.projection *| prompt_multiplier;
+    p.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes = following_bytes.dense_ffn *| prompt_multiplier;
     p.qwen35_dense_prefill_remaining_replay_projection_bytes = remaining_projection;
     p.qwen35_dense_prefill_remaining_replay_dense_ffn_bytes = remaining_dense_ffn;
 }
@@ -33720,6 +33812,25 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_token_major_replay_steps);
     try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_first_token_major_layer);
     try std.testing.expectEqualStrings("full-attn-boundary", qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason));
+
+    const next_ssm_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, profile.qwen35_dense_prefill_first_token_major_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .ssm), next_ssm_run.kind);
+    try std.testing.expectEqual(@as(u32, 4), next_ssm_run.start_layer);
+    try std.testing.expectEqual(@as(u32, 3), next_ssm_run.layers);
+    try std.testing.expectEqual(@as(u32, 7), next_ssm_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), next_ssm_run.stop_kind);
+
+    const next_attn_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, 7);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), next_attn_run.kind);
+    try std.testing.expectEqual(@as(u32, 1), next_attn_run.layers);
+    try std.testing.expectEqual(@as(u32, 8), next_attn_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .ssm), next_attn_run.stop_kind);
+
+    const final_attn_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, 31);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), final_attn_run.kind);
+    try std.testing.expectEqual(@as(u32, 1), final_attn_run.layers);
+    try std.testing.expectEqual(@as(u32, 32), final_attn_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .none), final_attn_run.stop_kind);
 
     const prefix_cmd = MetalCommand{
         .handle = null,
