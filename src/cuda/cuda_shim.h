@@ -65,6 +65,15 @@ uint64_t cuda_buffer_device_ptr(CudaBuf* buf);
 // Explicit transfers (synchronous on the ctx stream).
 void     cuda_upload(CudaCtx* ctx, CudaBuf* buf, const void* src, size_t size);
 void     cuda_download(CudaCtx* ctx, CudaBuf* buf, void* dst, size_t size);
+// Async (no-sync) transfers on the ctx stream — capturable into a CUDA graph so
+// the per-step embed H2D and argmax D2H fold into the single graph launch
+// instead of costing a separate stream sync each. Use PINNED host memory
+// (cuda_alloc_host) for the host side so the captured copy is truly async.
+void     cuda_upload_async(CudaCtx* ctx, CudaBuf* buf, const void* src, size_t size);
+void     cuda_download_async(CudaCtx* ctx, CudaBuf* buf, void* dst, size_t size);
+// Pinned (page-locked) host allocation, required for async graph-captured copies.
+void*    cuda_alloc_host(size_t size);
+void     cuda_free_host(void* ptr);
 void     cuda_free_buffer(CudaBuf* buf);
 
 // ---- Pipeline management -----------------------------------------------------

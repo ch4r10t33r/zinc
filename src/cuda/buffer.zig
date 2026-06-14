@@ -101,3 +101,28 @@ pub fn upload(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, data: []const u8) voi
 pub fn download(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, dst: []u8) void {
     shim.cuda_download(ctx, buf.handle, @ptrCast(dst.ptr), dst.len);
 }
+
+/// Async host→device copy (no stream sync). Capturable into a CUDA graph; the
+/// host side must be pinned (see `allocHost`). @see download(Async) for D2H.
+pub fn uploadAsync(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, data: []const u8) void {
+    shim.cuda_upload_async(ctx, buf.handle, @ptrCast(data.ptr), data.len);
+}
+
+/// Async device→host copy (no stream sync). Capturable into a CUDA graph; the
+/// destination must be pinned host memory (see `allocHost`).
+pub fn downloadAsync(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, dst: []u8) void {
+    shim.cuda_download_async(ctx, buf.handle, @ptrCast(dst.ptr), dst.len);
+}
+
+/// Pinned (page-locked) host allocation of `n` `T` values, required as the host
+/// endpoint of an async graph-captured copy. Free with `freeHost`.
+pub fn allocHost(comptime T: type, n: usize) ![]T {
+    const p = shim.cuda_alloc_host(n * @sizeOf(T)) orelse return error.OutOfMemory;
+    const tp: [*]T = @ptrCast(@alignCast(p));
+    return tp[0..n];
+}
+
+/// Free a pinned host allocation from `allocHost`.
+pub fn freeHost(slice: anytype) void {
+    shim.cuda_free_host(@ptrCast(@constCast(slice.ptr)));
+}

@@ -236,7 +236,8 @@ pub const ForwardCuda = struct {
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
     gate_scalar_buf: CudaBuffer, // [1] f32 shared-expert sigmoid gate logit
-    host_embed: []f32,
+    host_embed: []f32, // PINNED: async embed H2D source (graph-capturable)
+    host_tok: []u32, // PINNED: async argmax D2H dest (graph-capturable), len 1
     host_router_ids: []u32, // [n_experts_used] downloaded expert ids
 
     // constant buffers
@@ -334,7 +335,8 @@ pub const ForwardCuda = struct {
             .router_logits_buf = try buffer.createBuffer(ctx, router_logits_elems * f4),
             .router_out_buf = try buffer.createBuffer(ctx, router_out_elems * @sizeOf(u32)),
             .gate_scalar_buf = try buffer.createBuffer(ctx, f4),
-            .host_embed = try allocator.alloc(f32, d.n_embd),
+            .host_embed = try buffer.allocHost(f32, d.n_embd),
+            .host_tok = try buffer.allocHost(u32, 1),
             .host_router_ids = try allocator.alloc(u32, @max(@as(u32, 1), d.n_experts_used)),
             .inv_freq = try buffer.createBuffer(ctx, (d.rope_dim / 2) * f4),
             .sinks = try buffer.createBuffer(ctx, d.n_layers * d.n_head * f4),
@@ -413,7 +415,8 @@ pub const ForwardCuda = struct {
         a.free(self.ssm_conv_state);
         a.free(self.ssm_state);
         a.free(self.conv_off);
-        a.free(self.host_embed);
+        buffer.freeHost(self.host_embed);
+        buffer.freeHost(self.host_tok);
         a.free(self.host_router_ids);
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
@@ -434,20 +437,22 @@ pub const ForwardCuda = struct {
         const d = self.d;
         const ctx = self.ctx;
 
-        // EMBED: CPU-dequant the token_embd row, upload to hidden. Done OUTSIDE
-        // any graph capture — it depends on host data and buffer.upload syncs the
-        // stream (illegal mid-capture); the captured chain starts from `hidden`.
+        // EMBED: CPU-dequant the token_embd row into the PINNED host_embed buffer.
+        const use_graph = run_layers and self.graph != null;
         self.model.dequantEmbeddingRow(token, self.host_embed);
-        buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        // Non-graph path uploads (sync) here. The graph path defers the H2D into
+        // decodeStepGraph so it is CAPTURED as the graph's first node (riding the
+        // single graph launch instead of a separate sync) — host_embed is pinned.
+        if (!use_graph) buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
 
         // TAIL tensors (resolved up-front so the graph and async paths share them).
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
 
-        // CUDA-graph replay path: capture the full dense per-step chain (layers +
-        // tail) and launch it as one graph. Bit-identical to the async chain (same
-        // kernels, same order, same single stream) — see decodeStepGraph.
-        if (run_layers and self.graph != null) {
+        // CUDA-graph replay path: capture the full dense per-step chain (embed H2D
+        // + layers + tail + argmax D2H) and launch it as one graph. Bit-identical
+        // to the async chain (same kernels, same order, same single stream).
+        if (use_graph) {
             return try self.decodeStepGraph(pos, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
         }
 
@@ -487,6 +492,9 @@ pub const ForwardCuda = struct {
 
         self.capturing = true;
         _ = shim.cuda_graph_begin(ctx);
+        // EMBED H2D as the graph's first node (pinned host_embed → truly async,
+        // captures cleanly). Folds the per-token upload sync into the graph launch.
+        buffer.uploadAsync(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (isFullAttn(L, d.full_attn_interval)) {
@@ -499,14 +507,17 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         self.tailDispatch(&cmd, out_norm, lm_head, lm_type);
         cmd.releaseCompleted(); // captured onto the stream; no event record / no sync
+        // ARGMAX D2H as the graph's last node (pinned host_tok), so the predicted
+        // token lands in host memory after the single graph-launch sync — no extra
+        // per-token download sync.
+        buffer.downloadAsync(ctx, &self.argmax_buf, std.mem.sliceAsBytes(self.host_tok));
         self.capturing = false;
 
-        // End capture, instantiate-or-update the cached exec, launch + sync.
+        // End capture, instantiate-or-update the cached exec, launch + ONE sync
+        // (drains the embed H2D, layer chain, tail, and argmax D2H together).
         _ = shim.cuda_graph_end_launch(ctx, self.graph.?);
 
-        var tok: u32 = 0;
-        buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
-        return tok;
+        return self.host_tok[0];
     }
 
     /// Record the decode tail (final rms_norm → LM head matvec → argmax) onto

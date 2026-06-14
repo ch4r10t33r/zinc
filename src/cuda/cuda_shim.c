@@ -112,6 +112,22 @@ void cuda_download(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
     if (!cu_ok(cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
     cuStreamSynchronize(c->stream);
 }
+// Async variants: enqueue the copy on the ctx stream and return WITHOUT syncing.
+// Issued between cuda_graph_begin/end_launch they become memcpy graph nodes, so
+// the embed H2D and argmax D2H ride the single graph launch instead of each
+// costing a WSL2 sync round-trip. Host side must be pinned (cuda_alloc_host).
+void cuda_upload_async(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
+    cuMemcpyHtoDAsync(b->dptr, src, size, c->stream);
+}
+void cuda_download_async(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
+    cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream);
+}
+void* cuda_alloc_host(size_t size) {
+    void* p = NULL;
+    if (!cu_ok(cuMemAllocHost(&p, size ? size : 1), "cuMemAllocHost")) return NULL;
+    return p;
+}
+void cuda_free_host(void* p) { if (p) cuMemFreeHost(p); }
 void cuda_free_buffer(CudaBuf* b) {
     if (!b) return;
     if (b->owns && b->dptr) cuMemFree(b->dptr);
