@@ -1569,6 +1569,7 @@ const DirectComputeTracking = struct {
 // projections can use trust-after-success after the first passing pair.
 const direct_decode_model_slice_enabled_default = false;
 const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_prefill_model_slice_enabled_default = false;
 const direct_lm_head_decode_cadence_default: u32 = 0;
 const direct_router_decode_enabled_default = false;
 const direct_router_decode_cadence_default: u32 = 32;
@@ -1610,6 +1611,15 @@ fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
 
 fn directDecodeModelSliceCadence() u32 {
     return directDecodeModelSliceCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"));
+}
+
+fn directPrefillModelSliceEnabledForEnv(raw_override: ?[]const u8) bool {
+    const raw = raw_override orelse return direct_prefill_model_slice_enabled_default;
+    return parseBoolEnv(raw, direct_prefill_model_slice_enabled_default);
+}
+
+fn directPrefillModelSliceEnabled() bool {
+    return directPrefillModelSliceEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_PREFILL_MODEL_SLICE"));
 }
 
 fn directLmHeadDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
@@ -1833,12 +1843,18 @@ fn generateScalarHybrid(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
+    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
     const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
     const direct_router_decode_enabled = directRouterDecodeEnabled();
     const direct_router_decode_cadence = directRouterDecodeCadence();
     if (token_boundary != null) {
+        if (direct_prefill_slice_enabled) {
+            log.info("M1 AMDGPU CS direct prefill model-slice validation enabled for the final prompt token", .{});
+        } else {
+            log.info("M1 AMDGPU CS direct prefill model-slice validation disabled by default; set ZINC_RT_DIRECT_PREFILL_MODEL_SLICE=1 for prompt-ingest validation", .{});
+        }
         if (direct_decode_slice_enabled) {
             if (direct_decode_slice_cadence == 0) {
                 log.info("M1 AMDGPU CS direct full decode model-slice cadence: first generated token only", .{});
@@ -1889,8 +1905,9 @@ fn generateScalarHybrid(
     for (prompt_tokens, 0..) |token, pos| {
         const eval_token = if (pos == 0) direct_prompt0_token orelse token else token;
         var selection: ArgmaxTop2Result = .{};
-        const selection_out: ?*ArgmaxTop2Result = if (pos + 1 == prompt_tokens.len) &selection else null;
-        const direct_compute_tracking: ?DirectComputeTracking = if (pos + 1 == prompt_tokens.len and token_boundary != null)
+        const is_final_prompt_token = pos + 1 == prompt_tokens.len;
+        const selection_out: ?*ArgmaxTop2Result = if (is_final_prompt_token) &selection else null;
+        const direct_compute_tracking: ?DirectComputeTracking = if (is_final_prompt_token and direct_prefill_slice_enabled and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
                 .ops = &direct_compute_ops,
@@ -1915,7 +1932,7 @@ fn generateScalarHybrid(
             direct_compute_tracking,
             null,
         );
-        if (selection_out != null) {
+        if (selection_out != null and direct_prefill_slice_enabled) {
             const gpu_token = directComputeArgmaxTop2(token_boundary, selection) catch |err| blk: {
                 log.warn("M1 AMDGPU CS direct argmax compute unavailable ({s}); first token remains host-selected", .{@errorName(err)});
                 break :blk null;
@@ -2107,10 +2124,16 @@ fn generateScalarDense(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
+    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
     const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
     if (token_boundary != null) {
+        if (direct_prefill_slice_enabled) {
+            log.info("M1 AMDGPU CS dense direct prefill model-slice validation enabled for the final prompt token", .{});
+        } else {
+            log.info("M1 AMDGPU CS dense direct prefill model-slice validation disabled by default; set ZINC_RT_DIRECT_PREFILL_MODEL_SLICE=1 for prompt-ingest validation", .{});
+        }
         if (direct_decode_slice_enabled) {
             if (direct_decode_slice_cadence == 0) {
                 log.info("M1 AMDGPU CS dense direct full decode model-slice cadence: first generated token only", .{});
@@ -2136,7 +2159,7 @@ fn generateScalarDense(
     for (prompt_tokens, 0..) |token, pos| {
         const need_logits = pos + 1 == prompt_tokens.len;
         const eval_token = if (pos == 0) direct_prompt0_token orelse token else token;
-        const direct_compute_tracking: ?DirectComputeTracking = if (need_logits and token_boundary != null)
+        const direct_compute_tracking: ?DirectComputeTracking = if (need_logits and direct_prefill_slice_enabled and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
                 .ops = &direct_compute_ops,
@@ -10115,6 +10138,12 @@ test "direct decode model slice policy defaults to LM-head only proof" {
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
     try std.testing.expectEqual(@as(u32, direct_decode_model_slice_cadence_default), directDecodeModelSliceCadenceForEnv("bad"));
+    try std.testing.expect(!directPrefillModelSliceEnabledForEnv(null));
+    try std.testing.expect(directPrefillModelSliceEnabledForEnv("1"));
+    try std.testing.expect(directPrefillModelSliceEnabledForEnv("true"));
+    try std.testing.expect(!directPrefillModelSliceEnabledForEnv("0"));
+    try std.testing.expect(!directPrefillModelSliceEnabledForEnv("false"));
+    try std.testing.expect(!directPrefillModelSliceEnabledForEnv("bad"));
     try std.testing.expectEqual(@as(u32, direct_lm_head_decode_cadence_default), directLmHeadDecodeCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 4), directLmHeadDecodeCadenceForEnv("4"));
     try std.testing.expectEqual(@as(u32, 0), directLmHeadDecodeCadenceForEnv("0"));
