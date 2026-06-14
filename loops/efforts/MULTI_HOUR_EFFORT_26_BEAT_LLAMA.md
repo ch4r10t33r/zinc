@@ -30,6 +30,14 @@ The real prefill gaps are **far bigger than the blog/dashboard say** (which stil
 
 ## Targets (priority; BAR = BEAT llama on the 5090, **llama-bench** baseline, interleaved-A/B)
 
+> **Real pp512 prefill gaps (llama-bench, 2026-06-14, on main):** gemma-31B 517 vs 3096 (~6×), gemma-26B 343 vs 7978 (~23×), qwen35-9B **85.5 vs 7569 (~88×)**, qwen36-27B **45.4 vs 2820 (~62×)**, qwen36-35B-A3B **41.4 vs 6535 (~158×)**. Decode is fine (~70% of llama). **The qwen prefill gap dwarfs everything → T0 is now the top lever.**
+
+- **T0 — qwen BATCHED PREFILL (THE BIGGEST LEVER, 62–158× behind).** Qwen35/36 prefill is **per-token**: `main.zig:526` loops `prefillStep` once per prompt token because the hybrid-SSM forward has NO `prefillBatched` — so it fires ~T×512 tiny kernel launches vs llama's batched all-T-at-once. **Build `prefillBatched` in `forward_cuda.zig`, mirroring gemma's** (`forward_cuda_gemma.zig:729`). Incremental — validate 5/5 token-correct (batched MUST equal per-token) at EACH step:
+  1. **prefillBatched skeleton** — batch the embed `[T,n_embd]`; per-layer loop; v0 may wrap the existing per-token ops in an internal T-loop just to wire structure + validate.
+  2. **Batch the SSM scan (single biggest win, do early):** `ssm_delta_net` (`kernels.cu:947`) ALREADY loops `n_tok` internally but is only ever called with `n_tok=1` (`forward_cuda.zig:716`). Stage conv_out token-major for all T, then call it ONCE with `n_tok=T` → the whole sequential scan runs in one launch (recurrence preserved = bit-correct), collapsing T scan launches → 1. NOT a research parallel-scan; the kernel already supports it.
+  3. **Batch the matmuls:** Q/K/V/O, alpha/beta, FFN gate/up/down → `T×K` GEMMs (route through the same batched-dmmv / cuBLAS path gemma uses; rows independent).
+  4. **Batch conv1d + norms + attention** over T (conv1d carries a small per-channel state like the scan; attention = the `gemma_attention_batched` pattern).
+  BAR: beat llama qwen prefill (35-9B 7569, 27B 2820, 35B-A3B 6535 t/s). **NOTE:** the old "batched prefill = DEAD END" memory was gemma-on-4090 (a different, launch-bound regime). On the 5090 (compute-bound) for qwen — currently per-token and 62–158× behind — batching is unambiguously the lever, and gemma's own batched prefill already proved it pays here (cuBLAS +2.5×).
 - **T1 — kill the dequant round-trip on dense prefill GEMM (close the remaining ~6.5×).** Options: (a) **persistent fp16 weight cache** — dequant each dense weight to fp16 ONCE per model load, cuBLAS reads fp16 directly every prefill (trades ~2× VRAM on the dense weights for removing the per-GEMM dequant; simplest clearly-real win); (b) **MMQ-style on-the-fly dequant GEMM** (the real llama approach — dequant in the GEMM K-loop, no scratch round-trip); (c) cp.async/wgmma fp16 pipelining on the existing TC kernel. Validate 5/5 token-correct, A/B vs `llama-bench` (~3283).
 - **T2 — MoE expert GEMM (prefill ~26× + decode 31–42%).** Same root cause: experts run hand-written Q4_K-dequant matvecs vs llama's MMQ. Route the batched routed-expert matvecs through the cuBLAS/MMQ path (per-expert or grouped GEMM); for DECODE additionally drop the router host round-trip (GPU-side gather) + wider expert kernels. Token-correct gate.
 - **T3 (stretch) — dense decode last mile (gemma-31B 82%, qwen35-9B 75%, qwen36-27B 91%).** Deeper kernel fusion (Effort 23 playbook). Lower priority (already close).
@@ -37,8 +45,8 @@ The real prefill gaps are **far bigger than the blog/dashboard say** (which stil
 ## Plan (incremental, validate-before-commit; ONE target per cycle)
 
 1. ✅ **DONE (c1, c9, c10) — MERGED TO MAIN:** TC default-on + cuBLAS Q4_K/Q6_K dense prefill GEMM → gemma-31B prefill ~2.5×.
-2. **NEXT — T1 dequant round-trip:** start with the persistent fp16 weight cache (simplest) or MMQ on-the-fly dequant; A/B vs llama-bench (~3283).
-3. Then T2 (MoE expert GEMM), T3.
+2. **NEXT (biggest lever) — T0 qwen batched prefill:** build `prefillBatched`; land the `n_tok=T` SSM scan first (one-launch, the single biggest win, kernel already supports it), validate 5/5, A/B vs llama-bench (qwen 2820–7569). Then batch the matmuls + attention.
+3. Then T1 (gemma dequant round-trip), T2 (MoE expert GEMM), T3.
 
 ## Validation contract
 
