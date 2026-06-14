@@ -8448,6 +8448,76 @@ pub const InferenceEngine = struct {
         const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
         recordQueuedPrefillStart(profile, prompt_tokens.len, async_chunk_request, async_chunk_tokens);
         var first_async_submit_ns: i128 = -1;
+
+        const qwen35_dense_full_prefix_materialized =
+            defaultQwen35Dense9bQueuedPrefillEnabled(self.config) and
+            @as(usize, @intCast(self.qwen35_dense_prefill_layer0_active_tokens)) >= prompt_tokens.len and
+            self.qwen35_dense_prefill_active_layers >= self.config.n_layers;
+        if (qwen35_dense_full_prefix_materialized) {
+            // Adapt llama.cpp `ggml_metal_graph_compute` materialization:
+            // the dense Qwen3.5 9B precompute command already produced every
+            // prompt row through the final layer. Do not replay those rows as
+            // decode-shaped copy-only steps; consume only the last row needed
+            // by final_norm + LM head.
+            if (pending_count > 0) {
+                recordQueuedPrefillAsyncSubmit(profile, &first_async_submit_ns);
+            }
+            recordQueuedPrefillChunk(profile, prompt_tokens.len, true);
+            const materialized_tail_start = profileStart(profile != null);
+            if (profile) |p| {
+                const prompt_u32 = saturatingU32FromUsize(prompt_tokens.len);
+                p.decode_steps += prompt_u32;
+                p.shared_cmd_steps += prompt_u32;
+            }
+
+            var final_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (final_cmd.handle != null) final_cmd.wait();
+            const final_record_start = profileStart(profile != null);
+            const final_base = @as(usize, prompt_tokens.len - 1) * hidden_dim_usize;
+            const final_base_u32: u32 = @intCast(final_base);
+            dispatchCopyRmsNormOffsetOnCmd(
+                self,
+                &final_cmd,
+                &self.qwen_ssm_prefill_branch_buf,
+                &self.hidden_buf,
+                &self.norm_buf,
+                &self.final_norm_gpu,
+                hidden_dim,
+                final_base_u32,
+            );
+            profileBarrierBuffers(&final_cmd, profile, .final, &.{&self.norm_buf});
+
+            if (shouldCpuLmHeadFallback(self)) {
+                recordQueuedPrefillChunkWork(profile, &final_cmd, profileElapsedNs(final_record_start), true);
+                const final_wait_start = profileStart(profile != null);
+                const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
+                    @intCast(final_wait_start - first_async_submit_ns)
+                else
+                    0;
+                commitAndWaitProfiled(&final_cmd, profile);
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(self.norm_buf.cpu_ptr.?));
+                const out_ptr: [*]f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+                try cpuLmHeadFallbackWithArgmax(self, norm_ptr, out_ptr);
+                recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
+            } else {
+                dispatchLmHeadAndArgmaxOnCmd(self, &final_cmd, &self.norm_buf, &self.logits_buf, &self.argmax_buf, hidden_dim, self.config.vocab_size, profile);
+                recordQueuedPrefillChunkWork(profile, &final_cmd, profileElapsedNs(final_record_start), true);
+                const final_wait_start = profileStart(profile != null);
+                const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
+                    @intCast(final_wait_start - first_async_submit_ns)
+                else
+                    0;
+                commitAndWaitProfiled(&final_cmd, profile);
+                recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
+            }
+
+            pending_completed_by_final_wait = true;
+            self.position = @intCast(prompt_tokens.len);
+            state.position = self.position;
+            if (profile) |p| p.total_step_ns += profileElapsedNs(materialized_tail_start);
+            return;
+        }
+
         if (async_chunk_tokens <= 1) {
             for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
                 const record_start = profileStart(profile != null);
