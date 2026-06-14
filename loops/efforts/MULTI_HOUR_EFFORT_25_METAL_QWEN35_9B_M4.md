@@ -80,7 +80,9 @@ ZINC_CROSS_EFFORT_EVERY=3 \
 ZINC_HARD_FAMILY_COOLDOWN=1 \
 ZINC_WORKLOAD_RESET_ON_CHANGE=1 \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
-bun loops/implement_metal.ts --effort 25 --agent codex --model gpt-5.5 --cycles 100
+bun loops/implement_metal.ts \
+  --effort-file loops/efforts/MULTI_HOUR_EFFORT_25_METAL_QWEN35_9B_M4.md \
+  --agent codex --model gpt-5.5 --cycles 100
 ```
 
 For a baseline-only check:
@@ -96,7 +98,9 @@ ZINC_MIN_DECODE_TOKENS=32 \
 ZINC_BENCHMARK_RUNS=3 \
 ZINC_BENCHMARK_WARMUPS=1 \
 ZINC_RUN_TIMEOUT_MS=900000 \
-bun loops/implement_metal.ts --effort 25 --dry-run
+bun loops/implement_metal.ts \
+  --effort-file loops/efforts/MULTI_HOUR_EFFORT_25_METAL_QWEN35_9B_M4.md \
+  --dry-run
 ```
 
 ## Baseline interpretation
@@ -167,3 +171,41 @@ Expected Qwen 9B shape facts to verify from GGUF/profile:
   batching/orchestration gate instead of shader retuning.
 - If five cycles show prefill flat with `prefillBatched` active, add exact-shape
   microbench evidence before the next production runtime edit.
+- For this effort, speed-neutral `optimization` cycles are now treated as churn by
+  the Metal harness. Label evidence-only work as `@@@STEP_KIND: analysis` or
+  `@@@STEP_KIND: enablement`; production optimization work must move the accepted
+  prefill median.
+
+## 2026-06-14 overnight analysis
+
+Overnight run:
+
+- Results dir: `.metal_optimize/2026-06-14T05-19-50`
+- Log: `/tmp/zinc_m4_qwen35_effort25_20260613_221950.log`
+- Cycles: 21
+- Initial measured baseline: `38.4 prefill tok/s`
+- Harness-selected best: `38.1 prefill tok/s`
+- Decode guard at tail: `35.12 tok/s` vs `35.18 tok/s` baseline (`-0.2%`)
+
+Conclusion: no production speedup landed. The run explored queued one-command
+prefill, deeper SSM/full-attention prefix materialization, packed Q/gate batched
+deinterleave, fused Q4_K gate/up+SwiGLU, KV/RoPE fusion, full-prefix materialized
+tails, and small-batch Q4_K/Q6_K tail kernels. All stayed in the `37.7-38.1
+tok/s` band while the pre-agent baseline was already around `38.4 tok/s`.
+
+Harness finding: fresh runs were locking the workload without seeding
+`currentBest` / `bestTokPerSec` from the pre-agent baseline, so the first neutral
+cycle could become the promoted tree. `implement_metal.ts` was updated to seed
+the accepted baseline immediately and reject neutral `optimization` keeps on this
+structural Qwen3.5 9B M4 prefill effort.
+
+Next useful work should be analysis/enablement, not another default-on kernel
+variant:
+
+1. Capture a profile that explicitly compares ZINC's remaining token-major replay
+   against llama.cpp's layer-major graph for layers 1-31.
+2. Add counters that report how many Qwen3.5 9B layers/tokens are truly
+   layer-major materialized, plus the first fallback reason.
+3. Only after those counters name the blocker, implement a dense-hybrid
+   layer-major prefill path. Do not repeat 32-token tiling, tail kernels, or
+   prefix-depth variants without new evidence.

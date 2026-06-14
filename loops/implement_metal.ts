@@ -26,7 +26,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 // ── Color & display ──────────────────────────────────────────────────
 
@@ -134,6 +134,8 @@ const NEAR_MISS_MIN_GAIN_PCT = parsePositiveFloatEnv("ZINC_NEAR_MISS_MIN_GAIN_PC
 // Format: space-separated KEY=VALUE pairs. Empty = no diagnostic.
 const NEAR_MISS_DIAGNOSTIC_ENV_RAW = process.env.ZINC_NEAR_MISS_DIAGNOSTIC_ENV ?? "";
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
+const PROFILE_CAPTURE_CHARS = parsePositiveIntEnv("ZINC_PROFILE_CAPTURE_CHARS", 24000);
+const PROFILE_PROMPT_CHARS = parsePositiveIntEnv("ZINC_PROFILE_PROMPT_CHARS", 12000);
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
 const RECENT_PROGRESS_WINDOW = 10;
 const QWEN36_PLATEAU_STALL_CYCLES = 20;
@@ -383,6 +385,26 @@ function isQwen36LargeMoeRun(
     effortText.includes("35b") ||
     effortText.includes("35b-a3b");
   return qwen36 && largeMoe && !isGemmaRun(state);
+}
+
+function isQwen35Dense9bM4PrefillRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan" | "metricMode">,
+): boolean {
+  const model = displayModelLabel().toLowerCase();
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  const qwen35 = model.includes("qwen35-9b") ||
+    model.includes("qwen3.5-9b") ||
+    model.includes("qwen 3.5 9b") ||
+    effortText.includes("qwen35-9b") ||
+    effortText.includes("qwen3.5 9b") ||
+    effortText.includes("qwen 3.5 9b");
+  const metalM4 = effortText.includes("metal") ||
+    effortText.includes("m4") ||
+    model.includes("qwen35-9b");
+  return qwen35 && metalM4 && (state?.metricMode ?? METRIC_MODE) === "prefill";
 }
 
 function promptTrunc(s: string, max: number): string {
@@ -3132,7 +3154,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       `## Profile Output (cycle ${state.lastProfileCycle})`,
       "Use this to identify the actual hotspots. Focus optimization on the slowest phases.",
       "```",
-      state.lastProfileOutput.slice(-3000),
+      state.lastProfileOutput.slice(-PROFILE_PROMPT_CHARS),
       "```",
       "",
     );
@@ -3334,19 +3356,40 @@ async function loadState(runDir: string): Promise<RunState | null> {
  * `loops/efforts`. Returns `{ file, plan }` on success, null if no matching
  * doc exists.
  */
+function inferEffortIdFromFileName(file: string): number | null {
+  const match = basename(file).match(/^MULTI_HOUR_EFFORT_(\d+)(?:_|\.)/);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function loadEffortPlanFile(filePath: string): Promise<{ file: string; plan: string } | null> {
+  const resolvedPath = isAbsolute(filePath) ? filePath : resolve(REPO_ROOT, filePath);
+  if (!existsSync(resolvedPath)) return null;
+  const file = basename(resolvedPath);
+  const plan = await readFile(resolvedPath, "utf8");
+  return { file, plan };
+}
+
 async function loadEffortPlan(effort: number): Promise<{ file: string; plan: string } | null> {
   const prefix = `MULTI_HOUR_EFFORT_${effort}_`;
   if (!existsSync(EFFORTS_DIR)) return null;
   const matches = readdirSync(EFFORTS_DIR).filter(
     (name) => name.startsWith(prefix) && name.endsWith(".md"),
-  );
+  ).sort();
   if (matches.length === 0) return null;
+  let file = matches[0];
   if (matches.length > 1) {
-    console.error(
-      clr("1;33", `  ⚠ Multiple effort docs match ${prefix}*.md: ${matches.join(", ")}. Using ${matches[0]}.`),
-    );
+    const metalMatches = matches.filter((name) => /(?:^|_)METAL(?:_|\.md$)/i.test(name));
+    if (metalMatches.length === 1) {
+      file = metalMatches[0];
+      console.error(
+        clr("1;33", `  ⚠ Multiple effort docs match ${prefix}*.md: ${matches.join(", ")}. Using Metal effort ${file}.`),
+      );
+    } else {
+      throw new Error(`Ambiguous effort ${effort}: ${matches.join(", ")}. Use --effort-file <path>.`);
+    }
   }
-  const file = matches[0];
   const plan = await readFile(join(EFFORTS_DIR, file), "utf8");
   return { file, plan };
 }
@@ -3379,9 +3422,21 @@ async function syncWorkloadBeforeCycle(runDir: string, state: RunState, result: 
 
   if (!state.workload) {
     state.workload = workload;
-    if (state.cycles.length > 0 && WORKLOAD_RESET_ON_CHANGE) {
+    const shouldSeedBaseline =
+      result.containsReference &&
+      result.tokPerSec != null &&
+      result.tokPerSec > 0 &&
+      (
+        !state.currentBest?.containsReference ||
+        (state.currentBest.tokPerSec ?? 0) <= 0 ||
+        state.bestTokPerSec <= 0 ||
+        (state.cycles.length > 0 && WORKLOAD_RESET_ON_CHANGE)
+      );
+    if (shouldSeedBaseline) {
       resetPerformanceBaselinesToMeasurement(state, result);
-      console.log(clr("1;33", `  ◎ Workload contract locked for legacy state; reset performance baselines to ${result.tokPerSec?.toFixed(2) ?? "n/a"} ${METRIC_LABEL}`));
+      state.workload = workload;
+      const legacyNote = state.cycles.length > 0 ? " for legacy state" : "";
+      console.log(clr("1;36", `  ◎ Workload contract locked${legacyNote}; seeded accepted baseline at ${result.tokPerSec?.toFixed(2) ?? "n/a"} ${METRIC_LABEL}`));
     } else {
       console.log(clr("1;36", `  ◎ Workload contract locked: prompt=${workload.promptTokens ?? "?"} tokens raw=${workload.rawPromptHash} prepared=${workload.preparedPromptHash ?? "unknown"}`));
     }
@@ -3574,7 +3629,7 @@ async function runProfileBenchmark(): Promise<string> {
     [...zincModelArgs(), ...zincPromptArgs(), "-n", String(Math.min(MAX_TOKENS, 32)), "--profile"],
     { timeout: RUN_TIMEOUT_MS },
   );
-  const combined = (run.stderr + run.stdout).slice(-4000);
+  const combined = (run.stderr + run.stdout).slice(-PROFILE_CAPTURE_CHARS);
   console.log(clr("2", "    profile captured"));
   return combined;
 }
@@ -3959,6 +4014,10 @@ export function shouldRejectPlateauNeutralKeep(args: {
   if (rejectGemmaGeGLUPassiveEvidenceChurn(args)) return true;
   if (args.stepKind !== "optimization") return false;
 
+  if (isQwen35Dense9bM4PrefillRun(args.state)) {
+    return true;
+  }
+
   const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();
   if (/\b(profile|measure|microbench|counter|diagnos|validator|validate|diff|instrument|coherence|harness|bench-metal-shapes|metal-shapes|exact-shape)\b/.test(text)) {
     return false;
@@ -4060,6 +4119,7 @@ async function main() {
   let model: string | undefined;
   let resume = false;
   let effort: number | null = null;
+  let effortFile: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -4093,6 +4153,15 @@ async function main() {
         effort = parsed;
         break;
       }
+      case "--effort-file": {
+        const value = args[++i];
+        if (!value) {
+          console.error("Invalid --effort-file value; expected a markdown file path.");
+          process.exit(1);
+        }
+        effortFile = value;
+        break;
+      }
       case "--help":
         console.log([
           "Usage: bun loops/implement_metal.ts [options]",
@@ -4105,6 +4174,7 @@ async function main() {
           "  --resume                Resume the most recent run",
           "  --effort N              Load MULTI_HOUR_EFFORT_N_*.md from loops/efforts",
           "                          and splice it into every agent prompt",
+          "  --effort-file <path>    Load this exact effort markdown file",
         ].join("\n"));
         process.exit(0);
     }
@@ -4114,7 +4184,17 @@ async function main() {
   // build loop starts. Kept null in resume mode when no --effort is passed so
   // the saved state's effortPlan wins.
   let effortBundle: { file: string; plan: string } | null = null;
-  if (effort != null) {
+  if (effortFile != null) {
+    effortBundle = await loadEffortPlanFile(effortFile);
+    if (!effortBundle) {
+      console.error(clr("1;31", `No effort file found at ${effortFile}.`));
+      process.exit(1);
+    }
+    effort ??= inferEffortIdFromFileName(effortBundle.file);
+    console.log(
+      clr("1;36", `  Effort file: loaded ${effortBundle.file} (${effortBundle.plan.length} chars)`),
+    );
+  } else if (effort != null) {
     effortBundle = await loadEffortPlan(effort);
     if (!effortBundle) {
       console.error(
@@ -4182,6 +4262,12 @@ async function main() {
       state.effortPlan = effortBundle.plan;
       state.effortId = effort;
       state.effortFile = effortBundle.file;
+    } else if (state.effortFile) {
+      const refreshed = await loadEffortPlanFile(join(EFFORTS_DIR, state.effortFile));
+      if (refreshed) {
+        state.effortPlan = refreshed.plan;
+        state.effortFile = refreshed.file;
+      }
     } else if (state.effortId != null) {
       const refreshed = await loadEffortPlan(state.effortId);
       if (refreshed) {
@@ -4265,7 +4351,14 @@ async function main() {
     // take effect on the next cycle without needing --resume. The doc
     // is re-spliced into every agent prompt anyway; only the in-memory
     // copy needs to refresh.
-    if (state.effortId != null) {
+    if (state.effortFile) {
+      const refreshed = await loadEffortPlanFile(join(EFFORTS_DIR, state.effortFile));
+      if (refreshed && refreshed.plan !== state.effortPlan) {
+        state.effortPlan = refreshed.plan;
+        state.effortFile = refreshed.file;
+        console.log(clr("1;36", `  Effort plan reloaded (${refreshed.file}, ${refreshed.plan.length} chars)`));
+      }
+    } else if (state.effortId != null) {
       const refreshed = await loadEffortPlan(state.effortId);
       if (refreshed && refreshed.plan !== state.effortPlan) {
         state.effortPlan = refreshed.plan;
