@@ -167,7 +167,6 @@ const required_shader_files = [_][]const u8{
     "deinterleave.metal",
     "flash_attn.metal",
     "kv_cache_write.metal",
-    "rope_batched_kv_q8.metal",
     "rope_fused.metal",
     "sigmoid_mul.metal",
     "swiglu.metal",
