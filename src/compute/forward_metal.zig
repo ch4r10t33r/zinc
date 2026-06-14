@@ -3653,6 +3653,16 @@ const RopeBatchedPush = extern struct {
     attn_scale_bits: u32,
 };
 
+/// Push constants for `rope_batched_kv_q8.metal`.
+const RopeBatchedKvQ8Push = extern struct {
+    stride: u32,
+    rope_dim: u32,
+    n_kv_heads: u32,
+    position_base: u32,
+    freq_base_bits: u32,
+    dst_offset_bytes: u32,
+};
+
 /// Push constants for flash_attn_batched — mirrors BatchedFlashAttnPush in
 /// src/shaders/metal/flash_attn_batched.metal.
 const BatchedFlashAttnPush = extern struct {
@@ -6066,6 +6076,7 @@ pub const InferenceEngine = struct {
     flash_attn_batched_q8_pipe: MetalPipeline,
     // Batched rotary position embedding — rotates N tokens at consecutive positions in one dispatch.
     rope_batched_pipe: MetalPipeline,
+    rope_batched_kv_q8_pipe: MetalPipeline,
 
     // Preloaded norm weight buffers (f32, GPU-accessible via UMA)
     attn_norm_bufs: []MetalBuffer,
@@ -6913,6 +6924,7 @@ pub const InferenceEngine = struct {
         self.flash_attn_batched_pipe = try loadShaderPipeline(ctx, "flash_attn_batched");
         self.flash_attn_batched_q8_pipe = try loadShaderPipeline(ctx, "flash_attn_batched_q8");
         self.rope_batched_pipe = try loadShaderPipeline(ctx, "rope_batched");
+        self.rope_batched_kv_q8_pipe = try loadShaderPipeline(ctx, "rope_batched_kv_q8");
         const q8_simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
         const q8_dual_simd_width = if (self.dmmv_q8_0_dual_pipe.thread_execution_width > 0) self.dmmv_q8_0_dual_pipe.thread_execution_width else @as(u32, 32);
         self.q8_tg_override = options.q8_tg_override orelse
@@ -7864,6 +7876,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.flash_attn_batched_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_q8_pipe);
         metal_pipeline.freePipeline(&self.rope_batched_pipe);
+        metal_pipeline.freePipeline(&self.rope_batched_kv_q8_pipe);
 
         for (0..self.config.n_layers) |i| {
             metal_buffer.freeBuffer(&self.attn_norm_bufs[i]);
@@ -15520,6 +15533,44 @@ fn dispatchKvCacheWriteBatchedQ8OnCmd(
     cmd.dispatchV2(&engine.kv_cache_write_q8_pipe, .{ n_blocks, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(KvCacheWritePush), 0);
 }
 
+/// Batched Q8 KV-cache write with K RoPE fused into the write. This mirrors
+/// llama.cpp's materialize-only-when-consumed discipline: the rotated K row is
+/// consumed only by the Q8 cache, so it never needs a temporary f32 store.
+fn dispatchRopeBatchedKvCacheWriteQ8OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    src_k: *const MetalBuffer,
+    src_v: *const MetalBuffer,
+    freq_buf: *const MetalBuffer,
+    head_dim: u32,
+    rope_dim: u32,
+    n_kv_heads: u32,
+    position_base: u32,
+    n_tokens: u32,
+    freq_base: f32,
+    use_freq_buffer: bool,
+    dst_offset_bytes: u32,
+) void {
+    const push = RopeBatchedKvQ8Push{
+        .stride = head_dim,
+        .rope_dim = rope_dim,
+        .n_kv_heads = n_kv_heads,
+        .position_base = position_base,
+        .freq_base_bits = if (use_freq_buffer) 0 else @bitCast(freq_base),
+        .dst_offset_bytes = dst_offset_bytes,
+    };
+    const bufs = [_]*const MetalBuffer{
+        src_k,
+        src_v,
+        freq_buf,
+        &engine.kv_k_cache[layer_idx],
+        &engine.kv_v_cache[layer_idx],
+    };
+    const n_blocks = n_tokens * n_kv_heads * @divTrunc(head_dim, 32);
+    cmd.dispatchV2(&engine.rope_batched_kv_q8_pipe, .{ n_blocks, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(RopeBatchedKvQ8Push), 0);
+}
+
 fn dispatchDeinterleaveOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -20798,22 +20849,58 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     }
 
     const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
-    dispatch_before = cmd.dispatch_count;
-    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
-    profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
-    recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
-
-    if (engine.kv_cache_q8) {
-        const n_blocks = n_tokens * (attn.kv_dim / 32);
-        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_blocks);
+    const can_fuse_k_rope_q8_write =
+        engine.kv_cache_q8 and
+        engine.rope_batched_kv_q8_pipe.handle != null and
+        attn.head_dim % 32 == 0 and
+        attn.rope_dim > 0 and
+        attn.rope_dim <= attn.head_dim and
+        attn.rope_dim % 2 == 0;
+    if (can_fuse_k_rope_q8_write) {
+        // Adapts llama.cpp `ggml_metal_op_encode_impl` dependency checking:
+        // this K-RoPE result has one consumer, the Q8 KV cache, so skip the
+        // temporary f32 materialization and the rope->write barrier.
+        dispatch_before = cmd.dispatch_count;
+        dispatchRopeBatchedKvCacheWriteQ8OnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
+            rope_freq_buf,
+            attn.head_dim,
+            attn.rope_dim,
+            attn.n_kv_heads,
+            0,
+            n_tokens,
+            attn.rope_freq_base,
+            attn.use_rope_freq_factors,
+            0,
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+        profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
+        });
+        recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
     } else {
-        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_tokens * attn.kv_dim);
+        dispatch_before = cmd.dispatch_count;
+        dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+        profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+        recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
+
+        if (engine.kv_cache_q8) {
+            const n_blocks = n_tokens * (attn.kv_dim / 32);
+            dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_blocks);
+        } else {
+            dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_tokens * attn.kv_dim);
+        }
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+        profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
+        });
     }
-    if (profile) |p| p.full_attn_kv_write_calls += 1;
-    profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
-        &engine.qwen_ssm_prefill_proj_qkv_buf,
-        &engine.qwen_ssm_prefill_proj_z_buf,
-    });
 
     dispatch_before = cmd.dispatch_count;
     dispatchDeinterleaveBatchedOnCmd(engine, cmd, &engine.qwen35_dense_prefill_swiglu_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, attn.head_dim, cfg.n_heads, n_tokens);
@@ -34422,6 +34509,8 @@ test "batched MoE Metal shaders compile" {
 
     var kv_cache_write_pipe = try loadShaderPipeline(ctx, "kv_cache_write");
     defer metal_pipeline.freePipeline(&kv_cache_write_pipe);
+    var rope_batched_kv_q8_pipe = try loadShaderPipeline(ctx, "rope_batched_kv_q8");
+    defer metal_pipeline.freePipeline(&rope_batched_kv_q8_pipe);
 
     var rope_pipe = try loadShaderPipeline(ctx, "rope_fused");
     defer metal_pipeline.freePipeline(&rope_pipe);
@@ -34712,6 +34801,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(deinterleave_batched_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
     try std.testing.expect(kv_cache_write_pipe.handle != null);
+    try std.testing.expect(rope_batched_kv_q8_pipe.handle != null);
     try std.testing.expect(rope_pipe.handle != null);
     try std.testing.expect(sigmoid_mul_pipe.handle != null);
     try std.testing.expect(dmmv_pipe.handle != null);
