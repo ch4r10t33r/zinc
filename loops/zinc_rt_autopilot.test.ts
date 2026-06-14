@@ -179,6 +179,51 @@ describe("M1 migration keep signals", () => {
     expect(decision.reason).toContain("performance recovery");
   });
 
+  test("rejects post-coverage slice-only widening without a throughput gain", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 34.8,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=128 direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode rows=128 chunks=2 consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=128 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 34.82,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=256 direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode rows=256 chunks=4 consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=256 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+
+    const decision = decideMigrateKeep(before, after, 34.95);
+    expect(decision.keep).toBe(false);
+  });
+
+  test("keeps post-coverage slice work when it produces a measured throughput gain", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 34.8,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=128 direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode rows=128 chunks=2 consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=128 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 34.95,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=256 direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail phase=decode rows=256 chunks=4 consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_decode_model_slices=256 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+
+    const decision = decideMigrateKeep(before, after, 34.8);
+    expect(decision.keep).toBe(true);
+    expect(decision.reason).toContain("throughput gain");
+  });
+
   test("keeps shortcut-free M1 measurement cleanup despite scalar slowdown", () => {
     const before = abBenchmark(benchmarkResult({
       decodeTps: 3.81,

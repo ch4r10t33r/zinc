@@ -246,6 +246,9 @@ const DECODE_MODEL_SLICE_MAX_TPS_REGRESSION = 0.10;
 const INCREMENTAL_DECODE_SLICE_MAX_REL_TPS_DROP = 0.003;
 const INCREMENTAL_DECODE_SLICE_MAX_ABS_TPS_DROP = 0.08;
 const INCREMENTAL_DECODE_SLICE_MAX_BEST_TPS_DROP = 0.20;
+const POST_COVERAGE_PIVOT_MIN_DECODE_SLICES = 64;
+const POST_COVERAGE_MIN_ABS_TPS_GAIN_KEEP = 0.10;
+const POST_COVERAGE_REL_TPS_GAIN_KEEP = 0.003;
 const SHORTCUT_FREE_MAX_TPS_REGRESSION = 0.20;
 const HARD_PIVOT_STALL_CYCLES = 8;
 const AGENT_TIMEOUT_MS = 3_600_000; // 1h — M0 layer-lowering cycles can be substantial
@@ -1621,6 +1624,29 @@ function incrementalDecodeSliceEnvelopeOk(
   return true;
 }
 
+function postCoveragePivotActive(output: string): boolean {
+  return (
+    isShortcutFreeZincRtOutput(output) &&
+    maxPositiveCounter(output, ["direct_decode_model_slices", "direct_decode_model_ops"]) >=
+      POST_COVERAGE_PIVOT_MIN_DECODE_SLICES
+  );
+}
+
+function postCoverageThroughputGainOk(before: ABBenchmark, after: ABBenchmark): boolean {
+  if (!migrationEvidenceQualityOk(before, after)) return false;
+  if (!hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput)) return false;
+
+  const beforeRt = before.zinc_rt.decodeTps;
+  const afterRt = after.zinc_rt.decodeTps;
+  if (beforeRt == null || afterRt == null) return false;
+
+  const requiredGain = Math.max(
+    POST_COVERAGE_MIN_ABS_TPS_GAIN_KEEP,
+    beforeRt * POST_COVERAGE_REL_TPS_GAIN_KEEP,
+  );
+  return afterRt >= beforeRt + requiredGain;
+}
+
 function hasMigratePerformanceRecovery(before: ABBenchmark, after: ABBenchmark, migrateBestRt: number | null): boolean {
   if (migrateBestRt == null) return false;
   if (!migrationEvidenceQualityOk(before, after)) return false;
@@ -1686,14 +1712,19 @@ export function decideMigrateKeep(before: ABBenchmark, after: ABBenchmark, migra
   }
   if (hasNewDirectDecodeModelSliceSignal(before, after)) {
     const hadDecodeSlice = hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput);
+    const postCoveragePivot = hadDecodeSlice && postCoveragePivotActive(before.zinc_rt.runOutput);
     const envelopeOk = hadDecodeSlice
-      ? incrementalDecodeSliceEnvelopeOk(before, after, migrateBestRt)
+      ? (postCoveragePivot
+        ? postCoverageThroughputGainOk(before, after)
+        : incrementalDecodeSliceEnvelopeOk(before, after, migrateBestRt))
       : migrationEvidenceEnvelopeOk(before, after, DECODE_MODEL_SLICE_MAX_TPS_REGRESSION);
     if (envelopeOk) {
       return {
         keep: true,
         reason: hadDecodeSlice
-          ? "new consumed decode-phase direct model-slice signal within performance envelope"
+          ? (postCoveragePivot
+            ? "post-coverage direct model-slice throughput gain"
+            : "new consumed decode-phase direct model-slice signal within performance envelope")
           : "new consumed decode-phase direct model-slice signal",
       };
     }
@@ -1832,6 +1863,13 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
     lines.push(`- Performance recovery gap: this run already has ${directDecodeSlices} consumed decode model slices and shortcut-free output, but throughput is ${currentRt.toFixed(1)} tok/s vs best ${bestRt.toFixed(1)}. Stop widening coverage by default; recover tok/s by reducing low-yield slice overhead, batching expensive slice submissions, or narrowing debug/validation coverage while keeping a real consumed decode slice.`);
   }
 
+  if (
+    directDecodeSlices >= POST_COVERAGE_PIVOT_MIN_DECODE_SLICES &&
+    isShortcutFreeZincRtOutput(before.zinc_rt.runOutput)
+  ) {
+    lines.push(`- Post-coverage gap: ${directDecodeSlices} consumed shortcut-free decode slices are enough proof that M1 slices work. More row widening is useful only if it removes enough CPU work per fence to raise tok/s; prefer batching multiple slices/submissions, reducing validation overhead, or making broad coverage debug-only.`);
+  }
+
   return lines.length > 0 ? lines.map((line) => `  ${line}`).join("\n") : "  (none detected)";
 }
 
@@ -1896,6 +1934,10 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
     directDecodeSlices > 0 &&
     isShortcutFreeZincRtOutput(before.zinc_rt.runOutput) &&
     currentRt < bestRt - Math.max(0.5, bestRt * 0.015);
+  const postCoverageThroughputMode =
+    phase === "migrate" &&
+    directDecodeSlices >= POST_COVERAGE_PIVOT_MIN_DECODE_SLICES &&
+    isShortcutFreeZincRtOutput(before.zinc_rt.runOutput);
 
   // Decide milestone hint based on observable state
   let milestoneHint = "";
@@ -2153,6 +2195,23 @@ Next useful work must do one of these:
       "Do not widen router/SSM/attention/LM-head coverage just to increase `direct_decode_model_slices`; the harness will reject incremental slice-only changes that fall materially below the best tok/s checkpoint.",
       "",
     ] : []),
+    ...(postCoverageThroughputMode ? [
+      "## Post-Coverage Throughput Pivot",
+      "",
+      `The current tree already has ${directDecodeSlices} consumed, shortcut-free decode model slices. That is enough M1 evidence; the next cycles must be about making those slices efficient enough to beat ${baselineLabel}.`,
+      "",
+      "The harness now treats extra slice coverage as a cost unless it moves throughput. A pure widening change such as 256→512 rows, a new verifier, or a higher recurring cadence should be rejected unless the 96-token A/B median improves by a measurable amount.",
+      "",
+      "Preferred work:",
+      "- batch multiple MoE/router/LM-head slices into one CS submission and one fence;",
+      "- replace larger CPU matvec regions per existing fence instead of adding more fences;",
+      "- make validation-only or broad coverage paths debug/env gated so the default path is faster;",
+      "- measure candidate env knobs before changing defaults, and keep only the faster default;",
+      "- report a measured-dead result if a proposed direct slice is slower because fence/setup overhead dominates.",
+      "",
+      `Keep threshold for incremental slice-only work in this mode: zinc_rt must improve by at least ${POST_COVERAGE_MIN_ABS_TPS_GAIN_KEEP.toFixed(2)} tok/s or ${(POST_COVERAGE_REL_TPS_GAIN_KEEP * 100).toFixed(1)}% over the cycle's before sample. Flat coverage-only changes are not progress toward beating ${baselineLabel}.`,
+      "",
+    ] : []),
     "## Rules",
     "",
     `1. Make ONE focused change toward beating ${baselineLabel}. ${phase === "migrate" ? "Correctness/coherent output > tok/s — fix the broken path first." : "Tok/s > everything else."}`,
@@ -2160,7 +2219,7 @@ Next useful work must do one of these:
       "   MIGRATE progress must be exercised by the current benchmark or by a new harness-visible validation gate.",
       "   Do not add standalone future packet/building-block code unless this cycle also wires it into executed forward progress or a failing/passing validation gate.",
       "   If the verified graph is not lowered, prefer lowering the smallest real executed slice over adding another verifier.",
-      "   After shortcut-free consumed decode slices already exist, incremental coverage is keepable only if tok/s stays close to the best checkpoint or improves from the current sample.",
+      `   After ${POST_COVERAGE_PIVOT_MIN_DECODE_SLICES}+ shortcut-free consumed decode slices already exist, incremental coverage is keepable only if it produces a measured tok/s gain; prefer batching/fewer fences/default-fast paths over more rows.`,
     ] : []),
     "2. Before printing the final `@@@` markers, self-verify changed files on the remote. Run repo-root `.env` + rsync + the exact build gates:",
     "   `set -a; source .env; set +a`",
