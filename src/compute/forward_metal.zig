@@ -903,6 +903,18 @@ fn qwen35DenseSsmResourceBarriersEnabled(cfg: ModelConfig, in_prefill_phase: boo
         (in_prefill_phase and defaultQwen35Dense9bQueuedPrefillEnabled(cfg));
 }
 
+fn qwen35Dense9bPrefillMaterializedTokens(cfg: ModelConfig, prompt_len: usize) usize {
+    const capped = @min(prompt_len, @as(usize, qwen_ssm_projection_prefill_max_tokens));
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return capped;
+
+    // The current Q4_K/Q6_K prompt GEMM tile is 32 token columns wide. For the
+    // public 33-40 token band, a full-prompt prefix records a second wide tile
+    // that mostly computes unused columns. Materialize one full tile and let
+    // the short tail use the validated token path.
+    if (capped > 32 and capped <= 40) return 32;
+    return capped;
+}
+
 fn shouldUseDenseQwen35QueuedPrefillTokenCommand(cfg: ModelConfig, in_prefill_phase: bool, has_embed_override: bool) bool {
     return in_prefill_phase and has_embed_override and defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
 }
@@ -21224,7 +21236,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const d_inner = cfg.ssm_d_inner;
     const dt_rank = cfg.ssm_dt_rank;
     const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
-    const n_tokens: u32 = @min(qwen_ssm_projection_prefill_max_tokens, @as(u32, @intCast(prompt_len)));
+    const n_tokens: u32 = @intCast(qwen35Dense9bPrefillMaterializedTokens(cfg, prompt_len));
     const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
     const shexp_inter_dim: u32 = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
     const lt = engine.layer_tensors[0];
@@ -33494,17 +33506,21 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     const qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 36, null);
     try std.testing.expectEqual(@as(usize, 36), qwen_base);
     try std.testing.expectEqual(@as(usize, 36), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 36));
 
     const nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 33, null);
     try std.testing.expectEqual(@as(usize, 33), nearby_qwen_base);
     try std.testing.expectEqual(@as(usize, 33), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 33));
 
     const upper_nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 40, null);
     try std.testing.expectEqual(@as(usize, 40), upper_nearby_qwen_base);
     try std.testing.expectEqual(@as(usize, 40), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 40));
 
     const outside_balanced_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 41, null);
     try std.testing.expectEqual(@as(usize, 16), outside_balanced_qwen_base);
+    try std.testing.expectEqual(@as(usize, 41), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 41));
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 0, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 16, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 9), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 32, outside_balanced_qwen_base, false));
