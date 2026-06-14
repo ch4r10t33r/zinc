@@ -60,7 +60,7 @@ ZINC_MODEL_ID=qwen35-9b-q4k-m \
 ZINC_METRIC_MODE=prefill \
 ZINC_PROMPT_MODE=raw \
 ZINC_TEST_PROMPT="$PROMPT" \
-ZINC_REFERENCE_TEXT=tok/s \
+ZINC_REFERENCE_TEXT="tokens per second" \
 ZINC_MAX_TOKENS=96 \
 ZINC_MIN_DECODE_TOKENS=32 \
 ZINC_TARGET_TOK_PER_SEC=333 \
@@ -90,7 +90,7 @@ ZINC_MODEL_ID=qwen35-9b-q4k-m \
 ZINC_METRIC_MODE=prefill \
 ZINC_PROMPT_MODE=raw \
 ZINC_TEST_PROMPT="$PROMPT" \
-ZINC_REFERENCE_TEXT=tok/s \
+ZINC_REFERENCE_TEXT="tokens per second" \
 ZINC_MAX_TOKENS=96 \
 ZINC_MIN_DECODE_TOKENS=32 \
 ZINC_BENCHMARK_RUNS=3 \
@@ -107,6 +107,13 @@ Current public numbers:
 - decode: about `29 tok/s`
 - llama.cpp prefill: `79-445 tok/s` depending on prompt scenario
 - llama.cpp decode: about `57-58 tok/s`
+
+Harness correctness sentinel:
+
+- Use `ZINC_REFERENCE_TEXT="tokens per second"`.
+- Do not use the literal `tok/s` as the sentinel. The baseline answer is
+  semantically correct but may phrase the unit as `tokens per second`, and the
+  loop should not route a valid baseline into rollback/correctness-repair mode.
 
 Milestones:
 
