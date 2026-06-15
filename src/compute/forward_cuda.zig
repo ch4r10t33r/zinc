@@ -253,10 +253,10 @@ const Pipelines = struct {
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
-    dmmv_q4k_btok: [7]CudaPipeline,
-    dmmv_q6k_btok: [7]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec
-    dmmv_q5k_btok: [7]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
-    dmmv_q8_0_btok: [7]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
+    dmmv_q4k_btok: [15]CudaPipeline, // Effort 28: token-batch matvec B=2..16 (idx B-2)
+    dmmv_q6k_btok: [15]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec
+    dmmv_q5k_btok: [15]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
+    dmmv_q8_0_btok: [15]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
@@ -586,22 +586,18 @@ pub const ForwardCuda = struct {
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
-        // Effort 28: Q4_K token-batch matvec instantiations (B=2..8 → idx B-2).
-        pipes.dmmv_q4k_btok[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok2");
-        pipes.dmmv_q4k_btok[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok3");
-        pipes.dmmv_q4k_btok[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok4");
-        pipes.dmmv_q4k_btok[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok5");
-        pipes.dmmv_q4k_btok[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok6");
-        pipes.dmmv_q4k_btok[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok7");
-        pipes.dmmv_q4k_btok[6] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok8");
-        // Effort 28: Q6_K/Q5_K/Q8_0 token-batch matvecs (B=2..8, idx B-2) — qwen
-        // residual O-proj/FFN-down on some layers are not Q4_K → cover them too.
-        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8" }, 0..) |suf, i| {
+        // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
+        // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
+        // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
+        // the old 8-cap into the higher-concurrency serving regime (btok stays
+        // bandwidth-bound to the ~B≈27 roofline crossover vs the padded tile GEMM).
+        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16" }, 0..) |suf, i| {
+            pipes.dmmv_q4k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok" ++ suf);
             pipes.dmmv_q6k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_btok" ++ suf);
             pipes.dmmv_q5k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_btok" ++ suf);
             pipes.dmmv_q8_0_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_btok" ++ suf);
         }
-        log.info("nvrtc: compiled {d} kernel pipelines", .{38});
+        log.info("nvrtc: compiled {d} kernel pipelines", .{70});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -1101,7 +1097,7 @@ pub const ForwardCuda = struct {
         defer self.decode_b1 = false;
         // Small-B (2..8) Q4_K token-batch matvec fast path (opt-in). `defer` clears
         // it so an early-return error never leaks the flag past this call.
-        self.decode_mrow = (B >= 2 and B <= 8) and (self.decode_mrow_force orelse mrowMatvecOn());
+        self.decode_mrow = (B >= 2 and B <= 16) and (self.decode_mrow_force orelse mrowMatvecOn());
         defer self.decode_mrow = false;
         // MoE shared-expert batching RIDES the btok path: batching the dense shared
         // expert over B rows is only a win when the batched GEMM is the bandwidth-
@@ -1340,7 +1336,7 @@ pub const ForwardCuda = struct {
         // (a_offset/x_offset/y_offset 0), and the kernel honors acc_mode for the
         // residual GEMMs (O-proj / FFN-down / SSM-out). Reads each weight row once,
         // amortizing the dequant over the B tokens → bandwidth-bound, no tile waste.
-        if (self.decode_mrow and B >= 2 and B <= 8) {
+        if (self.decode_mrow and B >= 2 and B <= 16) {
             // Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
             // O-proj/FFN-down/SSM-out on mixed-quant layers. Each btok is
             // bit-identical-per-row to its *_fast matvec → token-identical decode.

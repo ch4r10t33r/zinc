@@ -173,10 +173,10 @@ const Pipelines = struct {
     rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
-    dmmv_q4k_btok: [7]CudaPipeline, // Effort 28: small-B (2..8) token-batch matvec
-    dmmv_q6k_btok: [7]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec (gemma ffn_down)
-    dmmv_q5k_btok: [7]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
-    dmmv_q8_0_btok: [7]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
+    dmmv_q4k_btok: [15]CudaPipeline, // Effort 28: token-batch matvec B=2..16 (idx B-2)
+    dmmv_q6k_btok: [15]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec (gemma ffn_down)
+    dmmv_q5k_btok: [15]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
+    dmmv_q8_0_btok: [15]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
     dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
@@ -509,18 +509,13 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
-        // Effort 28: small-B token-batch Q4_K matvec (B=2..8), pipeline idx B-2.
-        pipes.dmmv_q4k_btok[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok2");
-        pipes.dmmv_q4k_btok[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok3");
-        pipes.dmmv_q4k_btok[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok4");
-        pipes.dmmv_q4k_btok[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok5");
-        pipes.dmmv_q4k_btok[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok6");
-        pipes.dmmv_q4k_btok[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok7");
-        pipes.dmmv_q4k_btok[6] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok8");
-        // Effort 28: Q6_K/Q5_K/Q8_0 token-batch matvecs (B=2..8, idx B-2) — the
-        // non-Q4_K decode GEMMs (gemma-31b ffn_down is Q6_K) otherwise hit the
-        // tile-padding GEMM at small B.
-        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8" }, 0..) |suf, i| {
+        // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
+        // quant — the non-Q4_K decode GEMMs (gemma-31b ffn_down is Q6_K) otherwise
+        // hit the tile-padding GEMM at small B. B=9..16 extends btok past the old
+        // 8-cap into the higher-concurrency serving regime (btok stays bandwidth-
+        // bound to the ~B≈27 roofline crossover vs the padded tile GEMM).
+        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16" }, 0..) |suf, i| {
+            pipes.dmmv_q4k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok" ++ suf);
             pipes.dmmv_q6k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_btok" ++ suf);
             pipes.dmmv_q5k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_btok" ++ suf);
             pipes.dmmv_q8_0_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_btok" ++ suf);
@@ -1190,7 +1185,7 @@ pub const ForwardGemma = struct {
         // Effort 28: small-B Q4_K token-batch matvec for 2≤B≤8 (opt-in, default-off;
         // see `gemmDispatchA`). `defer` clears it so an early-return error never
         // leaks the flag into a later prefillBatched (which never sets it).
-        self.decode_mrow = (B >= 2 and B <= 8) and (self.decode_mrow_force orelse mrowMatvecOn());
+        self.decode_mrow = (B >= 2 and B <= 16) and (self.decode_mrow_force orelse mrowMatvecOn());
         defer self.decode_mrow = false;
 
         // Mirror prefillBatched's GEMM knobs so the batched projections/FFN take
@@ -1370,7 +1365,7 @@ pub const ForwardGemma = struct {
         // bandwidth-bound, no tile waste, bit-identical to dmmv_q4k_fast per row.
         // Skip when the normf16 opt-in staged the fp16 norm into act_f16 instead of
         // materializing the f32 x this kernel reads (a_preconv & use_tc_normf16).
-        if (self.decode_mrow and T >= 2 and T <= 8 and !(a_preconv and self.use_tc_normf16)) {
+        if (self.decode_mrow and T >= 2 and T <= 16 and !(a_preconv and self.use_tc_normf16)) {
             // Q4_K covers proj/gate/up; Q6_K covers gemma-31b's ffn_down; Q5_K/Q8_0
             // cover other mixed-quant dense weights. All bit-identical-per-row to
             // their *_fast matvec → token-identical to the serial decode path.
