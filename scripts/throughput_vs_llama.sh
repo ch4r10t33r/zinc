@@ -14,6 +14,17 @@
 # Root cause: zinc's batched-decode kernel is compute-INEFFICIENT (100% util at B=8
 # but only 4.5 tok/s) — no CUDA-graph capture + dequant-in-loop GEMM. Architecture
 # scales; the per-step kernel is the bottleneck (same gap Effort 26 found in prefill).
+#
+# SHARED-BOX NOTE (2026-06-15): while Effort-27 runs, it holds a CUDA context on the
+# 5090 CONTINUOUSLY → every round here tags CONTENDED and the GATE VERDICT prints
+# BLOCKED (0 clean). Confirmed live this date: ZINC0/ZINCM/llama all 5 rounds
+# contended, medians empty. To run the flip gate co-tenant-safely WITHOUT a clean
+# window: use the SMALL model `MODEL=$HOME/workspace/Qwen3.5-9B-Q4_K_M.gguf` (~5GB —
+# fits alongside e27's 16GB gemma-26b under the 24GB cap; reloads ~15s not ~45s, far
+# lower WSL2-wedge risk than gemma-31b's 17GB). The ZINCM-vs-ZINC0 flip decision does
+# NOT need llama (llama may not support qwen35's hybrid-SSM), but a TRUSTWORTHY result
+# still needs a clean 5090 window — the contention guard only EXCLUDES garbage, it
+# can't manufacture clean rounds. Flip ZINC_BATCH_MROW default-on only on a CLEAN run.
 set -u
 GPU=${ZINC_GPU:-GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350}
 ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
@@ -83,4 +94,14 @@ awk '/CONTENDED/{next}
      { split($2,a,"="); B=a[2]; split($3,c,"="); v=c[2]; key=$1" B="B; n[key]++; val[key,n[key]]=v }
      END{ for(k in n){ m=n[k]; for(i=1;i<=m;i++){ for(j=i+1;j<=m;j++){ if(val[k,j]<val[k,i]){t=val[k,i];val[k,i]=val[k,j];val[k,j]=t} } }
           med=(m%2)?val[k,(m+1)/2]:(val[k,m/2]+val[k,m/2+1])/2; printf "%-7s median_ext_agg_tok/s=%.2f (n=%d)\n", k, med, m } }' "$OUT" | sort
+# Self-reporting GATE VERDICT: when EVERY round is CONTENDED the medians awk above
+# (which skips CONTENDED rows) emits NOTHING — silently empty, ambiguous with a
+# crash. This makes the gate state explicit so the flip decision is never read off
+# garbage: BLOCKED (no clean data → re-run in a clean 5090 window) vs USABLE.
+echo "=== GATE VERDICT ==="
+awk '/ext_agg_tok\/s/{tot++; if(/CONTENDED/)cont++; else clean++}
+     END{ tot=tot+0; clean=clean+0; cont=cont+0;
+          if(clean==0) printf "BLOCKED: %d/%d rounds CONTENDED (foreign compute on the 5090, e.g. Effort-27), 0 clean — medians above are EMPTY, do NOT flip; re-run in a clean 5090 window.\n", cont, tot;
+          else if(cont>0) printf "USABLE-PARTIAL: %d/%d rounds clean (%d excluded as CONTENDED) — medians above are clean-only.\n", clean, tot, cont;
+          else printf "CLEAN: all %d rounds uncontended — medians above are fully trustworthy.\n", tot }' "$OUT"
 echo "=== TPVL DONE ==="
