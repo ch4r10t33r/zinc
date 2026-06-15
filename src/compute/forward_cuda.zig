@@ -237,6 +237,10 @@ const Pipelines = struct {
     // Effort 28 4c: batched-decode GEMM (one weight read amortized over B rows).
     gemm: [4]CudaPipeline, // q4k, q5k, q6k, q8_0 tiled_v2
     gemm_f32: CudaPipeline, // f32 weights (e.g. some ssm projections)
+    // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
+    // Reads each weight row once + amortizes the dequant over B tokens, dodging
+    // the 64-tile padding waste of the batched GEMM at small B (opt-in).
+    dmmv_q4k_btok: [7]CudaPipeline,
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
@@ -374,6 +378,16 @@ pub const ForwardCuda = struct {
     // for an in-process A/B (null → env default).
     decode_b1: bool = false,
     decode_b1_force: ?bool = null,
+    // Effort 28: at small batch B (2..8) the 64×64 batched GEMM wastes 56-62/64
+    // row-slots and goes compute-bound on tile padding (head-to-head: B=8 100%
+    // util, slow). Set true in `decodeBatch` for 2≤B≤8 when `mrowMatvecOn()`
+    // (opt-in, ZINC_BATCH_MROW=1); routes Q4_K projection/FFN GEMMs through the
+    // token-batch matvec (`dmmv_q4k_btok`, weight read once + dequant amortized
+    // over B → bandwidth-bound). Never set by `decodeStep`/`prefillStep`.
+    // `decode_mrow_force` (harness-only) overrides the env gate for an in-process
+    // A/B (null → env default).
+    decode_mrow: bool = false,
+    decode_mrow_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -492,7 +506,15 @@ pub const ForwardCuda = struct {
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{31});
+        // Effort 28: Q4_K token-batch matvec instantiations (B=2..8 → idx B-2).
+        pipes.dmmv_q4k_btok[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok2");
+        pipes.dmmv_q4k_btok[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok3");
+        pipes.dmmv_q4k_btok[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok4");
+        pipes.dmmv_q4k_btok[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok5");
+        pipes.dmmv_q4k_btok[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok6");
+        pipes.dmmv_q4k_btok[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok7");
+        pipes.dmmv_q4k_btok[6] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok8");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{38});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -632,6 +654,8 @@ pub const ForwardCuda = struct {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+                for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
             } else {
                 pipeline.freePipeline(&@field(self.pipes, f.name));
             }
@@ -957,6 +981,10 @@ pub const ForwardCuda = struct {
         // the flag past this call (production decodeStep/prefillStep never set it).
         self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
         defer self.decode_b1 = false;
+        // Small-B (2..8) Q4_K token-batch matvec fast path (opt-in). `defer` clears
+        // it so an early-return error never leaks the flag past this call.
+        self.decode_mrow = (B >= 2 and B <= 8) and (self.decode_mrow_force orelse mrowMatvecOn());
+        defer self.decode_mrow = false;
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -1078,6 +1106,15 @@ pub const ForwardCuda = struct {
         // (q4k/q5k/q6k/q8_0/f32). Only set on a B==1 decodeBatch step.
         if (B == 1 and self.decode_b1) {
             self.dmmvDispatch(cmd, w, x, y, M, K, acc_mode, 0);
+            return;
+        }
+        // Effort 28: small-B Q4_K token-batch matvec. x/y are token-major [B,*]
+        // (a_offset/x_offset/y_offset 0), and the kernel honors acc_mode for the
+        // residual GEMMs (O-proj / FFN-down / SSM-out). Reads each weight row once,
+        // amortizing the dequant over the B tokens → bandwidth-bound, no tile waste.
+        if (self.decode_mrow and B >= 2 and B <= 8 and w.info.type_ == .q4_k) {
+            const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode };
+            cmd.dispatch(&self.pipes.dmmv_q4k_btok[B - 2], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
             return;
         }
         const idx = dmmvIdx(w.info.type_);
@@ -1895,6 +1932,15 @@ fn b1MatvecOn() bool {
     const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the small-B (2..8) Q4_K token-batch matvec is OPT-IN (default OFF,
+// enable ZINC_BATCH_MROW=1/on/true/yes). Default-off keeps the validated batched
+// GEMM path the serving default until the throughput win is confirmed.
+fn mrowMatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
+        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
 
 fn isFullAttn(L: u32, interval: u32) bool {

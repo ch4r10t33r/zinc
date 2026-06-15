@@ -1661,6 +1661,74 @@ __device__ __forceinline__ void dmmv_q4k_mrow_impl(const unsigned* a_u32, const 
 extern "C" __global__ void dmmv_q4k_mr2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<2>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_mr4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<4>(a_u32, x, y, pc); }
 
+// ---- dmmv_q4k_btok (Effort 28) — token-BATCH matvec: read ONE weight row once,
+// reuse its dequant across B token x-vectors -> B outputs. The TRANSPOSE of
+// dmmv_q4k_mrow (which reads one x across R weight rows). Targets batched DECODE
+// at small B (2..8): the 64x64 gemm_q4k_tiled_v2 wastes 56-62/64 row-slots and
+// goes COMPUTE-bound on tile padding (head-to-head: B=8 100% util, slow). This
+// reads each Q4_K weight row ONCE (the dominant decode traffic) and amortizes the
+// dequant across the B tokens -> bandwidth-bound, no tile waste. x token-major
+// [B,K], y token-major [B,M]. Same Q4_K dequant arithmetic as dmmv_q4k_fast
+// (bit-exact); per-token reduction matches dmmv_q4k_fast so btok at row b ==
+// dmmv_q4k_fast on x[b] (the B==1 path) bit-for-bit -> ARGMAX-identical to gemm.
+template<int B>
+__device__ __forceinline__ void dmmv_q4k_btok_impl(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u;
+    unsigned ngrp = blockDim.x >> 4;
+    unsigned a0 = (pc.a_offset >> 2), xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) sum[b] = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        // weight superblock for `row` — read + dequant ONCE, reuse across B tokens.
+        unsigned blk = a0 + row * bpr * 36u + i * 36u;
+        unsigned dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+        float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+        unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+        unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+        float f0 = d*(float)(s0&0x3Fu), b0 = dm*(float)(s1&0x3Fu);
+        float f1 = d*(float)((s0>>8)&0x3Fu), b1 = dm*(float)((s1>>8)&0x3Fu);
+        float f2 = d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2 = dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3 = d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3 = dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        unsigned bidx = (i * 256u + y_loc) >> 2, bidx2 = (i * 256u + y_loc + 128u) >> 2;
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            const float4* xv = (const float4*)(x + (unsigned)b * pc.K + xo);
+            float4 by0 = xv[bidx], by1 = xv[bidx + 8u], by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+            float s = 0.0f;
+            s += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+            s += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+            s += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+            s += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+            sum[b] += s;
+        }
+    }
+    #pragma unroll
+    for (int b = 0; b < B; b++) {
+        float t = zinc_block_reduce_sum(sum[b]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)b * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += t; else y[yi] = t;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q4k_btok2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<2>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok3(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<3>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<4>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok5(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<5>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok6(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<6>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok7(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<7>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok8(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<8>(a_u32, x, y, pc); }
+
 // ---- dmmv_q5k multi-row (perf research, agenda 1: extend mr2 to Q5_K) --------
 // One block computes R=2 output rows; each shared x-superblock loaded once and
 // reused across both rows. Same Q5_K dequant as dmmv_q5k_fast (qh 5th-bit
