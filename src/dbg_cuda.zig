@@ -499,8 +499,8 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                 return;
             };
             std.debug.print("SLOTSTATE_SMOKE:{s} (slots={d} slot_ctx={d})\n", .{ if (ok) "ok" else "FAIL", slots_n, slot_ctx });
-            if (nseq == 0 or q.d.n_experts > 0) {
-                std.debug.print("BATCHDEC:skip ({s})\n", .{if (q.d.n_experts > 0) "MoE — qwen batched decode is sub-step 4d" else "no sequences"});
+            if (nseq == 0) {
+                std.debug.print("BATCHDEC:skip (no sequences)\n", .{});
                 return;
             }
 

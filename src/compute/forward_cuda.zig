@@ -855,7 +855,9 @@ pub const ForwardCuda = struct {
     /// trivially token-identical to N isolated single-sequence runs — proving the
     /// per-slot KV + SSM conv/recurrent isolation and per-seq positions. Batching
     /// the projections/FFN over B rows + fusing the per-seq attention/SSM kernels
-    /// (the throughput win) is sub-step 4c. MoE (qwen36) is 4d → `error.Unsupported`.
+    /// (the throughput win) is sub-step 4c. MoE (qwen36) FFN is sub-step 4d: the
+    /// per-layer FFN runs `moeFfnBlockBatchedDecode` (per-row MoE, verbatim block
+    /// math -> token-identical) when `n_experts>0`, else `ffnBlockBatchedDecode`.
     ///
     /// Requires `allocSlotState(n_slots, slot_ctx)` with n_slots > max(slots) and
     /// slot_ctx > max(positions). Each sequence b's slot must already hold its
@@ -869,7 +871,6 @@ pub const ForwardCuda = struct {
     pub fn decodeBatch(self: *ForwardCuda, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
         const d = self.d;
         const ctx = self.ctx;
-        if (d.n_experts > 0) return error.Unsupported; // dense qwen35; MoE is 4d
         if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
         const B: u32 = @intCast(tokens.len);
         std.debug.assert(positions.len == B and slots.len == B and out.len == B);
@@ -925,7 +926,7 @@ pub const ForwardCuda = struct {
             } else {
                 try self.ssmLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf);
             }
-            try self.ffnBlockBatchedDecode(L, B, db);
+            if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
         }
 
         // TAIL per row: rms_norm → LM head → argmax → out[bi]. Reuse single-row scratch.
@@ -1122,6 +1123,127 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
         self.gemmDispatch(&cmd, wdown, &db.swiglu, &db.hidden, d.n_embd, d.n_ff, B, 1);
         cmd.commitAndWait();
+    }
+
+    /// 4d: batched-decode MoE FFN block (qwen36-35b-a3b). The MoE FFN is STATELESS
+    /// (no KV, no SSM recurrent state — it reads `hidden`, routes to experts, and
+    /// accumulates the routed + shared-expert output back into `hidden`), so unlike
+    /// the attention/SSM blocks it needs NO per-slot state and NO per-seq position.
+    /// Each of the B rows is therefore an independent single-token MoE FFN: loop the
+    /// rows, aliasing row b's slice of `db.hidden`, and run the production block math
+    /// VERBATIM on it via `moeFfnRowDecode` (so batched == N-serial token-identical
+    /// by construction). The per-row scratch (`ffn_norm_buf`/`gate_buf`/… and the
+    /// host expert-id readback) is shared across rows, so each row runs to
+    /// completion (`waitPending`) before the next reuses it. Fusing the per-row MoE
+    /// over B rows (router GEMM [B,n_experts] + `build_expert_order` over B·n_used)
+    /// is a later throughput sub-step; this first establishes correctness (mirrors
+    /// 4b → 4c for attention/SSM). Production `moeFfnBlock`/`decodeStep` UNTOUCHED.
+    fn moeFfnBlockBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
+            try self.moeFfnRowDecode(L, &hrow);
+        }
+    }
+
+    /// Per-row MoE FFN: the production `moeFfnBlock` body VERBATIM but reading/
+    /// accumulating into the caller's `hidden_row` (a `db.hidden` row alias) instead
+    /// of the single-seq `self.hidden`, and run SYNCHRONOUSLY (`waitPending` at the
+    /// end) so the shared per-row scratch is safe to reuse for the next row. Keeping
+    /// this a separate verbatim copy leaves production `moeFfnBlock` byte-identical.
+    fn moeFfnRowDecode(self: *ForwardCuda, L: u32, hidden_row: *const CudaBuffer) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // expert_ff = intermediate_dim
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [hidden, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight"); // stacked [hidden, ef, n_experts]
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight"); // stacked [ef, hidden, n_experts]
+
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
+
+        // --- Router: rms_norm → logits → top-k softmax. -----------------------
+        {
+            var cmd = try command.beginCommand(ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ hidden_row, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            self.dmmvDispatch(&cmd, wrouter, &self.ffn_norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            if (batched_experts) {
+                self.submit(cmd); // async: experts read the ids GPU-side, no readback
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers the ids next
+                self.drainPending();
+            }
+        }
+
+        if (!batched_experts) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        }
+
+        // --- Routed experts → SwiGLU → down, slot-major into down_buf.
+        {
+            var cmd = try command.beginCommand(ctx);
+            if (batched_experts) {
+                const nrows_gu = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &self.ffn_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &self.ffn_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sg = SwigluPush{ .N = nrows_gu };
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router_ids[j];
+                    self.dmmvDispatch(&cmd, wge, &self.ffn_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                    self.dmmvDispatch(&cmd, wue, &self.ffn_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                    cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
+                }
+            }
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            self.submit(cmd);
+        }
+
+        // --- Shared expert: gate/up/SwiGLU/down, scaled by sigmoid(gate logit).
+        {
+            const wgs = self.layer(L, "ffn_gate_shexp.weight");
+            const wus = self.layer(L, "ffn_up_shexp.weight");
+            const wds = self.layer(L, "ffn_down_shexp.weight");
+            const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [hidden, 1] F32
+            const sf = d.shexp_ff;
+            var cmd = try command.beginCommand(ctx);
+            self.dmmvDispatch(&cmd, wgs, &self.ffn_norm_buf, &self.gate_buf, sf, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wus, &self.ffn_norm_buf, &self.up_buf, sf, d.n_embd, 0, 0);
+            const sg = SwigluPush{ .N = sf };
+            cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+            self.dmmvDispatch(&cmd, wgi, &self.ffn_norm_buf, &self.gate_scalar_buf, 1, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wds, &self.swiglu_buf, &self.down_buf, d.n_embd, sf, 0, 0);
+            const ss = SigmoidAccPush{ .N = d.n_embd };
+            cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.gate_scalar_buf }, &ss, @sizeOf(SigmoidAccPush), 0);
+            self.submit(cmd);
+        }
+        self.waitPending(); // sync: shared per-row scratch reused by the next row
     }
 
     /// Slot-state variant of `attentionLayer`: identical block math, but the KV
