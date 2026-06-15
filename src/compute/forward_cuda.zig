@@ -408,6 +408,13 @@ pub const ForwardCuda = struct {
     ssm_state_slots: ?[]CudaBuffer = null,
     n_slots: u32 = 0,
     slot_ctx: u32 = 0,
+    // E28 degradation fix: persistent device scratch for the per-step batched
+    // decode positions[]/slots[] uploads — allocated ONCE alongside the slot
+    // state (sized to n_slots ≥ B), reused every `decodeBatch` step so the
+    // serving loop no longer cudaMalloc/cudaFrees two u32 buffers per decoded
+    // token (per-step alloc/free fragments the allocator → monotonic collapse).
+    pos_scratch: ?CudaBuffer = null,
+    slots_scratch: ?CudaBuffer = null,
 
     // Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
     // Lazily allocated on the first decodeBatch call, grown if B exceeds cap.
@@ -658,6 +665,10 @@ pub const ForwardCuda = struct {
         self.ssm_state_slots = ss;
         self.n_slots = n_slots;
         self.slot_ctx = slot_ctx;
+        // Persistent per-step decode scratch (see field comment): sized to the
+        // max batch (n_slots) so every decodeBatch step just re-uploads into it.
+        self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
     }
 
     pub fn freeSlotState(self: *ForwardCuda) void {
@@ -665,6 +676,12 @@ pub const ForwardCuda = struct {
             if (field.*) |bufs| {
                 for (bufs) |*b| buffer.freeBuffer(b);
                 self.allocator.free(bufs);
+                field.* = null;
+            }
+        }
+        inline for (.{ &self.pos_scratch, &self.slots_scratch }) |field| {
+            if (field.*) |*b| {
+                buffer.freeBuffer(b);
                 field.* = null;
             }
         }
@@ -921,14 +938,14 @@ pub const ForwardCuda = struct {
 
         // 4c-step-2: upload per-seq positions[]/slots[] ONCE (same for all layers)
         // to device u32 buffers for the fused batched attention kernels.
-        var pos_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
-        var slot_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
-        defer {
-            buffer.freeBuffer(&pos_buf);
-            buffer.freeBuffer(&slot_buf);
-        }
-        buffer.upload(ctx, &pos_buf, std.mem.sliceAsBytes(positions));
-        buffer.upload(ctx, &slot_buf, std.mem.sliceAsBytes(slots));
+        // E28 degradation fix: reuse the persistent pos/slots scratch (allocated
+        // in allocSlotState, sized to n_slots ≥ B) instead of a cudaMalloc/free
+        // pair per step. The fused batched kernels read only the first B entries.
+        std.debug.assert(B <= self.n_slots);
+        const pos_buf = &self.pos_scratch.?;
+        const slot_buf = &self.slots_scratch.?;
+        buffer.upload(ctx, pos_buf, std.mem.sliceAsBytes(positions));
+        buffer.upload(ctx, slot_buf, std.mem.sliceAsBytes(slots));
         var max_seq_len: u32 = 1;
         for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
 
@@ -940,9 +957,9 @@ pub const ForwardCuda = struct {
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (isFullAttn(L, d.full_attn_interval)) {
-                try self.attentionLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf, max_seq_len);
+                try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
             } else {
-                try self.ssmLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf);
+                try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
             }
             if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
         }

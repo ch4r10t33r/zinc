@@ -361,6 +361,14 @@ pub const ForwardGemma = struct {
     kv_v_slots: ?[]CudaBuffer = null,
     n_slots: u32 = 0,
     slot_ctx: u32 = 0,
+    // E28 degradation fix: persistent device scratch for the per-step batched
+    // decode positions[]/slots[] uploads. Allocated ONCE alongside the slot KV
+    // (sized to n_slots, the max batch ≥ B) and reused every `decodeBatch` step
+    // — so the serving loop no longer cudaMalloc/cudaFrees two u32 buffers per
+    // decoded token (the per-step alloc/free fragments the allocator and drove
+    // the observed monotonic throughput collapse over a sustained run).
+    pos_scratch: ?CudaBuffer = null,
+    slots_scratch: ?CudaBuffer = null,
 
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
@@ -1164,20 +1172,21 @@ pub const ForwardGemma = struct {
         // 1c: upload per-seq positions[]/slots[] ONCE (same for all layers) to device
         // u32 arrays the batched attention kernels index by blockIdx.y=b. Max causal
         // length across rows sizes the attention kernel's shared scratch.
-        var pos_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
-        var slots_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
-        defer {
-            buffer.freeBuffer(&pos_buf);
-            buffer.freeBuffer(&slots_buf);
-        }
-        buffer.upload(ctx, &pos_buf, std.mem.sliceAsBytes(positions));
-        buffer.upload(ctx, &slots_buf, std.mem.sliceAsBytes(slots));
+        // E28 degradation fix: reuse the persistent pos/slots scratch (allocated
+        // in allocSlotKv, sized to n_slots ≥ B) instead of a cudaMalloc/cudaFree
+        // pair per step. The batched attention kernels read only the first B
+        // entries. (Eliminates 2 device alloc + 2 free per decoded token.)
+        std.debug.assert(B <= self.n_slots);
+        const pos_buf = &self.pos_scratch.?;
+        const slots_buf = &self.slots_scratch.?;
+        buffer.upload(ctx, pos_buf, std.mem.sliceAsBytes(positions));
+        buffer.upload(ctx, slots_buf, std.mem.sliceAsBytes(slots));
         var max_seq_len: u32 = 1;
         for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
 
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            try self.attentionLayerBatchedDecode(L, B, b, &pos_buf, &slots_buf, max_seq_len);
+            try self.attentionLayerBatchedDecode(L, B, b, pos_buf, slots_buf, max_seq_len);
             try self.ffnBlockBatched(L, B, b); // position-independent; dense LOS folded in
         }
         self.waitPending(); // single tail drain: both blocks chain async on the shared stream
@@ -1495,6 +1504,10 @@ pub const ForwardGemma = struct {
         self.kv_v_slots = vv;
         self.n_slots = n_slots;
         self.slot_ctx = slot_ctx;
+        // Persistent per-step decode scratch (see field comment): sized to the
+        // max batch (n_slots) so every decodeBatch step just re-uploads into it.
+        self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
     }
 
     pub fn freeSlotKv(self: *ForwardGemma) void {
@@ -1507,6 +1520,14 @@ pub const ForwardGemma = struct {
             for (vs) |*b| buffer.freeBuffer(b);
             self.allocator.free(vs);
             self.kv_v_slots = null;
+        }
+        if (self.pos_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.pos_scratch = null;
+        }
+        if (self.slots_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.slots_scratch = null;
         }
         self.n_slots = 0;
         self.slot_ctx = 0;
