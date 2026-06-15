@@ -262,6 +262,20 @@ pub const ForwardCuda = struct {
     ssm_state: []CudaBuffer,
     conv_off: []u32, // per-layer circular conv state offset
 
+    // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
+    // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
+    // carries the hybrid-SSM per-slot conv + recurrent state: attn layers populate
+    // the KV slots [n_slots*slot_ctx*kv_dim], ssm layers the conv [n_slots*
+    // conv_state_len] + recurrent [n_slots*ssm_state_len] slots; the "wrong" layer
+    // type gets a 1-elem stub so free is uniform. ADDITIVE — the single-sequence
+    // kv_k/kv_v/ssm_conv_state/ssm_state above stay the production decodeStep path.
+    kv_k_slots: ?[]CudaBuffer = null,
+    kv_v_slots: ?[]CudaBuffer = null,
+    ssm_conv_slots: ?[]CudaBuffer = null,
+    ssm_state_slots: ?[]CudaBuffer = null,
+    n_slots: u32 = 0,
+    slot_ctx: u32 = 0,
+
     /// Compile kernels, allocate every device buffer, upload inv_freq + sinks,
     /// zero the KV cache and SSM state.
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardCuda {
@@ -432,6 +446,7 @@ pub const ForwardCuda = struct {
         for (self.kv_v) |*b| buffer.freeBuffer(b);
         for (self.ssm_conv_state) |*b| buffer.freeBuffer(b);
         for (self.ssm_state) |*b| buffer.freeBuffer(b);
+        self.freeSlotState();
         a.free(self.kv_k);
         a.free(self.kv_v);
         a.free(self.ssm_conv_state);
@@ -451,6 +466,133 @@ pub const ForwardCuda = struct {
             }
         }
         self.* = undefined;
+    }
+
+    // ---- Effort 28 inc 4: per-sequence slot state (batched decode plumbing) ----
+
+    /// Allocate per-sequence slot state for `n_slots` concurrent sequences, each
+    /// with up to `slot_ctx` positions. Attn layers get slot KV; ssm layers get
+    /// per-slot conv + recurrent state (zero-initialised). Additive — production
+    /// single-sequence buffers are untouched. Re-callable (frees first).
+    pub fn allocSlotState(self: *ForwardCuda, n_slots: u32, slot_ctx: u32) !void {
+        self.freeSlotState();
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const d = self.d;
+        const kk = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const vv = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const cc = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const ss = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            if (isFullAttn(L, d.full_attn_interval)) {
+                const kv_bytes = @as(usize, n_slots) * slot_ctx * d.kv_dim * f4;
+                kk[li] = try buffer.createBuffer(ctx, kv_bytes);
+                vv[li] = try buffer.createBuffer(ctx, kv_bytes);
+                cc[li] = try buffer.createBuffer(ctx, f4);
+                ss[li] = try buffer.createBuffer(ctx, f4);
+            } else {
+                kk[li] = try buffer.createBuffer(ctx, f4);
+                vv[li] = try buffer.createBuffer(ctx, f4);
+                cc[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.conv_state_len * f4);
+                ss[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.ssm_state_len * f4);
+                try zeroBuffer(self.allocator, ctx, &cc[li], n_slots * d.conv_state_len);
+                try zeroBuffer(self.allocator, ctx, &ss[li], n_slots * d.ssm_state_len);
+            }
+        }
+        self.kv_k_slots = kk;
+        self.kv_v_slots = vv;
+        self.ssm_conv_slots = cc;
+        self.ssm_state_slots = ss;
+        self.n_slots = n_slots;
+        self.slot_ctx = slot_ctx;
+    }
+
+    pub fn freeSlotState(self: *ForwardCuda) void {
+        inline for (.{ &self.kv_k_slots, &self.kv_v_slots, &self.ssm_conv_slots, &self.ssm_state_slots }) |field| {
+            if (field.*) |bufs| {
+                for (bufs) |*b| buffer.freeBuffer(b);
+                self.allocator.free(bufs);
+                field.* = null;
+            }
+        }
+        self.n_slots = 0;
+        self.slot_ctx = 0;
+    }
+
+    /// Byte offset of slot `slot`'s K/V for position `pos` in attn layer `L`'s slot
+    /// KV: (slot*slot_ctx + pos)*kv_dim*sizeof(f32). The future per-seq kv-write +
+    /// slot attention kernels (4b/4c) will use this exact indexing.
+    pub fn slotKvOffsetBytes(self: *const ForwardCuda, slot: u32, pos: u32) usize {
+        return (@as(usize, slot) * self.slot_ctx + pos) * self.d.kv_dim * @sizeOf(f32);
+    }
+    /// Byte offset of slot `slot`'s conv ring (ssm layer): slot*conv_state_len*f4.
+    pub fn slotConvOffsetBytes(self: *const ForwardCuda, slot: u32) usize {
+        return @as(usize, slot) * self.d.conv_state_len * @sizeOf(f32);
+    }
+    /// Byte offset of slot `slot`'s recurrent state (ssm layer): slot*ssm_state_len*f4.
+    pub fn slotStateOffsetBytes(self: *const ForwardCuda, slot: u32) usize {
+        return @as(usize, slot) * self.d.ssm_state_len * @sizeOf(f32);
+    }
+
+    /// Upload distinct data into two device regions of `buf` and read both back to
+    /// prove they do NOT alias (the slot-offset arithmetic carves non-overlapping
+    /// per-sequence regions). Returns false if either write clobbered the other.
+    fn nonOverlapCheck(self: *ForwardCuda, buf: *CudaBuffer, off_a: usize, off_b: usize, n: u32) !bool {
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const a = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(a);
+        const b = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(b);
+        const rd = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(rd);
+        for (a, 0..) |*v, i| v.* = 7.5 + @as(f32, @floatFromInt(i));
+        @memset(b, -3.0);
+        var va = try buffer.aliasBuffer(buf, off_a, n * f4);
+        defer buffer.freeBuffer(&va);
+        var vb = try buffer.aliasBuffer(buf, off_b, n * f4);
+        defer buffer.freeBuffer(&vb);
+        buffer.upload(ctx, &vb, std.mem.sliceAsBytes(b));
+        buffer.upload(ctx, &va, std.mem.sliceAsBytes(a));
+        buffer.download(ctx, &va, std.mem.sliceAsBytes(rd));
+        for (a, rd) |x, y| if (x != y) return false;
+        buffer.download(ctx, &vb, std.mem.sliceAsBytes(rd));
+        for (b, rd) |x, y| if (x != y) return false;
+        return true;
+    }
+
+    /// Sub-step 4a plumbing smoke: prove the slot-offset arithmetic round-trips and
+    /// that distinct slots map to NON-overlapping device regions for BOTH the
+    /// attention KV and the SSM conv + recurrent state. Requires allocSlotState
+    /// with n_slots >= 2 (so slot 0 and slot n_slots-1 differ). Returns true on
+    /// success.
+    pub fn slotStateSmoke(self: *ForwardCuda) !bool {
+        if (self.kv_k_slots == null or self.n_slots < 2 or self.slot_ctx == 0) return error.SlotStateNotAllocated;
+        const d = self.d;
+        var attn_l: ?u32 = null;
+        var ssm_l: ?u32 = null;
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            if (isFullAttn(L, d.full_attn_interval)) {
+                if (attn_l == null) attn_l = L;
+            } else if (ssm_l == null) ssm_l = L;
+        }
+        // Attn KV: slot 0 / pos 0 vs the last slot / last position.
+        if (attn_l) |L| {
+            const ks = &self.kv_k_slots.?[L];
+            const off_a = self.slotKvOffsetBytes(0, 0);
+            const off_b = self.slotKvOffsetBytes(self.n_slots - 1, self.slot_ctx - 1);
+            if (!try self.nonOverlapCheck(ks, off_a, off_b, d.kv_dim)) return false;
+        }
+        // SSM conv + recurrent: slot 0 vs the last slot.
+        if (ssm_l) |L| {
+            const cs = &self.ssm_conv_slots.?[L];
+            if (!try self.nonOverlapCheck(cs, self.slotConvOffsetBytes(0), self.slotConvOffsetBytes(self.n_slots - 1), d.conv_state_len)) return false;
+            const ss = &self.ssm_state_slots.?[L];
+            if (!try self.nonOverlapCheck(ss, self.slotStateOffsetBytes(0), self.slotStateOffsetBytes(self.n_slots - 1), d.ssm_state_len)) return false;
+        }
+        return true;
     }
 
     /// Run one greedy decode step for `token` at sequence position `pos`,

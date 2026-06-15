@@ -470,8 +470,22 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
             }
             std.debug.print("BATCH_GATE:{s} BATCH_SANITY:{s} (nseq={d} ngen={d})\n", .{ if (gate_pass) "PASS" else "FAIL", if (sanity_pass) "PASS" else "FAIL", nseq, ng });
         },
-        else => {
-            std.debug.print("BATCHDEC:skip (qwen — increment 4)\n", .{});
+        .qwen => |*q| {
+            // Inc 4 sub-step 4a: per-sequence slot state plumbing (KV + SSM conv +
+            // recurrent). No batched forward yet (decodeBatch for qwen is 4b) —
+            // just prove the slot buffers allocate + carve non-overlapping per-seq
+            // regions. The BATCH_SEQ lines above ARE the qwen serial reference
+            // (production prefill+decodeStep) the 4b proof will reproduce.
+            const slot_ctx: u32 = 512;
+            const slots_n = @max(@as(u32, 2), if (nseq == 0) @as(u32, 2) else nseq);
+            try q.allocSlotState(slots_n, slot_ctx);
+            defer q.freeSlotState();
+            const ok = q.slotStateSmoke() catch |e| {
+                std.debug.print("SLOTSTATE_SMOKE:ERR {s}\n", .{@errorName(e)});
+                return;
+            };
+            std.debug.print("SLOTSTATE_SMOKE:{s} (slots={d} slot_ctx={d})\n", .{ if (ok) "ok" else "FAIL", slots_n, slot_ctx });
+            std.debug.print("BATCHDEC:skip (qwen decodeBatch — increment 4 sub-step 4b)\n", .{});
         },
     }
 }
