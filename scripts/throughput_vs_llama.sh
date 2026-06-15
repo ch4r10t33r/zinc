@@ -19,7 +19,7 @@ GPU=${ZINC_GPU:-GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350}
 ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
 MODEL=${MODEL:-$HOME/workspace/models/gemma-4-31B-it-Q4_K_M.gguf}
 LLAMA=${LLAMA:-$HOME/workspace/llama.cpp/build/bin/llama-server}
-NG=${NG:-64}; ROUNDS=${ROUNDS:-2}; NP=${NP:-8}; BLIST=${BLIST:-"1 2 4 8"}
+NG=${NG:-64}; ROUNDS=${ROUNDS:-3}; NP=${NP:-8}; BLIST=${BLIST:-"1 2 4 8"}
 PROMPT="Write a detailed adventure story about a dragon who learns to write computer code."
 HOST=127.99.0.1
 export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-/tmp/tpvlgc}
@@ -36,25 +36,51 @@ gen_zinc(){  curl -N -s --max-time 900 -X POST "http://$HOST:$1/v1/completions" 
 gen_llama(){ curl -N -s --max-time 900 -X POST "http://$HOST:$1/v1/completions" -H 'Content-Type: application/json' \
                -d "{\"prompt\":\"$PROMPT\",\"n_predict\":$NG,\"ignore_eos\":true}" >/dev/null 2>&1; }
 
-sweep(){ local tag=$1 port=$2 fn=$3 B t0 t1 wall agg r i pids
+# Count compute procs on the 5090 (real UUID $GPU) that are NOT our own server
+# ($1=server pid). This box is SHARED with Effort-27, whose validate_catalog/A-B
+# runs UNPINNED and leaks onto GPU 0 (the 5090) — co-running inference crushes the
+# serve throughput (observed: ZINC B=1 24.9->0.92 the moment e27 validate co-ran),
+# so any round measured under contention is GARBAGE. Rounds tagged CONTENDED here
+# are EXCLUDED from the medians below → the gate stays trustworthy on the shared box.
+foreign_on_gpu(){ nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>/dev/null \
+  | awk -F', *' -v g="$GPU" -v me="$1" '$1==g && $2+0!=me+0{n++} END{print n+0}'; }
+
+sweep(){ local tag=$1 port=$2 fn=$3 spid=$4 B t0 t1 wall agg r i pids f0 f1 flag
   $fn "$port"
   for r in $(seq 1 "$ROUNDS"); do for B in $BLIST; do
+    f0=$(foreign_on_gpu "$spid")
     t0=$(date +%s.%N); pids=(); for ((i=0;i<B;i++)); do $fn "$port" & pids+=($!); done; wait "${pids[@]}"; t1=$(date +%s.%N)
+    f1=$(foreign_on_gpu "$spid")
     wall=$(echo "$t1-$t0"|bc -l); agg=$(echo "scale=2;$B*$NG/$wall"|bc -l)
-    printf "%-5s B=%-2s ext_agg_tok/s=%-8s wall=%ss (r%s)\n" "$tag" "$B" "$agg" "$(printf '%.2f' "$wall")" "$r" | tee -a "$OUT"
+    flag=""; [ "$f0" -gt 0 ] || [ "$f1" -gt 0 ] && flag=" CONTENDED(f0=$f0,f1=$f1)"
+    printf "%-5s B=%-2s ext_agg_tok/s=%-8s wall=%ss (r%s)%s\n" "$tag" "$B" "$agg" "$(printf '%.2f' "$wall")" "$r" "$flag" | tee -a "$OUT"
   done; done; }
 
 wait_ready(){ for _ in $(seq 1 360); do curl -s --max-time 3 "http://$HOST:$2/health" 2>/dev/null | grep -q 'ok' && return 0
     kill -0 "$1" 2>/dev/null || return 1; sleep 1; done; return 1; }
 
-echo "=== ZINC serve (parallel $NP, budget-only EOS, NG $NG) ==="
-CUDA_VISIBLE_DEVICES=$GPU ZINC_GPU=$GPU ZINC_SCHED_EOS=4294967295 "$ZINC" -m "$MODEL" -p 8190 -c 2048 --parallel $NP -n "$NG" >/tmp/tpvl_zinc.log 2>&1 &
-ZPID=$!; wait_ready "$ZPID" 8190 && sweep "ZINC" 8190 gen_zinc || { echo "zinc not ready"; tail /tmp/tpvl_zinc.log; }
-kill "$ZPID" 2>/dev/null; wait "$ZPID" 2>/dev/null; sleep 4
+# zinc arm; $2 = ZINC_BATCH_MROW value (0 = baseline tile-GEMM path = the documented
+# 30-42x-behind run; 1 = btok + MoE launch-collapse wins active — the recurring gate).
+run_zinc(){ local tag=$1 mrow=$2 port=8190
+  echo "=== ZINC serve $tag (ZINC_BATCH_MROW=$mrow, parallel $NP, budget-only EOS, NG $NG) ==="
+  CUDA_VISIBLE_DEVICES=$GPU ZINC_GPU=$GPU ZINC_BATCH_MROW=$mrow ZINC_SCHED_EOS=4294967295 \
+    "$ZINC" -m "$MODEL" -p $port -c 2048 --parallel $NP -n "$NG" >/tmp/tpvl_zinc_$tag.log 2>&1 &
+  local ZPID=$!
+  wait_ready "$ZPID" $port && sweep "$tag" $port gen_zinc "$ZPID" || { echo "$tag not ready"; tail /tmp/tpvl_zinc_$tag.log; }
+  kill "$ZPID" 2>/dev/null; wait "$ZPID" 2>/dev/null; sleep 4
+}
+run_zinc ZINC0 0   # baseline: tile-GEMM batched decode (mrow OFF)
+run_zinc ZINCM 1   # the recurring gate: btok + MoE wins active (mrow ON)
 
 echo "=== LLAMA-server (-np $NP -ngl 99, ignore_eos) ==="
 CUDA_VISIBLE_DEVICES=$GPU "$LLAMA" -m "$MODEL" --host 0.0.0.0 --port 8191 -ngl 99 -c 8192 -np $NP >/tmp/tpvl_llama.log 2>&1 &
-LPID=$!; wait_ready "$LPID" 8191 && sweep "LLAMA" 8191 gen_llama || { echo "llama not ready"; tail /tmp/tpvl_llama.log; }
+LPID=$!; wait_ready "$LPID" 8191 && sweep "LLAMA" 8191 gen_llama "$LPID" || { echo "llama not ready"; tail /tmp/tpvl_llama.log; }
 kill "$LPID" 2>/dev/null; wait "$LPID" 2>/dev/null
 
-echo "=== RESULTS ==="; cat "$OUT"; echo "=== TPVL DONE ==="
+echo "=== RESULTS (per round) ==="; cat "$OUT"
+echo "=== MEDIANS (tag x B; CONTENDED rounds excluded — shared box w/ Effort-27) ==="
+awk '/CONTENDED/{next}
+     { split($2,a,"="); B=a[2]; split($3,c,"="); v=c[2]; key=$1" B="B; n[key]++; val[key,n[key]]=v }
+     END{ for(k in n){ m=n[k]; for(i=1;i<=m;i++){ for(j=i+1;j<=m;j++){ if(val[k,j]<val[k,i]){t=val[k,i];val[k,i]=val[k,j];val[k,j]=t} } }
+          med=(m%2)?val[k,(m+1)/2]:(val[k,m/2]+val[k,m/2+1])/2; printf "%-7s median_ext_agg_tok/s=%.2f (n=%d)\n", k, med, m } }' "$OUT" | sort
+echo "=== TPVL DONE ==="
