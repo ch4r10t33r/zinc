@@ -216,10 +216,12 @@ const CaseId = enum {
     qwen35_9b_dense_gate_up_q4k,
     qwen35_9b_dense_down_q4k,
     qwen35_9b_ssm_q4q4,
+    qwen27b_prefill_tail_hot,
     qwen27b_decode_hot,
     qwen27b_dense_gate_up_q4k,
     qwen27b_ssm_q4q4,
     qwen27b_ssm_q6_qkv,
+    qwen27b_ssm_out_q8,
     qwen27b_lm_head_q6k,
     moe_gate,
     moe_up,
@@ -362,9 +364,10 @@ fn helpText() []const u8 {
     \\                            | qwen35_9b_prefill_hot
     \\                            | qwen35_9b_dense_gate_up_q4k
     \\                            | qwen35_9b_dense_down_q4k | qwen35_9b_ssm_q4q4
+    \\                            | qwen27b_prefill_tail_hot
     \\                            | qwen27b_decode_hot
     \\                            | qwen27b_dense_gate_up_q4k | qwen27b_ssm_q4q4
-    \\                            | qwen27b_ssm_q6_qkv | qwen27b_lm_head_q6k
+    \\                            | qwen27b_ssm_q6_qkv | qwen27b_ssm_out_q8 | qwen27b_lm_head_q6k
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_geglu | moe_gate_up_geglu_cols | moe_gate_up_swiglu
@@ -418,10 +421,12 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "qwen35_9b_dense_gate_up_q4k")) return .qwen35_9b_dense_gate_up_q4k;
     if (std.mem.eql(u8, arg, "qwen35_9b_dense_down_q4k")) return .qwen35_9b_dense_down_q4k;
     if (std.mem.eql(u8, arg, "qwen35_9b_ssm_q4q4")) return .qwen35_9b_ssm_q4q4;
+    if (std.mem.eql(u8, arg, "qwen27b_prefill_tail_hot")) return .qwen27b_prefill_tail_hot;
     if (std.mem.eql(u8, arg, "qwen27b_decode_hot")) return .qwen27b_decode_hot;
     if (std.mem.eql(u8, arg, "qwen27b_dense_gate_up_q4k")) return .qwen27b_dense_gate_up_q4k;
     if (std.mem.eql(u8, arg, "qwen27b_ssm_q4q4")) return .qwen27b_ssm_q4q4;
     if (std.mem.eql(u8, arg, "qwen27b_ssm_q6_qkv")) return .qwen27b_ssm_q6_qkv;
+    if (std.mem.eql(u8, arg, "qwen27b_ssm_out_q8")) return .qwen27b_ssm_out_q8;
     if (std.mem.eql(u8, arg, "qwen27b_lm_head_q6k")) return .qwen27b_lm_head_q6k;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
@@ -451,11 +456,13 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .qwen35_9b_dense_gate_up_q4k,
             .qwen35_9b_dense_down_q4k,
             .qwen35_9b_ssm_q4q4,
+            .qwen27b_prefill_tail_hot,
             .lm_head_q4k_argmax,
             .qwen27b_decode_hot,
             .qwen27b_dense_gate_up_q4k,
             .qwen27b_ssm_q4q4,
             .qwen27b_ssm_q6_qkv,
+            .qwen27b_ssm_out_q8,
             .qwen27b_lm_head_q6k,
             => false,
             else => true,
@@ -487,6 +494,17 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .dense_down_q6k,
             .qwen27b_ssm_q4q4,
             .qwen27b_ssm_q6_qkv,
+            .qwen27b_ssm_out_q8,
+            .qwen27b_lm_head_q6k,
+            => true,
+            else => false,
+        },
+        .qwen27b_prefill_tail_hot => switch (case_id) {
+            .qwen27b_dense_gate_up_q4k,
+            .dense_down_q6k,
+            .qwen27b_ssm_q4q4,
+            .qwen27b_ssm_q6_qkv,
+            .qwen27b_ssm_out_q8,
             .qwen27b_lm_head_q6k,
             => true,
             else => false,
@@ -1115,6 +1133,20 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .cols = hidden_dim,
             };
         },
+        .qwen27b_ssm_out_q8 => blk: {
+            if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
+            const hidden_dim = model.config.hidden_dim;
+            const d_inner = model.config.ssm_d_inner;
+            const out = findTensorBySuffixAndShape(model, "ssm_out.weight", .q8_0, hidden_dim, d_inner) orelse
+                return error.MissingSsmOutTensor;
+            break :blk .{
+                .key = "qwen27b_ssm_out_q8",
+                .label = "Qwen3.6 27B SSM Q8_0 out",
+                .tensor0 = out,
+                .rows0 = hidden_dim,
+                .cols = d_inner,
+            };
+        },
         .qwen27b_lm_head_q6k => blk: {
             if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
             const tensor = findTensorByName(model, "output.weight") orelse
@@ -1248,7 +1280,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .is_moe_swiglu_fused = true,
             };
         },
-        .all, .gemma26_prefill_hot, .qwen35_9b_prefill_hot, .qwen27b_decode_hot => error.InvalidCase,
+        .all, .gemma26_prefill_hot, .qwen35_9b_prefill_hot, .qwen27b_prefill_tail_hot, .qwen27b_decode_hot => error.InvalidCase,
         .post_norm_residual_wide => error.InvalidCase,
     };
 }
@@ -4490,7 +4522,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .dense_down_q6k, .post_norm_residual_wide, .qwen35_9b_dense_gate_up_q4k, .qwen35_9b_dense_down_q4k, .qwen35_9b_ssm_q4q4, .qwen27b_dense_gate_up_q4k, .qwen27b_ssm_q4q4, .qwen27b_ssm_q6_qkv, .qwen27b_lm_head_q6k, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .dense_down_q6k, .post_norm_residual_wide, .qwen35_9b_dense_gate_up_q4k, .qwen35_9b_dense_down_q4k, .qwen35_9b_ssm_q4q4, .qwen27b_dense_gate_up_q4k, .qwen27b_ssm_q4q4, .qwen27b_ssm_q6_qkv, .qwen27b_ssm_out_q8, .qwen27b_lm_head_q6k, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});

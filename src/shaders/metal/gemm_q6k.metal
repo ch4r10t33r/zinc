@@ -3,7 +3,9 @@ using namespace metal;
 
 // Q6_K GEMM kernel — dequantize-then-multiply using simdgroup matrix operations.
 // Port of llama.cpp kernel_mul_mm for Q6_K weights × f32 input → f32 output.
-// Same tile structure as gemm_q4k.metal (64×32 output, 4 simdgroups, NK=32).
+// Same tile structure as gemm_q4k.metal (64×32 output, 4 simdgroups, NK=32)
+// by default. ZINC_GEMM_Q6K_NR1/ZINC_GEMM_Q6K_THREADS allow the Qwen dense
+// prefill path to use a 64×48 tile for 33-48 token prompts.
 
 struct GemmPush {
     int32_t  ne00;      // K dimension
@@ -67,11 +69,21 @@ static void dequantize_q6_K(device const block_q6_K * xb, short il, thread half4
     }
 }
 
+#ifndef ZINC_GEMM_Q6K_NR1
+#define ZINC_GEMM_Q6K_NR1 32
+#endif
+#ifndef ZINC_GEMM_Q6K_THREADS
+#define ZINC_GEMM_Q6K_THREADS 128
+#endif
+
 constant constexpr int NR0 = 64;
-constant constexpr int NR1 = 32;
+constant constexpr int NR1 = ZINC_GEMM_Q6K_NR1;
 constant constexpr int NK  = 32;
 constant constexpr int NL0 = NK/16;
 constant constexpr int NL1 = NK/8;
+constant constexpr int NCB = NR1/8;
+constant constexpr int NT = ZINC_GEMM_Q6K_THREADS;
+constant constexpr int A_LOAD_THREADS = 128;
 
 kernel void main0(
     constant GemmPush & args [[buffer(0)]],
@@ -92,10 +104,11 @@ kernel void main0(
     const short nr0 = min(args.ne0 - r0, NR0);
     const short nr1 = min(args.ne1 - r1, NR1);
 
-    const short lr0 = min((short)(tiitg / NL0), (short)(nr0 - 1));
+    const ushort a_tiitg = tiitg & (A_LOAD_THREADS - 1);
+    const short lr0 = min((short)(a_tiitg / NL0), (short)(nr0 - 1));
     const short lr1 = min((short)(tiitg / NL1), (short)(nr1 - 1));
 
-    const short il0 = (tiitg % NL0);
+    const short il0 = (a_tiitg % NL0);
     short il = il0;
 
     const short offset1 = il0 / QK_NL;
@@ -116,24 +129,28 @@ kernel void main0(
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         half4x4 temp_a;
-        dequantize_q6_K(x, il, temp_a);
+        if (tiitg < A_LOAD_THREADS) {
+            dequantize_q6_K(x, il, temp_a);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            const short sx = 2 * il0 + i / 8;
-            const short sy = (tiitg / NL0) / 8;
-            const short lx = (tiitg / NL0) % 8;
-            const short ly = i % 8;
-            const short ib = 8 * sx + sy;
-            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i/4][i%4];
+        if (tiitg < A_LOAD_THREADS) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (a_tiitg / NL0) / 8;
+                const short lx = (a_tiitg / NL0) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = temp_a[i/4][i%4];
+            }
         }
 
         {
             const short sx = (tiitg % NL1);
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
-            const short ib = 4 * sx + sy;
+            const short ib = NCB * sx + sy;
             *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device float2x4 *) y));
         }
 
@@ -161,7 +178,7 @@ kernel void main0(
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
             }
             lsma += 8 * 64;
-            lsmb += 4 * 64;
+            lsmb += NCB * 64;
         }
     }
 
@@ -179,17 +196,16 @@ kernel void main0(
             simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgitg == 0) {
-            for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float *) dst + r0 + (r1 + j) * args.ne0;
-                device float4 * D4 = (device float4 *) D;
-                threadgroup float  * C  = temp_str + (j * NR0);
-                threadgroup float4 * C4 = (threadgroup float4 *) C;
-                int i = 0;
-                for (; i < nr0 / 4; i++) *(D4 + i) = *(C4 + i);
-                i *= 4;
-                for (; i < nr0; i++) *(D + i) = *(C + i);
-            }
+        threadgroup float * temp_base = (threadgroup float *) shmem;
+        for (int j = tiitg; j < nr1; j += NT) {
+            device float  * D  = (device float *) dst + r0 + (r1 + j) * args.ne0;
+            device float4 * D4 = (device float4 *) D;
+            threadgroup float  * C  = temp_base + (j * NR0);
+            threadgroup float4 * C4 = (threadgroup float4 *) C;
+            int i = 0;
+            for (; i < nr0 / 4; i++) *(D4 + i) = *(C4 + i);
+            i *= 4;
+            for (; i < nr0; i++) *(D + i) = *(C + i);
         }
     }
 }

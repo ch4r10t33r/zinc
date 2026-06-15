@@ -61,11 +61,21 @@ static inline float swiglu(float gate, float up) {
     return up * gate * fast::divide(1.0f, 1.0f + fast::exp(-gate));
 }
 
+#ifndef ZINC_GEMM_GATE_UP_NR1
+#define ZINC_GEMM_GATE_UP_NR1 32
+#endif
+#ifndef ZINC_GEMM_GATE_UP_THREADS
+#define ZINC_GEMM_GATE_UP_THREADS 128
+#endif
+
 constant constexpr int NR0 = 64;
-constant constexpr int NR1 = 32;
+constant constexpr int NR1 = ZINC_GEMM_GATE_UP_NR1;
 constant constexpr int NK = 32;
 constant constexpr int NL0 = NK / 16;
 constant constexpr int NL1 = NK / 8;
+constant constexpr int NCB = NR1 / 8;
+constant constexpr int NT = ZINC_GEMM_GATE_UP_THREADS;
+constant constexpr int A_LOAD_THREADS = 128;
 
 kernel void main0(
     constant GemmGateUpPush & args [[buffer(0)]],
@@ -86,10 +96,12 @@ kernel void main0(
     const short nr0 = min(args.ne0 - r0, NR0);
     const short nr1 = min(args.ne1 - r1, NR1);
 
-    const short lr0 = min((short)(tiitg / NL0), (short)(nr0 - 1));
+    const ushort a_tiitg = tiitg & (A_LOAD_THREADS - 1);
+    const short lr0 = min((short)(a_tiitg / NL0), (short)(nr0 - 1));
     const short lr1 = min((short)(tiitg / NL1), (short)(nr1 - 1));
-    const short il0 = tiitg % NL0;
-    const short iy = 8 * (tiitg % NL1);
+    const short il0 = a_tiitg % NL0;
+    const short il1 = tiitg % NL1;
+    const short iy = 8 * il1;
 
     short il_gate = il0;
     short il_up = il0;
@@ -113,24 +125,28 @@ kernel void main0(
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         half4x4 temp_gate;
-        dequantize_q4_K(gate_x, il_gate, temp_gate);
+        if (tiitg < A_LOAD_THREADS) {
+            dequantize_q4_K(gate_x, il_gate, temp_gate);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            const short sx = 2 * il0 + i / 8;
-            const short sy = (tiitg / NL0) / 8;
-            const short lx = (tiitg / NL0) % 8;
-            const short ly = i % 8;
-            const short ib = 8 * sx + sy;
-            *(sa + 64 * ib + 8 * ly + lx) = temp_gate[i / 4][i % 4];
+        if (tiitg < A_LOAD_THREADS) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (a_tiitg / NL0) / 8;
+                const short lx = (a_tiitg / NL0) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = temp_gate[i / 4][i % 4];
+            }
         }
 
         {
-            const short sx = tiitg % NL1;
+            const short sx = il1;
             const short sy = (tiitg / NL1) / 8;
             const short ly = (tiitg / NL1) % 8;
-            const short ib = 4 * sx + sy;
+            const short ib = NCB * sx + sy;
             *(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device float2x4 *) y));
         }
 
@@ -157,21 +173,25 @@ kernel void main0(
                 simdgroup_multiply_accumulate(mc_gate[i], mb[i / 4], ma[i % 4], mc_gate[i]);
             }
             lsma_gate += 8 * 64;
-            lsmb += 4 * 64;
+            lsmb += NCB * 64;
         }
 
         half4x4 temp_up;
-        dequantize_q4_K(up_x, il_up, temp_up);
+        if (tiitg < A_LOAD_THREADS) {
+            dequantize_q4_K(up_x, il_up, temp_up);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            const short sx = 2 * il0 + i / 8;
-            const short sy = (tiitg / NL0) / 8;
-            const short lx = (tiitg / NL0) % 8;
-            const short ly = i % 8;
-            const short ib = 8 * sx + sy;
-            *(sa + 64 * ib + 8 * ly + lx) = temp_up[i / 4][i % 4];
+        if (tiitg < A_LOAD_THREADS) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (a_tiitg / NL0) / 8;
+                const short lx = (a_tiitg / NL0) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = temp_up[i / 4][i % 4];
+            }
         }
 
         il_up = (il_up + 2 < QK_NL) ? il_up + 2 : il_up % 2;
@@ -196,14 +216,14 @@ kernel void main0(
                 simdgroup_multiply_accumulate(mc_up[i], mb[i / 4], ma[i % 4], mc_up[i]);
             }
             lsma_up += 8 * 64;
-            lsmb += 4 * 64;
+            lsmb += NCB * 64;
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     threadgroup float * gate_tmp = (threadgroup float *)shmem;
-    threadgroup float * up_tmp = (threadgroup float *)(shmem + 8192);
+    threadgroup float * up_tmp = (threadgroup float *)(shmem + NR0 * NR1 * sizeof(float));
 
     threadgroup float * gate_store =
         gate_tmp + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
@@ -218,7 +238,7 @@ kernel void main0(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int total = int(nr0) * int(nr1);
-    for (int idx = tiitg; idx < total; idx += 128) {
+    for (int idx = tiitg; idx < total; idx += NT) {
         const int col = idx / int(nr0);
         const int row = idx - col * int(nr0);
         const float gate = gate_tmp[col * NR0 + row];
