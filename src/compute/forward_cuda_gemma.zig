@@ -73,6 +73,9 @@ const RmsRopeBatchPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32,
 const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride: u32, dst_stride: u32 };
 // Decode fusion: per-head Q/K rms_norm + RoPE + KV-write in one launch.
 const RmsRopeQkvPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, n_head: u32, n_kv_head: u32, kv_offset: u32 };
+// Effort 28 1c: batched-DECODE twin (grid.y = B) — per-seq position/slot from device arrays.
+const RmsRopeQkvSeqPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, n_head: u32, n_kv_head: u32, slot_ctx: u32 };
+const GemmaAttnSlotPush = extern struct { head_dim: u32, n_heads: u32, n_kv_heads: u32, slot_ctx: u32, scale_bits: u32, window: u32 };
 const SwigluPush = extern struct { N: u32 };
 const F32ToF16Push = extern struct { N: u32 }; // cycle 12: activation downcast for the TC f16-A GEMM
 const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 }; // e26 c9: Q4_K weight → fp16 for the cuBLAS prefill GEMM
@@ -164,15 +167,21 @@ const Pipelines = struct {
     rms_norm_residual_scale_norm: CudaPipeline,
     rms_norm_rope: CudaPipeline,
     rms_norm_rope_qkv: CudaPipeline,
+    rms_norm_rope_qkv_seq: CudaPipeline, // Effort 28 1c: batched-decode (grid.y=B) twin
     rms_norm_kvwrite: CudaPipeline,
     rms_norm_rope_batched: CudaPipeline,
     rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
+    dmmv_q4k_btok: [26]CudaPipeline, // Effort 28: token-batch matvec B=2..27 (idx B-2)
+    dmmv_q6k_btok: [26]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec (gemma ffn_down)
+    dmmv_q5k_btok: [26]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
+    dmmv_q8_0_btok: [26]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
     dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
     gemma_attention_batched: CudaPipeline,
+    gemma_attention_batched_seq: CudaPipeline, // Effort 28 1c: batched-decode per-seq slot attn
     geglu: CudaPipeline,
     scale_accumulate: CudaPipeline,
     scalar_mul: CudaPipeline,
@@ -351,9 +360,58 @@ pub const ForwardGemma = struct {
     kv_k: []CudaBuffer,
     kv_v: []CudaBuffer,
 
+    // Effort 28 increment 1 — slot-based KV for batched / continuous decode.
+    // Allocated lazily by allocSlotKv (driven by the dbg_cuda `batch` harness);
+    // SEPARATE from the production single-sequence kv_k/kv_v, which stay the
+    // default and are never touched. Each concurrent sequence occupies one slot
+    // of up to slot_ctx positions: the K/V for (slot s, pos p) in layer L live at
+    // (s*slot_ctx + p)*kv_dim(L). Null until a batched path allocates them.
+    kv_k_slots: ?[]CudaBuffer = null,
+    kv_v_slots: ?[]CudaBuffer = null,
+    n_slots: u32 = 0,
+    slot_ctx: u32 = 0,
+    // E28 degradation fix: persistent device scratch for the per-step batched
+    // decode positions[]/slots[] uploads. Allocated ONCE alongside the slot KV
+    // (sized to n_slots, the max batch ≥ B) and reused every `decodeBatch` step
+    // — so the serving loop no longer cudaMalloc/cudaFrees two u32 buffers per
+    // decoded token (the per-step alloc/free fragments the allocator and drove
+    // the observed monotonic throughput collapse over a sustained run).
+    pos_scratch: ?CudaBuffer = null,
+    slots_scratch: ?CudaBuffer = null,
+    // E28 degradation fix (suspect #2): persistent per-step decode TAIL scratch.
+    // `argmax_scratch` [n_slots] u32 collects every row's argmax into a distinct
+    // slot so the whole tail (rms_norm → LM head → argmax for all B rows) runs in
+    // ONE command buffer + ONE commitAndWait + ONE B-wide download, instead of B
+    // serial commitAndWait+download round-trips per decoded token. `embed_host`
+    // [n_slots·n_embd] f32 stages the per-step embedding dequant so decodeBatch no
+    // longer does a host allocator.alloc/free of B·n_embd floats every step.
+    argmax_scratch: ?CudaBuffer = null,
+    embed_host: ?[]f32 = null,
+
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
     batch: ?BatchScratch = null,
+    // Effort 28 (perf lever): when a decodeBatch step has B==1 (the common
+    // serving case — ALL per-token prefill + single-client decode), route the
+    // per-layer projection/FFN GEMMs through the tuned `dmmv` matvec (exactly
+    // what production `decodeStep` uses) instead of the 64×64-tiled batched TC
+    // GEMM, which wastes 63/64 of its tile on one row (B=1 batched ≈2.2 vs
+    // decodeStep ≈8 tok/s). Set per-call by `decodeBatch` (true only when B==1
+    // AND `b1MatvecOn()`); never set by prefill/decodeStep, so those paths are
+    // untouched even at T==1. `decode_b1_force` (harness-only) overrides the env
+    // gate for an in-process A/B (null → use the env default).
+    decode_b1: bool = false,
+    decode_b1_force: ?bool = null,
+    // Effort 28: small-B (2..8) Q4_K token-batch matvec. At a small decode batch
+    // the 64×64-tiled batched GEMM wastes 56-62/64 row-slots and goes compute-bound
+    // on tile padding; `dmmv_q4k_btok` reads each Q4_K weight row ONCE and amortizes
+    // its dequant across the B token x-vectors → bandwidth-bound, no tile waste,
+    // bit-identical to `dmmv_q4k_fast` per row. Set per-call by `decodeBatch` (true
+    // only when 2≤B≤8 AND `mrowMatvecOn()`); never set by prefill/decodeStep.
+    // OPT-IN, default-off (ZINC_BATCH_MROW); `decode_mrow_force` (harness-only)
+    // overrides the env gate for an in-process A/B (null → env default).
+    decode_mrow: bool = false,
+    decode_mrow_force: ?bool = null,
     // Effort 24 cycle 11: route the dense batched Q4_K GEMMs through the fp16
     // tensor-core kernel (gemm_q4k_tc) instead of the f32 register-tiled GEMM.
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
@@ -444,6 +502,7 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_residual_scale_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale_norm");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
         pipes.rms_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_qkv");
+        pipes.rms_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_qkv_seq");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
         pipes.rms_norm_rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_batched");
         pipes.rms_norm_kvwrite_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite_batched");
@@ -457,10 +516,22 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
+        // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
+        // quant — the non-Q4_K decode GEMMs (gemma-31b ffn_down is Q6_K) otherwise
+        // hit the tile-padding GEMM at small B. B=9..16 extends btok past the old
+        // 8-cap into the higher-concurrency serving regime (btok stays bandwidth-
+        // bound to the ~B≈27 roofline crossover vs the padded tile GEMM).
+        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27" }, 0..) |suf, i| {
+            pipes.dmmv_q4k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok" ++ suf);
+            pipes.dmmv_q6k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_btok" ++ suf);
+            pipes.dmmv_q5k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_btok" ++ suf);
+            pipes.dmmv_q8_0_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_btok" ++ suf);
+        }
         pipes.dmmv_q4k_fast_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast_dual");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
+        pipes.gemma_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched_seq");
         pipes.geglu = try pipeline.createPipeline(ctx, src.ptr, "geglu");
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
         pipes.scalar_mul = try pipeline.createPipeline(ctx, src.ptr, "scalar_mul");
@@ -637,11 +708,20 @@ pub const ForwardGemma = struct {
         a.free(self.host_router);
         a.free(self.down_scales);
         self.freeBatch();
+        self.freeSlotKv();
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+                for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q6k_btok")) {
+                for (&self.pipes.dmmv_q6k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q5k_btok")) {
+                for (&self.pipes.dmmv_q5k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q8_0_btok")) {
+                for (&self.pipes.dmmv_q8_0_btok) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
@@ -1080,6 +1160,196 @@ pub const ForwardGemma = struct {
         self.submit(cmd);
     }
 
+    // ---- Effort 28 increment 1 sub-step 1b: batched DECODE ------------------
+
+    /// Batched DECODE step (DENSE gemma only): advance B independent sequences by
+    /// ONE token each in a SINGLE B-row forward. The projections + FFN reuse the
+    /// batched-prefill GEMM path — `gemmDispatch`/`ffnBlockBatched` read each
+    /// weight ONCE for all B rows (the launch / weight-bandwidth amortization that
+    /// makes batching a throughput win). The attention inner (per-head V/Q/K
+    /// norm + RoPE + KV-write + causal softmax) LOOPS per row through the proven
+    /// single-token kernels (`rms_norm_rope_qkv` / `gemma_attention`) against each
+    /// sequence's OWN KV slot at its OWN position — so row b attends over slot
+    /// `slots[b]`'s history [0..positions[b]] only. Fusing that per-row loop into
+    /// one batched-seq attention kernel is sub-step 1c (a perf step; the looped
+    /// form here is already correct for mixed positions). ADDITIVE — the production
+    /// `decodeStep` / `prefillBatched` paths are untouched.
+    ///
+    /// Requires `allocSlotKv(n_slots, slot_ctx)` first, with n_slots > max(slots)
+    /// and slot_ctx > max(positions). Each sequence b's slot must already hold its
+    /// KV history for [0..positions[b]-1] (written by prior `decodeBatch` calls —
+    /// e.g. a per-token B=1 prefill into the slot). Writes b's new K/V at its slot.
+    ///
+    ///   tokens[b]     input token for sequence b this step
+    ///   positions[b]  sequence b's current position (slot holds [0..pos-1])
+    ///   slots[b]      sequence b's KV slot index
+    ///   out_tokens[b] greedy argmax for sequence b (caller advances pos + feeds back)
+    pub fn decodeBatch(self: *ForwardGemma, tokens: []const u32, positions: []const u32, slots: []const u32, out_tokens: []u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        if (d.n_experts > 0) return error.Unsupported; // increment 1 = dense gemma only
+        if (self.kv_k_slots == null) return error.SlotKvNotAllocated;
+        const B: u32 = @intCast(tokens.len);
+        std.debug.assert(positions.len == B and slots.len == B and out_tokens.len == B);
+
+        // Effort 28 B==1 matvec fast path: when this step batches a single
+        // sequence, route the per-layer projection/FFN GEMMs to the tuned matvec
+        // (see `gemmDispatchA`). `defer` clears it so an early-return error never
+        // leaks the flag into a later prefillBatched (which never sets it).
+        self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
+        defer self.decode_b1 = false;
+        // Effort 28: small-B Q4_K token-batch matvec for 2≤B≤8 (opt-in, default-off;
+        // see `gemmDispatchA`). `defer` clears it so an early-return error never
+        // leaks the flag into a later prefillBatched (which never sets it).
+        self.decode_mrow = (B >= 2 and B <= 27) and (self.decode_mrow_force orelse mrowMatvecOn());
+        defer self.decode_mrow = false;
+
+        // Mirror prefillBatched's GEMM knobs so the batched projections/FFN take
+        // the same kernel path. cuBLAS self-gates on T >= cublas_min_t (128), so a
+        // small decode batch keeps the hand TC / f32 GEMM; the env A/B knobs apply.
+        self.use_tc = tcDefaultOn();
+        self.use_cublas = cublasDefaultOn();
+        self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        self.use_tc_plain = std.posix.getenv("ZINC_BATCHED_TC_PLAIN") != null;
+        self.use_tc_q6 = std.posix.getenv("ZINC_BATCHED_TC_NOQ6") == null;
+        self.use_tc_m128 = std.posix.getenv("ZINC_BATCHED_TC_M128") != null;
+        self.use_tc_m64 = std.posix.getenv("ZINC_BATCHED_TC_M64") != null;
+        self.use_tc_q6_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
+        self.use_tc_m128_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
+        self.use_tc_sharea = std.posix.getenv("ZINC_BATCHED_TC_SHAREA") != null;
+        self.use_tc_normf16 = std.posix.getenv("ZINC_BATCHED_TC_NORMF16") != null;
+
+        std.debug.assert(B <= self.n_slots);
+        const b = try self.ensureBatch(B);
+
+        // EMBED all B input tokens into b.hidden [B, n_embd] (dequant, scale, upload).
+        // Suspect-#2 fix: stage into the persistent host embed buffer (sized to
+        // n_slots ≥ B) instead of a per-step allocator.alloc/free.
+        const embd_scale = std.math.sqrt(@as(f32, @floatFromInt(d.n_embd)));
+        const host = self.embed_host.?[0 .. B * d.n_embd];
+        for (0..B) |bi| {
+            const row = host[bi * d.n_embd ..][0..d.n_embd];
+            self.model.dequantEmbeddingRow(tokens[bi], row);
+            for (row) |*v| v.* *= embd_scale;
+        }
+        buffer.upload(ctx, &b.hidden, std.mem.sliceAsBytes(host));
+
+        // 1c: upload per-seq positions[]/slots[] ONCE (same for all layers) to device
+        // u32 arrays the batched attention kernels index by blockIdx.y=b. Max causal
+        // length across rows sizes the attention kernel's shared scratch.
+        // E28 degradation fix: reuse the persistent pos/slots scratch (allocated
+        // in allocSlotKv, sized to n_slots ≥ B) instead of a cudaMalloc/cudaFree
+        // pair per step. The batched attention kernels read only the first B
+        // entries. (Eliminates 2 device alloc + 2 free per decoded token.)
+        const pos_buf = &self.pos_scratch.?;
+        const slots_buf = &self.slots_scratch.?;
+        buffer.upload(ctx, pos_buf, std.mem.sliceAsBytes(positions));
+        buffer.upload(ctx, slots_buf, std.mem.sliceAsBytes(slots));
+        var max_seq_len: u32 = 1;
+        for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
+
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            try self.attentionLayerBatchedDecode(L, B, b, pos_buf, slots_buf, max_seq_len);
+            try self.ffnBlockBatched(L, B, b); // position-independent; dense LOS folded in
+        }
+        self.waitPending(); // single tail drain: both blocks chain async on the shared stream
+
+        // TAIL: final rms_norm → LM head → per-row argmax for all B rows.
+        // Suspect-#2 fix: chain every row's tail into ONE command buffer +
+        // ONE commitAndWait + ONE B-wide download (was B serial commitAndWait +
+        // B downloads per decoded token). The single decode scratch
+        // (`norm_buf`/`logits_buf`) is reused across rows: on ONE stream the
+        // dispatches execute strictly in order, so row b+1's rms_norm cannot run
+        // until row b's LM head has consumed `norm_buf` — identical math to the
+        // per-row-commitAndWait form. Only the argmax OUTPUT must be per-row, so
+        // each row's argmax writes its own slot of `argmax_scratch` (aliased at
+        // bi·4) and we download all B results once.
+        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
+        const lm_head = self.model.get("output.weight") orelse self.model.get("token_embd.weight") orelse return error.MissingTensor;
+        const lm_idx = dmmvIdx(lm_head.info.type_);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var hid = try buffer.aliasBuffer(&b.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hid);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hid, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+            if (lm_idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            }
+            const am = ArgmaxPush{ .N = d.vocab };
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
+        }
+        cmd.commitAndWait();
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out_tokens));
+    }
+
+    /// Decode variant of `attentionLayerBatched` (1c — batched attention kernels).
+    /// The pre-norm + Q/K/V + O projections run BATCHED over B rows; the per-head
+    /// V/Q/K norm+RoPE+KV-write and the causal softmax run as ONE launch each over
+    /// all B rows via `rms_norm_rope_qkv_seq` / `gemma_attention_batched_seq`
+    /// (grid.y = b). Each row b uses its OWN `positions[b]` (read from the device
+    /// `pos_buf`) and its OWN KV slot `slots[b]` (`slot_buf`) — so the whole layer
+    /// is FOUR batched launches (norm+QKV proj, qkv-norm/rope, attention, O+postnorm)
+    /// with NO per-row host syncs. Submitted async on the shared stream like
+    /// `attentionLayerBatched`; drained by `decodeBatch`'s single tail waitPending.
+    /// The per-(b,head) block math is copied verbatim from the single-token kernels,
+    /// so the output is bit-identical to the 1b per-row looped form.
+    fn attentionLayerBatchedDecode(self: *ForwardGemma, L: u32, B: u32, b: *BatchScratch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const g = self.geom[L];
+        const f4 = @sizeOf(f32);
+        const wan = self.layer(L, "attn_norm.weight");
+        const wq = self.layer(L, "attn_q.weight");
+        const wk = self.layer(L, "attn_k.weight");
+        const wv_opt = self.model.getLayer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wpan = self.layer(L, "post_attention_norm.weight");
+        const kk = self.kv_k_slots.?;
+        const vv = self.kv_v_slots.?;
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+
+        // (1) Batched pre-attn norm + Q/K/V projections over B rows.
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wq, &b.norm, &b.q, g.q_dim, d.n_embd, B);
+        self.gemmDispatchA(&cmd, wk, &b.norm, &b.k, g.kv_dim, d.n_embd, B, true);
+        if (wv_opt) |wv| self.gemmDispatchA(&cmd, wv, &b.norm, &b.v, g.kv_dim, d.n_embd, B, true);
+
+        // (2) ONE batched per-seq V/Q/K norm+RoPE+KV-write into each row's slot at
+        // its own position. v_in is b.v on SWA layers (Wv present) else the raw K
+        // projection b.k (mirrors the production single-seq path's v_src fallback).
+        const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
+        const nr_sh = g.head_dim * f4;
+        const v_in: *const CudaBuffer = if (wv_opt != null) &b.v else &b.k;
+        const qkv = RmsRopeQkvSeqPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .n_head = d.n_head, .n_kv_head = g.n_kv_head, .slot_ctx = self.slot_ctx };
+        cmd.dispatch(&self.pipes.rms_norm_rope_qkv_seq, .{ d.n_head + 2 * g.n_kv_head, B, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &b.k, v_in, &wqn.gpu_buffer, &wkn.gpu_buffer, inv_freq, &b.q, &kk[L], &vv[L], pos_buf, slot_buf }, &qkv, @sizeOf(RmsRopeQkvSeqPush), nr_sh);
+
+        // (3) ONE batched per-seq causal (sliding-window on SWA) softmax attention:
+        // grid=(n_head, B); row b reads slot slots[b]'s history [0..positions[b]].
+        const window: u32 = if (g.is_swa) d.sliding_window else 0;
+        const attn = GemmaAttnSlotPush{ .head_dim = g.head_dim, .n_heads = d.n_head, .n_kv_heads = g.n_kv_head, .slot_ctx = self.slot_ctx, .scale_bits = @bitCast(@as(f32, 1.0)), .window = window };
+        cmd.dispatch(&self.pipes.gemma_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &kk[L], &vv[L], &b.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(GemmaAttnSlotPush), max_seq_len * 4);
+
+        // (4) Batched O projection + fused post-attn norm + residual over B rows.
+        self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, B);
+        cmd.dispatch(&self.pipes.rms_norm_residual, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.o, &wpan.gpu_buffer, &b.hidden }, &rms, @sizeOf(RmsPush), 0);
+        // Async on the shared stream; chains before the FFN block + next layer.
+        self.submit(cmd);
+    }
+
     /// Batched prefill GEMM dispatch: Y[T,M] = A[T,K]·W[M,K]^T. Q4_K/Q5_K/Q6_K
     /// weights take the register-blocked gemm_*_tiled_v2 tile; any other quant
     /// (q8_0/f32) falls back to a per-token dmmv loop (correctness-first). Buffers
@@ -1096,6 +1366,39 @@ pub const ForwardGemma = struct {
     /// act_f16. Byte-identical: x is unchanged and nothing writes act_f16 between
     /// the group's GEMMs, so the staged half bits are bit-for-bit Q's/gate's.
     fn gemmDispatchA(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32, a_preconv: bool) void {
+        // Effort 28: B==1 decode → tuned matvec (decodeStep's path). All decode
+        // projections/FFN GEMMs overwrite y (acc_mode 0) and are contiguous
+        // (a_offset 0) at T==1, so this is a drop-in for the batched-GEMM tile.
+        // Only set on a B==1 decodeBatch step; prefill (a_preconv staging) never
+        // reaches here with decode_b1 true.
+        if (T == 1 and self.decode_b1) {
+            self.dmmvDispatch(cmd, w, x, y, M, K, 0, 0);
+            return;
+        }
+        // Effort 28: small-B (2..8) Q4_K token-batch matvec. x/y are token-major
+        // [T,*] (contiguous), and every decode GEMM here overwrites y (the residual
+        // is the separate rms_norm_residual, not GEMM acc) → acc_mode 0. Reads each
+        // Q4_K weight row ONCE, amortizing the dequant over the T tokens →
+        // bandwidth-bound, no tile waste, bit-identical to dmmv_q4k_fast per row.
+        // Skip when the normf16 opt-in staged the fp16 norm into act_f16 instead of
+        // materializing the f32 x this kernel reads (a_preconv & use_tc_normf16).
+        if (self.decode_mrow and T >= 2 and T <= 27 and !(a_preconv and self.use_tc_normf16)) {
+            // Q4_K covers proj/gate/up; Q6_K covers gemma-31b's ffn_down; Q5_K/Q8_0
+            // cover other mixed-quant dense weights. All bit-identical-per-row to
+            // their *_fast matvec → token-identical to the serial decode path.
+            const btok: ?*CudaPipeline = switch (w.info.type_) {
+                .q4_k => &self.pipes.dmmv_q4k_btok[T - 2],
+                .q6_k => &self.pipes.dmmv_q6k_btok[T - 2],
+                .q5_k => &self.pipes.dmmv_q5k_btok[T - 2],
+                .q8_0 => &self.pipes.dmmv_q8_0_btok[T - 2],
+                else => null,
+            };
+            if (btok) |pipe| {
+                const push = DmmvPush{ .M = M, .K = K };
+                cmd.dispatch(pipe, .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+        }
         const gi: ?usize = switch (w.info.type_) {
             .q4_k => 0,
             .q5_k => 1,
@@ -1274,6 +1577,113 @@ pub const ForwardGemma = struct {
             }
             self.batch = null;
         }
+    }
+
+    // ---- Effort 28 increment 1: slot-based KV (batched / continuous decode) --
+
+    /// Allocate slot-based KV for `n_slots` concurrent sequences of up to
+    /// `slot_ctx` positions each. ADDITIVE: a fresh per-layer allocation that
+    /// never aliases or touches the production single-sequence kv_k/kv_v. The
+    /// batched-decode path (sub-steps 1b/1c) writes/reads it via
+    /// `slotKvOffsetBytes`; the production decodeStep is unchanged. Idempotent —
+    /// frees any prior slot KV first. Sub-step 1a only allocates + smoke-tests it.
+    pub fn allocSlotKv(self: *ForwardGemma, n_slots: u32, slot_ctx: u32) !void {
+        self.freeSlotKv();
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const kk = try self.allocator.alloc(CudaBuffer, self.d.n_layers);
+        const vv = try self.allocator.alloc(CudaBuffer, self.d.n_layers);
+        for (0..self.d.n_layers) |li| {
+            const bytes = @as(usize, n_slots) * slot_ctx * self.geom[li].kv_dim * f4;
+            kk[li] = try buffer.createBuffer(ctx, bytes);
+            vv[li] = try buffer.createBuffer(ctx, bytes);
+        }
+        self.kv_k_slots = kk;
+        self.kv_v_slots = vv;
+        self.n_slots = n_slots;
+        self.slot_ctx = slot_ctx;
+        // Persistent per-step decode scratch (see field comment): sized to the
+        // max batch (n_slots) so every decodeBatch step just re-uploads into it.
+        self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        // Suspect-#2 tail scratch (see field comment): one argmax slot per row +
+        // a persistent host embed staging buffer, both sized to the max batch.
+        self.argmax_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.embed_host = try self.allocator.alloc(f32, @as(usize, n_slots) * self.d.n_embd);
+    }
+
+    pub fn freeSlotKv(self: *ForwardGemma) void {
+        if (self.kv_k_slots) |ks| {
+            for (ks) |*b| buffer.freeBuffer(b);
+            self.allocator.free(ks);
+            self.kv_k_slots = null;
+        }
+        if (self.kv_v_slots) |vs| {
+            for (vs) |*b| buffer.freeBuffer(b);
+            self.allocator.free(vs);
+            self.kv_v_slots = null;
+        }
+        if (self.pos_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.pos_scratch = null;
+        }
+        if (self.slots_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.slots_scratch = null;
+        }
+        if (self.argmax_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.argmax_scratch = null;
+        }
+        if (self.embed_host) |h| {
+            self.allocator.free(h);
+            self.embed_host = null;
+        }
+        self.n_slots = 0;
+        self.slot_ctx = 0;
+    }
+
+    /// Byte offset of sequence-slot `slot`'s K/V for position `pos` in layer `L`'s
+    /// slot KV buffer: (slot*slot_ctx + pos)*kv_dim(L)*sizeof(f32). This is the
+    /// exact indexing the 1c per-sequence kv-write + slot attention kernels use.
+    pub fn slotKvOffsetBytes(self: *const ForwardGemma, L: u32, slot: u32, pos: u32) usize {
+        return (@as(usize, slot) * self.slot_ctx + pos) * self.geom[L].kv_dim * @sizeOf(f32);
+    }
+
+    /// Sub-step 1a plumbing smoke: prove the slot-KV offset arithmetic round-trips
+    /// and that distinct (slot,pos) pairs map to NON-overlapping device regions.
+    /// Writes a sentinel into (slot 0, pos 0) and a distinct pattern into the LAST
+    /// (slot, pos) of layer 0's K cache, reads both back, and checks neither write
+    /// clobbered the other. Returns true on success. Requires allocSlotKv first.
+    pub fn slotKvSmoke(self: *ForwardGemma) !bool {
+        const ks = self.kv_k_slots orelse return error.SlotKvNotAllocated;
+        if (self.n_slots == 0 or self.slot_ctx == 0) return error.SlotKvNotAllocated;
+        const ctx = self.ctx;
+        const kv_dim = self.geom[0].kv_dim;
+        const f4 = @sizeOf(f32);
+        const pat = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(pat);
+        const sentinel = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(sentinel);
+        const rd = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(rd);
+        for (pat, 0..) |*v, i| v.* = 1234.5 + @as(f32, @floatFromInt(i));
+        @memset(sentinel, -1.0);
+
+        const off_pat = self.slotKvOffsetBytes(0, self.n_slots - 1, self.slot_ctx - 1);
+        const off_sent = self.slotKvOffsetBytes(0, 0, 0);
+        var v_pat = try buffer.aliasBuffer(&ks[0], off_pat, kv_dim * f4);
+        defer buffer.freeBuffer(&v_pat);
+        var v_sent = try buffer.aliasBuffer(&ks[0], off_sent, kv_dim * f4);
+        defer buffer.freeBuffer(&v_sent);
+
+        buffer.upload(ctx, &v_sent, std.mem.sliceAsBytes(sentinel)); // (0,0)
+        buffer.upload(ctx, &v_pat, std.mem.sliceAsBytes(pat)); // far away
+        buffer.download(ctx, &v_pat, std.mem.sliceAsBytes(rd));
+        for (pat, rd) |x, y| if (x != y) return false;
+        buffer.download(ctx, &v_sent, std.mem.sliceAsBytes(rd));
+        for (sentinel, rd) |x, y| if (x != y) return false;
+        return true;
     }
 
     // ---- per-block builders -------------------------------------------------
@@ -2072,6 +2482,34 @@ fn ceilDiv(a: u32, b: u32) u32 {
 /// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
 fn tcDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the B==1 decodeBatch matvec fast path is default-ON (opt out
+// ZINC_BATCH_B1_MATVEC=0/off/false/no). When a decode step batches just one
+// sequence — every per-token prefill, and any single-client decode — the
+// 64×64-tiled TC GEMM processes one row and wastes the tile, so routing those
+// projections to the tuned `dmmv` matvec (the same kernel `decodeStep` uses)
+// recovers the ~4× per-stream gap. Token-identical to the production decode
+// matvec; argmax-identical to the batched-GEMM form (the BATCH_GATE tolerance).
+fn b1MatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the small-B (2..8) token-batch matvec (`*_btok`) is now DEFAULT-ON
+// (opt out with ZINC_BATCH_MROW=0/off/false/no). Same env knob as the qwen
+// `decodeBatch` port. Flipped 2026-06-15 after the CLEAN-window head-to-head gate
+// (throughput_vs_llama.sh, qwen35-9b, 5090, 60/60 rounds uncontended): mrow ON
+// clean-beats mrow OFF at every batched B (4.14×/2.83×/2.29× at B=2/4/8), no
+// regression at B=1. The batched mrow-ON path is token-identical to N-serial
+// (proven every cycle), so the flip just makes the validated-better path the
+// serving default; serial decodeStep/prefill never sets decode_mrow → catalog
+// correctness is unaffected by construction.
+fn mrowMatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }

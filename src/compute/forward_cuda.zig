@@ -82,9 +82,66 @@ const GatedNormPush = extern struct {
     d_state: u32,
     norm_per_head: u32,
 };
+// Effort 28 4c-2b: batched-decode SSM-inner kernels (byte-match kernels.cu).
+const ConvSeqPush = extern struct {
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: u32,
+    conv_state_len: u32,
+};
+const GatedNormSeqPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: u32,
+};
+const DeltaNetSeqPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    ssm_a_is_f16: u32,
+    dt_bias_is_f16: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    conv_stride_tok: u32,
+    ab_stride_tok: u32,
+    y_stride_tok: u32,
+    ssm_state_len: u32,
+};
 const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
+// Effort 28 4c-2: fused batched-decode attn front-end (byte-match kernels.cu).
+const QwenQkvSeqPush = extern struct {
+    head_dim: u32,
+    eps: f32,
+    rope_dim: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    slot_ctx: u32,
+};
+const AttnSlotPush = extern struct {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    slot_ctx: u32,
+    attn_scale_bits: u32,
+    sink_offset: u32,
+};
+// Effort 28 4c: batched GEMM push (must byte-match `struct GemmPush` in kernels.cu).
+// Output Y is token-major [T, M]; offsets are in BYTES; acc_mode 1 => Y += .
+const GemmPush = extern struct {
+    M: u32,
+    K: u32,
+    T: u32,
+    a_offset: u32 = 0,
+    x_offset: u32 = 0,
+    y_offset: u32 = 0,
+    acc_mode: u32 = 0,
+};
 const ArgmaxPush = extern struct { N: u32 };
 const EmbedPush = extern struct { K: u32, vocab: u32 };
 // MoE router/combine kernels (byte-match kernels.cu).
@@ -116,6 +173,19 @@ fn dmmvIdx(t: gguf.GGMLType) usize {
         .q8_0 => 3,
         .f32 => 4,
         else => 0,
+    };
+}
+
+/// Effort 28: a stacked-MoE expert weight type that has a GPU-side `dmmv_*_experts`
+/// kernel (reads the chosen expert id from `router_out_buf` GPU-side, no host
+/// readback). The async `batched_experts` path is enabled only when ALL of
+/// gate/up/down are supported; any other type (q8_0/f32) keeps the host-id
+/// fallback (correct, but per-row sync). Adding q6_k (cycle 2026-06-15) brings the
+/// 5 mixed-quant Q6_K-expert layers of qwen36-35b-a3b onto the async/collapse path.
+fn expertsSupported(t: gguf.GGMLType) bool {
+    return switch (t) {
+        .q4_k, .q5_k, .q6_k => true,
+        else => false,
     };
 }
 
@@ -190,9 +260,25 @@ const Pipelines = struct {
     rms_norm: CudaPipeline,
     dmmv: [5]CudaPipeline, // q4k, q5k, q6k, q8_0, f32
     dmmv_fast: [4]CudaPipeline, // q4k_fast, q5k_fast, q6k_fast, q8_0_fast (block=64)
+    // Effort 28 4c: batched-decode GEMM (one weight read amortized over B rows).
+    gemm: [4]CudaPipeline, // q4k, q5k, q6k, q8_0 tiled_v2
+    gemm_f32: CudaPipeline, // f32 weights (e.g. some ssm projections)
+    // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
+    // Reads each weight row once + amortizes the dequant over B tokens, dodging
+    // the 64-tile padding waste of the batched GEMM at small B (opt-in).
+    dmmv_q4k_btok: [26]CudaPipeline, // Effort 28: token-batch matvec B=2..27 (idx B-2)
+    dmmv_q6k_btok: [26]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec
+    dmmv_q5k_btok: [26]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
+    dmmv_q8_0_btok: [26]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
+    // Effort 28 4c-2: fused batched-decode attention (grid.y=B per-seq) twins.
+    qwen_norm_rope_qkv_seq: CudaPipeline,
+    naive_attention_batched_seq: CudaPipeline,
+    ssm_conv1d_seq: CudaPipeline,
+    ssm_delta_net_seq: CudaPipeline,
+    ssm_gated_norm_seq: CudaPipeline,
     sigmoid_mul: CudaPipeline,
     deinterleave: CudaPipeline,
     ssm_conv1d: CudaPipeline,
@@ -253,6 +339,66 @@ const BatchScratch = struct {
     w_f16: CudaBuffer, // [maxM*maxK] fp16 dequant'd weight for cuBLAS
 };
 
+/// Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
+/// Distinct from the single-token scratch on ForwardCuda — additive, never
+/// aliases it. Sized to the per-row max over the attention / SSM / FFN blocks so
+/// every batched projection (and the per-row inner on row b's slice) has room.
+const DecodeBatch = struct {
+    b_cap: u32,
+    hidden: CudaBuffer, // [B, n_embd] residual stream
+    norm: CudaBuffer, // [B, n_embd] pre-block rms norm
+    qfull: CudaBuffer, // [B, 2*q_dim] packed [Q|gate] (attn)
+    q: CudaBuffer, // [B, q_dim]
+    k: CudaBuffer, // [B, kv_dim]
+    v: CudaBuffer, // [B, kv_dim]
+    gate: CudaBuffer, // [B, max(q_dim, d_inner, n_ff)] attn gate / ssm z / ffn gate
+    attn_out: CudaBuffer, // [B, max(q_dim, conv_channels, d_inner)] attn out / ssm qkv / delta_out
+    swiglu: CudaBuffer, // [B, max(n_ff, conv_channels, d_inner)] conv_out / gated_norm / ffn swiglu
+    up: CudaBuffer, // [B, n_ff] ffn up
+    alpha: CudaBuffer, // [B, dt_rank] ssm alpha
+    beta: CudaBuffer, // [B, dt_rank] ssm beta
+    ssm_delta: CudaBuffer, // [B, d_inner] ssm delta-net output (dedicated stride)
+    ssm_y: CudaBuffer, // [B, d_inner] ssm gated-norm output → out-proj
+    ffn_norm: CudaBuffer, // [B, n_embd] ffn pre-norm
+    moe_down: CudaBuffer, // [B, n_embd] batched MoE shared-expert down output (pre-scale)
+    moe_gate_scalar: CudaBuffer, // [B] batched MoE shared-expert sigmoid gate logit
+
+    fn alloc(ctx: ?*shim.CudaCtx, d: Derived, b_cap: u32) !DecodeBatch {
+        const f4 = @sizeOf(f32);
+        const dt = @max(@as(u32, 1), d.dt_rank);
+        const di = @max(@as(u32, 1), d.d_inner);
+        const gate_n = @max(d.q_dim, @max(d.d_inner, d.n_ff));
+        const aout_n = @max(d.q_dim, @max(d.conv_channels, d.d_inner));
+        const swig_n = @max(d.n_ff, @max(d.conv_channels, d.d_inner));
+        return .{
+            .b_cap = b_cap,
+            .hidden = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .qfull = try buffer.createBuffer(ctx, b_cap * 2 * d.q_dim * f4),
+            .q = try buffer.createBuffer(ctx, b_cap * d.q_dim * f4),
+            .k = try buffer.createBuffer(ctx, b_cap * d.kv_dim * f4),
+            .v = try buffer.createBuffer(ctx, b_cap * d.kv_dim * f4),
+            .gate = try buffer.createBuffer(ctx, b_cap * gate_n * f4),
+            .attn_out = try buffer.createBuffer(ctx, b_cap * aout_n * f4),
+            .swiglu = try buffer.createBuffer(ctx, b_cap * swig_n * f4),
+            .up = try buffer.createBuffer(ctx, b_cap * d.n_ff * f4),
+            .alpha = try buffer.createBuffer(ctx, b_cap * dt * f4),
+            .beta = try buffer.createBuffer(ctx, b_cap * dt * f4),
+            .ssm_delta = try buffer.createBuffer(ctx, b_cap * di * f4),
+            .ssm_y = try buffer.createBuffer(ctx, b_cap * di * f4),
+            .ffn_norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .moe_down = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .moe_gate_scalar = try buffer.createBuffer(ctx, b_cap * f4),
+        };
+    }
+
+    fn free(self: *DecodeBatch) void {
+        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm, &self.moe_down, &self.moe_gate_scalar }) |b| {
+            buffer.freeBuffer(b);
+        }
+    }
+};
+
 /// Per-token GPU forward state for qwen35 greedy decode.
 pub const ForwardCuda = struct {
     allocator: std.mem.Allocator,
@@ -292,12 +438,91 @@ pub const ForwardCuda = struct {
     // recording, switching `submit`/attention to a no-sync capture path.
     graph: ?*shim.CudaGraph = null,
     capturing: bool = false,
+    // Effort 28: CUDA-graph replay for the BATCHED dense-decode step (qwen35),
+    // one cached CUgraphExec per distinct batch size B (index B). Opt-in via
+    // ZINC_BATCH_GRAPH (`batch_graph_on`) / harness `batch_graph_force`. The
+    // captured region is sync-free thanks to the dense launch-collapse (commit
+    // 3c6ca650): every batched block rides the async `submit` no-sync path under
+    // `capturing`, and the per-step scalars (positions/slots/tokens) live in
+    // device scratch uploaded BEFORE capture, so the topology + push-constants are
+    // invariant across steps → `cuGraphExecUpdate` is a cheap in-place no-op.
+    // MoE is now ALSO capturable when `moe_graph_capturable` (cycle 2026-06-15):
+    // after `4439e0be` (GPU-side expert-id for ALL supported quants) + `6516c010`
+    // (per-row sync collapse), the batched MoE routed + shared path contains NO
+    // host readback and NO commitAndWait — `submit`/`waitPending` are no-ops under
+    // `capturing` — and the expert id is read GPU-side from a device buffer (not a
+    // push constant), so topology + push-constants stay invariant across steps. Set
+    // only by `decodeBatch`.
+    batch_graph: [9]?*shim.CudaGraph = .{null} ** 9,
+    batch_graph_on: bool = false,
+    batch_graph_force: ?bool = null,
+    // True when EVERY MoE layer's gate/up/down expert tensors have a GPU-side
+    // `dmmv_*_experts` kernel (`expertsSupported`) → no host id readback anywhere on
+    // the routed path → the batched MoE decode step is stream-capturable. Computed
+    // once at init (false for dense models, which use the `n_experts==0` graph gate).
+    moe_graph_capturable: bool = false,
     // GPU-side embedding (Effort 25 cycle 5): when the token_embd tensor is Q4_K,
     // dequant the token's row on-GPU (reading the id from `tok_in_buf`) instead of
     // a per-token CPU dequant + full-row H2D. `embed_weight` points at the resident
     // token_embd.weight device buffer; null/false → fall back to the CPU path.
     embed_weight: ?*const CudaBuffer = null,
     embed_gpu: bool = false,
+    // Effort 28 B==1 matvec fast path (qwen analog of ForwardGemma.decode_b1).
+    // When a `decodeBatch` step batches a single sequence — every per-token
+    // prefill and any single-client decode — its per-layer projection/FFN GEMMs
+    // waste 63/64 of the 64×64 batched tile on one row. Set true only when B==1
+    // AND `b1MatvecOn()` (default-on, opt out ZINC_BATCH_B1_MATVEC=0); routes
+    // those GEMMs through the tuned `dmmvDispatch` matvec (exactly what production
+    // `decodeStep` uses). Never set by `decodeStep`/`prefillStep`, so the serial
+    // path is untouched. `decode_b1_force` (harness-only) overrides the env gate
+    // for an in-process A/B (null → env default).
+    decode_b1: bool = false,
+    decode_b1_force: ?bool = null,
+    // Effort 28: at small batch B (2..8) the 64×64 batched GEMM wastes 56-62/64
+    // row-slots and goes compute-bound on tile padding (head-to-head: B=8 100%
+    // util, slow). Set true in `decodeBatch` for 2≤B≤8 when `mrowMatvecOn()`
+    // (opt-in, ZINC_BATCH_MROW=1); routes Q4_K projection/FFN GEMMs through the
+    // token-batch matvec (`dmmv_q4k_btok`, weight read once + dequant amortized
+    // over B → bandwidth-bound). Never set by `decodeStep`/`prefillStep`.
+    // `decode_mrow_force` (harness-only) overrides the env gate for an in-process
+    // A/B (null → env default).
+    decode_mrow: bool = false,
+    decode_mrow_force: ?bool = null,
+    // Effort 28 MoE: batch the shared expert across ALL B rows of a decodeBatch
+    // step. The shared-expert gate/up/down are DENSE weights (not per-expert), so
+    // the per-row `moeFfnRowDecode` loop reads them B× redundantly; running them as
+    // ONE GEMM each over B rows reads each weight ONCE. This is only a win through
+    // the bandwidth-bound `btok` matvec (it rides the `decode_mrow` gate); through
+    // the tile GEMM it loses to the per-row matvec at small B (tile-padding tax).
+    // Enabled when `decode_mrow` AND `moeSharedBatchedOn()` (default-on, opt-out
+    // ZINC_BATCH_MOE_SHARED=0); `_force` overrides the env gate for an in-process
+    // A/B. Never set by decodeStep/prefillStep (they run the single-seq path).
+    moe_shared_batched: bool = false,
+    moe_shared_batched_force: ?bool = null,
+    // Effort 28 MoE launch-collapse: in the batched-decode MoE block the B per-row
+    // `moeFfnRoutedRowDecode` calls each ended with a blocking `waitPending` (to make
+    // the shared per-row scratch safe to reuse next row). For the pure-GPU async
+    // (`batched_experts`) path that sync is UNNECESSARY — all commands ride ONE
+    // shared CUstream in-order, so the rows queue back-to-back and drain together at
+    // the layer tail, removing B CPU↔GPU round-trips per MoE layer per token (the
+    // boost-starved qwen MoE decode is launch-bound). Default-on when the batched
+    // MoE path runs; `_force` lets the harness A/B it (false → restore per-row sync).
+    moe_collapse: bool = true,
+    moe_collapse_force: ?bool = null,
+    // Effort 28 DENSE batched-decode launch-collapse: the per-layer batched blocks
+    // (`attentionLayerBatchedDecode`/`ssmLayerBatchedDecode`/`ffnBlockBatchedDecode`)
+    // each ended with a blocking `commitAndWait` so the shared per-layer scratch
+    // (db.norm/db.qfull/db.gate/…) was safe to reuse next layer. That sync is
+    // UNNECESSARY — all commands ride ONE shared CUstream in-order, so layer L+1's
+    // writes serialize after layer L's reads with no host round-trip. Route those
+    // blocks through the async `submit` ring instead and drain once at the decode
+    // tail → removes ~2 CPU↔GPU round-trips per layer per token (boost-starved
+    // launch-bound decode), AND is the structural prerequisite for graph-capturing
+    // the batched step (a captured region must contain no commitAndWait). Default-on
+    // when the batched path runs; `_force` lets the harness A/B it (false → restore
+    // per-layer sync). Set only by `decodeBatch`; serial decodeStep never touches it.
+    decode_collapse: bool = true,
+    decode_collapse_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -325,6 +550,44 @@ pub const ForwardCuda = struct {
     use_cublas: bool = false, // dense Q4_K/Q6_K prefill GEMMs via cuBLAS fp16 TC
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
     cublas_min_t: u32 = 128, // only use cuBLAS once T amortizes the dequant round-trip
+
+    // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
+    // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
+    // carries the hybrid-SSM per-slot conv + recurrent state: attn layers populate
+    // the KV slots [n_slots*slot_ctx*kv_dim], ssm layers the conv [n_slots*
+    // conv_state_len] + recurrent [n_slots*ssm_state_len] slots; the "wrong" layer
+    // type gets a 1-elem stub so free is uniform. ADDITIVE — the single-sequence
+    // kv_k/kv_v/ssm_conv_state/ssm_state above stay the production decodeStep path.
+    kv_k_slots: ?[]CudaBuffer = null,
+    kv_v_slots: ?[]CudaBuffer = null,
+    ssm_conv_slots: ?[]CudaBuffer = null,
+    ssm_state_slots: ?[]CudaBuffer = null,
+    n_slots: u32 = 0,
+    slot_ctx: u32 = 0,
+    // E28 degradation fix: persistent device scratch for the per-step batched
+    // decode positions[]/slots[] uploads — allocated ONCE alongside the slot
+    // state (sized to n_slots ≥ B), reused every `decodeBatch` step so the
+    // serving loop no longer cudaMalloc/cudaFrees two u32 buffers per decoded
+    // token (per-step alloc/free fragments the allocator → monotonic collapse).
+    pos_scratch: ?CudaBuffer = null,
+    slots_scratch: ?CudaBuffer = null,
+    // E28 lever C suspect #2 (qwen port of the gemma `bf4ad2a6` fix): persistent
+    // scratch to collapse the per-step embed + tail B-serial GPU round-trips into
+    // single batched ops. `argmax_scratch` [n_slots] u32 collects every row's tail
+    // argmax (ONE B-wide download vs B downloads/token); `embed_host`
+    // [n_slots*n_embd] stages the CPU embed (ONE upload vs B); `tok_scratch`
+    // [n_slots] u32 holds the B token ids for the GPU embed path (ONE command
+    // buffer vs B commitAndWaits). All sized to n_slots ≥ B, alloc'd in
+    // allocSlotState / freed in freeSlotState. ADDITIVE — production decodeStep
+    // (single-seq argmax_buf/host_embed/tok_in_buf) is untouched.
+    argmax_scratch: ?CudaBuffer = null,
+    embed_host: ?[]f32 = null,
+    tok_scratch: ?CudaBuffer = null,
+
+    // Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
+    // Lazily allocated on the first decodeBatch call, grown if B exceeds cap.
+    // ADDITIVE — never aliases the single-sequence scratch above.
+    decode_batch: ?DecodeBatch = null,
 
     /// Compile kernels, allocate every device buffer, upload inv_freq + sinks,
     /// zero the KV cache and SSM state.
@@ -361,6 +624,11 @@ pub const ForwardCuda = struct {
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
+        pipes.qwen_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv_seq");
+        pipes.naive_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "naive_attention_batched_seq");
+        pipes.ssm_conv1d_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d_seq");
+        pipes.ssm_delta_net_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net_seq");
+        pipes.ssm_gated_norm_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm_seq");
         pipes.sigmoid_mul = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_mul");
         pipes.deinterleave = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate");
         pipes.ssm_conv1d = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d");
@@ -386,7 +654,24 @@ pub const ForwardCuda = struct {
         pipes.rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rope_batched");
         pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write_batched");
         pipes.attention_causal_batched = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{37});
+        // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
+        pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
+        pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
+        pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
+        pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
+        pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
+        // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
+        // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
+        // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
+        // the old 8-cap into the higher-concurrency serving regime (btok stays
+        // bandwidth-bound to the ~B≈27 roofline crossover vs the padded tile GEMM).
+        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27" }, 0..) |suf, i| {
+            pipes.dmmv_q4k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok" ++ suf);
+            pipes.dmmv_q6k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_btok" ++ suf);
+            pipes.dmmv_q5k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_btok" ++ suf);
+            pipes.dmmv_q8_0_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_btok" ++ suf);
+        }
+        log.info("nvrtc: compiled {d} kernel pipelines", .{147});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -532,6 +817,46 @@ pub const ForwardCuda = struct {
                 log.info("CUDA graph: MoE has a non-batched expert layer (per-slot fallback) — graph disabled", .{});
             }
         }
+        // Effort 28: is the batched MoE decode step stream-capturable? Only when
+        // EVERY MoE layer is on the GPU-side `batched_experts` path (all of
+        // gate/up/down `expertsSupported`) — else a layer host-gathers its expert
+        // ids (download + commitAndWait), illegal mid-capture. Dense models stay on
+        // the `n_experts==0` gate. Scanned once here (model weights are loaded).
+        if (d.n_experts > 0) {
+            self.moe_graph_capturable = blk: {
+                var L: u32 = 0;
+                while (L < d.n_layers) : (L += 1) {
+                    const wge = self.model.getLayer(L, "ffn_gate_exps.weight") orelse break :blk false;
+                    const wue = self.model.getLayer(L, "ffn_up_exps.weight") orelse break :blk false;
+                    const wde = self.model.getLayer(L, "ffn_down_exps.weight") orelse break :blk false;
+                    if (!expertsSupported(wge.info.type_) or !expertsSupported(wue.info.type_) or !expertsSupported(wde.info.type_)) break :blk false;
+                }
+                break :blk true;
+            };
+        }
+        // Effort 28: CUDA-graph replay for the BATCHED decode step. Per-B execs are
+        // created lazily on first use in `decodeBatch`.
+        // - MoE-capturable models (every routed layer reads expert ids GPU-side, no
+        //   host readback) are DEFAULT-ON: validated WIN on a CLEAN 5090 window
+        //   (qwen36-35b-a3b B=4, 3 boost-comparable rounds, graph ON +36..+46% agg,
+        //   token-identical BATCH_GATE+SANITY) — the boost-starved MoE step recovers
+        //   its per-step launch bubble via graph replay (mirrors e27's serial
+        //   MoE-graph default-on). Opt OUT with ZINC_BATCH_GRAPH=0/off/false/no.
+        // - Dense models stay OPT-IN (measured NEUTRAL-to-slightly-negative on a
+        //   clean window — the dense batched step is already launch-collapsed): env
+        //   must be set truthy.
+        const bg_env = std.posix.getenv("ZINC_BATCH_GRAPH");
+        const bg_falsey = if (bg_env) |v| (std.mem.eql(u8, v, "0") or
+            std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
+            std.ascii.eqlIgnoreCase(v, "no")) else false;
+        if (self.moe_graph_capturable) {
+            self.batch_graph_on = !bg_falsey; // default-on for MoE-capturable, opt-out
+        } else if (d.n_experts == 0) {
+            self.batch_graph_on = (bg_env != null) and !bg_falsey; // dense opt-in
+        }
+        if (self.batch_graph_on) {
+            log.info("ZINC_BATCH_GRAPH: batched decode will replay via per-B captured CUDA graphs (moe_capturable={})", .{self.moe_graph_capturable});
+        }
 
         return self;
     }
@@ -540,6 +865,7 @@ pub const ForwardCuda = struct {
         const a = self.allocator;
         self.freeBatch();
         if (self.graph) |g| shim.cuda_graph_free(g);
+        for (&self.batch_graph) |*bg| if (bg.*) |g| shim.cuda_graph_free(g);
         inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.tok_in_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
@@ -547,6 +873,8 @@ pub const ForwardCuda = struct {
         for (self.kv_v) |*b| buffer.freeBuffer(b);
         for (self.ssm_conv_state) |*b| buffer.freeBuffer(b);
         for (self.ssm_state) |*b| buffer.freeBuffer(b);
+        if (self.decode_batch) |*db| db.free();
+        self.freeSlotState();
         a.free(self.kv_k);
         a.free(self.kv_v);
         a.free(self.ssm_conv_state);
@@ -561,11 +889,213 @@ pub const ForwardCuda = struct {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
+                for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+                for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q6k_btok")) {
+                for (&self.pipes.dmmv_q6k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q5k_btok")) {
+                for (&self.pipes.dmmv_q5k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q8_0_btok")) {
+                for (&self.pipes.dmmv_q8_0_btok) |*p| pipeline.freePipeline(p);
             } else {
                 pipeline.freePipeline(&@field(self.pipes, f.name));
             }
         }
         self.* = undefined;
+    }
+
+    // ---- Effort 28 inc 4: per-sequence slot state (batched decode plumbing) ----
+
+    /// Allocate per-sequence slot state for `n_slots` concurrent sequences, each
+    /// with up to `slot_ctx` positions. Attn layers get slot KV; ssm layers get
+    /// per-slot conv + recurrent state (zero-initialised). Additive — production
+    /// single-sequence buffers are untouched. Re-callable (frees first).
+    pub fn allocSlotState(self: *ForwardCuda, n_slots: u32, slot_ctx: u32) !void {
+        self.freeSlotState();
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const d = self.d;
+        const kk = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const vv = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const cc = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        const ss = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            if (isFullAttn(L, d.full_attn_interval)) {
+                const kv_bytes = @as(usize, n_slots) * slot_ctx * d.kv_dim * f4;
+                kk[li] = try buffer.createBuffer(ctx, kv_bytes);
+                vv[li] = try buffer.createBuffer(ctx, kv_bytes);
+                cc[li] = try buffer.createBuffer(ctx, f4);
+                ss[li] = try buffer.createBuffer(ctx, f4);
+            } else {
+                kk[li] = try buffer.createBuffer(ctx, f4);
+                vv[li] = try buffer.createBuffer(ctx, f4);
+                cc[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.conv_state_len * f4);
+                ss[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.ssm_state_len * f4);
+                try zeroBuffer(self.allocator, ctx, &cc[li], n_slots * d.conv_state_len);
+                try zeroBuffer(self.allocator, ctx, &ss[li], n_slots * d.ssm_state_len);
+            }
+        }
+        self.kv_k_slots = kk;
+        self.kv_v_slots = vv;
+        self.ssm_conv_slots = cc;
+        self.ssm_state_slots = ss;
+        self.n_slots = n_slots;
+        self.slot_ctx = slot_ctx;
+        // Persistent per-step decode scratch (see field comment): sized to the
+        // max batch (n_slots) so every decodeBatch step just re-uploads into it.
+        self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        // Suspect-#2 port: persistent tail/embed scratch (see field comment).
+        self.argmax_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.tok_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.embed_host = try self.allocator.alloc(f32, @as(usize, n_slots) * d.n_embd);
+    }
+
+    pub fn freeSlotState(self: *ForwardCuda) void {
+        inline for (.{ &self.kv_k_slots, &self.kv_v_slots, &self.ssm_conv_slots, &self.ssm_state_slots }) |field| {
+            if (field.*) |bufs| {
+                for (bufs) |*b| buffer.freeBuffer(b);
+                self.allocator.free(bufs);
+                field.* = null;
+            }
+        }
+        inline for (.{ &self.pos_scratch, &self.slots_scratch, &self.argmax_scratch, &self.tok_scratch }) |field| {
+            if (field.*) |*b| {
+                buffer.freeBuffer(b);
+                field.* = null;
+            }
+        }
+        if (self.embed_host) |h| {
+            self.allocator.free(h);
+            self.embed_host = null;
+        }
+        self.n_slots = 0;
+        self.slot_ctx = 0;
+    }
+
+    /// Byte offset of slot `slot`'s K/V for position `pos` in attn layer `L`'s slot
+    /// KV: (slot*slot_ctx + pos)*kv_dim*sizeof(f32). The future per-seq kv-write +
+    /// slot attention kernels (4b/4c) will use this exact indexing.
+    pub fn slotKvOffsetBytes(self: *const ForwardCuda, slot: u32, pos: u32) usize {
+        return (@as(usize, slot) * self.slot_ctx + pos) * self.d.kv_dim * @sizeOf(f32);
+    }
+    /// Byte offset of slot `slot`'s conv ring (ssm layer): slot*conv_state_len*f4.
+    pub fn slotConvOffsetBytes(self: *const ForwardCuda, slot: u32) usize {
+        return @as(usize, slot) * self.d.conv_state_len * @sizeOf(f32);
+    }
+    /// Byte offset of slot `slot`'s recurrent state (ssm layer): slot*ssm_state_len*f4.
+    pub fn slotStateOffsetBytes(self: *const ForwardCuda, slot: u32) usize {
+        return @as(usize, slot) * self.d.ssm_state_len * @sizeOf(f32);
+    }
+
+    /// Effort 28 increment 4 (qwen serving): zero a REUSED slot's SSM conv ring +
+    /// recurrent state so a new request prefilling from pos=0 into this slot starts
+    /// from clean state. The serving engine reuses slots across requests
+    /// (nslots < concurrent clients) and qwen's SSM state is ACCUMULATED (not
+    /// position-indexed), so without this a reused slot inherits the prior request's
+    /// recurrent state → corruption. The attention slot KV needs NO reset (it is
+    /// position-indexed and overwritten on prefill; reads never reach beyond the
+    /// current sequence's positions — same reason gemma's slot KV reuses cleanly).
+    /// No-op if slot state is unallocated. Call on ADMIT, before per-token prefill.
+    pub fn resetSlot(self: *ForwardCuda, slot: u32) !void {
+        const cc = self.ssm_conv_slots orelse return;
+        const ss = self.ssm_state_slots orelse return;
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        std.debug.assert(slot < self.n_slots);
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) continue; // attn KV is position-overwritten
+            var convst = try buffer.aliasBuffer(&cc[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
+            defer buffer.freeBuffer(&convst);
+            try zeroBuffer(self.allocator, self.ctx, &convst, d.conv_state_len);
+            var recst = try buffer.aliasBuffer(&ss[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
+            defer buffer.freeBuffer(&recst);
+            try zeroBuffer(self.allocator, self.ctx, &recst, d.ssm_state_len);
+        }
+    }
+
+    /// Upload distinct data into two device regions of `buf` and read both back to
+    /// prove they do NOT alias (the slot-offset arithmetic carves non-overlapping
+    /// per-sequence regions). Returns false if either write clobbered the other.
+    fn nonOverlapCheck(self: *ForwardCuda, buf: *CudaBuffer, off_a: usize, off_b: usize, n: u32) !bool {
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const a = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(a);
+        const b = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(b);
+        const rd = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(rd);
+        for (a, 0..) |*v, i| v.* = 7.5 + @as(f32, @floatFromInt(i));
+        @memset(b, -3.0);
+        var va = try buffer.aliasBuffer(buf, off_a, n * f4);
+        defer buffer.freeBuffer(&va);
+        var vb = try buffer.aliasBuffer(buf, off_b, n * f4);
+        defer buffer.freeBuffer(&vb);
+        buffer.upload(ctx, &vb, std.mem.sliceAsBytes(b));
+        buffer.upload(ctx, &va, std.mem.sliceAsBytes(a));
+        buffer.download(ctx, &va, std.mem.sliceAsBytes(rd));
+        for (a, rd) |x, y| if (x != y) return false;
+        buffer.download(ctx, &vb, std.mem.sliceAsBytes(rd));
+        for (b, rd) |x, y| if (x != y) return false;
+        return true;
+    }
+
+    /// Sub-step 4a plumbing smoke: prove the slot-offset arithmetic round-trips and
+    /// that distinct slots map to NON-overlapping device regions for BOTH the
+    /// attention KV and the SSM conv + recurrent state. Requires allocSlotState
+    /// with n_slots >= 2 (so slot 0 and slot n_slots-1 differ). Returns true on
+    /// success.
+    pub fn slotStateSmoke(self: *ForwardCuda) !bool {
+        if (self.kv_k_slots == null or self.n_slots < 2 or self.slot_ctx == 0) return error.SlotStateNotAllocated;
+        const d = self.d;
+        var attn_l: ?u32 = null;
+        var ssm_l: ?u32 = null;
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            if (isFullAttn(L, d.full_attn_interval)) {
+                if (attn_l == null) attn_l = L;
+            } else if (ssm_l == null) ssm_l = L;
+        }
+        // Attn KV: slot 0 / pos 0 vs the last slot / last position.
+        if (attn_l) |L| {
+            const ks = &self.kv_k_slots.?[L];
+            const off_a = self.slotKvOffsetBytes(0, 0);
+            const off_b = self.slotKvOffsetBytes(self.n_slots - 1, self.slot_ctx - 1);
+            if (!try self.nonOverlapCheck(ks, off_a, off_b, d.kv_dim)) return false;
+        }
+        // SSM conv + recurrent: slot 0 vs the last slot.
+        if (ssm_l) |L| {
+            const cs = &self.ssm_conv_slots.?[L];
+            if (!try self.nonOverlapCheck(cs, self.slotConvOffsetBytes(0), self.slotConvOffsetBytes(self.n_slots - 1), d.conv_state_len)) return false;
+            const ss = &self.ssm_state_slots.?[L];
+            if (!try self.nonOverlapCheck(ss, self.slotStateOffsetBytes(0), self.slotStateOffsetBytes(self.n_slots - 1), d.ssm_state_len)) return false;
+        }
+        return true;
+    }
+
+    /// Reset the production single-sequence recurrent state to a fresh-process
+    /// start: zero every ssm layer's conv ring + recurrent state and clear the
+    /// per-layer conv offset. The attention KV cache needs no reset — it is
+    /// position-indexed and each sequence overwrites from pos 0, reading only what
+    /// it wrote. Used by the batch harness to make the per-sequence SERIAL
+    /// reference truly single-sequence (without this, the unindexed SSM recurrent
+    /// state leaks from one reference sequence into the next). Additive — never
+    /// called on the real decode/prefill path; that path runs one sequence/process.
+    pub fn resetState(self: *ForwardCuda) !void {
+        const d = self.d;
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            self.conv_off[li] = 0;
+            if (!isFullAttn(L, d.full_attn_interval)) {
+                try zeroBuffer(self.allocator, self.ctx, &self.ssm_conv_state[li], d.conv_state_len);
+                try zeroBuffer(self.allocator, self.ctx, &self.ssm_state[li], d.ssm_state_len);
+            }
+        }
     }
 
     /// Run one greedy decode step for `token` at sequence position `pos`,
@@ -654,18 +1184,6 @@ pub const ForwardCuda = struct {
         self.waitPending(); // drain the async layer ops; no logits for prompt-internal tokens
     }
 
-    // ======================================================================
-    // Effort 26 T0 — BATCHED PREFILL (qwen hybrid-SSM). The per-token prefill
-    // (`prefillStep`) re-reads every weight once PER prompt token (a matvec),
-    // so qwen prefill was 62–158× behind llama. This batches the whole prompt:
-    // the dominant dense projections/FFN run as ONE [T,K]×[K,M] GEMM each
-    // (cuBLAS fp16 TC, weight read once), the delta-net scan runs in ONE launch
-    // (`n_tok=T`, recurrence preserved), conv1d/gated-norm use batched kernels,
-    // and only the cheap per-head attention inner ops loop per token on the
-    // proven single-token kernels (via token-major aliases). Output equals the
-    // per-token path (bit-identical below the cuBLAS T-threshold; within the
-    // token-correctness gate above it).
-    // ======================================================================
     pub fn prefillBatched(self: *ForwardCuda, tokens: []const u32) !u32 {
         const d = self.d;
         const ctx = self.ctx;
@@ -753,9 +1271,9 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
-        self.gemmDispatch(&cmd, wq, &b.norm, &b.qfull, 2 * d.q_dim, d.n_embd, T);
-        self.gemmDispatch(&cmd, wk, &b.norm, &b.k, d.kv_dim, d.n_embd, T);
-        self.gemmDispatch(&cmd, wv, &b.norm, &b.v, d.kv_dim, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wq, &b.norm, &b.qfull, 2 * d.q_dim, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wk, &b.norm, &b.k, d.kv_dim, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wv, &b.norm, &b.v, d.kv_dim, d.n_embd, T);
 
         // Effort 26 T0: batched attention inner — each of the per-token ops below
         // is collapsed into ONE launch over all T tokens (grid.y = T, or grid.x
@@ -784,7 +1302,7 @@ pub const ForwardCuda = struct {
         const sm = SigmoidMulPush{ .N = T * d.q_dim };
         cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(T * d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.attn_out, &b.attn_gate, &b.attn_out }, &sm, @sizeOf(SigmoidMulPush), 0);
         // O projection → b.o, then fold into the residual stream.
-        self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, d.q_dim, T);
+        self.gemmDispatchPrefill(&cmd, wo, &b.attn_out, &b.o, d.n_embd, d.q_dim, T);
         const add = AddPush{ .N = T * d.n_embd };
         cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
         self.submit(cmd);
@@ -811,10 +1329,10 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
-        self.gemmDispatch(&cmd, wqkv, &b.norm, &b.qkv, d.conv_channels, d.n_embd, T);
-        self.gemmDispatch(&cmd, wz, &b.norm, &b.z, d.d_inner, d.n_embd, T);
-        self.gemmDispatch(&cmd, walpha, &b.norm, &b.alpha, d.dt_rank, d.n_embd, T);
-        self.gemmDispatch(&cmd, wbeta, &b.norm, &b.beta, d.dt_rank, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wqkv, &b.norm, &b.qkv, d.conv_channels, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wz, &b.norm, &b.z, d.d_inner, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, walpha, &b.norm, &b.alpha, d.dt_rank, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wbeta, &b.norm, &b.beta, d.dt_rank, d.n_embd, T);
         // Batched conv1d (+SiLU): one launch over all T, the circular conv-state
         // advances internally exactly as the per-token launches did.
         const conv = ConvBatchPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .n_tok = T, .state_offset = self.conv_off[L] };
@@ -843,7 +1361,7 @@ pub const ForwardCuda = struct {
         const gn = GatedNormBatchPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head, .n_tok = T };
         cmd.dispatch(&self.pipes.ssm_gated_norm_batched, .{ d.dt_rank, T, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.delta_out, &b.z, &wnorm.gpu_buffer, &b.ssm_gn }, &gn, @sizeOf(GatedNormBatchPush), 0);
         // Out projection → b.o, then fold into the residual stream.
-        self.gemmDispatch(&cmd, wout, &b.ssm_gn, &b.o, d.n_embd, d.d_inner, T);
+        self.gemmDispatchPrefill(&cmd, wout, &b.ssm_gn, &b.o, d.n_embd, d.d_inner, T);
         const add = AddPush{ .N = T * d.n_embd };
         cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
         self.submit(cmd);
@@ -862,11 +1380,11 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
-        self.gemmDispatch(&cmd, wgate, &b.ffn_norm, &b.gate_ff, d.n_ff, d.n_embd, T);
-        self.gemmDispatch(&cmd, wup, &b.ffn_norm, &b.up_ff, d.n_ff, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wgate, &b.ffn_norm, &b.gate_ff, d.n_ff, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wup, &b.ffn_norm, &b.up_ff, d.n_ff, d.n_embd, T);
         const sg = SwigluPush{ .N = T * d.n_ff };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &sg, @sizeOf(SwigluPush), 0);
-        self.gemmDispatch(&cmd, wdown, &b.swiglu_ff, &b.o, d.n_embd, d.n_ff, T);
+        self.gemmDispatchPrefill(&cmd, wdown, &b.swiglu_ff, &b.o, d.n_embd, d.n_ff, T);
         const add = AddPush{ .N = T * d.n_embd };
         cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
         self.submit(cmd);
@@ -877,7 +1395,7 @@ pub const ForwardCuda = struct {
     /// (T >= cublas_min_t); otherwise (and for other quants / short prompts) loop
     /// the proven per-token matvec over the token-major buffers (bit-identical to
     /// prefillStep). Always OVERWRITES y (residual folds use add_inplace).
-    fn gemmDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
+    fn gemmDispatchPrefill(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
         const idx = dmmvIdx(w.info.type_);
         if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 2 and self.use_cublas_q6))) {
             const b = &self.batch.?;
@@ -951,6 +1469,854 @@ pub const ForwardCuda = struct {
             }
             self.batch = null;
         }
+    }
+
+    pub fn decodeBatch(self: *ForwardCuda, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
+        const B: u32 = @intCast(tokens.len);
+        std.debug.assert(positions.len == B and slots.len == B and out.len == B);
+        const f4 = @sizeOf(f32);
+
+        // Effort 28 B==1 matvec fast path: when this step batches a single
+        // sequence, route the per-layer projection/FFN GEMMs (`gemmDispatch`) to
+        // the tuned matvec. `defer` clears it so an early-return error never leaks
+        // the flag past this call (production decodeStep/prefillStep never set it).
+        self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
+        defer self.decode_b1 = false;
+        // Small-B (2..8) Q4_K token-batch matvec fast path (opt-in). `defer` clears
+        // it so an early-return error never leaks the flag past this call.
+        self.decode_mrow = (B >= 2 and B <= 27) and (self.decode_mrow_force orelse mrowMatvecOn());
+        defer self.decode_mrow = false;
+        // MoE shared-expert batching RIDES the btok path: batching the dense shared
+        // expert over B rows is only a win when the batched GEMM is the bandwidth-
+        // bound `btok` matvec — through the 64×64 tile GEMM it is SLOWER than the
+        // per-row matvec at small B (tile-padding tax, measured −16% at B=4). So gate
+        // it on `decode_mrow` (= mrow/btok active) → no regression on the default
+        // mrow-off path. `defer` clears it so a forced A/B value never leaks.
+        self.moe_shared_batched = self.decode_mrow and (self.moe_shared_batched_force orelse moeSharedBatchedOn());
+        defer self.moe_shared_batched = false;
+        // MoE launch-collapse (async routed-expert path drops its per-row sync).
+        // Default-on; harness `_force` restores the per-row sync for an A/B. `defer`
+        // resets the live flag (the default field value stays true for serial paths
+        // that never touch it — harmless since they never run the routed-batch path).
+        self.moe_collapse = self.moe_collapse_force orelse true;
+        defer self.moe_collapse = true;
+        // DENSE batched-decode launch-collapse (async submit + single tail drain).
+        // Default-on; `_force` restores the per-layer sync for the harness A/B.
+        self.decode_collapse = self.decode_collapse_force orelse true;
+        defer self.decode_collapse = true;
+
+        const db = try self.ensureDecodeBatch(B);
+        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
+        const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
+
+        // EMBED all B rows into db.hidden, SAME kernel/weight as serial decodeStep
+        // so the projection inputs are bit-aligned. Suspect-#2 port: collapse the
+        // per-row B-serial round-trips. GPU path: upload all B token ids ONCE to
+        // tok_scratch, then ONE command buffer dispatches embed_q4k per row (the
+        // kernel reads tok[0] → alias tok_scratch at bi·4 for the bi-th id) into
+        // each row's db.hidden slice → ONE commitAndWait (was B). CPU path: dequant
+        // all B rows into the persistent embed_host, ONE upload to the contiguous
+        // [B,n_embd] db.hidden (was B uploads).
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) std.debug.assert(slots[bi] < self.n_slots and positions[bi] < self.slot_ctx);
+        if (self.embed_gpu) {
+            const tok_buf = &self.tok_scratch.?;
+            buffer.upload(ctx, tok_buf, std.mem.sliceAsBytes(tokens));
+            const push = EmbedPush{ .K = d.n_embd, .vocab = d.vocab };
+            const nsb = d.n_embd / 256;
+            var cmd = try command.beginCommand(ctx);
+            bi = 0;
+            while (bi < B) : (bi += 1) {
+                var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+                defer buffer.freeBuffer(&hrow);
+                var trow = try buffer.aliasBuffer(tok_buf, bi * @sizeOf(u32), @sizeOf(u32));
+                defer buffer.freeBuffer(&trow);
+                cmd.dispatch(&self.pipes.embed_q4k, .{ nsb, 1, 1 }, .{ 256, 1, 1 }, &.{ self.embed_weight.?, &trow, &hrow }, &push, @sizeOf(EmbedPush), 0);
+            }
+            cmd.commitAndWait();
+        } else {
+            const host = self.embed_host.?[0 .. B * d.n_embd];
+            bi = 0;
+            while (bi < B) : (bi += 1) {
+                self.model.dequantEmbeddingRow(tokens[bi], host[bi * d.n_embd ..][0..d.n_embd]);
+            }
+            buffer.upload(ctx, &db.hidden, std.mem.sliceAsBytes(host));
+        }
+
+        // 4c-step-2: upload per-seq positions[]/slots[] ONCE (same for all layers)
+        // to device u32 buffers for the fused batched attention kernels.
+        // E28 degradation fix: reuse the persistent pos/slots scratch (allocated
+        // in allocSlotState, sized to n_slots ≥ B) instead of a cudaMalloc/free
+        // pair per step. The fused batched kernels read only the first B entries.
+        std.debug.assert(B <= self.n_slots);
+        const pos_buf = &self.pos_scratch.?;
+        const slot_buf = &self.slots_scratch.?;
+        buffer.upload(ctx, pos_buf, std.mem.sliceAsBytes(positions));
+        buffer.upload(ctx, slot_buf, std.mem.sliceAsBytes(slots));
+        var max_seq_len: u32 = 1;
+        for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
+
+        // Effort 28 CUDA-graph replay (opt-in): the batched-decode step is sync-free
+        // after the launch-collapse, so capture the whole layer chain + tail into a
+        // per-B cached exec and replay it as ONE graph launch. The embed + pos/slot
+        // uploads above already ran (sync) into device scratch, so the captured
+        // kernels read the current step's data. Requires `decode_collapse` (no
+        // commitAndWait inside a captured region). For MoE, additionally requires the
+        // capturable batched routed+shared path (`moe_shared_batched` + `moe_collapse`,
+        // both ride `decode_mrow`) and `moe_graph_capturable` (no host id readback on
+        // ANY MoE layer) — else the routed loop host-gathers ids mid-capture.
+        const moe_graph_ok = d.n_experts == 0 or
+            (self.moe_graph_capturable and self.moe_shared_batched and self.moe_collapse);
+        const use_graph = moe_graph_ok and self.decode_collapse and (self.batch_graph_force orelse self.batch_graph_on);
+        if (use_graph) {
+            return try self.decodeBatchGraph(B, db, pos_buf, slot_buf, max_seq_len, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_, out);
+        }
+
+        // Layer-major: each block reads/writes db.hidden over ALL B rows. The big
+        // projection/FFN GEMMs read each weight ONCE for all B rows (the
+        // amortization win — 4c-step-1). Both the attention inner (4c-step-2a) AND
+        // the SSM inner (conv1d/delta-net/gated-norm, 4c-step-2b) are now FUSED into
+        // batched grid.y/z=B kernels — each block is ONE command buffer / one sync.
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
+            } else {
+                try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
+            }
+            if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
+        }
+
+        // TAIL: rms_norm → LM head → argmax for all B rows. Suspect-#2 port: chain
+        // every row into ONE command buffer + ONE commitAndWait + ONE B-wide
+        // download (was B serial commitAndWait+download per decoded token). On one
+        // stream the dispatches execute strictly in order, so reusing the single
+        // norm_buf/logits_buf scratch across rows is hazard-free (row b+1's rms_norm
+        // can't run until row b's LM head consumed norm_buf) → identical math to the
+        // per-row form. Only the argmax OUTPUT is per-row → each writes its own slot
+        // of argmax_scratch (aliased bi·4), downloaded once into out[0..B].
+        const lm_idx = dmmvIdx(lm_head.info.type_);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
+        bi = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hrow, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+            if (lm_idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            }
+            const am = ArgmaxPush{ .N = d.vocab };
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
+        }
+        cmd.commitAndWait();
+        // The tail commitAndWait drained the shared stream (incl. any async layer
+        // commands stashed by the dense launch-collapse) → their completion is
+        // guaranteed; free the stashed handles. No-op when n_pending==0 (e.g. the
+        // MoE path drains the ring each layer via its `waitPending`).
+        self.drainPending();
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
+    }
+
+    /// Effort 28: dense batched-decode step via CUDA-graph replay (one cached exec
+    /// per B). The embed + per-seq pos/slot/token uploads already ran (sync) into
+    /// device scratch in `decodeBatch`, so `db.hidden`/`pos_buf`/`slot_buf` hold this
+    /// step's data; capture the layer chain + tail (all on ONE stream via the
+    /// `submit` no-sync path under `capturing`) and launch as a single graph. Across
+    /// steps the topology AND push-constants are invariant (every per-seq scalar is
+    /// read from a device buffer, not a push constant) → `cuGraphExecUpdate` is a
+    /// cheap in-place no-op. Bit-identical to the non-graph batched chain (same
+    /// kernels, same order, same single stream) → token-identical to N serial runs.
+    /// Dense OR MoE (MoE gated by the caller on `moe_graph_capturable` — every layer
+    /// reads expert ids GPU-side, no host readback — plus `moe_shared_batched` +
+    /// `moe_collapse` so the routed+shared path is the no-sync batched form).
+    fn decodeBatchGraph(self: *ForwardCuda, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32, out_norm: *const CudaBuffer, lm_head: *const CudaBuffer, lm_type: gguf.GGMLType, out: []u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        if (self.batch_graph[B] == null) self.batch_graph[B] = shim.cuda_graph_create();
+        const g = self.batch_graph[B].?;
+
+        self.capturing = true;
+        _ = shim.cuda_graph_begin(ctx);
+        // Layer chain — each batched block rides the async `submit` ring, which under
+        // `capturing` records onto the captured stream with no event/sync. The
+        // attention smem is sized at the constant slot_ctx (not data-dependent
+        // max_seq_len) so the captured kernel-node shape is invariant across steps.
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
+            } else {
+                try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
+            }
+            // MoE: the capturable batched routed+shared path (gated above on
+            // moe_graph_capturable + moe_shared_batched + moe_collapse → no host
+            // readback, submit/waitPending are no-ops under `capturing`).
+            if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
+        }
+        // TAIL: rms_norm → LM head → argmax for all B rows, recorded into ONE command
+        // buffer (no commitAndWait — captured). On one stream the dispatches execute
+        // in order so reusing norm_buf/logits_buf across rows is hazard-free; only the
+        // argmax OUTPUT is per-row (each writes its own argmax_scratch slot).
+        const lm_idx = dmmvIdx(lm_type);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hrow, out_norm, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+            if (lm_idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            }
+            const am = ArgmaxPush{ .N = d.vocab };
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
+        }
+        cmd.releaseCompleted(); // captured onto the stream; no event record / no sync
+        self.capturing = false;
+
+        // End capture, instantiate-or-update the cached exec, launch + ONE sync
+        // (drains the whole captured layer chain + tail).
+        _ = shim.cuda_graph_end_launch(ctx, g);
+        // The argmax slots are now resident on the device; one B-wide D2H.
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
+    }
+
+    /// (Re)allocate the [B, dim] batched-decode scratch, growing if B exceeds cap.
+    fn ensureDecodeBatch(self: *ForwardCuda, B: u32) !*DecodeBatch {
+        if (self.decode_batch) |*db| {
+            if (db.b_cap >= B) return db;
+            db.free();
+            self.decode_batch = null;
+        }
+        self.decode_batch = try DecodeBatch.alloc(self.ctx, self.d, B);
+        return &self.decode_batch.?;
+    }
+
+    /// Batched GEMM y[B,M] = x[B,K] · Wᵀ for B rows, reading W ONCE (token-major
+    /// buffers; acc_mode 1 accumulates into y for the residual). The dense
+    /// projection / FFN weights are all q4k/q5k/q6k/q8_0 (tiled gemm) or f32.
+    fn gemmDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, B: u32, acc_mode: u32) void {
+        // Effort 28: B==1 decode → tuned matvec (decodeStep's path). At B==1 the
+        // single-row x/y are contiguous (a_offset 0) and dmmvDispatch honors the
+        // residual acc_mode (O-proj / FFN-down / SSM-out use acc_mode 1), so this
+        // is a drop-in for the batched-GEMM tile across every decode weight type
+        // (q4k/q5k/q6k/q8_0/f32). Only set on a B==1 decodeBatch step.
+        if (B == 1 and self.decode_b1) {
+            self.dmmvDispatch(cmd, w, x, y, M, K, acc_mode, 0);
+            return;
+        }
+        // Effort 28: small-B Q4_K token-batch matvec. x/y are token-major [B,*]
+        // (a_offset/x_offset/y_offset 0), and the kernel honors acc_mode for the
+        // residual GEMMs (O-proj / FFN-down / SSM-out). Reads each weight row once,
+        // amortizing the dequant over the B tokens → bandwidth-bound, no tile waste.
+        if (self.decode_mrow and B >= 2 and B <= 27) {
+            // Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
+            // O-proj/FFN-down/SSM-out on mixed-quant layers. Each btok is
+            // bit-identical-per-row to its *_fast matvec → token-identical decode.
+            const btok: ?*CudaPipeline = switch (w.info.type_) {
+                .q4_k => &self.pipes.dmmv_q4k_btok[B - 2],
+                .q6_k => &self.pipes.dmmv_q6k_btok[B - 2],
+                .q5_k => &self.pipes.dmmv_q5k_btok[B - 2],
+                .q8_0 => &self.pipes.dmmv_q8_0_btok[B - 2],
+                else => null,
+            };
+            if (btok) |pipe| {
+                const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode };
+                cmd.dispatch(pipe, .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+        }
+        const idx = dmmvIdx(w.info.type_);
+        const push = GemmPush{ .M = M, .K = K, .T = B, .acc_mode = acc_mode };
+        if (w.info.type_ == .f32) {
+            cmd.dispatch(&self.pipes.gemm_f32, .{ ceilDiv(M, 64), ceilDiv(B, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(B, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+        }
+    }
+
+    /// 4c-step-2 attention block: pre-norm + Q(+gate)/K/V + O projections run as
+    /// GEMMs over ALL B rows (each weight read once), AND the per-seq attention
+    /// inner is now FUSED into two batched grid.y=B launches — collapsing the
+    /// per-row deinterleave / q-k norm / RoPE / KV-write / softmax loop (mirrors
+    /// gemma's 1c). One command buffer, ONE commitAndWait (was B per-row syncs):
+    ///   1. batched pre-norm + Q(+gate)/K/V projections (GEMMs over B rows)
+    ///   2. qwen_norm_rope_qkv_seq — fused deinterleave + per-head q/k norm + RoPE
+    ///      + slot KV write + gate extract over (n_head+2*n_kv_head, B) at per-seq
+    ///      positions[]/slots[] (device buffers)
+    ///   3. naive_attention_batched_seq — per-(head,b) softmax(QK^T)V + sink over
+    ///      each row's slot KV history, seq_len=positions[b]+1
+    ///   4. sigmoid_mul — sigmoid-z gate over all B rows (token-major [B,q_dim])
+    ///   5. batched O projection, accumulate into db.hidden (residual)
+    /// Per-(head,b) arithmetic is copied from the per-row kernels → token-identical
+    /// to N serial runs (ARGMAX-identical given the GEMM reduction order).
+    fn attentionLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wq = self.layer(L, "attn_q.weight");
+        const wk = self.layer(L, "attn_k.weight");
+        const wv = self.layer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wan = self.layer(L, "attn_norm.weight");
+
+        var cmd = try command.beginCommand(ctx);
+
+        // 1. Batched pre-attn norm + Q(+gate)/K/V projections over B rows.
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wq, &db.norm, &db.qfull, 2 * d.q_dim, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wk, &db.norm, &db.k, d.kv_dim, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wv, &db.norm, &db.v, d.kv_dim, d.n_embd, B, 0);
+
+        // 2. Fused per-seq deinterleave + q/k norm + RoPE + slot KV write + gate
+        //    extract over (n_head + 2*n_kv_head, B). Writes db.q, db.gate, slot K/V.
+        const qkv = QwenQkvSeqPush{ .head_dim = d.head_dim, .eps = d.rms_eps, .rope_dim = d.rope_dim, .n_head = d.n_head, .n_kv_head = d.n_kv_head, .slot_ctx = self.slot_ctx };
+        const nr_sh: u32 = d.head_dim * 4;
+        cmd.dispatch(&self.pipes.qwen_norm_rope_qkv_seq, .{ d.n_head + 2 * d.n_kv_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.qfull, &db.k, &db.v, &wqn.gpu_buffer, &wkn.gpu_buffer, &self.inv_freq, &db.q, &db.gate, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], pos_buf, slot_buf }, &qkv, @sizeOf(QwenQkvSeqPush), nr_sh);
+
+        // 3. Batched per-seq attention over each row's slot KV history.
+        const attn = AttnSlotPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .slot_ctx = self.slot_ctx, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+        // The kernel's dynamic shared mem holds up to `seq_len`=positions[b]+1 f32
+        // scores per row. Under graph capture, request the constant MAX (slot_ctx)
+        // so the captured kernel-node smem size is invariant as positions grow →
+        // the cached exec updates in place instead of re-instantiating each step.
+        // The kernel still uses only seq_len entries (mirrors the serial path).
+        const attn_smem: u32 = if (self.capturing) self.slot_ctx * 4 else max_seq_len * 4;
+        cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), attn_smem);
+
+        // 4. Per-seq sigmoid-z gate over all B rows (token-major [B,q_dim] contiguous).
+        const sm = SigmoidMulPush{ .N = B * d.q_dim };
+        cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(B * d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.attn_out, &db.gate, &db.attn_out }, &sm, @sizeOf(SigmoidMulPush), 0);
+
+        // 5. Batched O projection, accumulate into db.hidden (residual).
+        self.gemmDispatch(&cmd, wo, &db.attn_out, &db.hidden, d.n_embd, d.q_dim, B, 1);
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
+    }
+
+    /// 4c-step-2b SSM block: pre-norm + qkv/z/alpha/beta + out projections run as
+    /// GEMMs over ALL B rows (each weight read once), AND the conv1d / delta-net
+    /// scan / gated-norm inner is now FUSED into three batched grid.y/z=B kernels
+    /// (the genuinely-new hybrid-SSM batched work; gemma had no SSM). Collapses the
+    /// per-row decode loop from B per-row `commitAndWait` syncs to ONE command
+    /// buffer / ONE commitAndWait (mirrors 4c-step-2a's attention fusion):
+    ///   1. batched pre-norm + qkv/z/alpha/beta projections (GEMMs over B rows)
+    ///   2. ssm_conv1d_seq — per-(channel,b) depthwise causal conv + SiLU over each
+    ///      row's slot conv ring at per-row state_offset = positions[b] % (d_conv-1)
+    ///   3. ssm_delta_net_seq — per-(head,row,b) gated delta-net scan over each
+    ///      row's slot recurrent state (one decode token per row)
+    ///   4. ssm_gated_norm_seq — per-(head,b) gated RMS-norm over token-major rows
+    ///   5. batched out projection, accumulate into db.hidden (residual)
+    /// Per-element arithmetic is copied verbatim from the per-row kernels (slot/row
+    /// bases derived from positions[]/slots[]) → token-identical to N serial runs.
+    fn ssmLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wan = self.layer(L, "attn_norm.weight");
+        const wqkv = self.layer(L, "attn_qkv.weight");
+        const wz = self.layer(L, "attn_gate.weight");
+        const walpha = self.layer(L, "ssm_alpha.weight");
+        const wbeta = self.layer(L, "ssm_beta.weight");
+        const wconv = self.layer(L, "ssm_conv1d.weight");
+        const wdt = self.layer(L, "ssm_dt.bias");
+        const wa = self.layer(L, "ssm_a");
+        const wnorm = self.layer(L, "ssm_norm.weight");
+        const wout = self.layer(L, "ssm_out.weight");
+
+        var cmd = try command.beginCommand(ctx);
+
+        // 1. Batched pre-norm + qkv / z / alpha / beta projections over B rows.
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wqkv, &db.norm, &db.attn_out, d.conv_channels, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wz, &db.norm, &db.gate, d.d_inner, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, walpha, &db.norm, &db.alpha, d.dt_rank, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wbeta, &db.norm, &db.beta, d.dt_rank, d.n_embd, B, 0);
+
+        // 2. Batched conv1d over (ceilDiv(conv_channels,64), B): each row reads/writes
+        //    its slot conv ring at per-row state_offset = positions[b] % (d_conv-1).
+        const conv = ConvSeqPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .conv_state_len = d.conv_state_len };
+        cmd.dispatch(&self.pipes.ssm_conv1d_seq, .{ ceilDiv(d.conv_channels, 64), B, 1 }, .{ 64, 1, 1 }, &.{ &db.attn_out, &wconv.gpu_buffer, &self.ssm_conv_slots.?[L], &db.swiglu, pos_buf, slot_buf }, &conv, @sizeOf(ConvSeqPush), 0);
+
+        // 3. Batched delta-net scan over (dt_rank, head_v_dim, B): each row reads/writes
+        //    its slot recurrent state (one decode token per row).
+        const dn = DeltaNetSeqPush{
+            .d_inner = d.d_inner,
+            .dt_rank = d.dt_rank,
+            .head_v_dim = d.head_v_dim,
+            .d_state = d.d_state,
+            .n_group = d.n_group,
+            .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+            .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+            .has_dt_bias = 1,
+            .has_ssm_a = 1,
+            .conv_stride_tok = d.conv_channels,
+            .ab_stride_tok = d.dt_rank,
+            .y_stride_tok = d.d_inner,
+            .ssm_state_len = d.ssm_state_len,
+        };
+        cmd.dispatch(&self.pipes.ssm_delta_net_seq, .{ d.dt_rank, d.head_v_dim, B }, .{ d.head_v_dim, 1, 1 }, &.{ &db.swiglu, &wdt.gpu_buffer, &db.alpha, &db.beta, &wa.gpu_buffer, &self.ssm_state_slots.?[L], &db.ssm_delta, slot_buf }, &dn, @sizeOf(DeltaNetSeqPush), 0);
+
+        // 4. Batched gated norm over (dt_rank, B): position/slot-independent.
+        const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+        const gn = GatedNormSeqPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
+        cmd.dispatch(&self.pipes.ssm_gated_norm_seq, .{ d.dt_rank, B, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &db.ssm_delta, &db.gate, &wnorm.gpu_buffer, &db.ssm_y }, &gn, @sizeOf(GatedNormSeqPush), 0);
+
+        // 5. Batched out projection, accumulate into db.hidden (residual).
+        self.gemmDispatch(&cmd, wout, &db.ssm_y, &db.hidden, d.n_embd, d.d_inner, B, 1);
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
+    }
+
+    /// 4c dense FFN block: fully batched over B rows (pre-norm + gate/up GEMMs +
+    /// SwiGLU + down GEMM accumulate). Position/slot-independent. Mirrors `ffnBlock`.
+    fn ffnBlockBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wgate = self.layer(L, "ffn_gate.weight");
+        const wup = self.layer(L, "ffn_up.weight");
+        const wdown = self.layer(L, "ffn_down.weight");
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wfn.gpu_buffer, &db.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wgate, &db.ffn_norm, &db.gate, d.n_ff, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wup, &db.ffn_norm, &db.up, d.n_ff, d.n_embd, B, 0);
+        const sg = SwigluPush{ .N = B * d.n_ff };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wdown, &db.swiglu, &db.hidden, d.n_embd, d.n_ff, B, 1);
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
+    }
+
+    /// 4d: batched-decode MoE FFN block (qwen36-35b-a3b). The MoE FFN is STATELESS
+    /// (no KV, no SSM recurrent state — it reads `hidden`, routes to experts, and
+    /// accumulates the routed + shared-expert output back into `hidden`), so unlike
+    /// the attention/SSM blocks it needs NO per-slot state and NO per-seq position.
+    /// Each of the B rows is therefore an independent single-token MoE FFN: loop the
+    /// rows, aliasing row b's slice of `db.hidden`, and run the production block math
+    /// VERBATIM on it via `moeFfnRowDecode` (so batched == N-serial token-identical
+    /// by construction). The per-row scratch (`ffn_norm_buf`/`gate_buf`/… and the
+    /// host expert-id readback) is shared across rows, so each row runs to
+    /// completion (`waitPending`) before the next reuses it. Fusing the per-row MoE
+    /// over B rows (router GEMM [B,n_experts] + `build_expert_order` over B·n_used)
+    /// is a later throughput sub-step; this first establishes correctness (mirrors
+    /// 4b → 4c for attention/SSM). Production `moeFfnBlock`/`decodeStep` UNTOUCHED.
+    ///
+    /// Effort 28 MoE perf: the SHARED expert (gate/up/down) is a DENSE FFN — the same
+    /// weights for every row — so the per-row loop reads them B× redundantly. When
+    /// `moe_shared_batched` (default-on), split each row into router+routed-experts
+    /// only (`moeFfnRowDecode` → routed accumulate into its `db.hidden` row), then run
+    /// the shared expert ONCE batched over all B rows (`moeSharedExpertBatched`,
+    /// reading each shared weight once). The shared input is the batched pre-norm
+    /// `db.ffn_norm` (computed up front before the routed accumulation overwrites
+    /// `db.hidden`), and the per-row routed path reads its own `db.ffn_norm` slice
+    /// (so the per-row rms_norm is also collapsed to one launch over B rows). Math is
+    /// byte-identical per row to the per-row shared expert (ARGMAX-identical given the
+    /// GEMM reduction order) → batched == N-serial token-identical. When off (the A/B
+    /// arm), fall back to the original full per-row `moeFfnRowDecode`.
+    fn moeFfnBlockBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        if (!self.moe_shared_batched) {
+            // A/B fallback: the original per-row MoE FFN (router + routed + shared).
+            var bi: u32 = 0;
+            while (bi < B) : (bi += 1) {
+                var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+                defer buffer.freeBuffer(&hrow);
+                try self.moeFfnRowDecode(L, &hrow);
+            }
+            return;
+        }
+        // Batched pre-norm for ALL B rows — the shared-expert input AND each routed
+        // row's router/expert input. One launch over grid B (was one rms_norm per
+        // row inside `moeFfnRowDecode`). Same per-row 256-thread reduction →
+        // bit-identical per row. Computed BEFORE the routed loop accumulates into
+        // db.hidden, so the shared expert reads the correct pre-norm.
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        {
+            var cmd = try command.beginCommand(self.ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wfn.gpu_buffer, &db.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+            self.submit(cmd); // async on the shared stream; consumed in-order below
+        }
+        // Per-row router + routed experts: reads row b's db.ffn_norm slice, routes,
+        // accumulates the routed (weighted) expert output into row b's db.hidden.
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var nrow = try buffer.aliasBuffer(&db.ffn_norm, bi * d.n_embd * f4, d.n_embd * f4);
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer {
+                buffer.freeBuffer(&nrow);
+                buffer.freeBuffer(&hrow);
+            }
+            try self.moeFfnRoutedRowDecode(L, &nrow, &hrow);
+        }
+        // Shared expert ONCE over all B rows (each shared weight read once).
+        try self.moeSharedExpertBatched(L, B, db);
+    }
+
+    /// Batched MoE shared expert over all B rows (the `db.ffn_norm` pre-norm): the
+    /// shared gate/up/down are DENSE weights, so they run as ONE `gemmDispatch` each
+    /// over the [B, n_embd] norm (reading each weight once) — the
+    /// `ffnBlockBatchedDecode` pattern. `swiglu` over the contiguous [B, sf] gate/up,
+    /// the per-row sigmoid(gate-logit)·down scale is element-wise so it stays a tiny
+    /// per-row dispatch (the weight reads — the cost — are batched). The down output
+    /// goes to `db.moe_down` (NOT accumulated by the GEMM) because it must be scaled
+    /// by sigmoid(gate logit) before accumulating into db.hidden. Byte-identical math
+    /// per row to the per-row shared expert (ARGMAX-identical given GEMM reduction).
+    fn moeSharedExpertBatched(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        const sf = d.shexp_ff;
+        const wgs = self.layer(L, "ffn_gate_shexp.weight");
+        const wus = self.layer(L, "ffn_up_shexp.weight");
+        const wds = self.layer(L, "ffn_down_shexp.weight");
+        const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [hidden, 1] F32
+        var cmd = try command.beginCommand(self.ctx);
+        self.gemmDispatch(&cmd, wgs, &db.ffn_norm, &db.gate, sf, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wus, &db.ffn_norm, &db.up, sf, d.n_embd, B, 0);
+        const sg = SwigluPush{ .N = B * sf };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wgi, &db.ffn_norm, &db.moe_gate_scalar, 1, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wds, &db.swiglu, &db.moe_down, d.n_embd, sf, B, 0);
+        const ss = SigmoidAccPush{ .N = d.n_embd };
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            var drow = try buffer.aliasBuffer(&db.moe_down, bi * d.n_embd * f4, d.n_embd * f4);
+            var srow = try buffer.aliasBuffer(&db.moe_gate_scalar, bi * f4, f4);
+            defer {
+                buffer.freeBuffer(&hrow);
+                buffer.freeBuffer(&drow);
+                buffer.freeBuffer(&srow);
+            }
+            cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &hrow, &drow, &srow }, &ss, @sizeOf(SigmoidAccPush), 0);
+        }
+        self.submit(cmd);
+        self.waitPending();
+    }
+
+    /// Router + routed-experts only (NO shared expert), reading the caller's
+    /// precomputed `norm_row` (a `db.ffn_norm` slice) instead of recomputing the
+    /// per-row rms_norm, and accumulating the routed (weighted) expert output into
+    /// `hidden_row`. The shared expert is run batched afterward by
+    /// `moeSharedExpertBatched`. Body is the router+routed half of `moeFfnRowDecode`
+    /// VERBATIM (same self.* per-row scratch, same `waitPending` so it is safe to
+    /// reuse for the next row); split out so the dense shared expert can amortize
+    /// across B rows. Used only by `moeFfnBlockBatchedDecode` (decode-batch path).
+    fn moeFfnRoutedRowDecode(self: *ForwardCuda, L: u32, norm_row: *const CudaBuffer, hidden_row: *const CudaBuffer) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // expert_ff = intermediate_dim
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [hidden, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight"); // stacked [hidden, ef, n_experts]
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight"); // stacked [ef, hidden, n_experts]
+
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        // GPU-side async experts (no host id readback) when ALL of gate/up/down have
+        // a `dmmv_*_experts` kernel. Adding q6_k (this cycle) brings the 5 mixed-quant
+        // Q6_K-expert layers onto this path so they ride the launch-collapse too.
+        const batched_experts = expertsSupported(wge.info.type_) and expertsSupported(wue.info.type_) and expertsSupported(wde.info.type_);
+
+        // --- Router: logits → top-k softmax (rms_norm precomputed → norm_row). ----
+        {
+            var cmd = try command.beginCommand(ctx);
+            self.dmmvDispatch(&cmd, wrouter, norm_row, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            if (batched_experts) {
+                self.submit(cmd); // async: experts read the ids GPU-side, no readback
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers the ids next
+                self.drainPending();
+            }
+        }
+
+        if (!batched_experts) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        }
+
+        // --- Routed experts → SwiGLU → down, slot-major into down_buf, then combine.
+        {
+            var cmd = try command.beginCommand(ctx);
+            if (batched_experts) {
+                const nrows_gu = n_used * ef;
+                self.expertsDispatch(&cmd, wge, norm_row, &self.gate_buf, &self.router_out_buf, ef, d.n_embd, gate_slice, 0, n_used);
+                self.expertsDispatch(&cmd, wue, norm_row, &self.up_buf, &self.router_out_buf, ef, d.n_embd, up_slice, 0, n_used);
+                const sg = SwigluPush{ .N = nrows_gu };
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                self.expertsDispatch(&cmd, wde, &self.swiglu_buf, &self.down_buf, &self.router_out_buf, d.n_embd, ef, down_slice, ef, n_used);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router_ids[j];
+                    self.dmmvDispatch(&cmd, wge, norm_row, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                    self.dmmvDispatch(&cmd, wue, norm_row, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                    cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
+                }
+            }
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            self.submit(cmd);
+        }
+        // LAUNCH-COLLAPSE: the async (`batched_experts`) path is pure-GPU and every
+        // command rides the context's ONE shared CUstream (strictly in-order), so
+        // the next row's writes to the shared scratch (router_*/gate_buf/up_buf/
+        // swiglu_buf/down_buf) serialize AFTER this row's reads — no per-row host
+        // sync is needed. The B rows' commands queue back-to-back and are drained
+        // together by the layer tail (`moeSharedExpertBatched`'s `waitPending`),
+        // removing B blocking CPU↔GPU round-trips per MoE layer per token (the
+        // boost-starved qwen MoE decode is launch-bound). The host-id FALLBACK
+        // path STILL syncs per row — it downloads `router_out_buf` to host-gather
+        // the expert ids and reuses the host `host_router_ids` scratch next row.
+        if (!batched_experts or !self.moe_collapse) self.waitPending();
+    }
+
+    /// Per-row MoE FFN: the production `moeFfnBlock` body VERBATIM but reading/
+    /// accumulating into the caller's `hidden_row` (a `db.hidden` row alias) instead
+    /// of the single-seq `self.hidden`, and run SYNCHRONOUSLY (`waitPending` at the
+    /// end) so the shared per-row scratch is safe to reuse for the next row. Keeping
+    /// this a separate verbatim copy leaves production `moeFfnBlock` byte-identical.
+    fn moeFfnRowDecode(self: *ForwardCuda, L: u32, hidden_row: *const CudaBuffer) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // expert_ff = intermediate_dim
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [hidden, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight"); // stacked [hidden, ef, n_experts]
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight"); // stacked [ef, hidden, n_experts]
+
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
+
+        // --- Router: rms_norm → logits → top-k softmax. -----------------------
+        {
+            var cmd = try command.beginCommand(ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ hidden_row, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            self.dmmvDispatch(&cmd, wrouter, &self.ffn_norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            if (batched_experts) {
+                self.submit(cmd); // async: experts read the ids GPU-side, no readback
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers the ids next
+                self.drainPending();
+            }
+        }
+
+        if (!batched_experts) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        }
+
+        // --- Routed experts → SwiGLU → down, slot-major into down_buf.
+        {
+            var cmd = try command.beginCommand(ctx);
+            if (batched_experts) {
+                const nrows_gu = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &self.ffn_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &self.ffn_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sg = SwigluPush{ .N = nrows_gu };
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router_ids[j];
+                    self.dmmvDispatch(&cmd, wge, &self.ffn_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                    self.dmmvDispatch(&cmd, wue, &self.ffn_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                    cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
+                }
+            }
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            self.submit(cmd);
+        }
+
+        // --- Shared expert: gate/up/SwiGLU/down, scaled by sigmoid(gate logit).
+        {
+            const wgs = self.layer(L, "ffn_gate_shexp.weight");
+            const wus = self.layer(L, "ffn_up_shexp.weight");
+            const wds = self.layer(L, "ffn_down_shexp.weight");
+            const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [hidden, 1] F32
+            const sf = d.shexp_ff;
+            var cmd = try command.beginCommand(ctx);
+            self.dmmvDispatch(&cmd, wgs, &self.ffn_norm_buf, &self.gate_buf, sf, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wus, &self.ffn_norm_buf, &self.up_buf, sf, d.n_embd, 0, 0);
+            const sg = SwigluPush{ .N = sf };
+            cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+            self.dmmvDispatch(&cmd, wgi, &self.ffn_norm_buf, &self.gate_scalar_buf, 1, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wds, &self.swiglu_buf, &self.down_buf, d.n_embd, sf, 0, 0);
+            const ss = SigmoidAccPush{ .N = d.n_embd };
+            cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.gate_scalar_buf }, &ss, @sizeOf(SigmoidAccPush), 0);
+            self.submit(cmd);
+        }
+        self.waitPending(); // sync: shared per-row scratch reused by the next row
+    }
+
+    /// Slot-state variant of `attentionLayer`: identical block math, but the KV
+    /// cache read/write target sequence `slot`'s region of the slot KV (aliased to
+    /// its base), and the kernels run SYNCHRONOUSLY (commitAndWait) so the per-row
+    /// slot aliases are safe to free on return. The kv-write/attention offsets are
+    /// pos-relative within the slot's aliased region — byte-for-byte the same
+    /// values as the single-seq path. 4c fuses this into a batched per-seq kernel.
+    fn attentionLayerSlot(self: *ForwardCuda, L: u32, pos: u32, slot: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wq = self.layer(L, "attn_q.weight"); // packed [Q | gate], M = 2*q_dim
+        const wk = self.layer(L, "attn_k.weight");
+        const wv = self.layer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wan = self.layer(L, "attn_norm.weight");
+
+        // Alias sequence `slot`'s KV region to its base; pos-relative offsets below.
+        const kv_base = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
+        const kv_span = @as(usize, self.slot_ctx) * d.kv_dim * f4;
+        var kk = try buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_base, kv_span);
+        var vv = try buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_base, kv_span);
+        defer {
+            buffer.freeBuffer(&kk);
+            buffer.freeBuffer(&vv);
+        }
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.qfull_buf, 2 * d.q_dim, d.n_embd, 0, 0);
+        const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
+        cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &self.qfull_buf, &self.q_buf, &self.gate_buf }, &deint, @sizeOf(DeintPush), 0);
+        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, d.kv_dim, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, d.kv_dim, d.n_embd, 0, 0);
+        const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, &self.q_buf }, &rms_h, @sizeOf(RmsPush), 0);
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, &self.k_buf }, &rms_h, @sizeOf(RmsPush), 0);
+        const rope_q = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.q_buf, &self.inv_freq }, &rope_q, @sizeOf(RopePush), 0);
+        const rope_k = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &self.k_buf, &self.inv_freq }, &rope_k, @sizeOf(RopePush), 0);
+        // KV write at this position WITHIN the slot's aliased region.
+        const kvw = KvWritePush{ .kv_dim = d.kv_dim, .dst_offset = pos * d.kv_dim };
+        const kv_grid = ceilDiv(d.kv_dim, 64);
+        cmd.dispatch(&self.pipes.kv_cache_write, .{ kv_grid, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.k_buf, &kk, &self.v_buf, &vv }, &kvw, @sizeOf(KvWritePush), 0);
+        const seq_len = pos + 1;
+        const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+        const attn_smem: u32 = seq_len * 4;
+        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
+        const sm = SigmoidMulPush{ .N = d.q_dim };
+        cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &self.attn_out_buf }, &sm, @sizeOf(SigmoidMulPush), 0);
+        self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.hidden, d.n_embd, d.q_dim, 1, 0);
+        cmd.commitAndWait(); // sync: keeps the slot aliases valid until the kernels run
+    }
+
+    /// Slot-state variant of `ssmLayer`: identical block math, but the conv ring
+    /// + recurrent state read/write sequence `slot`'s aliased region, and the conv
+    /// ring offset is DERIVED from the position (`pos % (d_conv-1)`) instead of the
+    /// per-layer host counter — production advances `conv_off[L]` one step per
+    /// token, so at position p it equals `p % (d_conv-1)`; deriving it makes each
+    /// slot's conv offset self-consistent without extra per-slot host state. Runs
+    /// SYNCHRONOUSLY so the per-row aliases are safe to free on return.
+    fn ssmLayerSlot(self: *ForwardCuda, L: u32, pos: u32, slot: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wan = self.layer(L, "attn_norm.weight");
+        const wqkv = self.layer(L, "attn_qkv.weight");
+        const wz = self.layer(L, "attn_gate.weight");
+        const walpha = self.layer(L, "ssm_alpha.weight");
+        const wbeta = self.layer(L, "ssm_beta.weight");
+        const wconv = self.layer(L, "ssm_conv1d.weight");
+        const wdt = self.layer(L, "ssm_dt.bias");
+        const wa = self.layer(L, "ssm_a");
+        const wnorm = self.layer(L, "ssm_norm.weight");
+        const wout = self.layer(L, "ssm_out.weight");
+
+        // Alias sequence `slot`'s conv ring + recurrent state to their bases.
+        var convst = try buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
+        var recst = try buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
+        defer {
+            buffer.freeBuffer(&convst);
+            buffer.freeBuffer(&recst);
+        }
+        const conv_off = pos % (d.d_conv - 1);
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        self.dmmvDispatch(&cmd, wqkv, &self.norm_buf, &self.attn_out_buf, d.conv_channels, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wz, &self.norm_buf, &self.gate_buf, d.d_inner, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, walpha, &self.norm_buf, &self.router_buf, d.dt_rank, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wbeta, &self.norm_buf, &self.down_buf, d.dt_rank, d.n_embd, 0, 0);
+        const conv = ConvPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .state_offset = conv_off };
+        cmd.dispatch(&self.pipes.ssm_conv1d, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &wconv.gpu_buffer, &convst, &self.swiglu_buf }, &conv, @sizeOf(ConvPush), 0);
+        const dn = DeltaNetPush{
+            .d_inner = d.d_inner,
+            .dt_rank = d.dt_rank,
+            .head_v_dim = d.head_v_dim,
+            .d_state = d.d_state,
+            .n_group = d.n_group,
+            .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+            .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+            .has_dt_bias = 1,
+            .has_ssm_a = 1,
+            .n_tok = 1,
+            .conv_stride_tok = d.conv_channels,
+            .ab_stride_tok = d.dt_rank,
+            .y_stride_tok = d.d_inner,
+        };
+        cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.swiglu_buf, &wdt.gpu_buffer, &self.router_buf, &self.down_buf, &wa.gpu_buffer, &recst, &self.attn_out_buf }, &dn, @sizeOf(DeltaNetPush), 0);
+        const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+        const gn = GatedNormPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
+        cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &wnorm.gpu_buffer, &self.swiglu_buf }, &gn, @sizeOf(GatedNormPush), 0);
+        self.dmmvDispatch(&cmd, wout, &self.swiglu_buf, &self.hidden, d.n_embd, d.d_inner, 1, 0);
+        cmd.commitAndWait(); // sync: keeps the slot aliases valid until the kernels run
     }
 
     /// Dense decode step via CUDA-graph replay (Effort 25). `hidden` already holds
@@ -1403,7 +2769,58 @@ pub const ForwardCuda = struct {
             cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
         }
     }
+
+    /// Effort 28: GPU-side stacked-MoE expert matvec over all `n_used` experts in
+    /// ONE launch (block g handles expert e=g/M, row=g%M; the chosen expert id is
+    /// read GPU-side from `ids`). Picks the `dmmv_*_experts` kernel by weight quant
+    /// (q4_k/q5_k/q6_k); the per-row math equals `dmmvDispatch` on x[e] bit-for-bit,
+    /// so the async path stays token-identical to the host-id fallback. `w.info.type_`
+    /// must be `expertsSupported`. x is shared (x_stride=0) for gate/up or per-expert
+    /// (x_stride=K) for down; output is slot-major y[e*M + row].
+    fn expertsDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, ids: *const CudaBuffer, M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32) void {
+        const p = ExpertsPush{ .M = M, .K = K, .slice = slice, .x_stride = x_stride, .n_used = n_used };
+        const pipe = switch (dmmvIdx(w.info.type_)) {
+            0 => &self.pipes.dmmv_q4k_experts,
+            1 => &self.pipes.dmmv_q5k_experts,
+            2 => &self.pipes.dmmv_q6k_experts,
+            else => unreachable, // gated by expertsSupported(w.info.type_)
+        };
+        cmd.dispatch(pipe, .{ n_used * M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y, ids }, &p, @sizeOf(ExpertsPush), 0);
+    }
 };
+
+// Effort 28: the B==1 decodeBatch matvec fast path is default-ON (opt out
+// ZINC_BATCH_B1_MATVEC=0/off/false/no — the SAME env knob as the gemma path).
+fn b1MatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the small-B (2..8) token-batch matvec (btok + MoE launch-collapse +
+// shared-expert batching) is now DEFAULT-ON (opt out with ZINC_BATCH_MROW=0/off/
+// false/no). Flipped 2026-06-15 after the CLEAN-window head-to-head gate
+// (throughput_vs_llama.sh, qwen35-9b, 5090, 60/60 rounds uncontended): ZINCM
+// (mrow ON) clean-beats ZINC0 (mrow OFF) at every batched B — B=2/4/8 medians
+// 34.76/48.02/60.33 vs 8.40/16.97/26.36 tok/s (4.14×/2.83×/2.29×), with NO
+// regression at B=1 (mrow only engages for 2≤B≤8). The batched mrow-ON path is
+// token-identical to N-serial (proven every cycle), so the default flip just makes
+// the validated-better path the serving default; the serial decodeStep/prefill path
+// never sets decode_mrow → catalog correctness is unaffected by construction.
+fn mrowMatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the MoE shared-expert batching is default-ON (opt out with
+// ZINC_BATCH_MOE_SHARED=0/off/false/no) — it is token-identical, so unlike the
+// opt-in matvec levers it ships on. The env knob exists for the in-process A/B.
+fn moeSharedBatchedOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MOE_SHARED") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
 
 fn isFullAttn(L: u32, interval: u32) bool {
     return (L + 1) % interval == 0;

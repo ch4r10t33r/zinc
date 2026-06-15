@@ -1227,6 +1227,148 @@ extern "C" __global__ void ssm_delta_net(
     }
     state[row_base + col] = rs;                             // write final state
 }
+
+// ---- ssm_conv1d_seq (Effort 28 4c-2b: batched DECODE per-seq conv1d) ---------
+// Batched twin of ssm_conv1d for DECODE: B sequences in ONE launch, each row b
+// reading/writing its OWN slot conv ring at per-row state_offset = positions[b] %
+// (d_conv-1). grid = (ceilDiv(conv_channels,64), B). Input/output token-major
+// [B, conv_channels]; `state` the slot conv buffer [n_slots*conv_state_len], row
+// b at base slots[b]*conv_state_len. Per-channel math copied verbatim from
+// ssm_conv1d (state_offset derived from positions[b] instead of a push field).
+struct ConvSeqPush { unsigned conv_channels, d_conv, kernel_is_f16, conv_state_len; };
+extern "C" __global__ void ssm_conv1d_seq(const float* current_input, const unsigned char* conv_kernel,
+                                          float* state, float* out_data,
+                                          const unsigned* positions, const unsigned* slots, ConvSeqPush pc) {
+    unsigned ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= pc.conv_channels) return;
+    unsigned b = blockIdx.y;
+    unsigned d_conv_1 = pc.d_conv - 1u;
+    unsigned state_offset = positions[b] % d_conv_1;
+    const float* in_row = current_input + (size_t)b * pc.conv_channels;
+    float* out_row = out_data + (size_t)b * pc.conv_channels;
+    float* st = state + (size_t)slots[b] * pc.conv_state_len;
+    float ci = in_row[ch];
+    float sum = 0.0f;
+    for (unsigned ki = 0; ki < pc.d_conv; ki++) {
+        unsigned k_idx = ch * pc.d_conv + ki;
+        float kw = (pc.kernel_is_f16 != 0u)
+                       ? zinc_half_to_float(((const unsigned short*)conv_kernel)[k_idx])
+                       : ((const float*)conv_kernel)[k_idx];
+        float sv;
+        if (ki < d_conv_1) {
+            unsigned slot = state_offset + ki;
+            if (slot >= d_conv_1) slot -= d_conv_1;
+            sv = st[(size_t)slot * pc.conv_channels + ch];
+        } else {
+            sv = ci;
+        }
+        sum += kw * sv;
+    }
+    out_row[ch] = sum / (1.0f + expf(-sum));            // SiLU
+    st[(size_t)state_offset * pc.conv_channels + ch] = ci;
+}
+
+// ---- ssm_gated_norm_seq (Effort 28 4c-2b: batched DECODE gated norm) ---------
+// Batched twin of ssm_gated_norm: grid = (dt_rank, B); block per (head h, row b).
+// o/z/out token-major [B, d_inner], row b at b*d_inner; norm_weight is the shared
+// layer weight (per-head index uses head_base only, NOT the row offset). Per-head
+// math copied verbatim from ssm_gated_norm.
+struct GatedNormSeqPush { unsigned d_inner, dt_rank, head_v_dim, d_state, norm_per_head; };
+extern "C" __global__ void ssm_gated_norm_seq(const float* o, const float* z, const float* norm_weight,
+                                              float* out, GatedNormSeqPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned head_base = h * pc.head_v_dim;
+    unsigned base = b * pc.d_inner + head_base;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) { float v = o[base + i]; ss += v * v; }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.head_v_dim + 1e-6f);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) {
+        float nv = o[base + i] * rinv;
+        unsigned norm_idx = (pc.norm_per_head != 0u) ? (head_base + i) : (i % pc.d_state);
+        nv *= norm_weight[norm_idx];
+        float zv = z[base + i];
+        out[base + i] = nv * (zv / (1.0f + expf(-zv)));
+    }
+}
+
+// ---- ssm_delta_net_seq (Effort 28 4c-2b: batched DECODE delta-net scan) ------
+// Batched twin of ssm_delta_net for single-token DECODE: grid = (dt_rank,
+// head_v_dim, B); block per (head h, row, b). Each row b reads/writes its OWN
+// slot recurrent state (base slots[b]*ssm_state_len) and its OWN token-major
+// slices of conv_out/alpha/beta/out_data (b*{conv,ab,y}_stride_tok). One token
+// per row (no n_tok loop). Per-(h,row,b) math copied verbatim from ssm_delta_net.
+struct DeltaNetSeqPush {
+    unsigned d_inner, dt_rank, head_v_dim, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned conv_stride_tok, ab_stride_tok, y_stride_tok, ssm_state_len;
+};
+extern "C" __global__ void ssm_delta_net_seq(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    const unsigned* slots, DeltaNetSeqPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned row = blockIdx.y;
+    unsigned b = blockIdx.z;
+    unsigned col = threadIdx.x;                  // 0..head_v_dim-1
+    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
+    unsigned hv = pc.head_v_dim;
+    unsigned qk_dim = pc.d_state * pc.n_group;
+    unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
+    size_t state_base = (size_t)slots[b] * pc.ssm_state_len;
+    size_t row_base = state_base + ((size_t)h * hv + row) * hv;
+    float rs = state[row_base + col];            // state[slot][h][row][col]
+
+    float dt_bias_val = 0.0f;
+    if (pc.has_dt_bias != 0u)
+        dt_bias_val = pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                                        : ((const float*)dt_bias)[h];
+    float ssm_a_val = 0.0f;
+    if (pc.has_ssm_a != 0u)
+        ssm_a_val = pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                                    : ((const float*)ssm_a)[h];
+    unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+
+    __shared__ float s_g, s_b;
+
+    // Single decode token for row b: bases are b * per-token stride.
+    unsigned conv_base = b * pc.conv_stride_tok;
+    unsigned q_off = conv_base + k_hi * pc.d_state;
+    unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
+    unsigned v_off = conv_base + 2u * qk_dim + h * hv;
+
+    // L2-normalize Q/K per group (sum-sq reduced across cols), scale Q.
+    float qi = (col < k_len) ? conv_out[q_off + col] : 0.0f;
+    float ki = (col < k_len) ? conv_out[k_off + col] : 0.0f;
+    float sumq = zinc_block_reduce_sum_all(qi * qi);
+    float sumk = zinc_block_reduce_sum_all(ki * ki);
+    float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
+    float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
+
+    if (col == 0) {
+        float a = alpha[b * pc.ab_stride_tok + h] + dt_bias_val;
+        float sp = logf(1.0f + expf(a));               // softplus
+        float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
+        s_g = expf(gate_val);
+        s_b = 1.0f / (1.0f + expf(-beta[b * pc.ab_stride_tok + h]));
+    }
+    __syncthreads();
+    float g = s_g, bcoef = s_b;
+
+    float v_val = conv_out[v_off + row];
+    rs *= g;                                            // decay
+    float sk = zinc_block_reduce_sum_all((col < k_len) ? rs * skv : 0.0f);
+    float delta = bcoef * (v_val - sk);
+    if (col < k_len) rs += skv * delta;                 // rank-1 update
+    float o = zinc_block_reduce_sum_all((col < k_len) ? rs * sq : 0.0f);  // readout
+    if (col == 0) out_data[b * pc.y_stride_tok + h * hv + row] = o;
+    state[row_base + col] = rs;                          // write final state
+}
+
 // ---- dmmv_q4k_fast (perf research, 5090) — port of tuned Vulkan dmmv_q4k -----
 // 16 threads per Q4_K superblock: header read once/thread (not 256x), qs read
 // once total, x via float4. Block-reduce over the block = one output row.
@@ -1517,19 +1659,21 @@ extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* 
     if (tid == 0) y[(size_t)e * pc.M + row] = sum;
 }
 
-// Batched Q6_K expert matvec (qwen36-35b-a3b MoE: 4 layers have Q6_K ffn_down):
-// one launch over all n_used experts, expert id read GPU-side from expert_ids[e],
-// so the MoE block needs no host readback for these layers either. Same Q6_K
-// dequant + 16-thread-superblock coalesced layout as dmmv_q6k_fast; expert
-// addressing mirrors dmmv_q5k_experts (a is byte-addressed -> unsigned char*).
-// per-expert x is x + e*x_stride; output slot-major y[e*M + row]. base unused (0).
+// Effort 28: Q6_K expert matvec — one launch over ALL n_used experts (block g
+// handles expert e=g/M, row=g%M). Same per-element dequant + block reduction as
+// dmmv_q6k_fast, but the expert id is read GPU-side from `expert_ids`
+// (router_out_buf) so the mixed-quant Q6_K-expert layers run on the async
+// (batched_experts) path with NO host readback → they ride the launch-collapse
+// instead of the per-row host-gather sync. Per-expert weight slice = id*slice +
+// base (bytes); x shared for gate/up (x_stride=0) or per-expert for down
+// (x_stride=K). Output slot-major y[e*M + row]. Row b == dmmv_q6k_fast on x[b].
 extern "C" __global__ void dmmv_q6k_experts(const unsigned char* a, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
     unsigned g = blockIdx.x;
     unsigned e = g / pc.M;
     if (e >= pc.n_used) return;
     unsigned row = g - e * pc.M;
     unsigned bpr = pc.K >> 8;
-    const unsigned char* arow = a + (size_t)expert_ids[e] * pc.slice + pc.base + (size_t)row * bpr * 210u;
+    const unsigned char* arow = a + ((size_t)expert_ids[e] * pc.slice + pc.base) + (size_t)row * bpr * 210u;
     const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
     unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
     unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
@@ -1841,6 +1985,342 @@ __device__ __forceinline__ void dmmv_q4k_mrow_impl(const unsigned* a_u32, const 
 }
 extern "C" __global__ void dmmv_q4k_mr2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<2>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_mr4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_mrow_impl<4>(a_u32, x, y, pc); }
+
+// ---- dmmv_q4k_btok (Effort 28) — token-BATCH matvec: read ONE weight row once,
+// reuse its dequant across B token x-vectors -> B outputs. The TRANSPOSE of
+// dmmv_q4k_mrow (which reads one x across R weight rows). Targets batched DECODE
+// at small B (2..8): the 64x64 gemm_q4k_tiled_v2 wastes 56-62/64 row-slots and
+// goes COMPUTE-bound on tile padding (head-to-head: B=8 100% util, slow). This
+// reads each Q4_K weight row ONCE (the dominant decode traffic) and amortizes the
+// dequant across the B tokens -> bandwidth-bound, no tile waste. x token-major
+// [B,K], y token-major [B,M]. Same Q4_K dequant arithmetic as dmmv_q4k_fast
+// (bit-exact); per-token reduction matches dmmv_q4k_fast so btok at row b ==
+// dmmv_q4k_fast on x[b] (the B==1 path) bit-for-bit -> ARGMAX-identical to gemm.
+template<int B>
+__device__ __forceinline__ void dmmv_q4k_btok_impl(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u;
+    unsigned ngrp = blockDim.x >> 4;
+    unsigned a0 = (pc.a_offset >> 2), xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) sum[b] = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        // weight superblock for `row` — read + dequant ONCE, reuse across B tokens.
+        unsigned blk = a0 + row * bpr * 36u + i * 36u;
+        unsigned dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+        float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+        unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+        unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+        float f0 = d*(float)(s0&0x3Fu), b0 = dm*(float)(s1&0x3Fu);
+        float f1 = d*(float)((s0>>8)&0x3Fu), b1 = dm*(float)((s1>>8)&0x3Fu);
+        float f2 = d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2 = dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3 = d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3 = dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        unsigned bidx = (i * 256u + y_loc) >> 2, bidx2 = (i * 256u + y_loc + 128u) >> 2;
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            const float4* xv = (const float4*)(x + (unsigned)b * pc.K + xo);
+            float4 by0 = xv[bidx], by1 = xv[bidx + 8u], by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+            float s = 0.0f;
+            s += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+            s += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+            s += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+            s += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+            sum[b] += s;
+        }
+    }
+    #pragma unroll
+    for (int b = 0; b < B; b++) {
+        float t = zinc_block_reduce_sum(sum[b]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)b * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += t; else y[yi] = t;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q4k_btok2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<2>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok3(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<3>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<4>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok5(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<5>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok6(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<6>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok7(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<7>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok8(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<8>(a_u32, x, y, pc); }
+// Effort 28: higher-B (9..16) — btok stays bandwidth-bound (one weight read
+// amortized over B tokens) up to the Q4_K roofline crossover (~B≈27), so it
+// keeps beating the 64×64 tile GEMM's padded compute in the B>8 serving regime.
+extern "C" __global__ void dmmv_q4k_btok9(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<9>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok10(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<10>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok11(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<11>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok12(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<12>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok13(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<13>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok14(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<14>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok15(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<15>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok16(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<16>(a_u32, x, y, pc); }
+// Effort 28: B=17..24 — extend btok up to (just below) the ~B≈27 Q4_K roofline
+// crossover so the B=17..24 serving regime keeps the bandwidth-bound matvec
+// instead of falling back to the padded 64×64 tile GEMM.
+extern "C" __global__ void dmmv_q4k_btok17(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<17>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok18(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<18>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok19(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<19>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok20(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<20>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok21(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<21>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok22(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<22>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok23(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<23>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok24(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<24>(a_u32, x, y, pc); }
+// Effort 28: B=25..27 — pin the upper edge of the ~B≈27 Q4_K roofline crossover
+// empirically. `sum[B]` register pressure grows here, so whether btok still beats
+// the 64×64 tile GEMM at B=25..27 is decided by a clean in-process BTOK_TIMING A/B.
+extern "C" __global__ void dmmv_q4k_btok25(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<25>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok26(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<26>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok27(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<27>(a_u32, x, y, pc); }
+
+// ---- dmmv_q6k_btok (Effort 28) — Q6_K token-BATCH matvec ---------------------
+// The Q6_K analog of dmmv_q4k_btok: read each Q6_K weight row's superblock + its
+// dequant ONCE, reuse across B token x-vectors. Targets gemma-31b's ffn_down
+// (Q6_K) decode GEMM, which otherwise hits the tile-padding gemm_q6k_tiled_v2 at
+// small B. Same per-element Q6_K dequant as dmmv_q6k_fast; per-token local sum
+// then sum[t] += s (the proven dmmv_q4k_btok reduction pattern) → token-identical
+// to dmmv_q6k_fast on x[t]. x token-major [B,K], y token-major [B,M].
+template<int B>
+__device__ __forceinline__ void dmmv_q6k_btok_impl(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 210u;
+    unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
+    unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
+    unsigned xvib = (half_id * 128u + e_start) >> 2, ngrp = blockDim.x >> 4;
+    unsigned xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned bi = ix; bi < bpr; bi += ngrp) {
+        const unsigned char* bb = arow + (size_t)bi * 210u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned char* ql = bb + half_id * 64u;
+        const unsigned char* qh = bb + 128u + half_id * 32u;
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+        float ds0 = d * (float)sc[is], ds2 = d * (float)sc[is + 2], ds4 = d * (float)sc[is + 4], ds6 = d * (float)sc[is + 6];
+        // dequant the 4 quads ONCE (weight-only) — reused across all B tokens.
+        float q1[4], q2[4], q3[4], q4[4];
+        #pragma unroll
+        for (unsigned li = 0; li < 4u; li++) {
+            unsigned l = e_start + li, qllo = ql[l], qlhi = ql[l + 32u], qhv = qh[l];
+            q1[li] = (float)((qllo & 0xFu) | (((qhv >> 0) & 3u) << 4)) - 32.0f;
+            q2[li] = (float)((qlhi & 0xFu) | (((qhv >> 2) & 3u) << 4)) - 32.0f;
+            q3[li] = (float)((qllo >> 4) | (((qhv >> 4) & 3u) << 4)) - 32.0f;
+            q4[li] = (float)((qlhi >> 4) | (((qhv >> 6) & 3u) << 4)) - 32.0f;
+        }
+        unsigned xb = (bi * 256u) / 4u + xvib;
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xv = (const float4*)(x + (unsigned)t * pc.K + xo);
+            float4 bx0 = xv[xb], bx32 = xv[xb + 8u], bx64 = xv[xb + 16u], bx96 = xv[xb + 24u];
+            float s = 0.0f;
+            #pragma unroll
+            for (unsigned li = 0; li < 4u; li++)
+                s += ds0 * q1[li] * (&bx0.x)[li] + ds2 * q2[li] * (&bx32.x)[li] + ds4 * q3[li] * (&bx64.x)[li] + ds6 * q4[li] * (&bx96.x)[li];
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q6k_btok2(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<2>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok3(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<3>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok4(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<4>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok5(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<5>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok6(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<6>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok7(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<7>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok8(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<8>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok9(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<9>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok10(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<10>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok11(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<11>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok12(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<12>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok13(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<13>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok14(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<14>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok15(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<15>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok16(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<16>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok17(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<17>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok18(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<18>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok19(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<19>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok20(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<20>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok21(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<21>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok22(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<22>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok23(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<23>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok24(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<24>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok25(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<25>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok26(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<26>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok27(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<27>(a, x, y, pc); }
+
+// ---- dmmv_q5k_btok (Effort 28) — Q5_K token-BATCH matvec ---------------------
+// The Q5_K analog: read each Q5_K weight row's superblock + dequant ONCE, reuse
+// across B tokens. Same per-element Q5_K dequant (qh 5th-bit promote) as
+// dmmv_q5k_fast; per-token local sum then sum[t] += s → token-identical to
+// dmmv_q5k_fast on x[t]. x token-major [B,K], y token-major [B,M].
+template<int B>
+__device__ __forceinline__ void dmmv_q5k_btok_impl(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 44u;
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u, ngrp = blockDim.x >> 4;
+    unsigned sba = 2u*v_im, sbb = 2u*v_im+1u, sbc = 2u*v_im+4u, sbd = 2u*v_im+5u;
+    unsigned xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 44u, dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF)), dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk+1u], sc1 = a_u32[blk+2u], sc2 = a_u32[blk+3u];
+        unsigned qh = a_u32[blk + 4u + (l0 >> 2)];
+        unsigned qs0 = a_u32[blk + 12u + (q_off >> 2)], qs1 = a_u32[blk + 12u + (q_off >> 2) + 16u];
+        unsigned s0=sc0>>shift, s1=sc1>>shift, s2=sc2>>shift;
+        float f0=d*(float)(s0&0x3Fu), b0=dm*(float)(s1&0x3Fu);
+        float f1=d*(float)((s0>>8)&0x3Fu), b1=dm*(float)((s1>>8)&0x3Fu);
+        float f2=d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2=dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3=d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3=dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        // dequant the 16 nibbles ONCE (weight-only, qh 5th-bit promote) — reused
+        // across all B tokens. v0[j] = group-0 quad lane j, etc. (matches the Q5
+        // macro in dmmv_q5k_fast: nibble + 16*qh_bit).
+        #define Q5B(q,sh,sb,j) ((float)(((q)>>(sh))&0xFu) + 16.0f*(float)(((qh)>>((sb)+(j)*8u))&1u))
+        float v0[4] = { Q5B(qs0,0,sba,0), Q5B(qs0,8,sba,1), Q5B(qs0,16,sba,2), Q5B(qs0,24,sba,3) };
+        float v1[4] = { Q5B(qs0,4,sbb,0), Q5B(qs0,12,sbb,1), Q5B(qs0,20,sbb,2), Q5B(qs0,28,sbb,3) };
+        float v2[4] = { Q5B(qs1,0,sbc,0), Q5B(qs1,8,sbc,1), Q5B(qs1,16,sbc,2), Q5B(qs1,24,sbc,3) };
+        float v3[4] = { Q5B(qs1,4,sbd,0), Q5B(qs1,12,sbd,1), Q5B(qs1,20,sbd,2), Q5B(qs1,28,sbd,3) };
+        #undef Q5B
+        unsigned bidx = (i*256u + y_loc) >> 2, bidx2 = (i*256u + y_loc + 128u) >> 2;
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xv = (const float4*)(x + (unsigned)t * pc.K + xo);
+            float4 by0=xv[bidx], by1=xv[bidx+8u], by2=xv[bidx2], by3=xv[bidx2+8u];
+            float s = 0.0f;
+            s += (f0*v0[0]-b0)*by0.x + (f0*v0[1]-b0)*by0.y + (f0*v0[2]-b0)*by0.z + (f0*v0[3]-b0)*by0.w;
+            s += (f1*v1[0]-b1)*by1.x + (f1*v1[1]-b1)*by1.y + (f1*v1[2]-b1)*by1.z + (f1*v1[3]-b1)*by1.w;
+            s += (f2*v2[0]-b2)*by2.x + (f2*v2[1]-b2)*by2.y + (f2*v2[2]-b2)*by2.z + (f2*v2[3]-b2)*by2.w;
+            s += (f3*v3[0]-b3)*by3.x + (f3*v3[1]-b3)*by3.y + (f3*v3[2]-b3)*by3.z + (f3*v3[3]-b3)*by3.w;
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q5k_btok2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<2>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok3(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<3>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<4>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok5(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<5>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok6(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<6>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok7(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<7>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok8(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<8>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok9(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<9>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok10(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<10>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok11(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<11>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok12(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<12>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok13(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<13>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok14(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<14>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok15(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<15>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok16(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<16>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok17(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<17>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok18(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<18>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok19(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<19>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok20(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<20>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok21(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<21>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok22(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<22>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok23(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<23>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok24(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<24>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok25(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<25>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok26(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<26>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok27(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<27>(a_u32, x, y, pc); }
+
+// ---- dmmv_q8_0_btok (Effort 28) — Q8_0 token-BATCH matvec --------------------
+// The Q8_0 analog: read each Q8_0 block (d + 32 int8) ONCE, reuse across B tokens.
+// Same per-element arithmetic as dmmv_q8_0_fast; per-token local sum then
+// sum[t] += s → token-identical to dmmv_q8_0_fast on x[t]. x/y token-major.
+template<int B>
+__device__ __forceinline__ void dmmv_q8_0_btok_impl(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 5;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 34u;
+    unsigned xb0 = pc.x_offset >> 2, tid = threadIdx.x;
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned bi = tid; bi < bpr; bi += blockDim.x) {
+        const unsigned char* blk = arow + (size_t)bi * 34u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)blk[0] | ((unsigned)blk[1] << 8)));
+        const signed char* qs = (const signed char*)(blk + 2);
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xb = (const float4*)(x + (unsigned)t * pc.K + xb0 + (size_t)bi * 32u);
+            float s = 0.0f;
+            #pragma unroll
+            for (unsigned j = 0; j < 8u; j++) { float4 xx = xb[j]; s += d * ((float)qs[j*4]*xx.x + (float)qs[j*4+1]*xx.y + (float)qs[j*4+2]*xx.z + (float)qs[j*4+3]*xx.w); }
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q8_0_btok2(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<2>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok3(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<3>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok4(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<4>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok5(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<5>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok6(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<6>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok7(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<7>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok8(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<8>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok9(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<9>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok10(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<10>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok11(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<11>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok12(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<12>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok13(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<13>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok14(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<14>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok15(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<15>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok16(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<16>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok17(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<17>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok18(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<18>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok19(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<19>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok20(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<20>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok21(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<21>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok22(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<22>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok23(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<23>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok24(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<24>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok25(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<25>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok26(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<26>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok27(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<27>(a, x, y, pc); }
 
 // ---- dmmv_q5k multi-row (perf research, agenda 1: extend mr2 to Q5_K) --------
 // One block computes R=2 output rows; each shared x-superblock loaded once and
@@ -3383,6 +3863,93 @@ extern "C" __global__ void rms_norm_rope_qkv(
         yt[i] = sh[i];
 }
 
+// ---- rms_norm_rope_qkv_seq (Effort 28 1c: batched DECODE per-seq norm/rope) --
+// Batched twin of rms_norm_rope_qkv: collapses the per-row decode loop into ONE
+// launch over B independent sequences. grid = (n_head + 2*n_kv_head, B). Row b is
+// sequence b at its OWN position positions[b] writing its OWN KV slot slots[b].
+//   q_in/k_in/v_in are token-major [B, q_dim] / [B, kv_dim] (this step's activations)
+//   q_out is token-major [B, q_dim] (in place); k_out/v_out are the slot KV buffers
+//   [n_slots*slot_ctx, kv_dim] — row b writes at (slot*slot_ctx + pos)*kv_dim.
+// Per-(head,b) block arithmetic is COPIED verbatim from rms_norm_rope_qkv (with
+// pc.position -> positions[b]), so it is bit-identical to the per-row launches.
+// No cross-block hazard: K writes slot KV, V writes slot KV, Q writes q_out per
+// (b,head) — disjoint regions; q_in==q_out is consumed into shared before write.
+struct RmsRopeQkvSeqPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned slot_ctx;
+};
+extern "C" __global__ void rms_norm_rope_qkv_seq(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out,
+    const unsigned* positions, const unsigned* slots, RmsRopeQkvSeqPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned b  = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim  = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    unsigned pos  = positions[b];
+    unsigned slot = slots[b];
+    size_t kv_base = ((size_t)slot * pc.slot_ctx + pos) * kv_dim;  // slot KV write pos
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    bool do_rope;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)b * q_dim + (size_t)head * hd;
+        yt = q_out + (size_t)b * q_dim + (size_t)head * hd;
+        w = wq; do_rope = true;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = k_out + kv_base + (size_t)head * hd;
+        w = wk; do_rope = true;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = v_out + kv_base + (size_t)head * hd;
+        w = nullptr; do_rope = false;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    if (!do_rope) { // V: plain normalize, no weight (matches rms_norm_kvwrite)
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            yt[i] = xt[i] * rinv;
+        return;
+    }
+
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pos * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
 // Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
 // carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
@@ -3559,6 +4126,77 @@ extern "C" __global__ void gemma_attention_batched(const float* q, const float* 
     }
 }
 
+// ---- gemma_attention_batched_seq (Effort 28 1c: batched request DECODE) ------
+// Batched twin of gemma_attention for DECODE: B independent sequences, each at
+// its OWN position over its OWN KV slot, in ONE launch. block (head=blockIdx.x,
+// b=blockIdx.y) computes attention for sequence b's single decode query, head h,
+// causally masked to its slot's keys [0..positions[b]] with the same optional
+// sliding-window mask. Q is token-major [B, n_heads, head_dim] (b.q, post
+// norm+RoPE). K/V are the slot KV buffers [n_slots*slot_ctx, n_kv_heads, head_dim];
+// sequence b reads slot slots[b] at base (slot*slot_ctx)*kv_dim. out is token-major
+// [B, n_heads, head_dim]. Math/reduction order are byte-for-byte identical to
+// gemma_attention against an aliased slot with seq_len=positions[b]+1 → the
+// batched output equals the per-row looped form bit-for-bit.
+struct GemmaAttnSlotPush { unsigned head_dim, n_heads, n_kv_heads, slot_ctx, scale_bits, window; };
+extern "C" __global__ void gemma_attention_batched_seq(
+    const float* q, const float* k, const float* v, float* out,
+    const unsigned* positions, const unsigned* slots, GemmaAttnSlotPush pc) {
+    extern __shared__ float s_scores[];           // size = max(seq_len) floats
+    __shared__ float s_m, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned pos = positions[b];
+    unsigned slot = slots[b];
+    unsigned seq_len = pos + 1u;                   // causal: attend keys [0..pos]
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;   // seq b, head h
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    unsigned start = 0;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) s_inv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    float inv = s_inv;
+
+    // Pass 3: out[b,head,d] = (sum_i e_i * V[i,d]) * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < seq_len; i++)
+            acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[((size_t)b * pc.n_heads + head) * hd + d] = acc * inv;
+    }
+}
+
 // ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
 // wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
 // interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and
@@ -3573,6 +4211,181 @@ extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, 
     unsigned src = h * 2u * pc.head_dim + d;
     q_out[i]    = qfull[src];
     gate_out[i] = qfull[src + pc.head_dim];
+}
+
+// ---- qwen_norm_rope_qkv_seq (Effort 28 4c-2: batched DECODE attn front-end) --
+// Batched fused twin of the qwen per-row decode attention front-end
+// (deinterleave_qgate + per-head q/k RMS-norm + RoPE + slot KV write + gate
+// extract): collapses the per-row decode loop into ONE launch over B sequences.
+// grid = (n_head + 2*n_kv_head, B). Row b is sequence b at its OWN position
+// positions[b] writing its OWN KV slot slots[b].
+//   qfull     token-major [B, 2*q_dim], q+gate INTERLEAVED per head (the
+//             deinterleave_qgate source layout: [Q(hd)|gate(hd)] per head)
+//   k_in/v_in token-major [B, kv_dim] (this step's K/V projections)
+//   wq/wk     per-head q/k norm weights ([head_dim]); inv_freq the RoPE buffer
+//   q_out     token-major [B, q_dim] (normed+roped Q)
+//   gate_out  token-major [B, q_dim] (RAW gate half, consumed post-attn by sigmoid_mul)
+//   k_out/v_out the slot KV buffers [n_slots*slot_ctx, kv_dim]; row b writes at
+//             (slot*slot_ctx + pos)*kv_dim + head*head_dim. V is NOT normalized (qwen).
+// Per-(head,b) arithmetic is COPIED from deinterleave_qgate + rms_norm(N=head_dim)
+// + rope + kv_cache_write (with pc.position -> positions[b]) so it is bit-identical
+// to the per-row launches. No cross-block hazard: each (b,head) writes disjoint
+// regions (Q/gate per (b,head); K/V into the slot at this step's position).
+struct QwenQkvSeqPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned slot_ctx;
+};
+extern "C" __global__ void qwen_norm_rope_qkv_seq(
+    const float* qfull, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* gate_out, float* k_out, float* v_out,
+    const unsigned* positions, const unsigned* slots, QwenQkvSeqPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned b  = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim  = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    unsigned pos  = positions[b];
+    unsigned slot = slots[b];
+    size_t kv_base = ((size_t)slot * pc.slot_ctx + pos) * kv_dim;  // slot KV write pos
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        // Q is interleaved with gate: [Q(hd) | gate(hd)] per head in qfull.
+        xt = qfull + (size_t)b * 2u * q_dim + (size_t)head * 2u * hd;
+        yt = q_out + (size_t)b * q_dim + (size_t)head * hd;
+        w  = wq;
+        // Extract the RAW gate half (no norm) — matches deinterleave_qgate's gate_out.
+        float* gt = gate_out + (size_t)b * q_dim + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            gt[i] = xt[hd + i];
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = k_out + kv_base + (size_t)head * hd;
+        w  = wk;
+    } else {
+        // V: NOT normalized for qwen — raw projection written straight to slot KV.
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        const float* vt = v_in + (size_t)b * kv_dim + (size_t)head * hd;
+        float* vo = v_out + kv_base + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            vo[i] = vt[i];
+        return;
+    }
+
+    // RMS-norm over head_dim (matches rms_norm with N=head_dim, per head).
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    // RoPE [0..rope_dim) (attn_scale 1, inv_freq buffer), copy tail [rope_dim..hd).
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pos * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
+// ---- naive_attention_batched_seq (Effort 28 4c-2: batched request DECODE) ----
+// Batched twin of naive_attention for DECODE: B independent sequences, each at
+// its OWN position over its OWN KV slot, in ONE launch. block (head=blockIdx.x,
+// b=blockIdx.y) computes sequence b's single decode query for head h, causally
+// over its slot's keys [0..positions[b]], with the attention-sink rescale.
+// Q is token-major [B, n_heads, head_dim] (b.q, post norm+RoPE); K/V are the slot
+// KV buffers [n_slots*slot_ctx, n_kv_heads, head_dim] (seq b reads slot slots[b]
+// at base (slot*slot_ctx)*kv_dim); out token-major [B, n_heads, head_dim]. Sink:
+// sinks[sink_offset+head] (NaN = none). Math/reduction order are byte-for-byte
+// naive_attention against an aliased slot with seq_len=positions[b]+1 → the
+// batched output equals the per-row looped form bit-for-bit.
+struct AttnSlotPush { unsigned head_dim, n_heads, n_kv_heads, slot_ctx, attn_scale_bits, sink_offset; };
+extern "C" __global__ void naive_attention_batched_seq(
+    const float* q, const float* k, const float* v, const float* sinks, float* out,
+    const unsigned* positions, const unsigned* slots, AttnSlotPush pc) {
+    extern __shared__ float s_scores[];           // size = max(seq_len) floats
+    __shared__ float s_m, s_rescale, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned pos = positions[b];
+    unsigned slot = slots[b];
+    unsigned seq_len = pos + 1u;
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    float scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)hd);
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) {
+        float sum = lsum, rescale = 1.0f, final_sum = lsum;
+        float sink_val = sinks[pc.sink_offset + head];
+        if (sink_val == sink_val) {   // sink present (NaN == NaN is false)
+            float sink_max = fmaxf(m, sink_val);
+            rescale = (sum > 0.0f) ? expf(m - sink_max) : 0.0f;
+            final_sum = sum * rescale + expf(sink_val - sink_max);
+        }
+        s_rescale = rescale;
+        s_inv = (final_sum > 0.0f) ? 1.0f / final_sum : 0.0f;
+    }
+    __syncthreads();
+    float rescale = s_rescale, inv = s_inv;
+
+    // Pass 3: out[b,head,d] = (sum_i e_i * V[i,d]) * rescale * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = 0; i < seq_len; i++)
+            acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[((size_t)b * pc.n_heads + head) * hd + d] = acc * rescale * inv;
+    }
 }
 
 // ---- attention_causal_batched (Effort 24: batched prefill attention) --------

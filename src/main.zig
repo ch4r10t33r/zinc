@@ -48,6 +48,9 @@ const cuda_device_mod = if (gpu.is_cuda) @import("cuda/device.zig") else struct 
 const loader_cuda_mod = if (gpu.is_cuda) @import("model/loader_cuda.zig") else struct {};
 const forward_cuda_mod = if (gpu.is_cuda) @import("compute/forward_cuda.zig") else struct {};
 const forward_cuda_gemma_mod = if (gpu.is_cuda) @import("compute/forward_cuda_gemma.zig") else struct {};
+// Effort 28 (inc 3 / 3b): CUDA multi-tenant serving engine (gemma dense). Only
+// referenced on the CUDA backend; the struct{} stub keeps other backends clean.
+const cuda_serve_mod = if (gpu.is_cuda) @import("server/cuda_serve.zig") else struct {};
 const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
 const routes_mod = @import("server/routes.zig");
@@ -1701,17 +1704,18 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         device.name(&name_buf), device.computeCapability(), device.smCount(),
     });
 
-    if (config.prompt == null) {
-        log.err("CUDA backend currently supports prompt mode only. Pass --prompt \"...\" (server mode is not yet wired on CUDA).", .{});
-        return error.ServerModeUnavailableOnThisBackend;
-    }
-
     // Load the model onto the GPU (weights uploaded verbatim-quantized).
     var model = loader_cuda_mod.Model.load(allocator, device.ctx, model_path) catch |err| {
         log.err("Failed to load model: {s}", .{@errorName(err)});
         return err;
     };
     defer model.deinit();
+
+    // server_mode = no CLI prompt → multi-tenant HTTP serving (Effort 28). Both the
+    // gemma4 dense forward AND the qwen35/36 hybrid-SSM+MoE forward expose the
+    // batched serving path (decodeBatch + slot state); the server dispatches by
+    // architecture via cuda_serve.Forward. Prompt mode (single-sequence) unchanged.
+    const server_mode = config.prompt == null;
 
     // Build the forward state. max_ctx must cover prompt + generated tokens.
     // gemma4 is a separate forward path (forward_cuda_gemma.zig); the
@@ -1726,6 +1730,7 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         log.info("CUDA gemma4 forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
             fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
         });
+        if (server_mode) return runCudaServe(.{ .gemma = &fwd }, &model, config, max_ctx, allocator);
         return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
     }
 
@@ -1737,6 +1742,7 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     log.info("CUDA forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
         fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
     });
+    if (server_mode) return runCudaServe(.{ .qwen = &fwd }, &model, config, max_ctx, allocator);
     return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
 }
 
@@ -1874,6 +1880,321 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     }
     const output_text = trimCliOutputText(text_buf.items, use_chat_prompt);
     log.info("Output ({d} tokens): {s}", .{ generated.items.len, output_text });
+}
+
+// ── Effort 28 increment 3 (3b): CUDA multi-tenant HTTP/SSE serving ───────────
+//
+// `zinc -m gemma.gguf` (no --prompt) → multi-tenant server: ONE GPU worker thread
+// runs the continuous-batching loop (ServeEngine, src/server/cuda_serve.zig);
+// each HTTP connection gets its own handler thread that tokenizes, enqueues, and
+// SSE-streams its OWN tokens as the worker produces them. The serving path reuses
+// the batched `decodeBatch` proven token-identical to N isolated single-sequence
+// runs in increments 1+2; the production single-sequence prompt path is untouched.
+
+/// Per-connection handler context, heap-allocated and handed to a detached thread.
+const ServeConnCtx = struct {
+    engine: *cuda_serve_mod.ServeEngine,
+    tokenizer: *tokenizer_mod.Tokenizer,
+    conn: http_mod.Connection,
+    allocator: std.mem.Allocator,
+    /// Gate mode: prompts are comma-separated raw token ids and the SSE payload is
+    /// the decimal token id (exact token-level comparison, no tokenizer/detok).
+    debug_ids: bool,
+    default_max: u32,
+    slot_ctx: u32,
+};
+
+/// Stand up the CUDA serving path: build the tokenizer, spawn the GPU worker via
+/// `ServeEngine`, then accept connections and hand each to a detached handler.
+/// `fwd` is a `cuda_serve.Forward` so the server drives EITHER the gemma4 dense or
+/// the qwen35/36 hybrid-SSM+MoE forward (Effort 28 increment 4 — qwen serving).
+fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, config: Config, max_ctx: u32, allocator: std.mem.Allocator) !void {
+    var tokenizer = tokenizer_mod.Tokenizer.initFromGGUF(&model.gguf_file, allocator) catch |err| {
+        log.err("Failed to init tokenizer from GGUF: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer tokenizer.deinit();
+
+    // Gate / EOS plumbing. ZINC_SERVE_DEBUG_IDS=1 → raw-token-id contract for the
+    // exact concurrency gate. ZINC_SCHED_EOS overrides the stop token so the HTTP
+    // gate and the `dbg_cuda serve` reference stop identically.
+    const debug_ids = envIsOn("ZINC_SERVE_DEBUG_IDS");
+    var eos = tokenizer.eosId();
+    if (std.posix.getenv("ZINC_SCHED_EOS")) |v| {
+        eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch eos;
+    }
+
+    const nslots = std.math.clamp(config.max_parallel, 1, 64);
+    const slot_ctx = max_ctx;
+
+    var engine = cuda_serve_mod.ServeEngine.init(allocator, fwd, nslots, slot_ctx, eos) catch |err| {
+        log.err("Failed to init CUDA serve engine: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer engine.deinit();
+    try engine.start();
+    defer engine.shutdown();
+
+    var server = http_mod.Server.init(allocator, config.port) catch |err| {
+        log.err("Failed to bind HTTP server on port {d}: {s}", .{ config.port, @errorName(err) });
+        return err;
+    };
+    defer server.deinit();
+
+    log.info("ZINC CUDA server listening on :{d} (slots={d}, ctx={d}, eos={d}, debug_ids={})", .{
+        config.port, nslots, slot_ctx, eos, debug_ids,
+    });
+
+    while (true) {
+        const conn = server.accept() catch |err| {
+            log.warn("accept failed: {s}", .{@errorName(err)});
+            continue;
+        };
+        const ctx = allocator.create(ServeConnCtx) catch {
+            var c = conn;
+            c.close();
+            continue;
+        };
+        ctx.* = .{
+            .engine = &engine,
+            .tokenizer = &tokenizer,
+            .conn = conn,
+            .allocator = allocator,
+            .debug_ids = debug_ids,
+            .default_max = config.max_tokens,
+            .slot_ctx = slot_ctx,
+        };
+        const t = std.Thread.spawn(.{}, handleServeConn, .{ctx}) catch {
+            ctx.conn.close();
+            allocator.destroy(ctx);
+            continue;
+        };
+        t.detach();
+    }
+}
+
+/// Minimal request body the serve path reads (OpenAI-ish). Unknown fields ignored.
+const ServeReqBody = struct {
+    prompt: ?[]const u8 = null,
+    messages: ?[]struct { role: []const u8 = "user", content: []const u8 = "" } = null,
+    max_tokens: ?u32 = null,
+    n_predict: ?u32 = null,
+};
+
+fn handleServeConn(ctx: *ServeConnCtx) void {
+    defer ctx.allocator.destroy(ctx);
+    var conn = ctx.conn;
+    defer conn.close();
+
+    const req = conn.readRequest() catch return;
+
+    if (req.method == .OPTIONS) {
+        conn.sendJson(200, "{}") catch {};
+        return;
+    }
+    if (req.method == .GET and std.mem.eql(u8, req.path, "/health")) {
+        conn.sendJson(200, "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
+        return;
+    }
+    // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
+    // around a B-concurrent phase → aggregate decode tok/s + mean batch occupancy.
+    if (req.method == .GET and std.mem.eql(u8, req.path, "/stats")) {
+        var sbuf: [256]u8 = undefined;
+        const js = ctx.engine.statsJson(&sbuf) catch "{}";
+        conn.sendJson(200, js) catch {};
+        return;
+    }
+    const is_gen = req.method == .POST and (std.mem.eql(u8, req.path, "/v1/completions") or
+        std.mem.eql(u8, req.path, "/v1/chat/completions") or std.mem.eql(u8, req.path, "/generate"));
+    if (!is_gen) {
+        conn.sendError(404, "not_found", "unknown route") catch {};
+        return;
+    }
+    const is_chat = std.mem.eql(u8, req.path, "/v1/chat/completions");
+    handleServeGenerate(ctx, &conn, req.body, is_chat) catch |err| {
+        log.warn("serve request failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []const u8, is_chat: bool) !void {
+    const allocator = ctx.allocator;
+
+    // ── Build the prompt token ids ───────────────────────────────────────────
+    var prompt_tokens: []u32 = undefined;
+    var max_tokens: u32 = ctx.default_max;
+    var owns_tokens = false;
+
+    if (ctx.debug_ids) {
+        // Gate contract: body is JSON {"prompt":"t0,t1,...","max_tokens":N}; the
+        // prompt is raw comma-separated token ids — bypasses tokenizer + detok so
+        // the streamed ids compare exactly to the isolated reference.
+        const parsed = std.json.parseFromSlice(ServeReqBody, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+            try conn.sendError(400, "invalid_request_error", "bad json");
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.max_tokens orelse parsed.value.n_predict) |m| max_tokens = m;
+        const ptxt = parsed.value.prompt orelse {
+            try conn.sendError(400, "invalid_request_error", "missing prompt");
+            return;
+        };
+        prompt_tokens = try parseTokenIdList(allocator, ptxt);
+        owns_tokens = true;
+    } else {
+        const parsed = std.json.parseFromSlice(ServeReqBody, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+            try conn.sendError(400, "invalid_request_error", "bad json");
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.max_tokens orelse parsed.value.n_predict) |m| max_tokens = m;
+
+        var prompt_text: []const u8 = "";
+        var chat_buf: ?[]u8 = null;
+        defer if (chat_buf) |b| allocator.free(b);
+        if (is_chat) {
+            const msgs = parsed.value.messages orelse {
+                try conn.sendError(400, "invalid_request_error", "missing messages");
+                return;
+            };
+            var roles = try allocator.alloc([]const u8, msgs.len);
+            defer allocator.free(roles);
+            var contents = try allocator.alloc([]const u8, msgs.len);
+            defer allocator.free(contents);
+            for (msgs, 0..) |m, i| {
+                roles[i] = m.role;
+                contents[i] = m.content;
+            }
+            const buf = try allocator.alloc(u8, 64 * 1024);
+            chat_buf = buf;
+            prompt_text = ctx.tokenizer.applyChatTemplate(roles, contents, buf) catch |err| {
+                try conn.sendError(400, "invalid_request_error", "chat template failed");
+                log.warn("chat template: {s}", .{@errorName(err)});
+                return;
+            };
+        } else {
+            prompt_text = parsed.value.prompt orelse {
+                try conn.sendError(400, "invalid_request_error", "missing prompt");
+                return;
+            };
+        }
+        prompt_tokens = try ctx.tokenizer.encodePrompt(prompt_text, allocator);
+        owns_tokens = true;
+    }
+    defer if (owns_tokens) allocator.free(prompt_tokens);
+
+    if (prompt_tokens.len == 0) {
+        try conn.sendError(400, "invalid_request_error", "empty prompt");
+        return;
+    }
+    // Clamp so prompt + generated never exceeds the slot KV depth.
+    if (prompt_tokens.len >= ctx.slot_ctx) {
+        try conn.sendError(400, "invalid_request_error", "prompt longer than context");
+        return;
+    }
+    const room: u32 = ctx.slot_ctx - @as(u32, @intCast(prompt_tokens.len));
+    if (max_tokens == 0 or max_tokens > room) max_tokens = room;
+
+    // ── Submit + stream ──────────────────────────────────────────────────────
+    var chan = cuda_serve_mod.ReqChannel{};
+    const id = ctx.engine.submit(prompt_tokens, max_tokens, &chan) catch {
+        try conn.sendError(500, "server_error", "enqueue failed");
+        return;
+    };
+    // From here the worker borrows `prompt_tokens` + `chan`; do not return without
+    // draining to `finished` (so the worker is done touching them) then `finish`.
+    defer ctx.engine.finish(id, &chan);
+
+    conn.sendSseStart() catch {
+        // Client gone before headers — still drain the engine so it frees the slot.
+        drainQuietly(ctx.engine, &chan);
+        return;
+    };
+
+    var buf: [32]u32 = undefined;
+    var dec_buf: [256]u8 = undefined;
+    var json_buf: [1024]u8 = undefined;
+    var write_failed = false;
+    while (true) {
+        const ch = ctx.engine.nextChunk(&chan, &buf);
+        var i: usize = 0;
+        while (i < ch.n) : (i += 1) {
+            const tok = buf[i];
+            if (write_failed) continue; // keep draining the engine, stop writing
+            if (ctx.debug_ids) {
+                const payload = std.fmt.bufPrint(&json_buf, "{d}", .{tok}) catch continue;
+                conn.writeSseEvent(payload) catch {
+                    write_failed = true;
+                };
+            } else {
+                const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
+                const payload = formatChunkJson(&json_buf, text, is_chat) catch continue;
+                conn.writeSseEvent(payload) catch {
+                    write_failed = true;
+                };
+            }
+        }
+        if (ch.finished) break;
+    }
+    if (!write_failed) conn.writeSseDone() catch {};
+}
+
+/// Drain a request's stream without writing (client disconnected) so the worker
+/// runs it to completion and frees the slot.
+fn drainQuietly(engine: *cuda_serve_mod.ServeEngine, chan: *cuda_serve_mod.ReqChannel) void {
+    var buf: [32]u32 = undefined;
+    while (true) {
+        const ch = engine.nextChunk(chan, &buf);
+        if (ch.finished) break;
+    }
+}
+
+/// Parse a comma-separated list of decimal token ids (gate/debug-ids contract).
+fn parseTokenIdList(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+    var list: std.ArrayList(u32) = .{};
+    errdefer list.deinit(allocator);
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |s| {
+        const t = std.mem.trim(u8, s, " \t\r\n");
+        if (t.len == 0) continue;
+        try list.append(allocator, try std.fmt.parseInt(u32, t, 10));
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Format one OpenAI-style streaming chunk carrying a single token's text.
+fn formatChunkJson(buf: []u8, text: []const u8, is_chat: bool) ![]const u8 {
+    var esc: [512]u8 = undefined;
+    const escaped = jsonEscape(&esc, text);
+    if (is_chat) {
+        return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}}}}]}}", .{escaped});
+    }
+    return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"text\":\"{s}\"}}]}}", .{escaped});
+}
+
+/// Minimal JSON string escaper for SSE token payloads (truncates on overflow).
+fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |c| {
+        const rep: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => &[_]u8{c},
+        };
+        if (n + rep.len > buf.len) break;
+        @memcpy(buf[n .. n + rep.len], rep);
+        n += rep.len;
+    }
+    return buf[0..n];
+}
+
+/// True if an env var is set to an "on" value (1/true/yes/on).
+fn envIsOn(name: []const u8) bool {
+    const v = std.posix.getenv(name) orelse return false;
+    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or
+        std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on");
 }
 
 // CUDA: `zinc --check` for NVIDIA. Detects the best CUDA device and prints a
