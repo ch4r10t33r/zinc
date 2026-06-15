@@ -2206,13 +2206,20 @@ fn b1MatvecOn() bool {
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
-// Effort 28: the small-B (2..8) Q4_K token-batch matvec is OPT-IN (default OFF,
-// enable ZINC_BATCH_MROW=1/on/true/yes). Default-off keeps the validated batched
-// GEMM path the serving default until the throughput win is confirmed.
+// Effort 28: the small-B (2..8) token-batch matvec (btok + MoE launch-collapse +
+// shared-expert batching) is now DEFAULT-ON (opt out with ZINC_BATCH_MROW=0/off/
+// false/no). Flipped 2026-06-15 after the CLEAN-window head-to-head gate
+// (throughput_vs_llama.sh, qwen35-9b, 5090, 60/60 rounds uncontended): ZINCM
+// (mrow ON) clean-beats ZINC0 (mrow OFF) at every batched B — B=2/4/8 medians
+// 34.76/48.02/60.33 vs 8.40/16.97/26.36 tok/s (4.14×/2.83×/2.29×), with NO
+// regression at B=1 (mrow only engages for 2≤B≤8). The batched mrow-ON path is
+// token-identical to N-serial (proven every cycle), so the default flip just makes
+// the validated-better path the serving default; the serial decodeStep/prefill path
+// never sets decode_mrow → catalog correctness is unaffected by construction.
 fn mrowMatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return false;
-    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
-        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 // Effort 28: the MoE shared-expert batching is default-ON (opt out with

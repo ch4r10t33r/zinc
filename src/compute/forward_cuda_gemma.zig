@@ -2448,14 +2448,19 @@ fn b1MatvecOn() bool {
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
-// Effort 28: the small-B (2..8) Q4_K token-batch matvec (`dmmv_q4k_btok`) is
-// OPT-IN, default-off (enable ZINC_BATCH_MROW=1/on/true/yes). Same env knob as the
-// qwen `decodeBatch` port. Default-off keeps the validated batched-GEMM path the
-// serving default until the throughput win is confirmed end-to-end vs llama-server.
+// Effort 28: the small-B (2..8) token-batch matvec (`*_btok`) is now DEFAULT-ON
+// (opt out with ZINC_BATCH_MROW=0/off/false/no). Same env knob as the qwen
+// `decodeBatch` port. Flipped 2026-06-15 after the CLEAN-window head-to-head gate
+// (throughput_vs_llama.sh, qwen35-9b, 5090, 60/60 rounds uncontended): mrow ON
+// clean-beats mrow OFF at every batched B (4.14×/2.83×/2.29× at B=2/4/8), no
+// regression at B=1. The batched mrow-ON path is token-identical to N-serial
+// (proven every cycle), so the flip just makes the validated-better path the
+// serving default; serial decodeStep/prefill never sets decode_mrow → catalog
+// correctness is unaffected by construction.
 fn mrowMatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return false;
-    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
-        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 // Effort 26 cycle 9: the cuBLAS dense Q4_K prefill GEMM is default-ON (opt out
