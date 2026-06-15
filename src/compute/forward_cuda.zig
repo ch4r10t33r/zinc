@@ -382,6 +382,19 @@ pub const ForwardCuda = struct {
     // recording, switching `submit`/attention to a no-sync capture path.
     graph: ?*shim.CudaGraph = null,
     capturing: bool = false,
+    // Effort 28: CUDA-graph replay for the BATCHED dense-decode step (qwen35),
+    // one cached CUgraphExec per distinct batch size B (index B). Opt-in via
+    // ZINC_BATCH_GRAPH (`batch_graph_on`) / harness `batch_graph_force`. The
+    // captured region is sync-free thanks to the dense launch-collapse (commit
+    // 3c6ca650): every batched block rides the async `submit` no-sync path under
+    // `capturing`, and the per-step scalars (positions/slots/tokens) live in
+    // device scratch uploaded BEFORE capture, so the topology + push-constants are
+    // invariant across steps → `cuGraphExecUpdate` is a cheap in-place no-op.
+    // MoE is excluded (the router host-readback is illegal mid-capture), exactly
+    // like the serial `graph` path. Set only by `decodeBatch`.
+    batch_graph: [9]?*shim.CudaGraph = .{null} ** 9,
+    batch_graph_on: bool = false,
+    batch_graph_force: ?bool = null,
     // GPU-side embedding (Effort 25 cycle 5): when the token_embd tensor is Q4_K,
     // dequant the token's row on-GPU (reading the id from `tok_in_buf`) instead of
     // a per-token CPU dequant + full-row H2D. `embed_weight` points at the resident
@@ -686,6 +699,13 @@ pub const ForwardCuda = struct {
             self.graph = shim.cuda_graph_create();
             log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
         }
+        // Effort 28: opt-in CUDA-graph replay for the BATCHED dense-decode step.
+        // Dense only (MoE router host-readback is illegal mid-capture); per-B execs
+        // are created lazily on first use in `decodeBatch`.
+        if (d.n_experts == 0 and std.posix.getenv("ZINC_BATCH_GRAPH") != null) {
+            self.batch_graph_on = true;
+            log.info("ZINC_BATCH_GRAPH: dense batched decode will replay via per-B captured CUDA graphs", .{});
+        }
 
         return self;
     }
@@ -693,6 +713,7 @@ pub const ForwardCuda = struct {
     pub fn deinit(self: *ForwardCuda) void {
         const a = self.allocator;
         if (self.graph) |g| shim.cuda_graph_free(g);
+        for (&self.batch_graph) |*bg| if (bg.*) |g| shim.cuda_graph_free(g);
         inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.tok_in_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
@@ -1125,6 +1146,18 @@ pub const ForwardCuda = struct {
         var max_seq_len: u32 = 1;
         for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
 
+        // Effort 28 CUDA-graph replay (opt-in): the dense batched-decode step is
+        // sync-free after the launch-collapse, so capture the whole layer chain +
+        // tail into a per-B cached exec and replay it as ONE graph launch. The
+        // embed + pos/slot uploads above already ran (sync) into device scratch,
+        // so the captured kernels read the current step's data. Requires
+        // `decode_collapse` (no commitAndWait may appear inside a captured region)
+        // and dense (MoE router host-readback is illegal mid-capture).
+        const use_graph = d.n_experts == 0 and self.decode_collapse and (self.batch_graph_force orelse self.batch_graph_on);
+        if (use_graph) {
+            return try self.decodeBatchGraph(B, db, pos_buf, slot_buf, max_seq_len, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_, out);
+        }
+
         // Layer-major: each block reads/writes db.hidden over ALL B rows. The big
         // projection/FFN GEMMs read each weight ONCE for all B rows (the
         // amortization win — 4c-step-1). Both the attention inner (4c-step-2a) AND
@@ -1174,6 +1207,72 @@ pub const ForwardCuda = struct {
         // guaranteed; free the stashed handles. No-op when n_pending==0 (e.g. the
         // MoE path drains the ring each layer via its `waitPending`).
         self.drainPending();
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
+    }
+
+    /// Effort 28: dense batched-decode step via CUDA-graph replay (one cached exec
+    /// per B). The embed + per-seq pos/slot/token uploads already ran (sync) into
+    /// device scratch in `decodeBatch`, so `db.hidden`/`pos_buf`/`slot_buf` hold this
+    /// step's data; capture the layer chain + tail (all on ONE stream via the
+    /// `submit` no-sync path under `capturing`) and launch as a single graph. Across
+    /// steps the topology AND push-constants are invariant (every per-seq scalar is
+    /// read from a device buffer, not a push constant) → `cuGraphExecUpdate` is a
+    /// cheap in-place no-op. Bit-identical to the non-graph batched chain (same
+    /// kernels, same order, same single stream) → token-identical to N serial runs.
+    /// Dense only (gated by the caller on `n_experts==0`).
+    fn decodeBatchGraph(self: *ForwardCuda, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32, out_norm: *const CudaBuffer, lm_head: *const CudaBuffer, lm_type: gguf.GGMLType, out: []u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        if (self.batch_graph[B] == null) self.batch_graph[B] = shim.cuda_graph_create();
+        const g = self.batch_graph[B].?;
+
+        self.capturing = true;
+        _ = shim.cuda_graph_begin(ctx);
+        // Layer chain — each batched block rides the async `submit` ring, which under
+        // `capturing` records onto the captured stream with no event/sync. The
+        // attention smem is sized at the constant slot_ctx (not data-dependent
+        // max_seq_len) so the captured kernel-node shape is invariant across steps.
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
+            } else {
+                try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
+            }
+            try self.ffnBlockBatchedDecode(L, B, db); // dense only — graph gated on n_experts==0
+        }
+        // TAIL: rms_norm → LM head → argmax for all B rows, recorded into ONE command
+        // buffer (no commitAndWait — captured). On one stream the dispatches execute
+        // in order so reusing norm_buf/logits_buf across rows is hazard-free; only the
+        // argmax OUTPUT is per-row (each writes its own argmax_scratch slot).
+        const lm_idx = dmmvIdx(lm_type);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hrow, out_norm, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+            if (lm_idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            }
+            const am = ArgmaxPush{ .N = d.vocab };
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
+        }
+        cmd.releaseCompleted(); // captured onto the stream; no event record / no sync
+        self.capturing = false;
+
+        // End capture, instantiate-or-update the cached exec, launch + ONE sync
+        // (drains the whole captured layer chain + tail).
+        _ = shim.cuda_graph_end_launch(ctx, g);
+        // The argmax slots are now resident on the device; one B-wide D2H.
         buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
     }
 
@@ -1274,7 +1373,13 @@ pub const ForwardCuda = struct {
 
         // 3. Batched per-seq attention over each row's slot KV history.
         const attn = AttnSlotPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .slot_ctx = self.slot_ctx, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), max_seq_len * 4);
+        // The kernel's dynamic shared mem holds up to `seq_len`=positions[b]+1 f32
+        // scores per row. Under graph capture, request the constant MAX (slot_ctx)
+        // so the captured kernel-node smem size is invariant as positions grow →
+        // the cached exec updates in place instead of re-instantiating each step.
+        // The kernel still uses only seq_len entries (mirrors the serial path).
+        const attn_smem: u32 = if (self.capturing) self.slot_ctx * 4 else max_seq_len * 4;
+        cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), attn_smem);
 
         // 4. Per-seq sigmoid-z gate over all B rows (token-major [B,q_dim] contiguous).
         const sm = SigmoidMulPush{ .N = B * d.q_dim };
