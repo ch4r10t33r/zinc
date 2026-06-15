@@ -189,6 +189,7 @@ const Pipelines = struct {
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q4k_experts_dual: CudaPipeline, // gate+up over all experts in ONE launch
     moe_combine_tail: CudaPipeline, // shared+moe → post_ffw_norm → hidden in ONE launch
+    rms_norm_triple: CudaPipeline, // 3 MoE pre-norms off the same hidden → ONE launch
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
     dmmv_q4k_experts_batched: CudaPipeline, // token-batched gate/up (all T prompt tokens)
     dmmv_q5_1_experts_batched: CudaPipeline, // token-batched down (all T prompt tokens)
@@ -471,6 +472,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q4k_experts_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_dual");
         pipes.moe_combine_tail = try pipeline.createPipeline(ctx, src.ptr, "moe_combine_tail");
+        pipes.rms_norm_triple = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_triple");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
         pipes.dmmv_q4k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_batched");
         pipes.dmmv_q5_1_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts_batched");
@@ -1444,7 +1446,12 @@ pub const ForwardGemma = struct {
         // --- shared expert → shared_buf -------------------------------------
         {
             var cmd = try command.beginCommand(ctx);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            // Fuse the THREE pre-norms off the (unchanged) hidden into one launch:
+            // ffn_norm (here), the router's no-weight norm (→norm_buf), and the
+            // routed-experts pre_ffw_norm_2 (→moe_norm_buf) share the identical
+            // Σhidden² reduction. Byte-identical to the 3 originals; removes 2
+            // launches + 2 redundant hidden reads/reductions per MoE layer.
+            cmd.dispatch(&self.pipes.rms_norm_triple, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &wpre2.gpu_buffer, &self.ffn_norm_buf, &self.norm_buf, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
             self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, sf, d.n_embd, 0, 0);
             self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, sf, d.n_embd, 0, 0);
             const sg = SwigluPush{ .N = sf };
@@ -1457,7 +1464,8 @@ pub const ForwardGemma = struct {
         // --- router logits + top-k softmax (computed from attn_out) ----------
         {
             var cmd = try command.beginCommand(ctx);
-            cmd.dispatch(&self.pipes.rms_norm_noweight, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            // norm_buf (= rms_norm_noweight(hidden)) was produced up front by
+            // rms_norm_triple; go straight to the router scale.
             const mv = MulVecPush{ .N = d.n_embd, .scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d.n_embd))) };
             cmd.dispatch(&self.pipes.mul_vec_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.norm_buf, &wrscale.gpu_buffer }, &mv, @sizeOf(MulVecPush), 0);
             self.dmmvDispatch(&cmd, wrouter, &self.norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
@@ -1493,7 +1501,8 @@ pub const ForwardGemma = struct {
             const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
 
             var cmd = try command.beginCommand(ctx);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            // moe_norm_buf (= rms_norm(hidden, pre_ffw_norm_2)) was produced up
+            // front by rms_norm_triple; go straight to the routed experts.
             // Batched path (gate_up Q4_K + down Q5_1): one launch over all
             // experts, ids read GPU-side from router_out_buf, slot-major output.
             // The fused gate_up reuses dmmv_q4k_experts with base=gu_half for the

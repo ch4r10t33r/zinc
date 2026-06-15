@@ -3061,6 +3061,41 @@ extern "C" __global__ void rms_norm_noweight(const float* x, float* y, RmsPush p
         yt[i] = xt[i] * rinv;
 }
 
+// ---- rms_norm_triple (gemma MoE: 3 pre-norms off the SAME hidden → 1 launch) -
+// In the gemma-26b MoE decode block, `self.hidden` is rms-normalized THREE times
+// per layer over the identical Σhidden² reduction, only the trailing weight
+// differs: ffn_norm (shared expert), no-weight (router), pre_ffw_norm_2 (routed
+// experts). hidden is unchanged until the combine tail, so all three share one
+// reduction. This fuses them: ONE block reduces Σx² once, then emits
+//   y1[i] = w1[i]*(x[i]*rinv)   (== rms_norm(x, w1))
+//   y2[i] =        x[i]*rinv    (== rms_norm_noweight(x))
+//   y3[i] = w3[i]*(x[i]*rinv)   (== rms_norm(x, w3))
+// Byte-identical to the three originals (same ss / rsqrtf(ss/N+eps) / left-to-
+// right multiply); removes 2 launches AND 2 redundant full hidden reads +
+// reductions per layer. Single block (grid {1,1,1}) like the originals — no
+// in-flight block count is lost (the C8-class block-count-preserving fusion).
+extern "C" __global__ void rms_norm_triple(const float* x, const float* w1, const float* w3,
+                                           float* y1, float* y2, float* y3, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float xr = xt[i] * rinv;
+        y1[(size_t)token * pc.N + i] = w1[i] * xr;
+        y2[(size_t)token * pc.N + i] = xr;
+        y3[(size_t)token * pc.N + i] = w3[i] * xr;
+    }
+}
+
 // ---- rms_norm_kvwrite (gemma: fuse per-head V rms_norm-noweight + V KV write) -
 // One block per KV head. Plain-normalizes V over head_dim (no weight, like
 // rms_norm_noweight) and writes the result STRAIGHT into the V cache at
