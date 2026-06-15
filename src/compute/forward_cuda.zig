@@ -85,6 +85,23 @@ const GatedNormPush = extern struct {
 const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
+// Effort 28 4c-2: fused batched-decode attn front-end (byte-match kernels.cu).
+const QwenQkvSeqPush = extern struct {
+    head_dim: u32,
+    eps: f32,
+    rope_dim: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    slot_ctx: u32,
+};
+const AttnSlotPush = extern struct {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    slot_ctx: u32,
+    attn_scale_bits: u32,
+    sink_offset: u32,
+};
 // Effort 28 4c: batched GEMM push (must byte-match `struct GemmPush` in kernels.cu).
 // Output Y is token-major [T, M]; offsets are in BYTES; acc_mode 1 => Y += .
 const GemmPush = extern struct {
@@ -194,6 +211,9 @@ const Pipelines = struct {
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
+    // Effort 28 4c-2: fused batched-decode attention (grid.y=B per-seq) twins.
+    qwen_norm_rope_qkv_seq: CudaPipeline,
+    naive_attention_batched_seq: CudaPipeline,
     sigmoid_mul: CudaPipeline,
     deinterleave: CudaPipeline,
     ssm_conv1d: CudaPipeline,
@@ -386,6 +406,8 @@ pub const ForwardCuda = struct {
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
+        pipes.qwen_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv_seq");
+        pipes.naive_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "naive_attention_batched_seq");
         pipes.sigmoid_mul = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_mul");
         pipes.deinterleave = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate");
         pipes.ssm_conv1d = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d");
@@ -843,14 +865,28 @@ pub const ForwardCuda = struct {
             }
         }
 
+        // 4c-step-2: upload per-seq positions[]/slots[] ONCE (same for all layers)
+        // to device u32 buffers for the fused batched attention kernels.
+        var pos_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
+        var slot_buf = try buffer.createBuffer(ctx, B * @sizeOf(u32));
+        defer {
+            buffer.freeBuffer(&pos_buf);
+            buffer.freeBuffer(&slot_buf);
+        }
+        buffer.upload(ctx, &pos_buf, std.mem.sliceAsBytes(positions));
+        buffer.upload(ctx, &slot_buf, std.mem.sliceAsBytes(slots));
+        var max_seq_len: u32 = 1;
+        for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
+
         // Layer-major: each block reads/writes db.hidden over ALL B rows. The big
         // projection/FFN GEMMs read each weight ONCE for all B rows (the
-        // amortization win — 4c); the per-seq attention/SSM inner still loops per
-        // row on its slice + slot state (kernel fusion is the next 4c step).
+        // amortization win — 4c-step-1). The attention inner is now FUSED into two
+        // batched grid.y=B kernels (4c-step-2); the SSM inner still loops per row
+        // on its slot conv/recurrent state (SSM fusion is the next 4c step).
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (isFullAttn(L, d.full_attn_interval)) {
-                try self.attentionLayerBatchedDecode(L, B, db, positions, slots);
+                try self.attentionLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf, max_seq_len);
             } else {
                 try self.ssmLayerBatchedDecode(L, B, db, positions, slots);
             }
@@ -905,15 +941,24 @@ pub const ForwardCuda = struct {
         }
     }
 
-    /// 4c attention block: pre-norm + Q(+gate)/K/V + O projections run as GEMMs
-    /// over ALL B rows (each weight read once). The per-head deinterleave / q-k
-    /// norm / RoPE / KV-write / softmax / gate inner loops per row on row b's slice
-    /// of the batched buffers + its slot KV at positions[b]. Per-row block math is
-    /// copied verbatim from `attentionLayer` (→ token-identical to N serial runs).
-    fn attentionLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, positions: []const u32, slots: []const u32) !void {
+    /// 4c-step-2 attention block: pre-norm + Q(+gate)/K/V + O projections run as
+    /// GEMMs over ALL B rows (each weight read once), AND the per-seq attention
+    /// inner is now FUSED into two batched grid.y=B launches — collapsing the
+    /// per-row deinterleave / q-k norm / RoPE / KV-write / softmax loop (mirrors
+    /// gemma's 1c). One command buffer, ONE commitAndWait (was B per-row syncs):
+    ///   1. batched pre-norm + Q(+gate)/K/V projections (GEMMs over B rows)
+    ///   2. qwen_norm_rope_qkv_seq — fused deinterleave + per-head q/k norm + RoPE
+    ///      + slot KV write + gate extract over (n_head+2*n_kv_head, B) at per-seq
+    ///      positions[]/slots[] (device buffers)
+    ///   3. naive_attention_batched_seq — per-(head,b) softmax(QK^T)V + sink over
+    ///      each row's slot KV history, seq_len=positions[b]+1
+    ///   4. sigmoid_mul — sigmoid-z gate over all B rows (token-major [B,q_dim])
+    ///   5. batched O projection, accumulate into db.hidden (residual)
+    /// Per-(head,b) arithmetic is copied from the per-row kernels → token-identical
+    /// to N serial runs (ARGMAX-identical given the GEMM reduction order).
+    fn attentionLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32) !void {
         const d = self.d;
         const ctx = self.ctx;
-        const f4 = @sizeOf(f32);
         const wq = self.layer(L, "attn_q.weight");
         const wk = self.layer(L, "attn_k.weight");
         const wv = self.layer(L, "attn_v.weight");
@@ -922,71 +967,32 @@ pub const ForwardCuda = struct {
         const wo = self.layer(L, "attn_output.weight");
         const wan = self.layer(L, "attn_norm.weight");
 
-        // Batched pre-attn norm + Q(+gate)/K/V projections over B rows.
-        {
-            var cmd = try command.beginCommand(ctx);
-            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
-            self.gemmDispatch(&cmd, wq, &db.norm, &db.qfull, 2 * d.q_dim, d.n_embd, B, 0);
-            self.gemmDispatch(&cmd, wk, &db.norm, &db.k, d.kv_dim, d.n_embd, B, 0);
-            self.gemmDispatch(&cmd, wv, &db.norm, &db.v, d.kv_dim, d.n_embd, B, 0);
-            cmd.commitAndWait();
-        }
+        var cmd = try command.beginCommand(ctx);
 
-        // Per-row attention inner on each row's slice + slot KV.
-        var bi: u32 = 0;
-        while (bi < B) : (bi += 1) {
-            const pos = positions[bi];
-            const slot = slots[bi];
-            var qf = try buffer.aliasBuffer(&db.qfull, bi * 2 * d.q_dim * f4, 2 * d.q_dim * f4);
-            var qq = try buffer.aliasBuffer(&db.q, bi * d.q_dim * f4, d.q_dim * f4);
-            var gg = try buffer.aliasBuffer(&db.gate, bi * d.q_dim * f4, d.q_dim * f4);
-            var ka = try buffer.aliasBuffer(&db.k, bi * d.kv_dim * f4, d.kv_dim * f4);
-            var va = try buffer.aliasBuffer(&db.v, bi * d.kv_dim * f4, d.kv_dim * f4);
-            var ao = try buffer.aliasBuffer(&db.attn_out, bi * d.q_dim * f4, d.q_dim * f4);
-            const kv_base = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
-            const kv_span = @as(usize, self.slot_ctx) * d.kv_dim * f4;
-            var kk = try buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_base, kv_span);
-            var vv = try buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_base, kv_span);
-            defer {
-                buffer.freeBuffer(&qf);
-                buffer.freeBuffer(&qq);
-                buffer.freeBuffer(&gg);
-                buffer.freeBuffer(&ka);
-                buffer.freeBuffer(&va);
-                buffer.freeBuffer(&ao);
-                buffer.freeBuffer(&kk);
-                buffer.freeBuffer(&vv);
-            }
+        // 1. Batched pre-attn norm + Q(+gate)/K/V projections over B rows.
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wq, &db.norm, &db.qfull, 2 * d.q_dim, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wk, &db.norm, &db.k, d.kv_dim, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wv, &db.norm, &db.v, d.kv_dim, d.n_embd, B, 0);
 
-            var cmd = try command.beginCommand(ctx);
-            const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
-            cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &qf, &qq, &gg }, &deint, @sizeOf(DeintPush), 0);
-            const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
-            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &wqn.gpu_buffer, &qq }, &rms_h, @sizeOf(RmsPush), 0);
-            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &ka, &wkn.gpu_buffer, &ka }, &rms_h, @sizeOf(RmsPush), 0);
-            const rope_q = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
-            cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &qq, &self.inv_freq }, &rope_q, @sizeOf(RopePush), 0);
-            const rope_k = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
-            cmd.dispatch(&self.pipes.rope, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &ka, &ka, &self.inv_freq }, &rope_k, @sizeOf(RopePush), 0);
-            const kvw = KvWritePush{ .kv_dim = d.kv_dim, .dst_offset = pos * d.kv_dim };
-            const kv_grid = ceilDiv(d.kv_dim, 64);
-            cmd.dispatch(&self.pipes.kv_cache_write, .{ kv_grid, 1, 1 }, .{ 64, 1, 1 }, &.{ &ka, &kk, &va, &vv }, &kvw, @sizeOf(KvWritePush), 0);
-            const seq_len = pos + 1;
-            const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-            const attn_smem: u32 = seq_len * 4;
-            cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &kk, &vv, &self.sinks, &ao }, &attn, @sizeOf(AttnPush), attn_smem);
-            const sm = SigmoidMulPush{ .N = d.q_dim };
-            cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &ao, &gg, &ao }, &sm, @sizeOf(SigmoidMulPush), 0);
-            cmd.commitAndWait();
-        }
+        // 2. Fused per-seq deinterleave + q/k norm + RoPE + slot KV write + gate
+        //    extract over (n_head + 2*n_kv_head, B). Writes db.q, db.gate, slot K/V.
+        const qkv = QwenQkvSeqPush{ .head_dim = d.head_dim, .eps = d.rms_eps, .rope_dim = d.rope_dim, .n_head = d.n_head, .n_kv_head = d.n_kv_head, .slot_ctx = self.slot_ctx };
+        const nr_sh: u32 = d.head_dim * 4;
+        cmd.dispatch(&self.pipes.qwen_norm_rope_qkv_seq, .{ d.n_head + 2 * d.n_kv_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.qfull, &db.k, &db.v, &wqn.gpu_buffer, &wkn.gpu_buffer, &self.inv_freq, &db.q, &db.gate, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], pos_buf, slot_buf }, &qkv, @sizeOf(QwenQkvSeqPush), nr_sh);
 
-        // Batched O projection, accumulate into db.hidden (residual).
-        {
-            var cmd = try command.beginCommand(ctx);
-            self.gemmDispatch(&cmd, wo, &db.attn_out, &db.hidden, d.n_embd, d.q_dim, B, 1);
-            cmd.commitAndWait();
-        }
+        // 3. Batched per-seq attention over each row's slot KV history.
+        const attn = AttnSlotPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .slot_ctx = self.slot_ctx, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+        cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), max_seq_len * 4);
+
+        // 4. Per-seq sigmoid-z gate over all B rows (token-major [B,q_dim] contiguous).
+        const sm = SigmoidMulPush{ .N = B * d.q_dim };
+        cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(B * d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.attn_out, &db.gate, &db.attn_out }, &sm, @sizeOf(SigmoidMulPush), 0);
+
+        // 5. Batched O projection, accumulate into db.hidden (residual).
+        self.gemmDispatch(&cmd, wo, &db.attn_out, &db.hidden, d.n_embd, d.q_dim, B, 1);
+        cmd.commitAndWait();
     }
 
     /// 4c SSM block: pre-norm + qkv/z/alpha/beta + out projections run as GEMMs

@@ -3375,6 +3375,181 @@ extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, 
     gate_out[i] = qfull[src + pc.head_dim];
 }
 
+// ---- qwen_norm_rope_qkv_seq (Effort 28 4c-2: batched DECODE attn front-end) --
+// Batched fused twin of the qwen per-row decode attention front-end
+// (deinterleave_qgate + per-head q/k RMS-norm + RoPE + slot KV write + gate
+// extract): collapses the per-row decode loop into ONE launch over B sequences.
+// grid = (n_head + 2*n_kv_head, B). Row b is sequence b at its OWN position
+// positions[b] writing its OWN KV slot slots[b].
+//   qfull     token-major [B, 2*q_dim], q+gate INTERLEAVED per head (the
+//             deinterleave_qgate source layout: [Q(hd)|gate(hd)] per head)
+//   k_in/v_in token-major [B, kv_dim] (this step's K/V projections)
+//   wq/wk     per-head q/k norm weights ([head_dim]); inv_freq the RoPE buffer
+//   q_out     token-major [B, q_dim] (normed+roped Q)
+//   gate_out  token-major [B, q_dim] (RAW gate half, consumed post-attn by sigmoid_mul)
+//   k_out/v_out the slot KV buffers [n_slots*slot_ctx, kv_dim]; row b writes at
+//             (slot*slot_ctx + pos)*kv_dim + head*head_dim. V is NOT normalized (qwen).
+// Per-(head,b) arithmetic is COPIED from deinterleave_qgate + rms_norm(N=head_dim)
+// + rope + kv_cache_write (with pc.position -> positions[b]) so it is bit-identical
+// to the per-row launches. No cross-block hazard: each (b,head) writes disjoint
+// regions (Q/gate per (b,head); K/V into the slot at this step's position).
+struct QwenQkvSeqPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned slot_ctx;
+};
+extern "C" __global__ void qwen_norm_rope_qkv_seq(
+    const float* qfull, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* gate_out, float* k_out, float* v_out,
+    const unsigned* positions, const unsigned* slots, QwenQkvSeqPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned b  = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim  = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    unsigned pos  = positions[b];
+    unsigned slot = slots[b];
+    size_t kv_base = ((size_t)slot * pc.slot_ctx + pos) * kv_dim;  // slot KV write pos
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        // Q is interleaved with gate: [Q(hd) | gate(hd)] per head in qfull.
+        xt = qfull + (size_t)b * 2u * q_dim + (size_t)head * 2u * hd;
+        yt = q_out + (size_t)b * q_dim + (size_t)head * hd;
+        w  = wq;
+        // Extract the RAW gate half (no norm) — matches deinterleave_qgate's gate_out.
+        float* gt = gate_out + (size_t)b * q_dim + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            gt[i] = xt[hd + i];
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = k_out + kv_base + (size_t)head * hd;
+        w  = wk;
+    } else {
+        // V: NOT normalized for qwen — raw projection written straight to slot KV.
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        const float* vt = v_in + (size_t)b * kv_dim + (size_t)head * hd;
+        float* vo = v_out + kv_base + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            vo[i] = vt[i];
+        return;
+    }
+
+    // RMS-norm over head_dim (matches rms_norm with N=head_dim, per head).
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    // RoPE [0..rope_dim) (attn_scale 1, inv_freq buffer), copy tail [rope_dim..hd).
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pos * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
+// ---- naive_attention_batched_seq (Effort 28 4c-2: batched request DECODE) ----
+// Batched twin of naive_attention for DECODE: B independent sequences, each at
+// its OWN position over its OWN KV slot, in ONE launch. block (head=blockIdx.x,
+// b=blockIdx.y) computes sequence b's single decode query for head h, causally
+// over its slot's keys [0..positions[b]], with the attention-sink rescale.
+// Q is token-major [B, n_heads, head_dim] (b.q, post norm+RoPE); K/V are the slot
+// KV buffers [n_slots*slot_ctx, n_kv_heads, head_dim] (seq b reads slot slots[b]
+// at base (slot*slot_ctx)*kv_dim); out token-major [B, n_heads, head_dim]. Sink:
+// sinks[sink_offset+head] (NaN = none). Math/reduction order are byte-for-byte
+// naive_attention against an aliased slot with seq_len=positions[b]+1 → the
+// batched output equals the per-row looped form bit-for-bit.
+struct AttnSlotPush { unsigned head_dim, n_heads, n_kv_heads, slot_ctx, attn_scale_bits, sink_offset; };
+extern "C" __global__ void naive_attention_batched_seq(
+    const float* q, const float* k, const float* v, const float* sinks, float* out,
+    const unsigned* positions, const unsigned* slots, AttnSlotPush pc) {
+    extern __shared__ float s_scores[];           // size = max(seq_len) floats
+    __shared__ float s_m, s_rescale, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned pos = positions[b];
+    unsigned slot = slots[b];
+    unsigned seq_len = pos + 1u;
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    float scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)hd);
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) {
+        float sum = lsum, rescale = 1.0f, final_sum = lsum;
+        float sink_val = sinks[pc.sink_offset + head];
+        if (sink_val == sink_val) {   // sink present (NaN == NaN is false)
+            float sink_max = fmaxf(m, sink_val);
+            rescale = (sum > 0.0f) ? expf(m - sink_max) : 0.0f;
+            final_sum = sum * rescale + expf(sink_val - sink_max);
+        }
+        s_rescale = rescale;
+        s_inv = (final_sum > 0.0f) ? 1.0f / final_sum : 0.0f;
+    }
+    __syncthreads();
+    float rescale = s_rescale, inv = s_inv;
+
+    // Pass 3: out[b,head,d] = (sum_i e_i * V[i,d]) * rescale * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = 0; i < seq_len; i++)
+            acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[((size_t)b * pc.n_heads + head) * hd + d] = acc * rescale * inv;
+    }
+}
+
 // ---- attention_causal_batched (Effort 24: batched prefill attention) --------
 // Prefill processes T prompt tokens at once. naive_attention is single-query
 // (grid=n_heads, one query over [0..seq_len)). This batches all T queries: block
