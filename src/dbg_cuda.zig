@@ -895,6 +895,85 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                 }
                 q.decode_mrow_force = null;
             }
+
+            // Effort 28 MoE perf A/B — time NG steady-state BATCHED decodeBatch steps
+            // (B=nseq) with the shared-expert batching OFF (per-row matvec, reads each
+            // shared weight B×) then ON (one btok matvec each over B rows) in ONE
+            // model load (boost-comparable). MoE models only (qwen36-35b-a3b).
+            // MEANINGFUL ONLY WITH ZINC_BATCH_MROW=1 — the shared batching rides the
+            // `decode_mrow`/btok gate, so without it both arms run the per-row path
+            // (no-op A/B). Token-identity is gated by BATCH_GATE above.
+            if (q.d.n_experts > 0 and nseq >= 2 and nseq <= 8) {
+                var which: u32 = 0;
+                while (which < 2) : (which += 1) {
+                    q.moe_shared_batched_force = (which == 1);
+                    try q.allocSlotState(nseq, slot_ctx);
+                    var ct: [MAXB]u32 = undefined;
+                    var cp: [MAXB]u32 = undefined;
+                    j = 0;
+                    while (j < nseq) : (j += 1) { // prefill seq j into slot j (B=1)
+                        const np = plens[j];
+                        var pos: u32 = 0;
+                        var tok: u32 = 0;
+                        var k: usize = 0;
+                        while (k < np) : (k += 1) {
+                            var tk = [_]u32{prompts[j][k]};
+                            var ps = [_]u32{pos};
+                            var sl = [_]u32{@intCast(j)};
+                            var ot = [_]u32{0};
+                            try q.decodeBatch(&tk, &ps, &sl, &ot);
+                            tok = ot[0];
+                            pos += 1;
+                        }
+                        ct[j] = tok;
+                        cp[j] = pos;
+                    }
+                    var w: u32 = 0; // warm a few batched steps before timing
+                    while (w < 3) : (w += 1) {
+                        var tks: [MAXB]u32 = undefined;
+                        var pss: [MAXB]u32 = undefined;
+                        var sls: [MAXB]u32 = undefined;
+                        var out: [MAXB]u32 = undefined;
+                        j = 0;
+                        while (j < nseq) : (j += 1) {
+                            tks[j] = ct[j];
+                            pss[j] = cp[j];
+                            sls[j] = @intCast(j);
+                        }
+                        try q.decodeBatch(tks[0..nseq], pss[0..nseq], sls[0..nseq], out[0..nseq]);
+                        j = 0;
+                        while (j < nseq) : (j += 1) {
+                            ct[j] = out[j];
+                            cp[j] += 1;
+                        }
+                    }
+                    var timer = try std.time.Timer.start();
+                    var s: u32 = 0;
+                    while (s < ng) : (s += 1) {
+                        var tks: [MAXB]u32 = undefined;
+                        var pss: [MAXB]u32 = undefined;
+                        var sls: [MAXB]u32 = undefined;
+                        var out: [MAXB]u32 = undefined;
+                        j = 0;
+                        while (j < nseq) : (j += 1) {
+                            tks[j] = ct[j];
+                            pss[j] = cp[j];
+                            sls[j] = @intCast(j);
+                        }
+                        try q.decodeBatch(tks[0..nseq], pss[0..nseq], sls[0..nseq], out[0..nseq]);
+                        j = 0;
+                        while (j < nseq) : (j += 1) {
+                            ct[j] = out[j];
+                            cp[j] += 1;
+                        }
+                    }
+                    const ns = timer.read();
+                    const tot = @as(f64, @floatFromInt(ng * nseq));
+                    const tps = tot * 1e9 / @as(f64, @floatFromInt(ns));
+                    std.debug.print("MOE_TIMING shared_batched={s} B={d}: {d:.2} tok/s agg ({d} steps)\n", .{ if (which == 1) "ON " else "OFF", nseq, tps, ng });
+                }
+                q.moe_shared_batched_force = null;
+            }
         },
     }
 }

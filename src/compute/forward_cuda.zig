@@ -290,6 +290,8 @@ const DecodeBatch = struct {
     ssm_delta: CudaBuffer, // [B, d_inner] ssm delta-net output (dedicated stride)
     ssm_y: CudaBuffer, // [B, d_inner] ssm gated-norm output → out-proj
     ffn_norm: CudaBuffer, // [B, n_embd] ffn pre-norm
+    moe_down: CudaBuffer, // [B, n_embd] batched MoE shared-expert down output (pre-scale)
+    moe_gate_scalar: CudaBuffer, // [B] batched MoE shared-expert sigmoid gate logit
 
     fn alloc(ctx: ?*shim.CudaCtx, d: Derived, b_cap: u32) !DecodeBatch {
         const f4 = @sizeOf(f32);
@@ -315,11 +317,13 @@ const DecodeBatch = struct {
             .ssm_delta = try buffer.createBuffer(ctx, b_cap * di * f4),
             .ssm_y = try buffer.createBuffer(ctx, b_cap * di * f4),
             .ffn_norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .moe_down = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .moe_gate_scalar = try buffer.createBuffer(ctx, b_cap * f4),
         };
     }
 
     fn free(self: *DecodeBatch) void {
-        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm }) |b| {
+        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm, &self.moe_down, &self.moe_gate_scalar }) |b| {
             buffer.freeBuffer(b);
         }
     }
@@ -391,6 +395,17 @@ pub const ForwardCuda = struct {
     // A/B (null → env default).
     decode_mrow: bool = false,
     decode_mrow_force: ?bool = null,
+    // Effort 28 MoE: batch the shared expert across ALL B rows of a decodeBatch
+    // step. The shared-expert gate/up/down are DENSE weights (not per-expert), so
+    // the per-row `moeFfnRowDecode` loop reads them B× redundantly; running them as
+    // ONE GEMM each over B rows reads each weight ONCE. This is only a win through
+    // the bandwidth-bound `btok` matvec (it rides the `decode_mrow` gate); through
+    // the tile GEMM it loses to the per-row matvec at small B (tile-padding tax).
+    // Enabled when `decode_mrow` AND `moeSharedBatchedOn()` (default-on, opt-out
+    // ZINC_BATCH_MOE_SHARED=0); `_force` overrides the env gate for an in-process
+    // A/B. Never set by decodeStep/prefillStep (they run the single-seq path).
+    moe_shared_batched: bool = false,
+    moe_shared_batched_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -1001,6 +1016,14 @@ pub const ForwardCuda = struct {
         // it so an early-return error never leaks the flag past this call.
         self.decode_mrow = (B >= 2 and B <= 8) and (self.decode_mrow_force orelse mrowMatvecOn());
         defer self.decode_mrow = false;
+        // MoE shared-expert batching RIDES the btok path: batching the dense shared
+        // expert over B rows is only a win when the batched GEMM is the bandwidth-
+        // bound `btok` matvec — through the 64×64 tile GEMM it is SLOWER than the
+        // per-row matvec at small B (tile-padding tax, measured −16% at B=4). So gate
+        // it on `decode_mrow` (= mrow/btok active) → no regression on the default
+        // mrow-off path. `defer` clears it so a forced A/B value never leaks.
+        self.moe_shared_batched = self.decode_mrow and (self.moe_shared_batched_force orelse moeSharedBatchedOn());
+        defer self.moe_shared_batched = false;
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -1315,15 +1338,177 @@ pub const ForwardCuda = struct {
     /// over B rows (router GEMM [B,n_experts] + `build_expert_order` over B·n_used)
     /// is a later throughput sub-step; this first establishes correctness (mirrors
     /// 4b → 4c for attention/SSM). Production `moeFfnBlock`/`decodeStep` UNTOUCHED.
+    ///
+    /// Effort 28 MoE perf: the SHARED expert (gate/up/down) is a DENSE FFN — the same
+    /// weights for every row — so the per-row loop reads them B× redundantly. When
+    /// `moe_shared_batched` (default-on), split each row into router+routed-experts
+    /// only (`moeFfnRowDecode` → routed accumulate into its `db.hidden` row), then run
+    /// the shared expert ONCE batched over all B rows (`moeSharedExpertBatched`,
+    /// reading each shared weight once). The shared input is the batched pre-norm
+    /// `db.ffn_norm` (computed up front before the routed accumulation overwrites
+    /// `db.hidden`), and the per-row routed path reads its own `db.ffn_norm` slice
+    /// (so the per-row rms_norm is also collapsed to one launch over B rows). Math is
+    /// byte-identical per row to the per-row shared expert (ARGMAX-identical given the
+    /// GEMM reduction order) → batched == N-serial token-identical. When off (the A/B
+    /// arm), fall back to the original full per-row `moeFfnRowDecode`.
     fn moeFfnBlockBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
         const d = self.d;
         const f4 = @sizeOf(f32);
+        if (!self.moe_shared_batched) {
+            // A/B fallback: the original per-row MoE FFN (router + routed + shared).
+            var bi: u32 = 0;
+            while (bi < B) : (bi += 1) {
+                var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+                defer buffer.freeBuffer(&hrow);
+                try self.moeFfnRowDecode(L, &hrow);
+            }
+            return;
+        }
+        // Batched pre-norm for ALL B rows — the shared-expert input AND each routed
+        // row's router/expert input. One launch over grid B (was one rms_norm per
+        // row inside `moeFfnRowDecode`). Same per-row 256-thread reduction →
+        // bit-identical per row. Computed BEFORE the routed loop accumulates into
+        // db.hidden, so the shared expert reads the correct pre-norm.
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        {
+            var cmd = try command.beginCommand(self.ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wfn.gpu_buffer, &db.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+            self.submit(cmd); // async on the shared stream; consumed in-order below
+        }
+        // Per-row router + routed experts: reads row b's db.ffn_norm slice, routes,
+        // accumulates the routed (weighted) expert output into row b's db.hidden.
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            var nrow = try buffer.aliasBuffer(&db.ffn_norm, bi * d.n_embd * f4, d.n_embd * f4);
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer {
+                buffer.freeBuffer(&nrow);
+                buffer.freeBuffer(&hrow);
+            }
+            try self.moeFfnRoutedRowDecode(L, &nrow, &hrow);
+        }
+        // Shared expert ONCE over all B rows (each shared weight read once).
+        try self.moeSharedExpertBatched(L, B, db);
+    }
+
+    /// Batched MoE shared expert over all B rows (the `db.ffn_norm` pre-norm): the
+    /// shared gate/up/down are DENSE weights, so they run as ONE `gemmDispatch` each
+    /// over the [B, n_embd] norm (reading each weight once) — the
+    /// `ffnBlockBatchedDecode` pattern. `swiglu` over the contiguous [B, sf] gate/up,
+    /// the per-row sigmoid(gate-logit)·down scale is element-wise so it stays a tiny
+    /// per-row dispatch (the weight reads — the cost — are batched). The down output
+    /// goes to `db.moe_down` (NOT accumulated by the GEMM) because it must be scaled
+    /// by sigmoid(gate logit) before accumulating into db.hidden. Byte-identical math
+    /// per row to the per-row shared expert (ARGMAX-identical given GEMM reduction).
+    fn moeSharedExpertBatched(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        const sf = d.shexp_ff;
+        const wgs = self.layer(L, "ffn_gate_shexp.weight");
+        const wus = self.layer(L, "ffn_up_shexp.weight");
+        const wds = self.layer(L, "ffn_down_shexp.weight");
+        const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [hidden, 1] F32
+        var cmd = try command.beginCommand(self.ctx);
+        self.gemmDispatch(&cmd, wgs, &db.ffn_norm, &db.gate, sf, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wus, &db.ffn_norm, &db.up, sf, d.n_embd, B, 0);
+        const sg = SwigluPush{ .N = B * sf };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wgi, &db.ffn_norm, &db.moe_gate_scalar, 1, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wds, &db.swiglu, &db.moe_down, d.n_embd, sf, B, 0);
+        const ss = SigmoidAccPush{ .N = d.n_embd };
         var bi: u32 = 0;
         while (bi < B) : (bi += 1) {
             var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
-            defer buffer.freeBuffer(&hrow);
-            try self.moeFfnRowDecode(L, &hrow);
+            var drow = try buffer.aliasBuffer(&db.moe_down, bi * d.n_embd * f4, d.n_embd * f4);
+            var srow = try buffer.aliasBuffer(&db.moe_gate_scalar, bi * f4, f4);
+            defer {
+                buffer.freeBuffer(&hrow);
+                buffer.freeBuffer(&drow);
+                buffer.freeBuffer(&srow);
+            }
+            cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &hrow, &drow, &srow }, &ss, @sizeOf(SigmoidAccPush), 0);
         }
+        self.submit(cmd);
+        self.waitPending();
+    }
+
+    /// Router + routed-experts only (NO shared expert), reading the caller's
+    /// precomputed `norm_row` (a `db.ffn_norm` slice) instead of recomputing the
+    /// per-row rms_norm, and accumulating the routed (weighted) expert output into
+    /// `hidden_row`. The shared expert is run batched afterward by
+    /// `moeSharedExpertBatched`. Body is the router+routed half of `moeFfnRowDecode`
+    /// VERBATIM (same self.* per-row scratch, same `waitPending` so it is safe to
+    /// reuse for the next row); split out so the dense shared expert can amortize
+    /// across B rows. Used only by `moeFfnBlockBatchedDecode` (decode-batch path).
+    fn moeFfnRoutedRowDecode(self: *ForwardCuda, L: u32, norm_row: *const CudaBuffer, hidden_row: *const CudaBuffer) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // expert_ff = intermediate_dim
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [hidden, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight"); // stacked [hidden, ef, n_experts]
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight"); // stacked [ef, hidden, n_experts]
+
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
+
+        // --- Router: logits → top-k softmax (rms_norm precomputed → norm_row). ----
+        {
+            var cmd = try command.beginCommand(ctx);
+            self.dmmvDispatch(&cmd, wrouter, norm_row, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            if (batched_experts) {
+                self.submit(cmd); // async: experts read the ids GPU-side, no readback
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers the ids next
+                self.drainPending();
+            }
+        }
+
+        if (!batched_experts) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        }
+
+        // --- Routed experts → SwiGLU → down, slot-major into down_buf, then combine.
+        {
+            var cmd = try command.beginCommand(ctx);
+            if (batched_experts) {
+                const nrows_gu = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, norm_row, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, norm_row, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sg = SwigluPush{ .N = nrows_gu };
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router_ids[j];
+                    self.dmmvDispatch(&cmd, wge, norm_row, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                    self.dmmvDispatch(&cmd, wue, norm_row, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                    cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
+                }
+            }
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            self.submit(cmd);
+        }
+        self.waitPending(); // sync: shared per-row scratch reused by the next row
     }
 
     /// Per-row MoE FFN: the production `moeFfnBlock` body VERBATIM but reading/
@@ -1969,6 +2154,15 @@ fn mrowMatvecOn() bool {
     const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
         std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
+}
+
+// Effort 28: the MoE shared-expert batching is default-ON (opt out with
+// ZINC_BATCH_MOE_SHARED=0/off/false/no) — it is token-identical, so unlike the
+// opt-in matvec levers it ships on. The env knob exists for the in-process A/B.
+fn moeSharedBatchedOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MOE_SHARED") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 fn isFullAttn(L: u32, interval: u32) bool {
