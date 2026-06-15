@@ -66,6 +66,10 @@ pub const AMDGPU_GEM_DOMAIN_DOORBELL: u64 = 0x40;
 pub const AMDGPU_GEM_CREATE_CPU_GTT_USWC: u64 = 1 << 2;
 /// GEM creation flag asking the kernel to zero-fill VRAM allocations before returning the BO.
 pub const AMDGPU_GEM_CREATE_VRAM_CLEARED: u64 = 1 << 3;
+/// GEM creation flag requiring the VRAM allocation to land in the CPU-visible
+/// BAR aperture so the BO can be mmap'd and written by the host (needs large /
+/// resizable BAR for allocations beyond the legacy 256 MiB window).
+pub const AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED: u64 = 1 << 0;
 /// GEM creation flag keeping the BO permanently mapped in the device VM so it never needs revalidation.
 pub const AMDGPU_GEM_CREATE_VM_ALWAYS_VALID: u64 = 1 << 6;
 

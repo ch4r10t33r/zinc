@@ -79,6 +79,38 @@ weight ptr in user_data + `workgroup_id_x` row-block offset), embed in `cs.zig`;
 keep coherence, A/B vs Vulkan, keep iff ratio↑ + coherent. Cycle 2 = native
 K-parallel **Q4_K** resident kernel (§806) for the gate/up experts that stay Q4_K.
 
+### 2026-06-15 de-risk probe results (`zinc --probe-gpu`)
+
+Built a reproducible GPU probe (`cs.zig` `sgprTgidProbe`/`sgprTgidDump`/
+`probeVramMappable`, `main.zig --probe-gpu`, kernels `tgid_probe.s` +
+`sgpr_tgid_dump.s`, llvm-mc-assembled) to validate the two gating assumptions
+before building the resident matvec:
+
+- **VRAM residency: ✅ WORKS.** A 400 MB `AMDGPU_GEM_DOMAIN_VRAM` BO (with
+  `CPU_ACCESS_REQUIRED`) is CPU-mmap'able and round-trips a host write/read →
+  large-BAR is available, the LM-head weight can live in VRAM at 576 GB/s. The
+  perf premise is sound.
+- **Multi-WG TGID delivery: ❌ BROKEN (root blocker, reproduced).** With 8 user
+  SGPRs + `ENABLE_SGPR_WORKGROUP_ID_X` (rsrc2=0x90) and `dispatchDirectInitiator(4,1,1)`,
+  the kernel RUNS (signature `0x53475052` written) but `workgroup_id_x` reaches
+  **none of s8..s19** for any of the 4 workgroups (exhaustive value-as-index
+  dump, all slots stay sentinel). User-data delivery is fine (output ptr in s0/s1
+  works), so the issue is specifically the *system* SGPR (workgroup id), not the
+  ABI offset. This is the same wall that stalled cycles 66–82.
+
+**Consequence:** without the workgroup id in-shader, the matvec can't be spread
+across the ~64 CUs in one submit (1 WG = 1 CU ≈ 1/64 bandwidth → loses to CPU),
+and per-WG host re-submit is too many submits/token. So the direct GPU matvec is
+blocked on gfx12 TGID delivery, NOT on VRAM or the kernel itself.
+
+**Next attempts to crack it (untried here):** (1) sweep s20..s31 / ttmp regs;
+(2) confirm whether `dispatchDirectInitiator(N)` actually launches N workgroups
+(atomic-count probe) vs a grid-dims register issue; (3) MIMIC RADV's exact gfx12
+compute COMPUTE_PGM_RSRC2 + COMPUTE_DISPATCH_INITIATOR + grid register setup
+(Vulkan/RADV dispatches multi-WG compute fine at 110 tok/s, so the correct
+register recipe exists — copy it). Probe lives on branch
+`zinc-rt-rdna1-lmhead-gpu-matvec`.
+
 ## Profiling Snapshot
 
 Remote node: R9700 RDNA4 / gfx1201, Linux 6.17, Zig 0.15.2. Measurements were

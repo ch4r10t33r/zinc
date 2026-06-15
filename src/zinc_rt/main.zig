@@ -23,6 +23,7 @@ pub const std_options = std.Options{
 const CliOptions = struct {
     show_help: bool = false,
     probe_tier: bool = false,
+    probe_gpu: bool = false,
     model_path: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     max_tokens: u32 = 256,
@@ -49,6 +50,11 @@ pub fn main() !void {
 
     if (options.show_help) {
         try printHelp();
+        return;
+    }
+
+    if (options.probe_gpu) {
+        try runGpuProbe();
         return;
     }
 
@@ -88,6 +94,65 @@ pub fn main() !void {
     try stdout.interface.flush();
 }
 
+/// `--probe-gpu`: validate the two gating assumptions for a resident-weight
+/// LM-head GPU matvec before building it — (1) multi-workgroup TGID delivery on
+/// the gfx1201 CS path, and (2) CPU-mappable VRAM (large-BAR) for the one-time
+/// weight upload. Prints findings; never errors fatally so it is safe to run on
+/// any node.
+fn runGpuProbe() !void {
+    var stdout_buffer: [2048]u8 = undefined;
+    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    const w = &stdout.interface;
+
+    var boundary = zinc_rt.cs.TokenBoundary.initDefault() catch |e| {
+        try w.print("probe: cannot init TokenBoundary: {s}\n", .{@errorName(e)});
+        try w.flush();
+        return;
+    };
+    defer boundary.deinit();
+
+    var out = [_]u32{0} ** 8;
+    boundary.sgprTgidProbe(4, out[0..4]) catch |e| {
+        try w.print("probe: TGID dispatch FAILED: {s}\n", .{@errorName(e)});
+        try w.flush();
+        return;
+    };
+    try w.print(
+        "probe: TGID out[0..4] = {{ {d}, {d}, {d}, {d} }}  (expect 0,1,2,3 => multi-WG delivery OK)\n",
+        .{ out[0], out[1], out[2], out[3] },
+    );
+
+    var dump = [_]u32{0} ** 1024;
+    boundary.sgprTgidDump(4, dump[0..]) catch |e| {
+        try w.print("probe: TGID dump dispatch FAILED: {s}\n", .{@errorName(e)});
+        try w.flush();
+        return;
+    };
+    try w.print("probe: tgid_dump ran-marker out[960] = 0x{x} (expect 0x53475052)\n", .{dump[960]});
+    var found: i64 = -1;
+    var c: usize = 0;
+    while (c < 12) : (c += 1) {
+        const ok = dump[c] == 0 and dump[16 + c] == 1 and dump[32 + c] == 2 and dump[48 + c] == 3;
+        try w.print("probe:   cand s{d}: wg0={d} wg1={d} wg2={d} wg3={d}{s}\n", .{
+            8 + c, dump[c], dump[16 + c], dump[32 + c], dump[48 + c],
+            if (ok) " <== TGID HERE" else "",
+        });
+        if (ok and found < 0) found = @intCast(c);
+    }
+    if (found >= 0) {
+        try w.print("probe: ==> workgroup_id_x delivered in SGPR s{d}\n", .{8 + @as(usize, @intCast(found))});
+    } else {
+        try w.print("probe: ==> workgroup_id_x NOT in s8..s19 (multi-WG TGID delivery broken)\n", .{});
+    }
+
+    const vram_ok = boundary.probeVramMappable(400 * 1024 * 1024) catch |e| blk: {
+        try w.print("probe: VRAM error: {s}\n", .{@errorName(e)});
+        break :blk false;
+    };
+    try w.print("probe: VRAM 400MB CPU-mappable + roundtrip = {}\n", .{vram_ok});
+    try w.flush();
+}
+
 fn parseArgs(args: []const []const u8) !CliOptions {
     var options = CliOptions{};
     var i: usize = 1;
@@ -97,6 +162,8 @@ fn parseArgs(args: []const []const u8) !CliOptions {
             options.show_help = true;
         } else if (std.mem.eql(u8, arg, "--probe-tier")) {
             options.probe_tier = true;
+        } else if (std.mem.eql(u8, arg, "--probe-gpu")) {
+            options.probe_gpu = true;
         } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
