@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# harvest_sweep.sh — classify perf/* branches for harvesting to main by CONTENT,
-# not just SHA ancestry. A win that was cherry-picked onto main has a different SHA
-# (so `git merge-base --is-ancestor` calls it "unmerged") but an EMPTY code diff vs
-# main — this tool reports that correctly so already-landed wins aren't re-harvested.
+# harvest_sweep.sh — classify perf/* branches for harvesting to main by
+# PATCH-EQUIVALENCE (git cherry), so a win cherry-picked onto main (different SHA,
+# same patch) is correctly seen as already-landed, not a false "unmerged". Using a
+# plain `git diff origin/main <branch>` is WRONG: it's non-empty whenever main is
+# merely AHEAD of the branch (always true here), not only when the branch carries
+# un-landed code.
 #
 #   scripts/harvest_sweep.sh [prefix]      # default prefix: perf/e27-
 #   scripts/harvest_sweep.sh perf/e26-
 #
-# Per branch it prints exactly one status (CODE = src/ *.zig/*.cu):
-#   MERGED    branch HEAD is an ancestor of origin/main (fully merged)
-#   ON-MAIN   code diff vs origin/main is EMPTY (already landed, e.g. cherry-picked,
-#             or a tried-then-reverted negative whose tree returned to main) — SKIP
-#   DOC-ONLY  diff touches no .zig/.cu (a logged negative / doc-only branch) — SKIP
-#   HARVEST   real un-landed code change vs origin/main — a candidate win to merge
+# Per branch, exactly one status (git cherry marks each branch commit '-' = patch
+# already in main, '+' = not in main; CODE = a '+' commit touching *.zig/*.cu):
+#   MERGED    branch HEAD is an ancestor of origin/main
+#   ON-MAIN   every branch commit is patch-equivalent to one already on main — SKIP
+#   DOC-ONLY  only un-landed commits are docs/logs (a logged negative) — SKIP
+#   HARVEST   an un-landed commit changes code — a candidate win to merge
 set -u
 PREFIX="${1:-perf/e27-}"
 git fetch origin -q --prune 2>/dev/null || true
@@ -22,13 +24,17 @@ git branch -r | sed 's/^[* ]*//' | grep -E "^origin/${PREFIX}" | while read -r r
   subj=$(git log -1 --format='%s' "$ref" 2>/dev/null | cut -c1-50)
   if git merge-base --is-ancestor "$ref" origin/main 2>/dev/null; then
     st="MERGED"
-  elif [ "$(git diff origin/main "$ref" -- 'src/' 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
-    st="ON-MAIN"
-  elif git diff --name-only origin/main "$ref" 2>/dev/null | grep -qE '\.(zig|cu)$'; then
-    st="HARVEST"
   else
-    st="DOC-ONLY"
+    unlanded=$(git cherry origin/main "$ref" 2>/dev/null | sed -n 's/^+ //p')
+    if [ -z "$unlanded" ]; then
+      st="ON-MAIN"
+    else
+      st="DOC-ONLY"
+      for c in $unlanded; do
+        if git show --name-only --format= "$c" 2>/dev/null | grep -qE '\.(zig|cu)$'; then st="HARVEST"; break; fi
+      done
+    fi
   fi
   printf "  %-9s %-36s %s\n" "$st" "$b" "$subj"
 done
-echo "  (HARVEST = merge to main; ON-MAIN/DOC-ONLY/MERGED = skip. CODE scope = src/ *.zig *.cu)"
+echo "  (HARVEST = un-landed code win → merge; ON-MAIN/DOC-ONLY/MERGED = skip)"
