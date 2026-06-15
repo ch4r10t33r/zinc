@@ -1954,6 +1954,14 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
         conn.sendJson(200, "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
         return;
     }
+    // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
+    // around a B-concurrent phase → aggregate decode tok/s + mean batch occupancy.
+    if (req.method == .GET and std.mem.eql(u8, req.path, "/stats")) {
+        var sbuf: [256]u8 = undefined;
+        const js = ctx.engine.statsJson(&sbuf) catch "{}";
+        conn.sendJson(200, js) catch {};
+        return;
+    }
     const is_gen = req.method == .POST and (std.mem.eql(u8, req.path, "/v1/completions") or
         std.mem.eql(u8, req.path, "/v1/chat/completions") or std.mem.eql(u8, req.path, "/generate"));
     if (!is_gen) {

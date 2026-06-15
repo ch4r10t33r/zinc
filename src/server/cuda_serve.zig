@@ -70,6 +70,20 @@ pub const ServeEngine = struct {
     worker: ?std.Thread = null,
     stop: bool = false,
 
+    /// Throughput counters (Effort 28, 3c — the aggregate-throughput gate). Only
+    /// the worker thread writes them; `/stats` handler threads read via atomic
+    /// load. `decode_*` cover the BATCHED decode step (the amortization win):
+    /// `decode_tokens` sums the batch occupancy `ndec` per step, so
+    /// decode_tokens/decode_wall_ns = aggregate decode tok/s and
+    /// decode_tokens/decode_steps = mean batch occupancy. `prefill_*` cover the
+    /// (still per-token B=1) prefill so the gate can see if admit dominates.
+    decode_steps: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decode_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decode_wall_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prefill_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    prefill_wall_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    peak_batch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     /// Allocate slot-based KV + a scheduler with `nslots` concurrent slots, each
     /// `slot_ctx` tokens deep. The forward (`g`) must already be initialized.
     pub fn init(
@@ -152,6 +166,23 @@ pub const ServeEngine = struct {
         chan.tokens.deinit(self.allocator);
     }
 
+    /// Write the cumulative throughput counters as JSON into `buf`. Lock-free
+    /// (atomic loads) so `/stats` never contends the worker. The gate diffs two
+    /// snapshots around each B-concurrent phase → pure decode tok/s + occupancy.
+    pub fn statsJson(self: *ServeEngine, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf,
+            "{{\"decode_steps\":{d},\"decode_tokens\":{d},\"decode_wall_ns\":{d}," ++
+            "\"prefill_tokens\":{d},\"prefill_wall_ns\":{d},\"peak_batch\":{d}}}",
+            .{
+                self.decode_steps.load(.monotonic),
+                self.decode_tokens.load(.monotonic),
+                self.decode_wall_ns.load(.monotonic),
+                self.prefill_tokens.load(.monotonic),
+                self.prefill_wall_ns.load(.monotonic),
+                self.peak_batch.load(.monotonic),
+            });
+    }
+
     // ── worker-thread internals ──────────────────────────────────────────────
 
     /// Append one token to a request's channel + wake its waiter (under lock).
@@ -200,6 +231,8 @@ pub const ServeEngine = struct {
         var pss: [scheduler_max]u32 = undefined;
         var sls: [scheduler_max]u32 = undefined;
         var out: [scheduler_max]u32 = undefined;
+        // Monotonic timer for the 3c throughput counters; non-fatal if absent.
+        var timer_opt = std.time.Timer.start() catch null;
 
         while (true) {
             // Wait for work (or shutdown) while idle — event-driven, no poll.
@@ -225,6 +258,7 @@ pub const ServeEngine = struct {
                 var pos: u32 = 0;
                 var tok: u32 = 0;
                 var k: usize = 0;
+                const pf_t0 = if (timer_opt) |*tm| tm.read() else 0;
                 while (k < np) : (k += 1) {
                     var tk = [_]u32{req.prompt_tokens[k]};
                     var ps = [_]u32{pos};
@@ -237,6 +271,10 @@ pub const ServeEngine = struct {
                     tok = ot[0];
                     pos += 1;
                 } else {
+                    if (timer_opt) |*tm| {
+                        _ = self.prefill_wall_ns.fetchAdd(tm.read() - pf_t0, .monotonic);
+                        _ = self.prefill_tokens.fetchAdd(np, .monotonic);
+                    }
                     // prefill ran to completion (no break)
                     req.appendToken(tok) catch {
                         self.failSlot(slot_id);
@@ -261,12 +299,20 @@ pub const ServeEngine = struct {
                     pss[i] = @intCast(req.prompt_tokens.len + gen_n - 1);
                     sls[i] = slot_id;
                 }
+                const dec_t0 = if (timer_opt) |*tm| tm.read() else 0;
                 g.decodeBatch(tks[0..ndec], pss[0..ndec], sls[0..ndec], out[0..ndec]) catch {
                     for (dec_buf[0..ndec]) |slot_id| {
                         if (self.sched.slots[slot_id] != null) self.failSlot(slot_id);
                     }
                     continue;
                 };
+                if (timer_opt) |*tm| {
+                    _ = self.decode_wall_ns.fetchAdd(tm.read() - dec_t0, .monotonic);
+                    _ = self.decode_tokens.fetchAdd(ndec, .monotonic);
+                    _ = self.decode_steps.fetchAdd(1, .monotonic);
+                    if (ndec > self.peak_batch.load(.monotonic))
+                        self.peak_batch.store(ndec, .monotonic);
+                }
                 for (dec_buf[0..ndec], 0..) |slot_id, i| {
                     const req = &self.sched.slots[slot_id].?;
                     req.appendToken(out[i]) catch {
