@@ -406,6 +406,16 @@ pub const ForwardCuda = struct {
     // A/B. Never set by decodeStep/prefillStep (they run the single-seq path).
     moe_shared_batched: bool = false,
     moe_shared_batched_force: ?bool = null,
+    // Effort 28 MoE launch-collapse: in the batched-decode MoE block the B per-row
+    // `moeFfnRoutedRowDecode` calls each ended with a blocking `waitPending` (to make
+    // the shared per-row scratch safe to reuse next row). For the pure-GPU async
+    // (`batched_experts`) path that sync is UNNECESSARY — all commands ride ONE
+    // shared CUstream in-order, so the rows queue back-to-back and drain together at
+    // the layer tail, removing B CPU↔GPU round-trips per MoE layer per token (the
+    // boost-starved qwen MoE decode is launch-bound). Default-on when the batched
+    // MoE path runs; `_force` lets the harness A/B it (false → restore per-row sync).
+    moe_collapse: bool = true,
+    moe_collapse_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -1024,6 +1034,12 @@ pub const ForwardCuda = struct {
         // mrow-off path. `defer` clears it so a forced A/B value never leaks.
         self.moe_shared_batched = self.decode_mrow and (self.moe_shared_batched_force orelse moeSharedBatchedOn());
         defer self.moe_shared_batched = false;
+        // MoE launch-collapse (async routed-expert path drops its per-row sync).
+        // Default-on; harness `_force` restores the per-row sync for an A/B. `defer`
+        // resets the live flag (the default field value stays true for serial paths
+        // that never touch it — harmless since they never run the routed-batch path).
+        self.moe_collapse = self.moe_collapse_force orelse true;
+        defer self.moe_collapse = true;
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -1508,7 +1524,17 @@ pub const ForwardCuda = struct {
             cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ hidden_row, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
             self.submit(cmd);
         }
-        self.waitPending(); // sync: shared per-row scratch reused by the next row
+        // LAUNCH-COLLAPSE: the async (`batched_experts`) path is pure-GPU and every
+        // command rides the context's ONE shared CUstream (strictly in-order), so
+        // the next row's writes to the shared scratch (router_*/gate_buf/up_buf/
+        // swiglu_buf/down_buf) serialize AFTER this row's reads — no per-row host
+        // sync is needed. The B rows' commands queue back-to-back and are drained
+        // together by the layer tail (`moeSharedExpertBatched`'s `waitPending`),
+        // removing B blocking CPU↔GPU round-trips per MoE layer per token (the
+        // boost-starved qwen MoE decode is launch-bound). The host-id FALLBACK
+        // path STILL syncs per row — it downloads `router_out_buf` to host-gather
+        // the expert ids and reuses the host `host_router_ids` scratch next row.
+        if (!batched_experts or !self.moe_collapse) self.waitPending();
     }
 
     /// Per-row MoE FFN: the production `moeFfnBlock` body VERBATIM but reading/
