@@ -415,15 +415,21 @@ pub const ForwardCuda = struct {
 
         // CUDA-graph decode replay. Capturable MoE (Effort-27 C2: qwen36-35b-a3b
         // decode +62%, output token-identical to non-graph) is DEFAULT-ON; opt out
-        // with ZINC_CUDA_GRAPH=0/off/false/no. The dense path (n_experts==0) stays
-        // opt-IN via a truthy ZINC_CUDA_GRAPH (Effort-25 left it that way: +8-12% on
-        // 9b, neutral on 27b). The MoE path is capturable ONLY when every layer takes
+        // with ZINC_CUDA_GRAPH=0/off/false/no. The dense path (n_experts==0) is now
+        // DEFAULT-ON for SMALL dense models only (Effort-27 C3: qwen35-9b +6.7% on
+        // this 4090); large dense (qwen36-27b) regresses ~3% so stays OPT-IN — see the
+        // n_embd gate below. Effort-25 first proved the dense graph but left it opt-IN;
+        // C3 productizes it for the size where it wins. The MoE path
+        // is capturable ONLY when every layer takes
         // the batched async expert path (Effort-27 C1): it reads expert ids GPU-side
         // with NO host readback, so the whole MoE step is a static stream. Before C1's
         // q5k/q6k experts kernels, mixed-quant layers fell to a per-slot fallback that
         // synced + read ids back mid-block (illegal during capture) — why Effort-25 C4
         // found the catalog MoE non-capturable. Non-capturable MoE runs the async
         // per-step path (self.graph stays null).
+        // Largest n_embd that still nets a win from the dense decode graph (see the
+        // gate below). qwen35-9b (4096) wins; qwen36-27b (5120) regresses.
+        const dense_graph_max_embd: u32 = 4096;
         const graph_env = std.posix.getenv("ZINC_CUDA_GRAPH");
         var graph_off = false;
         var graph_optin = false;
@@ -434,9 +440,16 @@ pub const ForwardCuda = struct {
         }
         if (!graph_off) {
             if (d.n_experts == 0) {
-                if (graph_optin) {
+                // Dense decode graph (Effort-25 proof; Effort-27 C3 productized).
+                // DEFAULT-ON only for SMALL dense models (n_embd <= 4096, e.g.
+                // qwen35-9b: +6.7% on the 4090) where per-launch overhead dominates.
+                // Large dense (qwen36-27b n_embd=5120) is OPT-IN: its big per-layer
+                // matvecs swamp the launch-bubbles the graph removes, so the graph
+                // re-instantiate cost makes it a ~3% REGRESSION (C3 measured 0.967
+                // median, 4 rounds) — same size-gating Effort-25 C4 saw on MoE graphs.
+                if (d.n_embd <= dense_graph_max_embd or graph_optin) {
                     self.graph = shim.cuda_graph_create();
-                    log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+                    log.info("CUDA graph: dense decode enabled (n_embd={d}, opt out ZINC_CUDA_GRAPH=0)", .{d.n_embd});
                 }
             } else if (self.moeGraphCapturable()) {
                 self.graph = shim.cuda_graph_create();
