@@ -17,6 +17,20 @@
 4090 decode is **launch/latency-bound** (Effort-25 proved graph replay buys ~8–12% on
 small dense; size-gated). llama's years-tuned gathered-expert matvecs lead on MoE.
 
+## ⚡ THE BAR (2026-06-15) — BEAT llama, don't just approach it
+Decode is largely CONVERGED: 8 wins on main (C1/C2/C3 + C7/C8/C11 fusions + C17/C19
+opt-in). gemma-26b MoE is at its lever CEILING (~63% of llama; ALL matvec levers
+REFUTED — float4/dp4a/thread-geometry, see [[project_gemma26b_moe_decode_analysis]])
+→ STOP re-grinding gemma-26b. The only realistic BEAT-llama targets left are the
+CLOSEST models: **qwen36-27B decode (91% of llama) + qwen35-9B (84-91%)** — push them
+OVER 100% via (a) deeper launch-fusion on `forward_cuda.zig` (Effort-23 playbook:
+aggregate ≥2 tiny per-token launches per fused kernel to clear the ±1% boost floor),
+and (b) LANDING the unmerged `perf/e23-*` dense-decode fusion wins (re-validate +
+re-implement on current main — the old cherry-picks conflicted). **Bar = decode tok/s
+> llama tg128, A/B on the 4090.** If qwen decode is also tapped, LOG it and stop — do
+not invent negative micro-opts. (NOTE 2026-06-15: e26/e28 = prefill on 5090; you own
+4090 decode; box wedges → loop runs under `scripts/loop_watchdog.sh`.)
+
 ## PRIMARY — MoE decode (the 31–42% gap)
 e26/5090 is doing PREFILL (all its cycles so far), so **MoE-decode is unclaimed in
 practice — own it here.** Per-token MoE decode = router norm→gate matvec→top-k, then 8
