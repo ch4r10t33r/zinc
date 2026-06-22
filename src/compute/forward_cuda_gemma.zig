@@ -447,7 +447,9 @@ pub const ForwardGemma = struct {
     use_tc_m64: bool = false, // cycle 15 A/B: ZINC_BATCHED_TC_M64 kill-switch forces the prior 24 KB-shared Q4_K TC kernel (cycle 12 default); the new default is the 8 KB-shared lowsmem kernel (+11.6%, byte-identical)
     use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
     use_grouped: bool = false, // cycle 18: ZINC_BATCHED_EXPERTS_GROUPED opts into token-GROUPED routed experts (build_expert_order + grouped matvecs → expert weight L2-resident across its tokens). Byte-identical to the cycle-8 _batched path; opt-in pending a measured win.
-    use_tc_experts: bool = false, // T2: ZINC_MOE_TC routes the routed gate/up experts through the fp16 Tensor cores (gather tokens by expert → per-expert gemm_q4k_tc → scatter; Q5_1 down stays matvec). fp16 → token-tolerance gate, not bit-identical. Opt-in pending a measured win.
+    use_tc_experts: bool = false, // T2: ZINC_MOE_TC routes the routed gate/up experts through the fp16 Tensor cores (single-launch padded grouped-TC GEMM: build_expert_order_padded → gemm_q4k_experts_grouped_tc; Q5_1 down stays matvec). fp16 → token-tolerance gate, not bit-identical. DEFAULT-ON (opt out ZINC_MOE_TC=0/off), T-gated by moe_tc_min_t (the grouped TC GEMM pads each expert run to a 64-token tile, so it only beats the matvec once T is large enough to fill the tiles).
+    tc_experts_forced: bool = false, // T2: ZINC_MOE_TC was set to an EXPLICIT truthy value (1/on/...) → force the grouped TC experts at ANY T, bypassing moe_tc_min_t. Lets validate_catalog exercise the TC path with a short prompt (set ZINC_MOE_TC=1). Unset env = default-on-but-gated; falsy = off.
+    moe_tc_min_t: u32 = 512, // T2: only route the routed experts through the grouped TC GEMM when the prefill batch T >= this. Measured crossover (clean solo A/B, 4090 / gemma-26b, matvec base vs ZINC_MOE_TC; boost-noisy so median over rounds): T=128 tie (tc 164 vs base 167), T=256 +8.6% (240 vs 221), T=512 median +49% & 2/3 paired wins (best round 279/293 vs 228, low-boost round −5%), T=1037 +5% clean rounds (~304 vs ~290; an earlier high-boost day showed +18%, 336 vs 270). Gate at 512 = decisive, zero-regression: below it the padded per-expert tiles are mostly empty (P=n_used*T spread over n_experts buckets) so the proven _batched matvec stays. Mirrors cublas_min_t.
     fuse_norm_combine: bool = false, // e27 cycle 17 A/B: ZINC_MOE_NORM_COMBINE fuses the MoE decode post_ffw_norm_2 + combine tail into ONE single-block launch (moe_norm_combine_tail). Byte-identical; off → the two-launch path. Read once in init.
     fuse_attn_moe_norm: bool = false, // e27 cycle 19 A/B: ZINC_ATTN_MOE_NORM fuses the MoE decode attention post-attn norm+residual + the 3 MoE pre-norms (rms_norm_triple) into ONE single-block launch (rms_norm_residual_triple). Byte-identical; off → the two-launch path. Read once in init.
     use_tc_m128_lowsmem: bool = false, // cycle 17 A/B: ZINC_BATCHED_TC_M128_LOWSMEM opts INTO the 12 KB-shared wider 128x64 M-tile Q4_K TC kernel (gemm_q4k_tc_f16a_m128_lowsmem) — synthesis of cycle 14's wider tile (halves the dominant f16-A read) + cycle 15's two-phase Cs (12 KB shared → ~6 blocks/SM, NOT m128's 44 KB→1 block/SM that lost -11.8%). Byte-identical to the m64/lowsmem default; measured this cycle to decide if it becomes the default.
@@ -927,7 +929,8 @@ pub const ForwardGemma = struct {
         // the cycle-8 launch batching). Byte-identical output (same per-block math; each
         // output computed once). Off → the proven cycle-8 _batched matvecs.
         self.use_grouped = std.posix.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
-        self.use_tc_experts = std.posix.getenv("ZINC_MOE_TC") != null;
+        self.use_tc_experts = moeTcDefaultOn();
+        self.tc_experts_forced = moeTcForced();
         // Cycle 19: ZINC_BATCHED_TC_SHAREA shares one f32→f16 activation recast across
         // the GEMMs that read the SAME input on the TC path (attn Q/K/V all read b.norm;
         // FFN/shared-expert gate+up both read b.ffn_norm). With it on, only the FIRST GEMM
@@ -990,7 +993,7 @@ pub const ForwardGemma = struct {
                 const pre = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
                 if (pre) {
                     try self.routerBatched(L, T, b);
-                    if (self.use_tc_experts) {
+                    if (self.use_tc_experts and (self.tc_experts_forced or T >= self.moe_tc_min_t)) {
                         try self.moeRoutedExpertsTC(L, T, b);
                     } else if (self.use_grouped) {
                         try self.moeRoutedExpertsGrouped(L, T, b);
@@ -2566,6 +2569,29 @@ fn ceilDiv(a: u32, b: u32) u32 {
 /// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
 fn tcDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// T2: the single-launch grouped Tensor-core MoE-expert GEMM (the gemma-MoE
+/// routed gate/up experts) is DEFAULT-ON for prefill (validated +18% on the
+/// 4090 / gemma-26b @T=1037, token-correct), T-gated by `moe_tc_min_t` so short
+/// prompts keep the proven `dmmv_*_experts_batched` matvec. True unless
+/// ZINC_MOE_TC is explicitly off (0/off/false/no) — the A/B kill-switch back to
+/// the matvec experts. Mirrors batchedPrefillDefaultOn's parsing.
+fn moeTcDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_MOE_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// T2: true only when ZINC_MOE_TC is set to an EXPLICIT truthy value — then the
+/// grouped TC experts run at ANY T (the `moe_tc_min_t` gate is bypassed). This
+/// is the testing/force lever: `ZINC_MOE_TC=1 validate_catalog` exercises the TC
+/// path even with the short catalog prompt. With the env unset the path is
+/// default-on but gated (long prompts only); with a falsy value it is off.
+fn moeTcForced() bool {
+    const v = std.posix.getenv("ZINC_MOE_TC") orelse return false;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
