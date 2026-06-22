@@ -2042,6 +2042,67 @@ extern "C" __global__ void build_expert_order(const unsigned* expert_ids, unsign
     }
 }
 
+// ---- T2 (grouped Tensor-core MoE-expert GEMM) primitives ---------------------
+// The routed-expert FFN gap vs llama is the SCALAR matvec compute (grouped matvec
+// is dead on both GPUs — Effort-26 c7 / 2026-06-22 4090 A/B). T2 puts the gate/up
+// experts on the Tensor cores by GATHERING each expert's tokens contiguously and
+// running the existing `gemm_q4k_tc` per expert. These three kernels are the glue:
+// an offsets-emitting counting sort + a gather + a scatter (the GEMM is reused).
+
+// build_expert_order_off — build_expert_order + an exclusive prefix-sum `offsets`
+// [n_experts+1] (offsets[e]..offsets[e+1] = expert e's contiguous run in order[]),
+// so the host can launch one gemm_q4k_tc per expert over its token slice. order[]
+// format is unchanged ((token<<16)|slot). Does not touch the existing
+// build_expert_order used by the grouped matvecs.
+extern "C" __global__ void build_expert_order_off(const unsigned* expert_ids, unsigned* order, unsigned* offsets, BuildOrderPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned cursor[256];
+    unsigned tid = threadIdx.x, nthr = blockDim.x;
+    unsigned P = pc.T * pc.n_used;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned acc = 0u;
+        for (unsigned e = 0; e < pc.n_experts; e++) { offsets[e] = acc; cursor[e] = acc; acc += counts[e]; }
+        offsets[pc.n_experts] = acc; // == P
+    }
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        unsigned pos = atomicAdd(&cursor[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+        order[pos] = (t << 16) | slot;
+    }
+}
+
+// gather_by_order — A_grouped[pos*K + k] = src[t*src_tok_stride + k] where
+// (t,_) = order[pos]. The gate/up experts all read the same per-token input row
+// (matvec x_stride=0), so gathering by token gives the [P,K] A for gemm_q4k_tc.
+struct GatherOrderPush { unsigned P, K, src_tok_stride; };
+extern "C" __global__ void gather_by_order(const float* src, const unsigned* order, float* dst, GatherOrderPush pc) {
+    unsigned pos = blockIdx.y;
+    if (pos >= pc.P) return;
+    const float* s = src + (size_t)(order[pos] >> 16) * pc.src_tok_stride;
+    float* dd = dst + (size_t)pos * pc.K;
+    for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < pc.K; k += gridDim.x * blockDim.x) dd[k] = s[k];
+}
+
+// scatter_by_order — dst[t*dst_tok_stride + slot*M + row] = Yg[pos*M + row], the
+// inverse of gather: writes each grouped GEMM output row back to its (token,slot).
+struct ScatterOrderPush { unsigned P, M, dst_tok_stride; };
+extern "C" __global__ void scatter_by_order(const float* yg, const unsigned* order, float* dst, ScatterOrderPush pc) {
+    unsigned pos = blockIdx.y;
+    if (pos >= pc.P) return;
+    unsigned packed = order[pos];
+    const float* s = yg + (size_t)pos * pc.M;
+    float* dd = dst + (size_t)(packed >> 16) * pc.dst_tok_stride + (size_t)(packed & 0xFFFFu) * pc.M;
+    for (unsigned m = blockIdx.x * blockDim.x + threadIdx.x; m < pc.M; m += gridDim.x * blockDim.x) dd[m] = s[m];
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
