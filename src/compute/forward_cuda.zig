@@ -641,6 +641,21 @@ pub const ForwardCuda = struct {
     serve_cublas: bool = false,
     serve_cublas_force: ?bool = null,
     serve_cublas_min_b: u32 = 28,
+    // Effort 29 T3 option-b: resident fp16 weight cache for the SERVING-decode
+    // cuBLAS path. cycle-7's serve_cublas re-dequants the FULL weight to fp16
+    // EVERY decode step (~8× btok's weight traffic — cycle-8 quantified the
+    // per-step time as dequant-dominated). Serving keeps weights resident, so
+    // dequant each dense weight ONCE into a resident fp16 buffer (keyed by its
+    // device-ptr) and have the per-step GEMM read the cached fp16 directly,
+    // killing the round-trip. Opt-in (ZINC_SERVE_WCACHE=1) — fp16 costs ~3.5×
+    // the Q4_K bytes in VRAM, a serving batch-capacity trade; budget-capped
+    // (ZINC_SERVE_WCACHE_MB, default 24 GB) with graceful per-GEMM fallback when
+    // the cap or VRAM is exhausted. Lazily allocated on first serving GEMM.
+    serve_wcache: ?std.AutoHashMap(usize, CudaBuffer) = null,
+    serve_wcache_on: bool = false,
+    serve_wcache_force: ?bool = null,
+    serve_wcache_bytes: usize = 0,
+    serve_wcache_cap: usize = 24 * 1024 * 1024 * 1024,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
     // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
@@ -979,6 +994,11 @@ pub const ForwardCuda = struct {
         for (self.ssm_conv_state) |*b| buffer.freeBuffer(b);
         for (self.ssm_state) |*b| buffer.freeBuffer(b);
         if (self.decode_batch) |*db| db.free();
+        if (self.serve_wcache) |*cache| {
+            var it = cache.valueIterator();
+            while (it.next()) |buf| buffer.freeBuffer(buf);
+            cache.deinit();
+        }
         self.freeSlotState();
         a.free(self.kv_k);
         a.free(self.kv_v);
@@ -1794,6 +1814,18 @@ pub const ForwardCuda = struct {
         }
         self.serve_cublas = (B >= self.serve_cublas_min_b) and (self.serve_cublas_force orelse serveCublasOn());
         defer self.serve_cublas = false;
+        // Effort 29 T3 option-b: resident fp16 weight cache for the serving GEMMs.
+        // Only meaningful when serve_cublas engages; lazily inits the map + reads
+        // the budget cap on first enable. ADDITIVE — the cache only changes WHERE
+        // the fp16 weight comes from (resident vs per-step scratch), the fp16 bytes
+        // are bit-identical to the per-step dequant → same token-correctness.
+        self.serve_wcache_on = self.serve_cublas and (self.serve_wcache_force orelse serveWcacheOn());
+        if (self.serve_wcache_on and self.serve_wcache == null) {
+            self.serve_wcache = std.AutoHashMap(usize, CudaBuffer).init(self.allocator);
+            if (std.posix.getenv("ZINC_SERVE_WCACHE_MB")) |mb| {
+                if (std.fmt.parseInt(usize, mb, 10) catch null) |v| self.serve_wcache_cap = v * 1024 * 1024;
+            }
+        }
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -2043,20 +2075,53 @@ pub const ForwardCuda = struct {
             const ci = dmmvIdx(w.info.type_);
             if (ci == 0 or ci == 2 or ci == 3) {
                 const db = &self.decode_batch.?;
-                if (ci == 0) {
-                    const dq = DequantQ4KPush{ .M = M, .K = K };
-                    cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
-                } else if (ci == 2) {
-                    const dq = DequantQ6KPush{ .M = M, .K = K };
-                    cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
-                } else {
-                    const dq = DequantQ8_0Push{ .M = M, .K = K };
-                    cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ8_0Push), 0);
+                // Effort 29 T3 option-b: pick the fp16 weight SOURCE. With the
+                // resident cache on, a HIT reuses the once-dequant'd buffer (skip
+                // the dequant launch entirely); a MISS dequants ONCE into a freshly
+                // allocated resident buffer (budget/VRAM permitting) and reuses it
+                // forever after. Cache off / cap-exhausted / alloc-fail → the
+                // per-step scratch `db.w_f16` (original cycle-7 round-trip path).
+                var dq_target: *const CudaBuffer = &db.w_f16;
+                var whandle = db.w_f16.handle;
+                var need_dequant = true;
+                if (self.serve_wcache_on and self.serve_wcache != null) {
+                    const cache = &self.serve_wcache.?;
+                    const key = @intFromPtr(w.gpu_buffer.handle);
+                    if (cache.getPtr(key)) |cached| {
+                        whandle = cached.handle;
+                        need_dequant = false;
+                    } else {
+                        const wbytes = @as(usize, M) * @as(usize, K) * @sizeOf(u16);
+                        if (self.serve_wcache_bytes + wbytes <= self.serve_wcache_cap) {
+                            if (buffer.createBuffer(self.ctx, wbytes)) |newbuf| {
+                                cache.put(key, newbuf) catch {
+                                    buffer.freeBuffer(@constCast(&newbuf));
+                                };
+                                if (cache.getPtr(key)) |cp| {
+                                    self.serve_wcache_bytes += wbytes;
+                                    dq_target = cp; // dequant ONCE into the resident buffer
+                                    whandle = cp.handle;
+                                }
+                            } else |_| {}
+                        }
+                    }
+                }
+                if (need_dequant) {
+                    if (ci == 0) {
+                        const dq = DequantQ4KPush{ .M = M, .K = K };
+                        cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, dq_target }, &dq, @sizeOf(DequantQ4KPush), 0);
+                    } else if (ci == 2) {
+                        const dq = DequantQ6KPush{ .M = M, .K = K };
+                        cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, dq_target }, &dq, @sizeOf(DequantQ6KPush), 0);
+                    } else {
+                        const dq = DequantQ8_0Push{ .M = M, .K = K };
+                        cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, dq_target }, &dq, @sizeOf(DequantQ8_0Push), 0);
+                    }
                 }
                 const cvt = F32ToF16Push{ .N = B * K };
                 cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(B * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, &db.act_f16 }, &cvt, @sizeOf(F32ToF16Push), 0);
                 const beta: f32 = if (acc_mode == 1) 1.0 else 0.0;
-                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(B), @intCast(K), db.w_f16.handle, db.act_f16.handle, y.handle, beta);
+                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(B), @intCast(K), whandle, db.act_f16.handle, y.handle, beta);
                 return;
             }
         }
@@ -3164,6 +3229,16 @@ fn cublasDefaultOn() bool {
 fn serveCublasOn() bool {
     const v = std.posix.getenv("ZINC_SERVE_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
+}
+
+/// Effort 29 T3 option-b: resident fp16 weight cache for the serving-decode
+/// cuBLAS GEMMs. OPT-IN (ZINC_SERVE_WCACHE=1) — it removes the per-step dequant
+/// round-trip but costs ~3.5× the Q4_K bytes in VRAM (a serving batch-capacity
+/// trade), so unlike serve_cublas it does NOT default on.
+fn serveWcacheOn() bool {
+    const v = std.posix.getenv("ZINC_SERVE_WCACHE") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
+        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
 
 /// Effort 29 T2: token-batched qwen2-MoE prefill FFN. DEFAULT-ON; ZINC_QWEN_MOE_BATCHED=0
