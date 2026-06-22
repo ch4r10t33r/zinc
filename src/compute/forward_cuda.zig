@@ -607,13 +607,22 @@ pub const ForwardCuda = struct {
     use_tc_experts: bool = false,
     tc_experts_forced: bool = false,
     // Crossover measured on the 4090 / qwen36-35b-a3b (256 experts, 8 active): the
-    // grouped-TC win is gated higher than the gemma path's 512 because 256 experts
+    // grouped-TC win is gated higher than the gemma path's 256 because 256 experts
     // each pad to a 64-token tile — at small T the per-expert run (≈T·8/256) is far
     // below 64, so the padded tiles are mostly empty and the wasted TC work cancels
-    // the weight-traffic win. Interleaved A/B: T=1037 neutral (≈+0.7%, in boost
-    // noise), T=1536 win (TC ≥ matvec every round, ≈+7.7% median), T=2000 clean
-    // +8.5% (3/3). Gate at 1536 = the zero-regression crossover.
-    moe_tc_min_t: u32 = 1536,
+    // the weight-traffic win. The original 1536 gate was set when only gate/up ran
+    // on TC; once the FULL expert FFN went on TC (Q5_K + Q6_K down-proj added) the
+    // per-tile fixed cost amortizes over the whole FFN → the crossover dropped, the
+    // same way the gemma gate fell 512→256 after its Q5_1 down-on-TC. Re-measured on a
+    // CLEAN 4090 (order-alternated A/B, forced TC vs matvec, full FFN on TC, 4 rounds
+    // each): T=768 4/4 win (TC/MV 1.27-1.51, matvec capped ~415 vs TC 503-590), T=640
+    // 4/4 win (1.08-1.49, worst MV-first round +8.4% — clear of the ±1.6% order-bias
+    // floor), T=512 MIXED (0.91/1.31/1.15/1.02 — a TC-loss + a tie round). So 640 is
+    // the zero-regression crossover; lowered 1024→640 to route the [640,1024) band to
+    // the grouped-TC experts (more prompts hit the 29× row's biggest lever). Below 640
+    // the proven _batched matvec stays (256 experts → <20 tok/64-tile = mostly-empty
+    // padded tiles, the wasted wmma cancels the weight-traffic win).
+    moe_tc_min_t: u32 = 640,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
     // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
