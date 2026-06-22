@@ -167,6 +167,7 @@ const GroupedTCDownPush = extern struct { M: u32, K: u32, slice: u32, n_used: u3
 // batched SSM/util kernels. Must byte-match kernels.cu.
 const F32ToF16Push = extern struct { N: u32 };
 const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
+const DequantQ5KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ6KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ8_0Push = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const AddPush = extern struct { N: u32 };
@@ -324,6 +325,7 @@ const Pipelines = struct {
     gemm_q6k_experts_grouped_tc: CudaPipeline, // down twin for the 4 Q6_K layers
     // Effort 26 T0: batched-prefill GEMM + SSM kernels (qwen prefillBatched).
     dequant_q4k_to_f16: CudaPipeline, // full Q4_K weight [M,K] → fp16 for cuBLAS
+    dequant_q5k_to_f16: CudaPipeline, // full Q5_K weight [M,K] → fp16 for cuBLAS (qwen attn_qkv/ssm_out)
     dequant_q6k_to_f16: CudaPipeline, // full Q6_K weight [M,K] → fp16 for cuBLAS
     dequant_q8_0_to_f16: CudaPipeline, // full Q8_0 weight [M,K] → fp16 for cuBLAS (shexp)
     f32_to_f16: CudaPipeline, // activation downcast [T,K] → fp16 for cuBLAS
@@ -590,6 +592,7 @@ pub const ForwardCuda = struct {
     // + the cuBLAS dense-GEMM toggles (mirrors the gemma prefillBatched path).
     batch: ?BatchScratch = null,
     use_cublas: bool = false, // dense Q4_K/Q6_K prefill GEMMs via cuBLAS fp16 TC
+    use_cublas_q5: bool = false, // also route Q5_K dense GEMMs through cuBLAS (qwen attn_qkv/ssm_out)
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
     use_cublas_q8: bool = false, // also route Q8_0 dense GEMMs through cuBLAS (qwen36 shexp)
     cublas_min_t: u32 = 128, // only use cuBLAS once T amortizes the dequant round-trip
@@ -718,6 +721,7 @@ pub const ForwardCuda = struct {
         pipes.gemm_q6k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_experts_grouped_tc");
         // Effort 26 T0: batched-prefill GEMM + SSM kernels.
         pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
+        pipes.dequant_q5k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q5k_to_f16");
         pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
         pipes.dequant_q8_0_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q8_0_to_f16");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
@@ -1265,6 +1269,7 @@ pub const ForwardCuda = struct {
         const f4 = @sizeOf(f32);
         // cuBLAS dense-GEMM defaults (mirror the gemma path): on unless opted out.
         self.use_cublas = cublasDefaultOn();
+        self.use_cublas_q5 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ5") == null;
         self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
         self.use_cublas_q8 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ8") == null;
         // Effort 29 T2: token-batched MoE FFN (qwen36). DEFAULT-ON; opt out to the
@@ -1619,11 +1624,14 @@ pub const ForwardCuda = struct {
     /// prefillStep). Always OVERWRITES y (residual folds use add_inplace).
     fn gemmDispatchPrefill(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
         const idx = dmmvIdx(w.info.type_);
-        if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 2 and self.use_cublas_q6) or (idx == 3 and self.use_cublas_q8))) {
+        if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 1 and self.use_cublas_q5) or (idx == 2 and self.use_cublas_q6) or (idx == 3 and self.use_cublas_q8))) {
             const b = &self.batch.?;
             if (idx == 0) {
                 const dq = DequantQ4KPush{ .M = M, .K = K };
                 cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
+            } else if (idx == 1) {
+                const dq = DequantQ5KPush{ .M = M, .K = K };
+                cmd.dispatch(&self.pipes.dequant_q5k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ5KPush), 0);
             } else if (idx == 2) {
                 const dq = DequantQ6KPush{ .M = M, .K = K };
                 cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);

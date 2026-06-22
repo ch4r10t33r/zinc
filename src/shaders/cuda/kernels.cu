@@ -3488,6 +3488,45 @@ extern "C" __global__ void dequant_q8_0_to_f16(const unsigned char* a, half* Wf1
     Wf16[i] = __float2half(d * (float)qs[within]);
 }
 
+// ---- dequant_q5k_to_f16 (Effort 29 cycle 16: full-weight Q5_K -> fp16) --------
+// Q5_K analog of dequant_q4k/q6k/q8_0_to_f16: dequant a Q5_K weight W[M,K]
+// (row-major, 256-elem superblocks = 176 BYTES each) to a dense fp16 buffer
+// Wf16[M,K] so prefill/serving GEMMs run on cuBLAS fp16 tensor cores. The
+// dense-path qwen models store attn_qkv (qwen35-9b) and ssm_out (qwen35-9b /
+// qwen36-27b) as Q5_K → gemmDispatchPrefill's cuBLAS path only fired for
+// Q4_K/Q6_K/Q8_0, so those large dense GEMMs fell back to per-token matvec
+// (~T launches each = a launch storm, same shape as the cycle-5 Q8_0 shared
+// expert). Per-element unpack identical to dmmv_q5k (5-bit q = nibble +
+// (qh_bit<<4); value = d*sc*q5 - dmin*mn, same get_scale_min_k4/zinc_q4k_scale_min
+// as Q4_K), then __float2half → the cuBLAS path's fp16 W bits match the matvec's
+// effective W exactly. Q5_K is BYTE-addressed → `const unsigned char* a`,
+// a_offset is BYTES. One thread per (row,col) element.
+struct DequantQ5KPush { unsigned M, K, a_offset; };
+extern "C" __global__ void dequant_q5k_to_f16(const unsigned char* a, half* Wf16, DequantQ5KPush pc) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)pc.M * pc.K;
+    if (i >= total) return;
+    unsigned row = (unsigned)(i / pc.K), k = (unsigned)(i % pc.K);
+    unsigned bpr = pc.K >> 8;            // Q5_K superblocks per row
+    unsigned within = k & 255u, b = k >> 8;
+    const unsigned char* blk = a + pc.a_offset + (size_t)row * bpr * 176u + (size_t)b * 176u;
+    float d = zinc_half_to_float((unsigned short)((unsigned)blk[0] | ((unsigned)blk[1] << 8)));
+    float dmin = zinc_half_to_float((unsigned short)((unsigned)blk[2] | ((unsigned)blk[3] << 8)));
+    const unsigned char* scales = blk + 4;     // 12 bytes
+    const unsigned char* qh = blk + 16;        // 32 bytes
+    const unsigned char* qs = blk + 48;        // 128 bytes
+    unsigned chunk = within >> 6;              // 0..3
+    unsigned half_ = (within & 63u) >> 5;      // 0..1
+    unsigned l = within & 31u;                 // 0..31
+    unsigned char ql = qs[chunk * 32u + l];
+    unsigned nib = (half_ == 0u) ? (ql & 0xFu) : (unsigned)(ql >> 4);
+    unsigned bit = (qh[l] >> (2u * chunk + half_)) & 1u;
+    unsigned q5 = nib + (bit ? 16u : 0u);
+    unsigned char sc, mn;
+    zinc_q4k_scale_min((int)(chunk * 2u + half_), scales, &sc, &mn);
+    Wf16[i] = __float2half(d * (float)sc * (float)q5 - dmin * (float)mn);
+}
+
 // ---- rms_norm_f16 (Effort 24 cycle 21: emit the fp16 norm DIRECTLY for the TC path) ----
 // Byte-for-byte f32_to_f16(rms_norm(x,w)): computes the SAME f32 normalized value
 // w[i]*(x[i]*rinv) with the SAME reduction order as rms_norm, then __float2half-stores
