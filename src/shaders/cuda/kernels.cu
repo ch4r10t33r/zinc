@@ -1803,6 +1803,141 @@ extern "C" __global__ void dmmv_q5_1_experts_batched(const unsigned char* a, con
     if (threadIdx.x == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
 }
 
+// ---- token-batched qwen2-MoE routed-expert matvecs (qwen36 MoE prefill) -----
+// Effort 29 T2: qwen36-35b-a3b prefill looped the WHOLE per-token MoE block over
+// all T prompt tokens (router + 8 routed experts + shared expert ≈ 14 launches ×
+// T tokens × 40 layers → heavily launch-bound; pp256 ~50 t/s). These are the
+// token-batched (grid.y = T) twins of the single-token dmmv_q5k_experts /
+// dmmv_q6k_experts / dmmv_f32 + moe_weighted_acc / sigmoid_scale_acc kernels:
+// each (token t, expert-slot e, row) block reads token t's router row
+// (expert_ids[t*routing_stride + e]), its input slice (x + t*x_tok_stride,
+// per-expert e*x_stride) and writes its output slice (y + t*y_tok_stride,
+// per-expert e*M). The per-block dequant + zinc_block_reduce_sum is byte-for-byte
+// the single-token kernel's, so the result is bit-identical to looping the
+// per-token kernels over t — only the launch is batched. ExpertsBatchPush is the
+// gemma prefill struct (M,K,slice,x_stride,n_used,base,routing_stride,
+// x_tok_stride,y_tok_stride); the qwen router_out_buf packs n_used ids then
+// n_used weight-bits per token (routing_stride = 2*n_used), so expert_ids[...+e]
+// reads slot e's chosen expert id exactly as the single-token kernel did.
+
+extern "C" __global__ void dmmv_q5k_experts_batched(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsBatchPush pc) {
+    unsigned t = blockIdx.y;
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (expert_ids[(size_t)t * pc.routing_stride + e] * pc.slice + pc.base >> 2) + row * bpr * 44u;
+    const float4* xv = (const float4*)(x + (size_t)t * pc.x_tok_stride + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u, ngrp = blockDim.x >> 4;
+    unsigned sba = 2u*v_im, sbb = 2u*v_im+1u, sbc = 2u*v_im+4u, sbd = 2u*v_im+5u;
+    float sum = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 44u, dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF)), dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk+1u], sc1 = a_u32[blk+2u], sc2 = a_u32[blk+3u];
+        unsigned qh = a_u32[blk + 4u + (l0 >> 2)];
+        unsigned qs0 = a_u32[blk + 12u + (q_off >> 2)], qs1 = a_u32[blk + 12u + (q_off >> 2) + 16u];
+        unsigned bidx = (i*256u + y_loc) >> 2, bidx2 = (i*256u + y_loc + 128u) >> 2;
+        float4 by0=xv[bidx], by1=xv[bidx+8u], by2=xv[bidx2], by3=xv[bidx2+8u];
+        unsigned s0=sc0>>shift, s1=sc1>>shift, s2=sc2>>shift;
+        float f0=d*(float)(s0&0x3Fu), b0=dm*(float)(s1&0x3Fu);
+        float f1=d*(float)((s0>>8)&0x3Fu), b1=dm*(float)((s1>>8)&0x3Fu);
+        float f2=d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2=dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3=d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3=dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        #define Q5E(q,sh,sb,j) ((float)(((q)>>(sh))&0xFu) + 16.0f*(float)(((qh)>>((sb)+(j)*8u))&1u))
+        sum += (f0*Q5E(qs0,0,sba,0)-b0)*by0.x + (f0*Q5E(qs0,8,sba,1)-b0)*by0.y + (f0*Q5E(qs0,16,sba,2)-b0)*by0.z + (f0*Q5E(qs0,24,sba,3)-b0)*by0.w;
+        sum += (f1*Q5E(qs0,4,sbb,0)-b1)*by1.x + (f1*Q5E(qs0,12,sbb,1)-b1)*by1.y + (f1*Q5E(qs0,20,sbb,2)-b1)*by1.z + (f1*Q5E(qs0,28,sbb,3)-b1)*by1.w;
+        sum += (f2*Q5E(qs1,0,sbc,0)-b2)*by2.x + (f2*Q5E(qs1,8,sbc,1)-b2)*by2.y + (f2*Q5E(qs1,16,sbc,2)-b2)*by2.z + (f2*Q5E(qs1,24,sbc,3)-b2)*by2.w;
+        sum += (f3*Q5E(qs1,4,sbd,0)-b3)*by3.x + (f3*Q5E(qs1,12,sbd,1)-b3)*by3.y + (f3*Q5E(qs1,20,sbd,2)-b3)*by3.z + (f3*Q5E(qs1,28,sbd,3)-b3)*by3.w;
+        #undef Q5E
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
+}
+
+extern "C" __global__ void dmmv_q6k_experts_batched(const unsigned char* a, const float* x, float* y, const unsigned* expert_ids, ExpertsBatchPush pc) {
+    unsigned t = blockIdx.y;
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + ((size_t)expert_ids[(size_t)t * pc.routing_stride + e] * pc.slice + pc.base) + (size_t)row * bpr * 210u;
+    const float4* xv = (const float4*)(x + (size_t)t * pc.x_tok_stride + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
+    unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
+    unsigned xvib = (half_id * 128u + e_start) >> 2, ngrp = blockDim.x >> 4;
+    float sum = 0.0f;
+    for (unsigned b = ix; b < bpr; b += ngrp) {
+        const unsigned char* bb = arow + (size_t)b * 210u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned char* ql = bb + half_id * 64u;
+        const unsigned char* qh = bb + 128u + half_id * 32u;
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+        float ds0 = d * (float)sc[is], ds2 = d * (float)sc[is + 2], ds4 = d * (float)sc[is + 4], ds6 = d * (float)sc[is + 6];
+        unsigned xb = (b * 256u) / 4u + xvib;
+        float4 bx0 = xv[xb], bx32 = xv[xb + 8u], bx64 = xv[xb + 16u], bx96 = xv[xb + 24u];
+        #pragma unroll
+        for (unsigned li = 0; li < 4u; li++) {
+            unsigned l = e_start + li, qllo = ql[l], qlhi = ql[l + 32u], qhv = qh[l];
+            float q1 = (float)((qllo & 0xFu) | (((qhv >> 0) & 3u) << 4)) - 32.0f;
+            float q2 = (float)((qlhi & 0xFu) | (((qhv >> 2) & 3u) << 4)) - 32.0f;
+            float q3 = (float)((qllo >> 4) | (((qhv >> 4) & 3u) << 4)) - 32.0f;
+            float q4 = (float)((qlhi >> 4) | (((qhv >> 6) & 3u) << 4)) - 32.0f;
+            sum += ds0*q1*(&bx0.x)[li] + ds2*q2*(&bx32.x)[li] + ds4*q3*(&bx64.x)[li] + ds6*q4*(&bx96.x)[li];
+        }
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
+}
+
+// Token-batched f32 matvec (qwen36-MoE prefill router logits + shared-expert gate
+// scalar): y[t, row] = sum_k W[row,k] * x[t,k]. grid (M rows, T tokens). Byte-for-
+// byte the single-token dmmv_f32's reduction (256 threads, zinc_block_reduce_sum).
+struct MatvecBatchPush { unsigned M, K, x_tok_stride, y_tok_stride; };
+extern "C" __global__ void dmmv_f32_batched(const float* w, const float* x, float* y, MatvecBatchPush pc) {
+    unsigned t = blockIdx.y;
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const float* wrow = w + (size_t)row * pc.K;
+    const float* xrow = x + (size_t)t * pc.x_tok_stride;
+    float sum = 0.0f;
+    for (unsigned k = threadIdx.x; k < pc.K; k += blockDim.x) sum += wrow[k] * xrow[k];
+    sum = zinc_block_reduce_sum(sum);
+    if (threadIdx.x == 0) y[(size_t)t * pc.y_tok_stride + row] = sum;
+}
+
+// Token-batched twin of moe_weighted_acc (qwen36-MoE prefill routed combine; no
+// per-expert down scale). a[t,i] += sum_j weight_j * b[t, j*src_stride + i].
+extern "C" __global__ void moe_weighted_acc_batched(float* a, const float* b, const unsigned* routing, MoeAccBatchPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pc.N) return;
+    unsigned t = blockIdx.y;
+    float* at = a + (size_t)t * pc.a_tok_stride;
+    const float* bt = b + (size_t)t * pc.b_tok_stride;
+    const unsigned* rt = routing + (size_t)t * pc.routing_stride;
+    float sum = 0.0f;
+    for (unsigned j = 0; j < pc.n_used; j++) {
+        float w = __uint_as_float(rt[pc.n_used + j]);
+        sum += w * bt[(size_t)j * pc.src_stride + i];
+    }
+    at[i] += sum;
+}
+
+// Token-batched twin of sigmoid_scale_acc (qwen36-MoE prefill shared-expert
+// gating): a[t,i] += sigmoid(c[t]) * b[t,i]. c is the per-token gate logit.
+extern "C" __global__ void sigmoid_scale_acc_batched(float* a, const float* b, const float* c, MoeAccBatchPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pc.N) return;
+    unsigned t = blockIdx.y;
+    float gate = 1.0f / (1.0f + expf(-c[t]));
+    a[(size_t)t * pc.a_tok_stride + i] += gate * b[(size_t)t * pc.b_tok_stride + i];
+}
+
 // ---- token-GROUPED routed-expert matvecs (gemma-26b MoE prefill) ------------
 // Effort 24 cycle 18: the cycle-8 token-batched kernels above launch grid.y =
 // token, so blocks reading the SAME expert weight are scattered across grid.y

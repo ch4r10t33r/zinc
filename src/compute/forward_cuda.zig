@@ -150,6 +150,11 @@ const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
 const SigmoidAccPush = extern struct { N: u32 };
 // Batched MoE expert matvec: one launch over all n_used experts, GPU-side ids.
 const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32 = 0 };
+// Effort 29 T2: token-batched (grid.y = T) MoE prefill twins — process ALL T
+// prompt tokens' routed/shared experts in one launch each (vs the per-token loop).
+const ExpertsBatchPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32, routing_stride: u32, x_tok_stride: u32, y_tok_stride: u32 };
+const MoeAccBatchPush = extern struct { N: u32, n_used: u32, src_stride: u32, a_tok_stride: u32, b_tok_stride: u32, routing_stride: u32 };
+const MatvecBatchPush = extern struct { M: u32, K: u32, x_tok_stride: u32, y_tok_stride: u32 };
 // Effort 26 T0 (qwen batched prefill): cuBLAS fp16-TC dense GEMM helpers + the
 // batched SSM/util kernels. Must byte-match kernels.cu.
 const F32ToF16Push = extern struct { N: u32 };
@@ -289,11 +294,19 @@ const Pipelines = struct {
     embed_q4k: CudaPipeline, // GPU-side Q4_K embedding-row dequant (Effort 25 c5)
     // MoE (qwen2_moe). Compiled unconditionally; only dispatched when n_experts>0.
     softmax_topk: CudaPipeline,
+    softmax_topk_batched: CudaPipeline, // Effort 29 T2: per-token top-k over all T
     moe_weighted_acc: CudaPipeline,
     sigmoid_scale_acc: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched gate/up over all experts
     dmmv_q5k_experts: CudaPipeline, // batched gate/up or down over all experts
     dmmv_q6k_experts: CudaPipeline, // batched down (the 4 Q6_K layers of 35b-a3b)
+    // Effort 29 T2: token-batched (grid.y = T) MoE prefill twins.
+    dmmv_q4k_experts_batched: CudaPipeline,
+    dmmv_q5k_experts_batched: CudaPipeline,
+    dmmv_q6k_experts_batched: CudaPipeline,
+    dmmv_f32_batched: CudaPipeline, // router logits + shared gate scalar (all T)
+    moe_weighted_acc_batched: CudaPipeline, // routed combine (all T)
+    sigmoid_scale_acc_batched: CudaPipeline, // shared-expert gating (all T)
     // Effort 26 T0: batched-prefill GEMM + SSM kernels (qwen prefillBatched).
     dequant_q4k_to_f16: CudaPipeline, // full Q4_K weight [M,K] → fp16 for cuBLAS
     dequant_q6k_to_f16: CudaPipeline, // full Q6_K weight [M,K] → fp16 for cuBLAS
@@ -337,6 +350,15 @@ const BatchScratch = struct {
     swiglu_ff: CudaBuffer, // [T, n_ff]
     act_f16: CudaBuffer, // [T, maxK] fp16 activation for cuBLAS
     w_f16: CudaBuffer, // [maxM*maxK] fp16 dequant'd weight for cuBLAS
+    // Effort 29 T2: token-major MoE prefill scratch (n_experts>0; size-1 stubs on
+    // the dense qwen35). Mirrors the per-token moeFfnBlock buffers, batched over T.
+    router_logits_e: CudaBuffer, // [T, n_experts]
+    router_table_e: CudaBuffer, // [T, 2*n_used] (ids then weight-bits per token)
+    gate_e: CudaBuffer, // [T, n_used*ef] routed gate projection (slot-major/token)
+    up_e: CudaBuffer, // [T, n_used*ef] routed up projection
+    swiglu_e: CudaBuffer, // [T, n_used*ef] routed SwiGLU
+    down_e: CudaBuffer, // [T, n_used*n_embd] routed down (slot-major per token)
+    gate_scalar_e: CudaBuffer, // [T] shared-expert sigmoid gate logit per token
 };
 
 /// Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
@@ -638,11 +660,18 @@ pub const ForwardCuda = struct {
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
         pipes.embed_q4k = try pipeline.createPipeline(ctx, src.ptr, "embed_lookup_q4k");
         pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
+        pipes.softmax_topk_batched = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk_batched");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
         pipes.dmmv_q6k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_experts");
+        pipes.dmmv_q4k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_batched");
+        pipes.dmmv_q5k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts_batched");
+        pipes.dmmv_q6k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_experts_batched");
+        pipes.dmmv_f32_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_f32_batched");
+        pipes.moe_weighted_acc_batched = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_batched");
+        pipes.sigmoid_scale_acc_batched = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc_batched");
         // Effort 26 T0: batched-prefill GEMM + SSM kernels.
         pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
         pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
@@ -1192,6 +1221,9 @@ pub const ForwardCuda = struct {
         // cuBLAS dense-GEMM defaults (mirror the gemma path): on unless opted out.
         self.use_cublas = cublasDefaultOn();
         self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        // Effort 29 T2: token-batched MoE FFN (qwen36). DEFAULT-ON; opt out to the
+        // proven per-token loop via ZINC_QWEN_MOE_BATCHED=0 (for the A/B baseline).
+        const moe_batched = qwenMoeBatchedOn();
 
         const b = try self.ensureBatch(T);
 
@@ -1209,17 +1241,22 @@ pub const ForwardCuda = struct {
                 try self.ssmLayerBatched(L, T, b);
             }
             if (d.n_experts > 0) {
-                // MoE FFN: loop the proven per-token block, aliasing self.hidden to
-                // each token's row (the routed/shared experts read the row's norm and
-                // accumulate back into it). Batching the expert GEMMs is a later target.
-                const saved_hidden = self.hidden;
-                var t: u32 = 0;
-                while (t < T) : (t += 1) {
-                    self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
-                    try self.moeFfnBlock(L);
-                    buffer.freeBuffer(&self.hidden);
+                if (moe_batched and self.moeBatchedSupported(L)) {
+                    // Token-batched MoE FFN: one launch per step over all T tokens.
+                    try self.moeFfnBlockBatched(L, T, b);
+                } else {
+                    // Fallback: loop the proven per-token block, aliasing self.hidden
+                    // to each token's row (the routed/shared experts read the row's
+                    // norm and accumulate back into it).
+                    const saved_hidden = self.hidden;
+                    var t: u32 = 0;
+                    while (t < T) : (t += 1) {
+                        self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
+                        try self.moeFfnBlock(L);
+                        buffer.freeBuffer(&self.hidden);
+                    }
+                    self.hidden = saved_hidden;
                 }
-                self.hidden = saved_hidden;
             } else {
                 try self.ffnBlockBatched(L, T, b);
             }
@@ -1390,6 +1427,98 @@ pub const ForwardCuda = struct {
         self.submit(cmd);
     }
 
+    /// Map a stacked-expert quant to its token-batched (grid.y = T) experts kernel.
+    fn expertsPipeBatched(self: *ForwardCuda, t: gguf.GGMLType) ?*CudaPipeline {
+        return switch (t) {
+            .q4_k => &self.pipes.dmmv_q4k_experts_batched,
+            .q5_k => &self.pipes.dmmv_q5k_experts_batched,
+            .q6_k => &self.pipes.dmmv_q6k_experts_batched,
+            else => null,
+        };
+    }
+
+    /// True when layer L's MoE block can run the token-batched prefill path: every
+    /// routed expert tensor has a batched kernel and the router / shared gate-scalar
+    /// weights are F32 (handled by dmmv_f32_batched). qwen36-35b-a3b is all-supported
+    /// (Q4_K/Q5_K/Q6_K experts, F32 router); a future unsupported quant falls back.
+    fn moeBatchedSupported(self: *ForwardCuda, L: u32) bool {
+        const wge = self.layer(L, "ffn_gate_exps.weight");
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight");
+        const wgi = self.layer(L, "ffn_gate_inp_shexp.weight");
+        return self.expertsPipeBatched(wge.info.type_) != null and
+            self.expertsPipeBatched(wue.info.type_) != null and
+            self.expertsPipeBatched(wde.info.type_) != null and
+            wrouter.info.type_ == .f32 and wgi.info.type_ == .f32;
+    }
+
+    /// Effort 29 T2: token-batched qwen2-MoE FFN over ALL T prompt tokens — the
+    /// batched twin of the per-token `moeFfnBlock` loop that qwen36-35b-a3b prefill
+    /// used to run (router + 8 routed experts + shared expert ≈ 14 launches × T ×
+    /// 40 layers → launch-bound, pp256 ~50 t/s). Each heavy step is ONE launch over
+    /// all T tokens (grid.y = T), reading token-major buffers; every per-(token)
+    /// kernel is byte-for-byte the single-token kernel's, so the result is
+    /// bit-identical to the per-token loop. Caller-gated by `moeBatchedSupported(L)`.
+    fn moeFfnBlockBatched(self: *ForwardCuda, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // routed-expert intermediate (512)
+        const sf = d.shexp_ff; // shared-expert intermediate (512)
+        const rt_stride = 2 * n_used;
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight");
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight");
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        const gate_pipe = self.expertsPipeBatched(wge.info.type_).?;
+        const up_pipe = self.expertsPipeBatched(wue.info.type_).?;
+        const down_pipe = self.expertsPipeBatched(wde.info.type_).?;
+
+        var cmd = try command.beginCommand(ctx);
+        // --- Router: batched rms_norm → F32 logits → per-token top-k softmax. -----
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        const rl = MatvecBatchPush{ .M = d.n_experts, .K = d.n_embd, .x_tok_stride = d.n_embd, .y_tok_stride = d.n_experts };
+        cmd.dispatch(&self.pipes.dmmv_f32_batched, .{ d.n_experts, T, 1 }, .{ 256, 1, 1 }, &.{ &wrouter.gpu_buffer, &b.ffn_norm, &b.router_logits_e }, &rl, @sizeOf(MatvecBatchPush), 0);
+        const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+        cmd.dispatch(&self.pipes.softmax_topk_batched, .{ T, 1, 1 }, .{ 64, 1, 1 }, &.{ &b.router_logits_e, &b.router_table_e }, &tk, @sizeOf(TopkPush), 0);
+
+        // --- Routed experts: gate/up → SwiGLU → down, slot-major per token. -------
+        const pg = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
+        cmd.dispatch(gate_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &b.ffn_norm, &b.gate_e, &b.router_table_e }, &pg, @sizeOf(ExpertsBatchPush), 0);
+        const pu = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
+        cmd.dispatch(up_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &b.ffn_norm, &b.up_e, &b.router_table_e }, &pu, @sizeOf(ExpertsBatchPush), 0);
+        const sg = SwigluPush{ .N = T * n_used * ef };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * n_used * ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_e, &b.up_e, &b.swiglu_e }, &sg, @sizeOf(SwigluPush), 0);
+        const pd = ExpertsBatchPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = n_used * ef, .y_tok_stride = n_used * d.n_embd };
+        cmd.dispatch(down_pipe, .{ n_used * d.n_embd, T, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &b.swiglu_e, &b.down_e, &b.router_table_e }, &pd, @sizeOf(ExpertsBatchPush), 0);
+        // Weighted combine of each token's n_used routed-down slices → hidden +=.
+        const ma = MoeAccBatchPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd, .a_tok_stride = d.n_embd, .b_tok_stride = n_used * d.n_embd, .routing_stride = rt_stride };
+        cmd.dispatch(&self.pipes.moe_weighted_acc_batched, .{ ceilDiv(d.n_embd, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.hidden, &b.down_e, &b.router_table_e }, &ma, @sizeOf(MoeAccBatchPush), 0);
+
+        // --- Shared expert: gate/up (dense GEMM) → SwiGLU → down, sigmoid-gated. ---
+        const wgs = self.layer(L, "ffn_gate_shexp.weight");
+        const wus = self.layer(L, "ffn_up_shexp.weight");
+        const wds = self.layer(L, "ffn_down_shexp.weight");
+        const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [n_embd, 1] F32
+        self.gemmDispatchPrefill(&cmd, wgs, &b.ffn_norm, &b.gate_ff, sf, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wus, &b.ffn_norm, &b.up_ff, sf, d.n_embd, T);
+        const ssg = SwigluPush{ .N = T * sf };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &ssg, @sizeOf(SwigluPush), 0);
+        // Shared-expert gate scalar = sigmoid(W_gi · norm) per token (1 row, all T).
+        const gs = MatvecBatchPush{ .M = 1, .K = d.n_embd, .x_tok_stride = d.n_embd, .y_tok_stride = 1 };
+        cmd.dispatch(&self.pipes.dmmv_f32_batched, .{ 1, T, 1 }, .{ 256, 1, 1 }, &.{ &wgi.gpu_buffer, &b.ffn_norm, &b.gate_scalar_e }, &gs, @sizeOf(MatvecBatchPush), 0);
+        self.gemmDispatchPrefill(&cmd, wds, &b.swiglu_ff, &b.o, d.n_embd, sf, T);
+        const ssa = MoeAccBatchPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd, .a_tok_stride = d.n_embd, .b_tok_stride = d.n_embd, .routing_stride = rt_stride };
+        cmd.dispatch(&self.pipes.sigmoid_scale_acc_batched, .{ ceilDiv(d.n_embd, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.hidden, &b.o, &b.gate_scalar_e }, &ssa, @sizeOf(MoeAccBatchPush), 0);
+        self.submit(cmd);
+    }
+
     /// Batched dense GEMM y[T,M] = x[T,K] · W[M,K]ᵀ. cuBLAS fp16 tensor cores for
     /// Q4_K (idx 0) and Q6_K (idx 2) once T amortizes the dequant→fp16 round-trip
     /// (T >= cublas_min_t); otherwise (and for other quants / short prompts) loop
@@ -1434,6 +1563,15 @@ pub const ForwardCuda = struct {
         const f4 = @sizeOf(f32);
         const max_k = @max(@max(d.n_embd, d.q_dim), @max(d.d_inner, d.n_ff));
         const max_w = @max(@max(d.conv_channels, 2 * d.q_dim), d.n_ff) * @max(d.n_embd, d.n_ff);
+        // Effort 29 T2: MoE prefill scratch. n_ff is the routed-expert intermediate
+        // (ef) on the MoE rows; gate/up/swiglu_ff also serve the shared expert
+        // (shexp_ff), so size them to the larger of the two. The routed buffers are
+        // size-1 stubs on the dense qwen35 (n_experts==0).
+        const max_ff = @max(d.n_ff, d.shexp_ff);
+        const moe = d.n_experts > 0;
+        const nu = @max(@as(u32, 1), d.n_experts_used);
+        const e_gu = if (moe) T * nu * d.n_ff * f4 else f4; // [T, n_used*ef]
+        const e_dn = if (moe) T * nu * d.n_embd * f4 else f4; // [T, n_used*n_embd]
         self.batch = BatchScratch{
             .t_cap = T,
             .hidden = try buffer.createBuffer(ctx, T * d.n_embd * f4),
@@ -1453,18 +1591,25 @@ pub const ForwardCuda = struct {
             .delta_out = try buffer.createBuffer(ctx, T * d.d_inner * f4),
             .ssm_gn = try buffer.createBuffer(ctx, T * d.d_inner * f4),
             .ffn_norm = try buffer.createBuffer(ctx, T * d.n_embd * f4),
-            .gate_ff = try buffer.createBuffer(ctx, T * d.n_ff * f4),
-            .up_ff = try buffer.createBuffer(ctx, T * d.n_ff * f4),
-            .swiglu_ff = try buffer.createBuffer(ctx, T * d.n_ff * f4),
+            .gate_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
+            .up_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
+            .swiglu_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
             .act_f16 = try buffer.createBuffer(ctx, T * max_k * @sizeOf(u16)),
             .w_f16 = try buffer.createBuffer(ctx, max_w * @sizeOf(u16)),
+            .router_logits_e = try buffer.createBuffer(ctx, if (moe) T * d.n_experts * f4 else f4),
+            .router_table_e = try buffer.createBuffer(ctx, if (moe) T * 2 * nu * f4 else f4),
+            .gate_e = try buffer.createBuffer(ctx, e_gu),
+            .up_e = try buffer.createBuffer(ctx, e_gu),
+            .swiglu_e = try buffer.createBuffer(ctx, e_gu),
+            .down_e = try buffer.createBuffer(ctx, e_dn),
+            .gate_scalar_e = try buffer.createBuffer(ctx, if (moe) T * f4 else f4),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardCuda) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16 }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16, &bb.router_logits_e, &bb.router_table_e, &bb.gate_e, &bb.up_e, &bb.swiglu_e, &bb.down_e, &bb.gate_scalar_e }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -2837,6 +2982,13 @@ fn aliasRow(buf: *const CudaBuffer, t: u32, width: u32) !CudaBuffer {
 /// ZINC_BATCHED_CUBLAS=0/off/false/no (the A/B kill-switch to the matvec path).
 fn cublasDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
+}
+
+/// Effort 29 T2: token-batched qwen2-MoE prefill FFN. DEFAULT-ON; ZINC_QWEN_MOE_BATCHED=0
+/// opts out to the per-token loop (the A/B baseline arm).
+fn qwenMoeBatchedOn() bool {
+    const v = std.posix.getenv("ZINC_QWEN_MOE_BATCHED") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
 }
 
