@@ -14,7 +14,7 @@ struct DualQ8DmmvPush {
 
 // Exact Qwen3.6 SSM dual Q8_0 repacked DMMV for K=2048.
 //
-// This keeps the accepted llama.cpp-style two-row Q8 geometry from
+// This keeps the accepted reference-style two-row Q8 geometry from
 // dmmv_q8_0_repacked_k2048_nr2_qwen.metal, but lets sibling SSM QKV and gate
 // projections sharing the same norm row run as one encoder dispatch. The
 // simdgroup count is now taken from the dispatcher (matches the K=2048 quad

@@ -871,7 +871,7 @@ pub inline fn dotQ4_0RowWithSum32Cols2048Unchecked(raw_data: []const u8, row_ind
 /// Each 32-element block is stored as one f16 scale followed by 16 packed nibble
 /// pairs (low nibble = first weight, high nibble = second weight), where each nibble
 /// encodes a value in [0, 15] representing the original weight offset by +8.
-/// Mirrors llama.cpp's `quantize_row_q4_0_ref`.
+/// Mirrors the reference implementation's `quantize_row_q4_0_ref`.
 /// @param src Source f32 values; length must be a positive multiple of 32.
 /// @param dst Destination byte buffer; must be at least `(src.len / 32) * 18` bytes.
 /// @note Asserts (debug builds only) that alignment and size preconditions hold.
@@ -910,7 +910,7 @@ pub fn quantizeRowToQ4_0(src: []const f32, dst: []u8) void {
 /// Quantize one row of f32 weights into the GGML `Q8_0` block layout.
 /// Each 32-element block is stored as one f16 scale followed by 32 signed int8
 /// values clamped to [-127, 127]; the scale is `max(|w|) / 127`.
-/// Mirrors llama.cpp's `quantize_row_q8_0_ref`.
+/// Mirrors the reference implementation's `quantize_row_q8_0_ref`.
 /// @param src Source f32 values; length must be a positive multiple of 32.
 /// @param dst Destination byte buffer; must be at least `(src.len / 32) * 34` bytes.
 /// @note Asserts (debug builds only) that alignment and size preconditions hold.

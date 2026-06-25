@@ -16,7 +16,7 @@ using namespace metal;
 //   - V-heads (head < n_q_heads + 2*n_kv_heads): Q8-quantize v_inout directly
 //     into kv_v_cache at `dst_offset_bytes`.
 //
-// Adapts llama.cpp `ggml_metal_op_concurrency_check/reset` single-consumer
+// Adapts the reference implementation `ggml_metal_op_concurrency_check/reset` single-consumer
 // fusion (ggml-metal-ops.cpp:159, 175) to the QK-norm → rope → kv-write chain
 // that the Q8 KV decode path of Qwen3.6 walks every dense full-attn layer.
 // The rotated K in k_inout has no remaining consumer (flash_attn_q8 reads

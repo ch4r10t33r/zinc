@@ -14,7 +14,7 @@ struct DualQ4KDmmvPush {
 
 // Dense single-token gate/up dual Q4_K matvec.
 //
-// This keeps llama.cpp's kernel_mul_mv_q4_K_f32 row mapping (2 simdgroups,
+// This keeps the reference implementation's kernel_mul_mv_q4_K_f32 row mapping (2 simdgroups,
 // 2 rows per simdgroup). grid.y selects gate vs up, so one Metal dispatch
 // replaces two launches without increasing the per-thread register footprint
 // of the original single-projection matvec.

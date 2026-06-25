@@ -4,7 +4,7 @@ using namespace metal;
 
 // Fused single-token Q/K-norm + Q/K-RoPE for the Q8 KV-cache decode path.
 // Adapted from `rope_kv_cache_write.metal`'s Q/K-norm-into-RoPE fusion (which
-// mirrors llama.cpp's `ggml_metal_op_rms_norm` op-fusion at
+// mirrors the reference implementation's `ggml_metal_op_rms_norm` op-fusion at
 // ggml-metal-ops.cpp:3384 — fusing rms_norm into the immediately-following
 // producer). The existing fused kernel writes K rotated straight into the
 // f32 KV cache; that path is gated on `!kv_cache_q8`, leaving Qwen3.6's hot

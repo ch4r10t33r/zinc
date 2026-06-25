@@ -11,7 +11,7 @@ struct Params {
 // Fused residual-add + RMS norm: hidden[i] += residual[i], then
 // output[i] = weights[i] * rms_norm(hidden[i]).
 // Eliminates one barrier and one dispatch per layer vs separate scale_acc + rms_norm.
-// Adapted from llama.cpp's fused norm approach (ggml-metal-common.cpp op fusion).
+// Adapted from the reference implementation's fused norm approach (ggml-metal-common.cpp op fusion).
 kernel void main0(
     constant Params& p [[buffer(0)]],
     device float* hidden [[buffer(1)]],

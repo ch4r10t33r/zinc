@@ -2,13 +2,13 @@
 //!
 //!   zig build cuda-dbg -- <token> [model.gguf]
 //!       Per-layer residual-norm dump at pos 0 (used to pinpoint the attention
-//!       gate bug: diff vs a llama.cpp eval-callback `l_out-N` reference).
+//!       gate bug: diff vs a reference implementation eval-callback `l_out-N` reference).
 //!
 //!   zig build cuda-dbg -- gen <id,id,...> <ngen> [model.gguf]
 //!       Autoregressive greedy generation from a prompt token-id list. Prefills
 //!       the ids (exercising pos>0 RoPE + multi-entry attention + SSM state
 //!       carry), then greedily emits ngen tokens. Diff GEN_IDS vs `/tmp/gen`
-//!       (llama.cpp greedy) to validate the full decode path beyond pos 0.
+//!       (the reference implementation greedy) to validate the full decode path beyond pos 0.
 //!
 //! Read-only w.r.t. the engine — uses only public ForwardCuda methods.
 //! @section CUDA Runtime
@@ -1890,7 +1890,7 @@ fn profMode(allocator: std.mem.Allocator, model_path: []const u8) !void {
 }
 
 /// Dump the full vocab logit vector for `token` at pos 0 to a raw-f32 file,
-/// for numerical-fidelity comparison vs a llama.cpp logit dump.
+/// for numerical-fidelity comparison vs a reference implementation logit dump.
 fn logitsMode(allocator: std.mem.Allocator, token: u32, out_path: []const u8, model_path: []const u8) !void {
     var dev = try device.CudaDevice.initBest(allocator);
     defer dev.deinit();
@@ -1974,7 +1974,7 @@ fn teacherForcedMode(allocator: std.mem.Allocator, prompt_arg: []const u8, gen_a
 
 /// Prefill a prompt id list, then dump the full vocab logit vector predicting
 /// the NEXT token (i.e. logits after the last prompt token) to a raw-f32 file.
-/// Lets a pos>0 logit-fidelity comparison vs llama.cpp pinpoint whether a greedy
+/// Lets a pos>0 logit-fidelity comparison vs the reference implementation pinpoint whether a greedy
 /// divergence is a real bug or a near-tie fp flip.
 fn gemmaLogitsMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_path: []const u8, model_path: []const u8) !void {
     var prompt_buf: [256]u32 = undefined;
@@ -2049,7 +2049,7 @@ fn dumpMode(allocator: std.mem.Allocator, token: u32, model_path: []const u8) !v
 
 /// gemma4 per-layer residual-norm dump at pos 0 (single token). Dumps the
 /// residual stream after attention, after FFN, and after the per-layer output
-/// scale (== llama.cpp `l_out-N`), so the post-outscale norm can be diffed
+/// scale (== the reference implementation `l_out-N`), so the post-outscale norm can be diffed
 /// against a gemma4 eval-callback reference to find the first divergent layer.
 fn gemmaDumpMode(allocator: std.mem.Allocator, model: *loader.Model, token: u32) !void {
     var fwd = try forwardgemma.ForwardGemma.init(allocator, model, 512);
@@ -2084,8 +2084,8 @@ fn gemmaDumpMode(allocator: std.mem.Allocator, model: *loader.Model, token: u32)
 /// gemma4 per-layer residual-VECTOR dump at the LAST position of a prompt id
 /// list. Prefills ids[0..n-1] (full forward, populating KV at pos 0..n-2), then
 /// at the final position steps through layers, writing the post-output-scale
-/// residual (== llama.cpp `l_out-N`) of every layer to a flat f32 binary
-/// [n_layers * n_embd]. Pairs with a llama.cpp eval-callback dumping l_out's last
+/// residual (== the reference implementation `l_out-N`) of every layer to a flat f32 binary
+/// [n_layers * n_embd]. Pairs with a reference implementation eval-callback dumping l_out's last
 /// column; cosine/maxdiff per layer pinpoints the first POSITION-dependent
 /// (rope/KV) divergence that the pos-0 norm dump cannot see.
 fn gemmaLayerDumpMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_path: []const u8, model_path: []const u8) !void {

@@ -6,7 +6,7 @@ using namespace metal;
 // Gemma stores each expert's gate and up matrices in one tensor:
 // [expert][gate rows][up rows].  The regular MoE path launches two Q4_K
 // DMMVs over the same selected experts and input vector.  This kernel keeps
-// llama.cpp's small-batch mul_mv_id shape, but computes both halves for each
+// the reference implementation's small-batch mul_mv_id shape, but computes both halves for each
 // intermediate row while the expert input is already resident in threadgroup
 // memory.
 

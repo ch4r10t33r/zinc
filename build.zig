@@ -490,7 +490,7 @@ pub fn build(b: *std.Build) void {
 
         // CUDA per-layer debug dump — drives forward_cuda layer-by-layer via the
         // public hooks, printing the residual-stream norm after each layer, to
-        // diff against a llama.cpp per-layer reference and pinpoint divergence.
+        // diff against a reference implementation per-layer reference and pinpoint divergence.
         const cuda_dbg_mod = b.createModule(.{
             .root_source_file = b.path("src/dbg_cuda.zig"),
             .target = target,

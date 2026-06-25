@@ -12,7 +12,7 @@ struct DmmvPush {
 // Repacked Q8_0 DMMV with four adjacent output rows per simdgroup.
 //
 // This keeps the SIMD-coalesced block layout from dmmv_q8_0_repacked.metal
-// and applies llama.cpp's multi-row matvec discipline to a wider Qwen3.6 SSM
+// and applies the reference implementation's multi-row matvec discipline to a wider Qwen3.6 SSM
 // shape: each simdgroup reuses the same activation vector for four neighboring
 // rows instead of two.
 kernel void main0(

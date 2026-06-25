@@ -24,7 +24,7 @@ struct DualQ8DmmvConv1dPush {
 // 3-element conv state in place. The conv1d state is per-channel and each
 // simdgroup owns disjoint channel indices, so there is no cross-thread race.
 //
-// Mirrors llama.cpp `ggml_metal_op_concurrency_check/reset` single-consumer
+// Mirrors the reference implementation `ggml_metal_op_concurrency_check/reset` single-consumer
 // fusion (ggml-metal-ops.cpp:159, 175) and extends cycle-13/22/23/25's
 // fusion discipline to the SSM qkv → conv1d edge — the only consumer of
 // the qkv slice of `attn_out_buf` in the decode token-major path is the

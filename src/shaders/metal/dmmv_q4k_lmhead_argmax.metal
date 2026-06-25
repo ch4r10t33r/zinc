@@ -10,7 +10,7 @@ struct DmmvPush {
     uint y_offset; // byte offset into output vector
 };
 
-// Port of llama.cpp's kernel_mul_mv_q4_K_f32 (non-ext variant) with a
+// Port of the reference implementation's kernel_mul_mv_q4_K_f32 (non-ext variant) with a
 // side-channel argmax partial per threadgroup for large Q4_K LM heads.
 // Matches dmmv_q4k.metal's floating-point accumulation pattern for
 // bit-identical logits, while avoiding a separate argmax_chunks pass over
@@ -19,7 +19,7 @@ struct DmmvPush {
 // Thread organization:
 //   512 threads per threadgroup = 16 simdgroups x 32 threads
 //   Each simdgroup processes 2 rows => 32 rows per threadgroup.
-// This keeps the same per-row llama.cpp matvec math while halving the
+// This keeps the same per-row the reference implementation matvec math while halving the
 // LM-head partial count again versus the 16-row greedy argmax path.
 //
 // Q4_K block layout (144 bytes, 256 elements):
@@ -63,7 +63,7 @@ kernel void main0(
 
     const int first_row = (r0 * NSG + sgitg) * NR0;
 
-    // nb01 in llama.cpp is the byte stride per row = nb * sizeof(block_q4_K)
+    // nb01 in the reference implementation is the byte stride per row = nb * sizeof(block_q4_K)
     const int nb01 = nb * BLOCK_SIZE;
 
     device const uchar* src0 = W + p.a_offset;

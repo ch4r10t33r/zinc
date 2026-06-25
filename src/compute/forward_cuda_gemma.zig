@@ -675,7 +675,7 @@ pub const ForwardGemma = struct {
             defer allocator.free(rf);
             @memset(rf, 1.0);
             // rope_freqs is stored PER-LAYER as `blk.{i}.rope_freqs.weight` on the
-            // full-attention layers (llama.cpp `tn(LLM_TENSOR_ROPE_FREQS,"weight",i)`),
+            // full-attention layers (the reference implementation `tn(LLM_TENSOR_ROPE_FREQS,"weight",i)`),
             // all sharing one copy (TENSOR_DUPLICATED) — NOT as a global tensor. The
             // old global `model.get("rope_freqs.weight")` returned null, so rf stayed
             // 1.0 and proportional rope was silently skipped on full layers, drifting
@@ -1880,7 +1880,7 @@ pub const ForwardGemma = struct {
     /// MoE FFN block (gemma4-26b-a4b). On entry `hidden` holds attn_out, the
     /// shared input to the dense shared expert, the routed experts, AND the
     /// router; it stays untouched until the final residual add. Mirrors the
-    /// llama.cpp gemma4.cpp build graph:
+    /// the reference implementation gemma4.cpp build graph:
     ///   shared = post_ffw_norm_1( geglu_ffn( ffn_norm(attn_out) ) )
     ///   logits = ffn_gate_inp · ( rms(attn_out)/sqrt(n_embd) * gate_inp_s )
     ///   moe    = post_ffw_norm_2( Σ_j w_j·downᵉ( geglu( gate_upᵉ( pre_ffw_norm_2(attn_out) ) ) ) )
@@ -2467,7 +2467,7 @@ pub const ForwardGemma = struct {
 
     // ---- public per-block hooks (dbg_cuda per-layer residual diff) ----------
     // Mirror ForwardCuda's *Pub hooks so dbg_cuda can dump the residual stream
-    // after each gemma layer block and diff it against llama.cpp `l_out-N`.
+    // after each gemma layer block and diff it against the reference implementation `l_out-N`.
     pub fn attentionLayerPub(self: *ForwardGemma, L: u32, pos: u32) !void {
         try self.attentionLayer(L, pos);
         self.waitPending(); // block may be async in-flight; readHidden needs it done

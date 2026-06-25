@@ -1,7 +1,7 @@
 #version 460
 // ZINC - Q8_0 weights x Q8_1 activation matrix-vector multiply.
 //
-// This mirrors llama.cpp's Vulkan mmvq idea for Q8_0: quantize the F32
+// This mirrors the reference implementation's Vulkan mmvq idea for Q8_0: quantize the F32
 // activation into Q8_1 blocks, then use integer dot products against Q8_0
 // weight blocks. Intended first for the Qwen 3.6 Q8_0 LM head.
 

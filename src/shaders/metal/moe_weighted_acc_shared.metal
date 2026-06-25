@@ -10,7 +10,7 @@ struct Params {
 
 // Fused MoE weighted accumulate + shared expert contribution.
 // Eliminates one barrier per layer vs separate moe_weighted_acc + sigmoid_scale_acc.
-// Adapted from llama.cpp's fused operation approach (ggml-metal.m, use fusion = true).
+// Adapted from the reference implementation's fused operation approach (ggml-metal.m, use fusion = true).
 //
 // Computes: accum[id] += sum(w_i * expert_i[id]) + sh_weight * shared[id]
 // where sh_weight = sigmoid(gate[0]) if has_gate, else 1.0.

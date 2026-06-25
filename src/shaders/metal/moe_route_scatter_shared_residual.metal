@@ -6,7 +6,7 @@ using namespace metal;
 // This follows vLLM's topk_weight_and_reduce shape: route outputs are already
 // stored in token*k+slot order, so each output element can reduce its top-k
 // routes directly. It also folds the shared-expert contribution and residual
-// add into the same pass, mirroring llama.cpp Metal's preference for fused
+// add into the same pass, mirroring the reference implementation Metal's preference for fused
 // graph tails over separate elementwise command-barrier pairs.
 
 struct Params {

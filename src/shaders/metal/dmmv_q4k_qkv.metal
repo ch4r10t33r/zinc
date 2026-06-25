@@ -8,7 +8,7 @@ using namespace metal;
 //   rows [M_q + M_k, total)       -> V
 //
 // This is the all-Q4 sibling of dmmv_q4k_qk_q6k_v.metal. It preserves the
-// llama.cpp-style 64-thread / 4-row Q4_K geometry while removing the separate
+// reference-style 64-thread / 4-row Q4_K geometry while removing the separate
 // V dispatch for Gemma layers whose V projection is also Q4_K.
 
 struct QKVDensePush {

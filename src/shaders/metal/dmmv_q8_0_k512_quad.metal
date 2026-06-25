@@ -13,7 +13,7 @@ struct DmmvPush {
 //
 // The generic quad-row Q8 path assigns one Q8 block to one lane. At K=512 that
 // leaves lanes 16..31 idle because there are only 16 blocks per row. Split each
-// block across two lanes instead. This variant extends llama.cpp's adjacent-row
+// block across two lanes instead. This variant extends the reference implementation's adjacent-row
 // reuse discipline to eight output rows per simdgroup; each lane loads the X
 // half-block once and applies it to eight Q8 rows.
 kernel void main0(

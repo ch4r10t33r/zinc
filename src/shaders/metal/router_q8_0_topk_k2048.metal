@@ -4,7 +4,7 @@ using namespace metal;
 
 // Exact Qwen3.6 Q8_0 router for hidden_dim=2048, n_experts=256, topk=8.
 //
-// Adapts llama.cpp `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` by
+// Adapts the reference implementation `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` by
 // baking the hot K=2048 row walk into the router/top-k kernel. The top-k
 // finalization keeps the same vLLM-style compact ids + normalized weights
 // contract as router_q8_0_topk.metal.

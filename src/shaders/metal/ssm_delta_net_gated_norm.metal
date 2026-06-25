@@ -54,7 +54,7 @@ kernel void main0(
     threadgroup float k[128];
     threadgroup float delta_out[128];
     // Keep each cross-simdgroup reduction in its own scratch lane. This mirrors
-    // llama.cpp's Metal matvec reducers, where reduction scratch is not reused
+    // the reference implementation's Metal matvec reducers, where reduction scratch is not reused
     // until the dependent value is fully consumed; here it lets the RMS pass
     // start without an extra barrier after the state update.
     threadgroup float partial_q[4];

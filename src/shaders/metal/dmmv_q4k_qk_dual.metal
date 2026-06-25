@@ -4,7 +4,7 @@ using namespace metal;
 // Dense Gemma single-token Q+K dual Q4_K matvec.
 //
 // Pairs the attention Q and K projections (same K dimension, both Q4_K, but
-// distinct M_q and M_k) into a single dispatch. Adapts llama.cpp's
+// distinct M_q and M_k) into a single dispatch. Adapts the reference implementation's
 // kernel_mul_mv_q4_K_f32 row layout (NSG=2, NR0=2, 64 threads). Unlike the
 // existing dmmv_q4k_dual_llama kernel — which dispatches the gate/up pair
 // over grid.y={0,1} with grid.x = max(M_gate, M_up) and so wastes

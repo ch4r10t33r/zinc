@@ -13,7 +13,7 @@ struct Params {
 
 // Exact Qwen3.6 token-major MoE finalize plus next-layer RMSNorm.
 //
-// Adapts llama.cpp's Metal graph-tail fusion discipline: once the MoE reduce
+// Adapts the reference implementation's Metal graph-tail fusion discipline: once the MoE reduce
 // has the final hidden row in registers, immediately materialize the next
 // layer's normalized input and avoid a separate RMSNorm dispatch/barrier.
 kernel void main0(

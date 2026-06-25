@@ -2,7 +2,7 @@
 using namespace metal;
 
 // Q5_K GEMM kernel for Qwen3.6 prompt-sized batched projections.
-// Adapted from llama.cpp ggml-metal.metal `kernel_mul_mm_q5_K_f32`:
+// Adapted from the reference implementation ggml-metal.metal `kernel_mul_mm_q5_K_f32`:
 // dequantize Q5_K weights into half tiles, multiply by a contiguous f32 token
 // matrix with simdgroup 8x8 matrix instructions, and store token-major f32.
 

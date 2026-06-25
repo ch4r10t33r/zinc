@@ -9,7 +9,7 @@ using namespace metal;
 //   routing = F32 router top-k(norm)
 //   shared_gate = dot(F32 shared-gate, norm)
 //
-// This adapts llama.cpp's dependency-edge fusion discipline and vLLM's compact
+// This adapts the reference implementation's dependency-edge fusion discipline and vLLM's compact
 // top-k metadata flow to the post-attention boundary. It keeps the same
 // selected-expert row format as router_f32_topk_batched.
 

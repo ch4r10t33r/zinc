@@ -7,7 +7,7 @@
 // the activation once per row-tile (~160x redundant); this kernel quantizes the
 // f32 SwiGLU activation exactly once into packed int8 + per-32-block scales.
 //
-// Block granularity is 32 elements (matching the GEMM's BK tile and llama.cpp's
+// Block granularity is 32 elements (matching the GEMM's BK tile and the reference implementation's
 // Q8_0 block size), so activation outliers are scaled locally — far more robust
 // than a single per-token scale for the unnormalized SwiGLU output.
 //

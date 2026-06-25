@@ -9,7 +9,7 @@ using namespace metal;
 // gate/up projections through the following SwiGLU, so this removes one small
 // dispatch from every routed MoE layer without changing routing semantics.
 //
-// Like llama.cpp's fixed-shape Metal mul_mv specializations, this bakes the
+// Like the reference implementation's fixed-shape Metal mul_mv specializations, this bakes the
 // Qwen3.6 K=2048 block count and row stride into the hot loop.
 
 struct MoeGateUpDualDmmvPush {

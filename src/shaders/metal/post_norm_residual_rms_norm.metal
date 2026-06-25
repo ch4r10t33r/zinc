@@ -18,7 +18,7 @@ struct Params {
 //   norm_out[i] = output_w[i] * hidden[i] * rsqrt(mean(hidden^2) + eps)
 //
 // Adapted from residual_rms_norm.metal (existing in-tree fusion) and
-// llama.cpp `ggml-metal-ops.cpp::ggml_metal_op_rms_norm` op-fusion idea
+// the reference implementation `ggml-metal-ops.cpp::ggml_metal_op_rms_norm` op-fusion idea
 // (residual+norm in one pass), extended to two reductions.
 //
 // 256 threads / 8 simdgroups per threadgroup. One token per threadgroup

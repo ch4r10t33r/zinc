@@ -1,5 +1,5 @@
 #version 460
-// ZINC — Q6_K DMMV, K-parallel (llama.cpp-style)
+// ZINC — Q6_K DMMV, K-parallel (reference-style)
 // 16 threads per Q6_K superblock, 4 blocks processed in parallel.
 // Each thread handles 16 weight elements via byte loads + vec4 B reads.
 // Wave64 subgroupAdd reduction. Zero shared memory.

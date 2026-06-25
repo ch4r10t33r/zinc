@@ -45,7 +45,7 @@ pub const standard_configs = [_]BenchConfig{
 
 /// Target bandwidth utilization thresholds.
 pub const targets = struct {
-    pub const vocab_output_pct: f64 = 90.0; // 93.2% measured in llama.cpp
+    pub const vocab_output_pct: f64 = 90.0; // 93.2% measured in the reference implementation
     pub const large_attn_pct: f64 = 80.0; // 83.6% measured
     pub const medium_attn_pct: f64 = 60.0; // 66.1% measured
 };

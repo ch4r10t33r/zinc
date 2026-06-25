@@ -8,7 +8,7 @@ using namespace metal;
 // Dispatch: grid (ceil(rows / 8), n_experts_used, 1), threadgroup (64, 1, 1).
 // Each workgroup handles 8 rows of one expert: each simdgroup computes four
 // adjacent rows while sharing the same cached activation vector. This mirrors
-// llama.cpp's Metal mul_mv_id Q5_1 shape (N_R0_Q5_1=4, N_SG_Q5_1=2). All experts
+// the reference implementation's Metal mul_mv_id Q5_1 shape (N_R0_Q5_1=4, N_SG_Q5_1=2). All experts
 // share the same input vector slice in X
 // (or n_experts_used × inter_dim slices when x_expert_stride != 0).
 //

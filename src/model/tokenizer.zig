@@ -156,7 +156,7 @@ pub const Tokenizer = struct {
             // Default: prepend BOS when a BOS token ID is defined.
             // Llama 3 uses GPT2 tokenizer format but requires BOS (128000).
             // Qwen3/3.5 explicitly omit BOS metadata — do NOT prepend.
-            // GPT-OSS defines a BOS token but llama.cpp does not prepend it for prompts.
+            // GPT-OSS defines a BOS token but the reference implementation does not prepend it for prompts.
             if (std.mem.eql(u8, architecture, "gpt-oss")) break :blk false;
             if (isQwen35LikeName(architecture) or isQwen35LikeName(pre_name)) break :blk false;
             break :blk bos_id != null;

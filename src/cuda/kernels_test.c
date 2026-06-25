@@ -36,7 +36,7 @@ static void get_scale_min_k4_h(int j, const uint8_t* q, uint8_t* d, uint8_t* m) 
            *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
 
-// Canonical llama.cpp dequant_row_q4_K for one 256-elem block (36 u32).
+// Canonical reference implementation dequant_row_q4_K for one 256-elem block (36 u32).
 static void deq_q4k_block_h(const uint32_t* blk, float* out) {
     uint32_t dd = blk[0];
     float d = half_to_float_h((uint16_t)(dd & 0xFFFF));
@@ -54,7 +54,7 @@ static void deq_q4k_block_h(const uint32_t* blk, float* out) {
     }
 }
 
-// Canonical llama.cpp dequant_row_q5_K for one 256-elem block (176 bytes).
+// Canonical reference implementation dequant_row_q5_K for one 256-elem block (176 bytes).
 static void deq_q5k_block_h(const unsigned char* blk, float* out) {
     float d = half_to_float_h((uint16_t)(blk[0] | (blk[1] << 8)));
     float dmin = half_to_float_h((uint16_t)(blk[2] | (blk[3] << 8)));
@@ -72,7 +72,7 @@ static void deq_q5k_block_h(const unsigned char* blk, float* out) {
     }
 }
 
-// Canonical llama.cpp dequant_row_q6_K for one 256-elem block (210 bytes).
+// Canonical reference implementation dequant_row_q6_K for one 256-elem block (210 bytes).
 static void deq_q6k_block_h(const unsigned char* blk, float* out) {
     float d = half_to_float_h((uint16_t)(blk[208] | (blk[209] << 8)));
     const uint8_t* ql = blk + 0;

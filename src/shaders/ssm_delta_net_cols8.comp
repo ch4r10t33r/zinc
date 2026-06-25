@@ -1,7 +1,7 @@
 #version 460
 // ZINC — SSM delta-net recurrent state update, 4 output rows per workgroup.
 //
-// Mirrors llama.cpp's GDN launch shape for S=128 on subgroup-clustered
+// Mirrors the reference implementation's GDN launch shape for S=128 on subgroup-clustered
 // hardware: one wave64 is split into four 16-lane clusters. Each cluster owns
 // one output row and each lane keeps 8 state columns in registers. Q/K L2
 // normalization is computed once per workgroup and shared across all 4 rows.

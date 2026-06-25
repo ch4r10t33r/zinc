@@ -9,7 +9,7 @@ struct DmmvPush {
     uint y_offset;
 };
 
-// Q8_0 LM-head greedy path: keep llama.cpp's two-rows-per-simdgroup
+// Q8_0 LM-head greedy path: keep the reference implementation's two-rows-per-simdgroup
 // mul_mv shape, but emit one (idx, value) pair per threadgroup instead of
 // materializing the full vocab logits.
 

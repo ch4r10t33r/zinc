@@ -3,7 +3,7 @@ using namespace metal;
 
 // Dense Gemma single-token gate/up Q4_K matvec fused with GeGLU.
 //
-// The row layout follows llama.cpp's kernel_mul_mv_q4_K_f32:
+// The row layout follows the reference implementation's kernel_mul_mv_q4_K_f32:
 // 64 threads per threadgroup, 2 simdgroups, 2 rows per simdgroup.
 // Unlike the older K=5376-specialized kernels, this does not stage the input
 // vector in threadgroup memory. It only fuses the two same-shape projections

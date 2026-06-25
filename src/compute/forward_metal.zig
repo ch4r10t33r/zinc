@@ -35,13 +35,13 @@ const qwen_ssm_projection_prefill_min_tokens: usize = 32;
 const qwen35_dense27b_queued_prefill_max_tokens: usize = 40;
 const qwen35_dense9b_prefill_prefix_layers: usize = 32;
 const qwen_ssm_projection_validate_default_tokens: u32 = 4;
-// llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
+// the reference implementation's Metal `ggml_metal_op_mul_mat_id` switches from the small
 // matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
 // that is only the minimum batch shape. Validate Qwen route packing closer to
 // the Effort 16 prompt so vLLM-style expert block packing and the SSM prefix
 // validator exercise about 1K route slots by default.
 const qwen_moe_route_pack_validate_tokens: u32 = 128;
-// Let the Qwen3.6 llama.cpp-style graph batching / vLLM route-packed MoE
+// Let the Qwen3.6 reference-style graph batching / vLLM route-packed MoE
 // prefix run until the model ends or a per-layer support guard fails. This
 // keeps the layer-major prompt path from falling back to token-major decode at
 // an arbitrary layer cap.
@@ -708,7 +708,7 @@ fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u
 fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32, enabled: bool) bool {
     const name = tensor.info.name;
 
-    // Adapt llama.cpp `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` and
+    // Adapt the reference implementation `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` and
     // `ggml-metal-impl.h`'s Q8_0 geometry (N_R0=2, N_SG=4): Qwen3.6 SSM
     // prompt prefill is dominated by these Q8 projections, and the 128-thread
     // shape keeps the per-row reduction close to the production Metal backend
@@ -722,7 +722,7 @@ fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTen
     }
     // ssm_out (M=2048, K=4096) and SSM attn_gate (M=4096, K=2048) intentionally
     // fall through to the nr=4 `dmmv_q8_0_repacked_k{2048,4096}_qwen` paths
-    // (same llama.cpp adjacent-row matvec grouping that won the cycle-1 LM head
+    // (same reference implementation adjacent-row matvec grouping that won the cycle-1 LM head
     // route and cycle-4 ssm_out route). The narrower M=4096 attn_gate produces
     // 64 workgroups under nr=4 — between ssm_out's 32 WG and qkv's 128 WG —
     // saturating M4 Max's 40 cores without the qkv-shape over-subscription that
@@ -802,7 +802,7 @@ fn isGemma26A4BMoeShape(cfg: ModelConfig) bool {
 fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
     // Keep Gemma26 Q8-down MoE on the routed device path by default. The
     // explicit fallback path has to break the shared decode command so CPU
-    // routing/post-vector work can observe intermediate buffers; llama.cpp's
+    // routing/post-vector work can observe intermediate buffers; the reference implementation's
     // `ggml_metal_op_mul_mat_id` keeps the selected-expert path device-side.
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
@@ -1060,7 +1060,7 @@ fn qwen35DensePrefillPrefixLayerLimit(cfg: ModelConfig) usize {
     if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return qwen35Dense9bPrefillPrefixLayerLimit();
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         const interval: usize = @intCast(@max(cfg.full_attn_interval, 1));
-        // llama.cpp's Metal `ggml_metal_op_mul_mat` keeps a 36-token prompt on
+        // the reference implementation's Metal `ggml_metal_op_mul_mat` keeps a 36-token prompt on
         // simdgroup matrix-matrix once dependencies allow it. The 63-layer
         // prefix measured correct, leaving only the final full-attention layer
         // in token replay; include that last interval so prefill reaches the
@@ -1123,7 +1123,7 @@ fn canFuseDenseFfnNextAttnNorm(
 fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
-        // per token. llama.cpp's `ggml_metal_graph_compute` keeps graph work in
+        // per token. the reference implementation's `ggml_metal_graph_compute` keeps graph work in
         // a small queued command-buffer set; group two 3xSSM+1xattn blocks while
         // avoiding the previously failed whole-token command buffer.
         return 8;
@@ -1139,7 +1139,7 @@ fn qwenSsmDeltaGatedNormExactShape(cfg: ModelConfig, dt_rank: u32, head_v_dim: u
 }
 
 fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
-    // llama.cpp keeps norm as a separate graph op before the Metal matmul
+    // the reference implementation keeps norm as a separate graph op before the Metal matmul
     // kernels. For the Qwen3.6 35B SSM shape, fusing RMSNorm into per-row Q8
     // DMMV repeats the 2048-wide norm reduction across thousands of rows.
     if (defaultQwen36SsmPrefillProjectionEnabled(cfg)) return false;
@@ -2516,7 +2516,7 @@ pub fn defaultKvCacheQ8Enabled(config: ModelConfig, debug_validation_enabled: bo
     // Disable Q8 KV cache for gpt-oss — the OAI SwiGLU activation is sensitive to
     // quantization noise in the KV cache, causing degenerate output.
     if (config.architecture == .gpt_oss) return false;
-    // Gemma4 uses the ISWA attention path in llama.cpp, which applies extra
+    // Gemma4 uses the ISWA attention path in the reference implementation, which applies extra
     // K/V rotation handling when the KV cache is quantized. Metal does not
     // implement that path yet, so keep Gemma4 on the unquantized cache for
     // correctness.
@@ -3967,7 +3967,7 @@ fn setDmmvTimingLabel(
 ) bool {
     if (!kernel_timing.enabled) return false;
 
-    // Same metadata discipline as llama.cpp `ggml_metal_op_encode_impl`: the
+    // Same metadata discipline as the reference implementation `ggml_metal_op_encode_impl`: the
     // probe labels the logical graph edge, not just the reusable pipeline.
     const path = classifyDmmvPath(engine, tensor);
     const detail = classifyDmmvDetail(engine, tensor, path);
@@ -5251,7 +5251,7 @@ fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool
 fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     if (route_slots == 0 or n_experts == 0) return 0;
 
-    // vLLM's `moe_align_block_size` and llama.cpp's Metal `mul_mm_id` both
+    // vLLM's `moe_align_block_size` and the reference implementation's Metal `mul_mm_id` both
     // operate on expert-contiguous route blocks. Once every expert has one
     // partially-filled block, each additional block needs `moe_route_block_cols`
     // more routes assigned to that expert. This is a correctness-safe upper
@@ -6200,7 +6200,7 @@ fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     // Auto-enable for dense Gemma (original case) and dense Qwen3 (Effort 14
     // post-loop-cycle-29 finding). Per-token prefill on Qwen3-8B Q4_K_M ran
     // at ~48 tok/s; batched ran at ~354 tok/s — 7.4x improvement, lifting
-    // ZINC from 12% to 85% of llama.cpp's 416 tok/s prefill on this M1 Max.
+    // ZINC from 12% to 85% of the reference implementation's 416 tok/s prefill on this M1 Max.
     // The structural checks in canUseBatchedPrefill (non-Gemma branch at
     // line 1336+) already accept Qwen3 dense via the generic structural
     // path; this function only controls whether the path fires WITHOUT
@@ -6264,7 +6264,7 @@ fn defaultCommandEncoderMode(cfg: ModelConfig) CommandEncoderMode {
     // (which uses `beginCommand`, i.e. the concurrent encoder) yet the
     // real Gemma 31B decode achieves ~5 GB/s effective when running through
     // the serial encoder. Switching back to `MTLDispatchTypeConcurrent`
-    // (which is exactly the encoder llama.cpp's `ggml-metal.m` uses for its
+    // (which is exactly the encoder the reference implementation's `ggml-metal.m` uses for its
     // graph compute) lets independent Q/K/V and gate/up projections overlap
     // and — more importantly — keeps the GPU busy enough that power-management
     // does not down-clock between the per-layer chain. Every existing
@@ -9117,7 +9117,7 @@ pub const InferenceEngine = struct {
     }
 
     fn prefillBatchQwenRoutePackedFullValidate(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, target_context_tokens: u32) !void {
-        // Validation-only replay of the production idea from llama.cpp
+        // Validation-only replay of the production idea from the reference implementation
         // `ggml_metal_op_mul_mat_id` and vLLM `moe_align_block_size`: run the
         // layer-major route-packed candidate over the active prompt, then
         // restore the token-major result so generation remains authoritative.
@@ -9207,7 +9207,7 @@ pub const InferenceEngine = struct {
         ref_logits: []const f32,
         tol: f32,
     ) !void {
-        // llama.cpp's `ggml_metal_op_mul_mat_id` and vLLM's
+        // the reference implementation's `ggml_metal_op_mul_mat_id` and vLLM's
         // `moe_align_block_size` both rely on expert-major route packing. When
         // this candidate diverges, cap the packed prefix depth to identify the
         // first layer whose packed-route output is no longer equivalent to the
@@ -9362,7 +9362,7 @@ pub const InferenceEngine = struct {
     }
 
     fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
-        // Mirror llama.cpp's Metal graph submission style: encode/commit the
+        // Mirror the reference implementation's Metal graph submission style: encode/commit the
         // token-major prompt graph ahead of the CPU and synchronize only at the
         // final prompt token. SSM recurrence and MoE routing stay on the existing
         // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
@@ -9503,7 +9503,7 @@ pub const InferenceEngine = struct {
         if (!self.canUseQueuedTokenMajorPrefill(prompt_len)) return false;
         if (shouldUseQwen35Dense27bQueuedTokenMajorPrefill(self.config, prompt_len)) return false;
         if (isGemma26A4BMoeShape(self.config) and prompt_len >= 64 and prompt_len <= 96) {
-            // llama.cpp's `ggml_metal_graph_compute` works well with a small
+            // the reference implementation's `ggml_metal_graph_compute` works well with a small
             // leading command because the long tail is encoded asynchronously.
             // This path records the tail serially; on the 70-token public
             // prompt it collapsed to [8,62] and made the final wait dominate.
@@ -9589,7 +9589,7 @@ pub const InferenceEngine = struct {
             return @min(prompt_len / 2, @as(usize, @intCast(requested)));
         }
 
-        // Adapt llama.cpp `ggml-metal-context.m::ggml_metal_graph_compute`:
+        // Adapt the reference implementation `ggml-metal-context.m::ggml_metal_graph_compute`:
         // commit a small leading graph slice so the GPU starts while the CPU
         // records the remaining command buffer. Recent Effort 16 sweeps put
         // the stable default back at 8 tokens; keep the env override available
@@ -9794,7 +9794,7 @@ pub const InferenceEngine = struct {
     fn prefillBatchQueuedTokenMajorSingleCommand(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
         // path, so long prompt graphs can be queued in a small number of ordered
-        // command buffers. llama.cpp's ggml_metal_graph_compute reports 1-2
+        // command buffers. the reference implementation's ggml_metal_graph_compute reports 1-2
         // command buffers as the practical sweet spot; submit a small leading
         // chunk so the GPU starts while the CPU records the long tail.
         const hidden_dim = self.config.hidden_dim;
@@ -9907,7 +9907,7 @@ pub const InferenceEngine = struct {
         var layer0_cmd = try beginProfiledCommand(self, profile);
         errdefer if (layer0_cmd.handle != null) layer0_cmd.wait();
 
-        // llama.cpp `ggml_metal_op_mul_mat_id` switches prompt-sized routed
+        // the reference implementation `ggml_metal_op_mul_mat_id` switches prompt-sized routed
         // work to row-batched kernels at >=32 tokens, and vLLM keeps MoE
         // prepare/finalize in token-major batches. Layer 0 was still using an
         // older per-token SSM tail here; seed the scratch hidden matrix with
@@ -9976,7 +9976,7 @@ pub const InferenceEngine = struct {
         defer if (layer0_pending.handle != null) layer0_pending.wait();
 
         if (route_packed_start_layer >= self.layer_tensors.len) {
-            // llama.cpp's Metal graph keeps prompt-sized work layer-major and
+            // the reference implementation's Metal graph keeps prompt-sized work layer-major and
             // materializes only requested graph outputs. Once the Qwen prefix
             // reaches model_end, every prompt token's KV/SSM state and final
             // hidden row already exist in scratch.hidden; avoid replaying
@@ -10976,7 +10976,7 @@ pub const InferenceEngine = struct {
     /// Q4_K LM head 1024: dedicated vocab projection kernel — 32 rows per threadgroup (1024 threads).
     /// On Apple9/M4, the 1024-thread shape tends to trade away too much
     /// occupancy for reuse, so keep that path reserved for Apple10-class parts.
-    /// Keep Gemma 31B's K=5376 layer decode on the llama.cpp-style
+    /// Keep Gemma 31B's K=5376 layer decode on the reference-style
     /// 2-simdgroup Q4_K kernel: caching the 21 KiB activation vector costs
     /// occupancy and buys little reuse compared with the much larger weight
     /// stream. The vocab projection is the exception: its very large M can
@@ -11001,7 +11001,7 @@ pub const InferenceEngine = struct {
                     // Qwen3.6 27B dense gate/up is the hottest Q4_K bucket
                     // (M=17408,K=5120). Cycle 5 showed that grouping gate/up
                     // projections in one dispatch loses throughput here, so keep
-                    // single-projection math. This variant adapts llama.cpp
+                    // single-projection math. This variant adapts the reference implementation
                     // `kernel_mul_mv_q4_K_f32_impl` more literally than the
                     // retained NSG4 cleanup route: bake K=5120, but preserve the
                     // 2-simdgroup / 4-row threadgroup shape to reduce per-TG
@@ -11060,10 +11060,10 @@ pub const InferenceEngine = struct {
                     break :blk .{ .pipe = &self.dmmv_q4k_lmhead_1024_pipe, .push_idx = 1, .rows_per_wg = 32, .block_size = 1024 };
                 }
                 // K=5376 (Gemma 31B dense) and other wide-K Q4_K shapes fall
-                // through to the llama.cpp-style 2-simdgroup base kernel below.
+                // through to the reference-style 2-simdgroup base kernel below.
                 // The previous specialized 512-thread/16-row variant ran at
                 // ~5 GB/s effective on Apple9 (cycle 24 of Effort 12 profile)
-                // versus llama.cpp's ~440 GB/s on the same shape; do not
+                // versus the reference implementation's ~440 GB/s on the same shape; do not
                 // re-specialize without bench-metal-shapes evidence.
                 if (K <= 3072 and
                     self.dmmv_q4k_lmhead_pipe.max_threads_per_threadgroup >= 512 and
@@ -11081,7 +11081,7 @@ pub const InferenceEngine = struct {
             .mxfp4 => .{ .pipe = &self.dmmv_mxfp4_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
             .q5_k => .{ .pipe = &self.dmmv_q5k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
             .q6_k => blk: {
-                // dmmv_q6k_llama is a faithful llama.cpp port (N_SG=2, N_R0=2,
+                // dmmv_q6k_llama is a faithful reference implementation port (N_SG=2, N_R0=2,
                 // simdgroup-parallel). The legacy dmmv_q6k_pipe is a SPIRV-Cross
                 // single-thread-per-row Vulkan port. For dense Q6_K matvec at
                 // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
@@ -11152,7 +11152,7 @@ pub const InferenceEngine = struct {
                         // 256 WGs (6.4 WG/core), the same density cycle 11
                         // KEPT for `exact_qwen_k4096` (M=2048 K=4096 SSM-out)
                         // and cycle 4 KEPT for `exact_qwen_k2048` M=4096
-                        // (SSM-gate). Adapted from llama.cpp
+                        // (SSM-gate). Adapted from the reference implementation
                         // `kernel_mul_mv_q8_0_f32_impl` (ggml-metal.metal)
                         // N_SG=1 fallback for short K rows.
                         //
@@ -11219,7 +11219,7 @@ pub const InferenceEngine = struct {
                         self.dmmv_q8_0_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
                     {
                         // Exact Qwen3.6 full-attention packed Q(+gate)
-                        // shape. This applies the same llama.cpp-style
+                        // shape. This applies the same reference-style
                         // adjacent-row Q8 matvec grouping used for SSM qkv to
                         // the remaining hot attn M=8192,K=2048 prompt bucket.
                         break :blk .{ .pipe = &self.dmmv_q8_0_k2048_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
@@ -11271,7 +11271,7 @@ pub const InferenceEngine = struct {
                         break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
                     }
                     // lm_head (M=248320 for Qwen3.6-35B): use 512-thread wide path.
-                    // Adapted from llama.cpp's Q8_0 mul_mat_vec with N_R0=2 (nr=2).
+                    // Adapted from the reference implementation's Q8_0 mul_mat_vec with N_R0=2 (nr=2).
                     if (K <= 2048 and M >= 65536 and tensor == self.lm_head and
                         self.dmmv_q8_0_k2048_pipe.max_threads_per_threadgroup >= 512)
                     {
@@ -11344,7 +11344,7 @@ pub const InferenceEngine = struct {
             return self.dmmvPipelineForType(tensor, M, K);
         }
 
-        // Adapt llama.cpp `ggml_metal_op_encode_impl`: hot graph recording
+        // Adapt the reference implementation `ggml_metal_op_encode_impl`: hot graph recording
         // keeps per-node dispatch metadata instead of re-deriving it for every
         // encoded op. Qwen3.6 prompt prefill records thousands of identical
         // non-repacked DMMVs in the token-major tail, so cache the selected
@@ -11732,7 +11732,7 @@ fn tensorModelIndex(engine: *const InferenceEngine, tensor: *const metal_loader.
 }
 
 fn classifyDmmvPath(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor) DmmvPathClass {
-    // Adapt llama.cpp `ggml_metal_op_encode_impl`'s graph-node metadata
+    // Adapt the reference implementation `ggml_metal_op_encode_impl`'s graph-node metadata
     // discipline: classify weight tensors once during engine init, then keep
     // profile-on command recording from rescanning tensor names thousands of
     // times per prompt.
@@ -12351,7 +12351,7 @@ fn canUseQwen36FullAttnQ8Pair(
     K: u32,
 ) bool {
     const cfg = engine.config;
-    // llama.cpp's `kernel_mul_mv_q8_0_f32_impl` amortizes X-vector loads across
+    // the reference implementation's `kernel_mul_mv_q8_0_f32_impl` amortizes X-vector loads across
     // adjacent row work. Use ZINC's paired-Q8 variant only for the measured
     // Qwen3.6 hybrid shape so unrelated Q8 attention paths stay unchanged.
     return cfg.architecture == .qwen2_moe and
@@ -12406,7 +12406,7 @@ fn canUseDenseQ4KGateUpDual(
     M: u32,
     K: u32,
 ) bool {
-    // llama.cpp keeps single-token FFN gate/up as ordinary mul_mv nodes.
+    // the reference implementation keeps single-token FFN gate/up as ordinary mul_mv nodes.
     // vLLM-style packing/fusion only pays off when there are multiple
     // token-expert rows to group, so keep Gemma 31B decode on the measured
     // single-projection Q4_K kernel instead of the custom K=5376 dual dispatch.
@@ -12524,7 +12524,7 @@ fn canUseQwen35SsmQ6Q4QkvGatePair(
     gate_rows: u32,
     K: u32,
 ) bool {
-    // Adapt llama.cpp `ggml_metal_op_encode_impl` dependency batching to the
+    // Adapt the reference implementation `ggml_metal_op_encode_impl` dependency batching to the
     // exact Qwen3.6 27B SSM projection pair: qkv and gate read the same norm
     // row and are only joined later at the conv/delta boundary. Reuse the
     // existing mixed Q4_K/Q6_K QKV shader with M_q=0 so this removes one
@@ -12555,7 +12555,7 @@ fn canUseQwen35SsmQ4Q4QkvGatePair(
     gate_rows: u32,
     K: u32,
 ) bool {
-    // Same llama.cpp `ggml_metal_op_encode_impl` same-input batching
+    // Same reference implementation `ggml_metal_op_encode_impl` same-input batching
     // discipline as the mixed Q6/Q4 sibling, but only for the all-Q4 SSM
     // pair that the current Qwen3.6 27B profile names separately. Reuse the
     // optimized single-axis Q4 dual-row shader instead of the dense gate/up
@@ -12835,7 +12835,7 @@ fn canUseDenseQ4KGateUpGeGLU(
 ) bool {
     // Effort-12 cycle-40 bench-metal-shapes confirmed dense Gemma 31B kernels run
     // at ~500 GB/s but per-token GPU wait is 57x the sum of kernel times — the
-    // bottleneck is per-dispatch overhead, not per-kernel bandwidth. llama.cpp
+    // bottleneck is per-dispatch overhead, not per-kernel bandwidth. the reference implementation
     // keeps single-token gate/up as separate mul_mv nodes because it pays no
     // dispatch tax on its target hardware, but on Apple9 with 60 dependent
     // layers each saved dispatch removes one encoder-pipeline stall. Re-enable
@@ -13033,7 +13033,7 @@ fn canUseQwen35Dense9bPrefillDownAcc(
     K: u32,
     layer_output_scale: f32,
 ) bool {
-    // Adapt llama.cpp `ggml_metal_op_mul_mat`'s producer/consumer discipline:
+    // Adapt the reference implementation `ggml_metal_op_mul_mat`'s producer/consumer discipline:
     // keep this exact-shape dense-down matvec in the same command stream and
     // write directly into its only consumer buffer. The guard avoids replacing
     // existing residual+norm fusions, validation paths, or scaled layer tails.
@@ -13097,7 +13097,7 @@ fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
     K: u32,
 ) !void {
     // Default-off validator for the Qwen3.6 27B dense FFN fusion that cycle 3
-    // rejected on throughput. It mirrors llama.cpp's fused op validation
+    // rejected on throughput. It mirrors the reference implementation's fused op validation
     // discipline: run the candidate next to the production reference, commit
     // once, compare the materialized activation row, then resume the normal
     // command stream with production buffers intact.
@@ -13286,7 +13286,7 @@ fn dispatchPairedQ8DmmvOnCmd(
     // default block=512 yields only ceil(512/32)=16 WGs → 0.4 WG/core on the
     // M4 Max's 40 cores — the same under-subscription anti-pattern cycles
     // 5-8/11/13 hit on the single-tensor Q8 paths. Cycle-14 dropped to
-    // block=64 (128 WGs / 3.2 WG/core). Adapted from llama.cpp
+    // block=64 (128 WGs / 3.2 WG/core). Adapted from the reference implementation
     // `kernel_mul_mv_q8_0_f32_impl`'s N_SG=2 default for short rows.
     //
     // Cycle-15: Qwen3.6 full-attn Q+attn_gate paired (M=4096 K=2048, 10/token
@@ -13309,7 +13309,7 @@ fn dispatchPairedQ8DmmvOnCmd(
     // (one simdgroup per TG processing 2 rows via `base_row = (tg_id *
     // simdgroups_per_tg + sg_idx) * 2`), so per-row simd_sum math is unchanged
     // and the kernel uses only simd_sum (no threadgroup barriers) — single-
-    // simdgroup TGs are bit-identical to llama.cpp's
+    // simdgroup TGs are bit-identical to the reference implementation's
     // `kernel_mul_mv_q8_0_f32_impl` short-row branch. Fires for Qwen3.6
     // full-attn K+V at M=kv_dim=512 (10 attn layers × ~32 decode tokens = 320
     // calls/req); cycle-29's sibling change at the SwiGLU-fused variant
@@ -13366,7 +13366,7 @@ fn dispatchQwenSsmDualRepackedQ8K2048OnCmd(
     // over 12288 total rows) was justified by "half the per-WG launch
     // overhead" — true for PREFILL where dispatches are batched and compute-
     // bound. For DECODE where the dual is a hot per-token matvec, drop to
-    // llama.cpp's original N_SG=4 / block=128 → 1536 WGs (~38 WG/core), the
+    // the reference implementation's original N_SG=4 / block=128 → 1536 WGs (~38 WG/core), the
     // shape the upstream Metal backend uses by default. The shader reads
     // `simdgroups_per_threadgroup`, so per-row math is unchanged.
     const block_size: u32 = 128;
@@ -13514,7 +13514,7 @@ fn dispatchPairedQ8SwiGLUOnCmd(
     // all at the 6.4/core density. Each TG holds one simdgroup (32 threads)
     // processing two rows via `base_row = (tg_id * simdgroups_per_tg + sg_idx)
     // * 2`; `simdgroups_per_threadgroup` reads as 1 so per-row simd_sum math
-    // is unchanged. Adapted from llama.cpp `kernel_mul_mv_q8_0_f32_impl`
+    // is unchanged. Adapted from the reference implementation `kernel_mul_mv_q8_0_f32_impl`
     // (ggml-metal.metal) N_SG=1 short-row branch: small M=512 prefers the
     // narrower TG count over wider per-WG simdgroup parallelism. The shared
     // SwiGLU fires once per MoE layer (40/token), so the per-call WG-density
@@ -13577,7 +13577,7 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     // false) AND by the dt_rank=32 alpha+beta tail every SSM layer (total
     // rows = 64). Cycle-6 halved 1024→512 (2.4→4.8 WG/core); cycle-7 went
     // 512→256 (4.8→9.6 WG/core) for the 12288-row qkv+z case. Cycle-8 landed
-    // on llama.cpp's exact N_SG_Q8_0=4 / block=128 default for qkv+z (768
+    // on the reference implementation's exact N_SG_Q8_0=4 / block=128 default for qkv+z (768
     // WGs / 19.2 WG/core matches sibling non-fused dual at 38 WG/core).
     //
     // Cycle-13: shape-conditional. The qkv+z case (M0+M1=12288, ~30/req) is
@@ -13802,7 +13802,7 @@ fn selectQ8RepackedDispatchKindUncached(
         engine.dmmv_q8_0_repacked_k2048_qwen_pipe.thread_execution_width == 32 and
         engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 512)
     {
-        // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s adjacent-row matvec
+        // Adapt the reference implementation `kernel_mul_mv_q8_0_f32_impl`'s adjacent-row matvec
         // grouping to the Qwen3.6 LM head: M=248320 is a multiple of four, so
         // route through the tail-free repacked K=2048 nr=4 kernel and gain X
         // reuse over the generic nr=2 path.
@@ -13817,7 +13817,7 @@ fn selectQ8RepackedDispatchKind(
     M: u32,
     K: u32,
 ) Q8RepackedDispatchKind {
-    // Adapt llama.cpp `ggml_metal_op_encode_impl`'s per-node dispatch metadata
+    // Adapt the reference implementation `ggml_metal_op_encode_impl`'s per-node dispatch metadata
     // discipline: Qwen prompt prefill records thousands of identical repacked
     // Q8 matvecs, so avoid re-running shape/name/pipeline predicates each time.
     if (tensorModelIndex(engine, tensor)) |idx| {
@@ -14064,7 +14064,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             engine.dmmv_q8_0_repacked_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_pipe.max_threads_per_threadgroup >= 128)
         {
-            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl` (N_R0_Q8_0=2,
+            // Adapt the reference implementation `kernel_mul_mv_q8_0_f32_impl` (N_R0_Q8_0=2,
             // N_SG_Q8_0=4) to the private-repacked SSM Q8 path. Keep the
             // accepted TG128 occupancy shape, but use fixed-K kernels for the
             // hot Qwen3.6 SSM projections so the active prompt path avoids
@@ -14136,7 +14136,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             engine.dmmv_q8_0_repacked_k2048_qwen_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 512)
         {
-            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s fixed row-group
+            // Adapt the reference implementation `kernel_mul_mv_q8_0_f32_impl`'s fixed row-group
             // discipline to Qwen3.6's exact SSM/full-attn Q8 shapes: all
             // production rows are multiples of four, so avoid the generic
             // tail predicates in the hottest repacked K=2048 path.
@@ -14152,7 +14152,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             engine.dmmv_q8_0_repacked_k2048_quad_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
         {
-            // Same adjacent-row matvec discipline as llama.cpp's
+            // Same adjacent-row matvec discipline as the reference implementation's
             // kernel_mul_mv_q8_0_f32_impl, but with ZINC's repacked row
             // stride and the Qwen3.6 SSM K=2048 shape baked into the shader.
             const block_size: u32 = 512;
@@ -14184,7 +14184,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             engine.dmmv_q8_0_repacked_k4096_quad_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_k4096_quad_pipe.max_threads_per_threadgroup >= 512)
         {
-            // Adapt llama.cpp's `kernel_mul_mv_q8_0_f32_impl` adjacent-row
+            // Adapt the reference implementation's `kernel_mul_mv_q8_0_f32_impl` adjacent-row
             // matvec grouping to ZINC's repacked Q8 SSM-out K=4096 shape.
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
@@ -14340,7 +14340,7 @@ fn dispatchLmHeadAndArgmaxOnCmd(
 /// True when the dense Gemma final LM head can fuse `final_norm` (RMS
 /// scaled by `final_norm_gpu`) into its Q4_K matvec via
 /// `dmmv_q4k_lmhead_norm.metal`. The fused kernel mirrors the base
-/// llama.cpp `kernel_mul_mv_q4_K_f32` row layout (NSG=2, NR0=2, 64
+/// the reference implementation `kernel_mul_mv_q4_K_f32` row layout (NSG=2, NR0=2, 64
 /// threads) used by `dmmv_q4k.metal` for K=hidden_dim=5376 on Gemma
 /// 31B, so we only enable it where the base kernel would already have
 /// been selected (Q4_K, K%256==0, no private weight buffer).
@@ -14667,7 +14667,7 @@ fn dispatchDmmvMoeQ5kOnCmd(
         engine.config.ssm_d_inner == 4096 and
         engine.config.n_experts_used == 8 and
         std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight");
-    // Mirrors llama.cpp's routed matvec row grouping: reuse one selected expert input
+    // Mirrors the reference implementation's routed matvec row grouping: reuse one selected expert input
     // vector across adjacent output rows. The quad-row Apple9 shape cuts the
     // hot Qwen routed-down workgroup count by 25% versus tri-row; keep the env
     // toggles so the harness can A/B it against tri or pair if register pressure
@@ -14728,7 +14728,7 @@ fn dispatchDmmvMoeQ5_1OnCmd(
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
-    // Match llama.cpp's Metal mul_mv_id Q5_1 shape: two simdgroups per
+    // Match the reference implementation's Metal mul_mv_id Q5_1 shape: two simdgroups per
     // threadgroup, four Q5_1 rows per simdgroup, one cached activation vector.
     const rows_per_wg: u32 = 8;
     const block_size: u32 = 64;
@@ -14782,7 +14782,7 @@ fn canUseDenseGemmaDecodeGemm(
     if (M < 1024 or K % 256 != 0) return false;
     _ = tensor;
 
-    // This call site is single-token decode (N=1). llama.cpp's
+    // This call site is single-token decode (N=1). the reference implementation's
     // `ggml_metal_op_mul_mat` keeps that case on `kernel_mul_mv_*` and only
     // switches to simdgroup matrix-matrix once the RHS batch clears its
     // break-even threshold. Dense batched prefill still calls
@@ -14796,7 +14796,7 @@ fn canUseDenseQ6kSimdgroupDmmv(
     M: u32,
     K: u32,
 ) bool {
-    // Dense single-token decode should follow llama.cpp's mul_mv Q6_K path.
+    // Dense single-token decode should follow the reference implementation's mul_mv Q6_K path.
     // The MoE Q6_K shader stages X in threadgroup memory for routed experts;
     // that does not match this N=1 dense projection shape.
     return canUseDenseQ6kSimdgroupDmmvShape(engine.config, tensor.info.name, M, K) and
@@ -15187,7 +15187,7 @@ fn dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd(
 }
 
 /// Dispatch route-slot ordered MoE DMMV. Unlike grouped-column prefill, this
-/// mirrors llama.cpp's small-batch `mul_mv_id` branch: grid.y is one selected
+/// mirrors the reference implementation's small-batch `mul_mv_id` branch: grid.y is one selected
 /// token/expert route, and `routing_buf[route]` is the real expert id.
 fn dispatchDmmvMoeRoutesOnCmd(
     engine: *InferenceEngine,
@@ -16292,7 +16292,7 @@ fn dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
     }
 }
 
-/// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
+/// Dispatch a Q5_K × f32 batched matmul. Same reference implementation simdgroup-MM tile
 /// shape as Q4_K/Q6_K, with Q5_K's 176-byte blocks.
 fn dispatchGemmQ5KOnCmd(
     engine: *InferenceEngine,
@@ -16793,7 +16793,7 @@ fn dispatchSigmoidMulOnCmd(
 /// sigmoid-multiply on the input. Drops the standalone `dispatchSigmoidMulOnCmd`
 /// + its preceding `attn_out_buf` barrier on the apply_attn_gate path — gate_buf
 /// is already visible from the QKV-stage barrier, and the gated kernel reuses
-/// the same X load that the base DMMV already needed. Mirrors llama.cpp's
+/// the same X load that the base DMMV already needed. Mirrors the reference implementation's
 /// `ggml_metal_op_concurrency_check/reset` discipline of fusing single-consumer
 /// pre-projection ops into the projection itself.
 fn dispatchQwenGatedAttnOutQ8DmmvOnCmd(
@@ -18050,7 +18050,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
     }
     {
-        // llama.cpp `mul_mat_id` and Qwen's route-packed prefix path consume
+        // the reference implementation `mul_mat_id` and Qwen's route-packed prefix path consume
         // packed IDs by indexing token rows as `route / k`. Gemma's grouped
         // route path can do the same, so only the short route-slot path still
         // materializes duplicated route input.
@@ -18874,7 +18874,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
     const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
     const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
 
-    // Adapted from llama.cpp `ggml_metal_op_mul_mat_id` and vLLM
+    // Adapted from the reference implementation `ggml_metal_op_mul_mat_id` and vLLM
     // `moe_align_block_size`: once the prompt slice supplies many rows, keep
     // this full-attention layer in layer-major order, then feed its per-token
     // FFN inputs into the existing expert-major route-packed MoE.
@@ -18890,7 +18890,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
     }
     profileBarrier(cmd, profile, .full_attn);
 
-    // Keep llama.cpp's layer-major graph shape through Q/K-norm attention
+    // Keep the reference implementation's layer-major graph shape through Q/K-norm attention
     // layers instead of falling back to token-major decode. The layout matches
     // generic batched prefill: q/k are token-major, and each head is a
     // contiguous head_dim slice, so RMSNorm can run over N*heads slices.
@@ -19023,7 +19023,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
     const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
 
-    // llama.cpp switches Metal matmul work to a batched matrix path once the
+    // the reference implementation switches Metal matmul work to a batched matrix path once the
     // row batch is large enough (`ggml_metal_op_mul_mat_id`). Keep Qwen SSM
     // recurrence token-ordered, but batch this layer's Q8 input projections,
     // SSM-out projection, and route-packed MoE over the full prompt slice.
@@ -19136,7 +19136,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         profileSsmBarrierBuffers(cmd, profile, .delta, &.{&scratch.attn_out});
     }
 
-    // Adapt llama.cpp's Metal encoder barrier discipline
+    // Adapt the reference implementation's Metal encoder barrier discipline
     // (`ggml_metal_op_concurrency_reset` plus the graph encoder path): keep
     // the recurrent state update token-ordered inside one layer-major dispatch,
     // then expose only one ordered scratch.attn_out read to the gated norm below.
@@ -19164,7 +19164,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
     profileSsmBarrierBuffers(cmd, profile, .out, &.{&scratch.down});
 
-    // Adapt llama.cpp `ggml_metal_op_concurrency_reset` and vLLM
+    // Adapt the reference implementation `ggml_metal_op_concurrency_reset` and vLLM
     // `grouped_topk`: after the token-ordered SSM recurrence and batched
     // ssm_out projection, the residual/FFN-router tail is row-independent.
     // Keep it layer-major over the prompt slice instead of staging each token
@@ -19233,7 +19233,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
-    // Adapt llama.cpp `ggml_metal_op_mul_mat_id` source indexing: packed IDs
+    // Adapt the reference implementation `ggml_metal_op_mul_mat_id` source indexing: packed IDs
     // already encode token*k+slot, so gate/up can read token-ordered norms
     // directly instead of materializing a duplicated route-slot input buffer.
     if (use_active_blocks) {
@@ -20037,7 +20037,7 @@ fn dispatchFullAttnPrepOnCmd(
     // norm weights are present (Gemma 4 attn_q_norm + attn_k_norm), the
     // kernel also folds in those two RMS-norm passes, eliminating two
     // standalone DMMV-equivalent dispatches per dense full-attn layer
-    // (≈60+60/token on Gemma 31B). Adapted from llama.cpp's pattern of
+    // (≈60+60/token on Gemma 31B). Adapted from the reference implementation's pattern of
     // op-fusing rms_norm into the immediately-following producer.
     const fuse_qk_norm_into_rope_kv =
         can_fuse_rope_kv_write and
@@ -20047,7 +20047,7 @@ fn dispatchFullAttnPrepOnCmd(
     // decode path: fold (Q-norm, K-norm, Q-rope, K-rope) into a single
     // in-place dispatch when the f32 fused kernel cannot fire because of Q8
     // KV. The follow-up Q8 KV cache write reads k_buf as before. Mirrors
-    // llama.cpp's `ggml_metal_op_rms_norm` op-fusion discipline.
+    // the reference implementation's `ggml_metal_op_rms_norm` op-fusion discipline.
     const fuse_qk_norm_into_rope_inplace =
         !can_fuse_rope_kv_write and
         engine.kv_cache_q8 and
@@ -20098,7 +20098,7 @@ fn dispatchFullAttnPrepOnCmd(
     if (did_v_norm_dispatch) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
     }
-    // Adapted from llama.cpp's `ggml_metal_op_concurrency_check` (ggml-metal-ops.cpp:159):
+    // Adapted from the reference implementation's `ggml_metal_op_concurrency_check` (ggml-metal-ops.cpp:159):
     // skip the post-norm barrier when no Q/K/V norm dispatch was issued — the
     // preceding QKV-projection barrier (above) already orders writes to q_buf,
     // k_buf, v_buf before the rope+kv-write kernel reads them. On Gemma 31B
@@ -20181,7 +20181,7 @@ fn dispatchFullAttnPrepOnCmd(
         // Slow path: separate Q-rope, K-rope, and KV cache write dispatches.
         dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
         dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
-        // Adapt llama.cpp `ggml_mem_ranges_check_dst` (ggml-metal-common.cpp:165):
+        // Adapt the reference implementation `ggml_mem_ranges_check_dst` (ggml-metal-common.cpp:165):
         // the immediate next dispatch (KV cache write, including the Q8 variant on
         // the Qwen3.6 hot path) only reads k_buf and v_buf — v_buf has no in-flight
         // write since the initial QKV barrier, so scope this rope barrier to k_buf
@@ -20296,7 +20296,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     }
 
     if (can_fuse_rope_kv_write) {
-        // K/V-only variant of the llama.cpp-style RoPE materialization path:
+        // K/V-only variant of the reference-style RoPE materialization path:
         // final non-terminal prompt tokens write rotated K/V directly to cache.
         const v_input_buf: *const MetalBuffer = if (attn.use_k_as_v and !engine.debug_validation_enabled)
             &engine.k_buf
@@ -20334,7 +20334,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     recordFullAttnDispatchDelta(profile, .rope, rope_dispatch_before, cmd.dispatch_count);
 }
 
-/// Adapted from llama.cpp `ggml_metal_op_rope_set_rows`: rotates the K vector
+/// Adapted from the reference implementation `ggml_metal_op_rope_set_rows`: rotates the K vector
 /// for the current token and writes the result plus a caller-selected V stream
 /// directly into the layer's KV cache slot. Extended to also rotate the Q
 /// vector in the same dispatch so the dense decode path collapses
@@ -20395,7 +20395,7 @@ fn dispatchFusedRopeKvCacheWriteOnCmd(
 /// guarded on f32 KV via `can_fuse_rope_kv_write`) so that Qwen3.6's hot
 /// `kv_cache_q8` decode path can also collapse the (Q-norm, K-norm, Q-rope,
 /// K-rope) sequence into a single grid dispatch. K stays in `k_buf` for the
-/// follow-up `dispatchKvCacheWriteOnCmd` to quantize. Mirrors llama.cpp's
+/// follow-up `dispatchKvCacheWriteOnCmd` to quantize. Mirrors the reference implementation's
 /// `ggml_metal_op_rms_norm` op-fusion (ggml-metal-ops.cpp:3384) extended to
 /// the attention prep path.
 fn dispatchRopeQkNormInplaceOnCmd(
@@ -21899,7 +21899,7 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
     else
         &engine.qwen35_dense_prefill_down_buf;
 
-    // Adapt llama.cpp `ggml_metal_op_mul_mat`: once layer-0 SSM has already
+    // Adapt the reference implementation `ggml_metal_op_mul_mat`: once layer-0 SSM has already
     // materialized N prompt FFN-norm rows, run dense FFN as batched matmuls
     // instead of replaying N decode-shaped matvec triples.
     if (validate_dense) {
@@ -21915,7 +21915,7 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
     }
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
     if (canUseQwen35Dense9bPrefillGateUpSwiGLUGemm(engine, gate_t, up_t, inter_dim, hidden_dim, n_tokens)) {
-        // Same producer/consumer fusion llama.cpp applies at the graph level,
+        // Same producer/consumer fusion the reference implementation applies at the graph level,
         // but specialized for this dense prompt prefix: gate and up consume the
         // same normalized rows, and the only consumer is SwiGLU.
         dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
@@ -22225,7 +22225,7 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     const o_t = lt.attn_output orelse return error.MissingTensor;
     const attn_work_buf = &engine.qwen35_dense_prefill_swiglu_buf;
 
-    // Adapt llama.cpp `ggml_metal_op_mul_mat`: the 32-40 token public prompt
+    // Adapt the reference implementation `ggml_metal_op_mul_mat`: the 32-40 token public prompt
     // is large enough to make this first full-attention layer a real batched
     // matmul/flash-attn slice, then hand its materialized FFN norm to the
     // existing dense batched FFN path.
@@ -22647,7 +22647,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             n_tokens,
         );
     }
-    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: this edge only
+    // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`: this edge only
     // protects QKV before conv. Keep Z/alpha/beta free to overlap until the
     // later conv/delta join.
     profileSsmResourceBarrierBuffers(&cmd, profile, .qkv, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
@@ -22680,7 +22680,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         );
         if (profile) |p| p.ssm_conv_calls += 1;
 
-        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: conv only
+        // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`: conv only
         // consumes QKV, and delta-net only needs QKV/alpha/beta. Use a true
         // resource barrier here so the independent Z projection can keep
         // running until the gated-norm join.
@@ -22767,7 +22767,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             );
         };
 
-        // Adapt llama.cpp `ggml_metal_graph_compute` output materialization:
+        // Adapt the reference implementation `ggml_metal_graph_compute` output materialization:
         // while layer-0 SSM is already layer-major, also materialize the
         // post-SSM hidden row and FFN norm that token-major MoE consumes.
         // This keeps MoE routing on the validated per-token path but removes
@@ -22776,7 +22776,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             profileSsmBarrierBuffers(&cmd, profile, .out, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
             const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
             const gate_inp_shexp = lt.ffn_gate_inp_shexp orelse return error.MissingTensor;
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` and vLLM
+            // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset` and vLLM
             // `fused_topk`: the SSM-out projection is the only dependency edge,
             // so compute the residual row, FFN norm, compact top-k routing, and
             // scalar shared gate in one layer-0 prefill dispatch.
@@ -22953,7 +22953,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         }
 
         if ((!router_batched and lt.ffn_gate_inp != null) or can_prefill_shared_down) {
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: the
+            // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`: the
             // immediate shared-down precompute only reads the normalized rows.
             // Router ids and shared-gate metadata are consumed by the later
             // token-major command buffer, matching vLLM's compact metadata
@@ -23013,7 +23013,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
 
             try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_shexp, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, shexp_inter_dim, hidden_dim, n_tokens);
             try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, up_shexp, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, shexp_inter_dim, hidden_dim, n_tokens);
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: this
+            // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`: this
             // join only feeds the shared-expert SwiGLU. Router ids and the
             // shared-gate scalar are vLLM-style compact metadata consumed by a
             // later command buffer, so keep them free until queue ordering
@@ -23703,11 +23703,11 @@ fn logQwenMoeRoutePackValidationDiff(
     }
 }
 
-/// Default-off safety rail for the vLLM/llama.cpp expert-grouped MoE shape.
+/// Default-off safety rail for the vLLM/reference implementation expert-grouped MoE shape.
 /// Captures a configured Qwen3.6 layer-0 prompt chunk from the current
 /// token-major path, then replays the grouped route-pack gate/up, activation,
 /// down projection, and weighted unpermute. This mirrors vLLM's
-/// `moe_permute`/`moe_unpermute` flow and llama.cpp's `mul_mm_id` split
+/// `moe_permute`/`moe_unpermute` flow and the reference implementation's `mul_mm_id` split
 /// between ID map creation and expert-major matrix work, but stays validation
 /// only until a real layer-major Qwen prefill path can feed multiple tokens.
 fn validateQwenMoeRoutePackChunk(
@@ -23977,7 +23977,7 @@ fn validateQwenMoeRoutePackChunk(
         n,
     );
     if (can_validate_active_blocks) {
-        // Validation-only check for the vLLM aligned-block/llama.cpp
+        // Validation-only check for the vLLM aligned-block/the reference implementation
         // `mul_mm_id_map0` schedule used by production route-packed MoE.
         try dispatchDmmvMoeColsActiveBlocksOnCmd(
             engine,
@@ -24511,7 +24511,7 @@ fn validateQwenRoutePackedSsmPrefix(
     dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen_moe_route_validate_layer_input_ref_buf, &scratch.hidden, n * hidden_dim, 0, 0);
     profileBarrier(&cmd, profile, .embed);
 
-    // Validation-only replay of llama.cpp/vLLM's grouped prompt shape: keep
+    // Validation-only replay of reference/vLLM's grouped prompt shape: keep
     // SSM state in token order, but validate the layer-major prefix result
     // before the route-packed MoE consumes it.
     try recordQwenSsmProjectionChunkOnCmd(engine, &cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n);
@@ -25545,7 +25545,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         dispatchSoftmaxTopkScaledOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, router_scale);
     }
 
-    // llama.cpp's build_moe_ffn keeps selected_experts on device and feeds it
+    // the reference implementation's build_moe_ffn keeps selected_experts on device and feeds it
     // into mul_mat_id. For Gemma decode N=1, router_output_buf is that compact
     // selected_experts+weights row; the DMMV MoE kernels consume the expert ids
     // directly and the accumulate kernel consumes the weights.
@@ -25640,7 +25640,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         }
     }
     {
-        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: the next
+        // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`: the next
         // kernels consume only the routed/shared activation inputs and optional
         // shared-gate scalar, so order those buffers instead of flushing the
         // whole encoder at this hot Gemma token-major MoE edge.
@@ -25931,7 +25931,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             norm_input_byte_offset,
         );
     } else if (use_dual_q4k_gate_up) {
-        // Adapted from llama.cpp's small-token `kernel_mul_mv_id` shape:
+        // Adapted from the reference implementation's small-token `kernel_mul_mv_id` shape:
         // cache the selected route input once per expert slot, then compute
         // separate gate/up Q4_K rows in one launch. vLLM-style route packing
         // is deliberately avoided here because token-major prefill still has
@@ -25958,7 +25958,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     }
     if (has_shexp and !use_prefill_shared_down) {
         // Qwen3.6 shared expert gate/up are equal-shape Q8_0 projections. Use
-        // the paired Q8 row kernel (llama.cpp-style rowwise mul_mv with shared
+        // the paired Q8 row kernel (reference-style rowwise mul_mv with shared
         // X-vector loads) for the production path now that the Qwen shared
         // batched validator covers gate/up/down diffs.
         if (use_fused_shared_q8_swiglu) {
@@ -25976,7 +25976,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         }
     }
     {
-        // llama.cpp's `ggml_metal_op_concurrency_check/reset` places barriers at
+        // the reference implementation's `ggml_metal_op_concurrency_check/reset` places barriers at
         // dependency edges. In Qwen's token-major routed MoE, Phase B only hands
         // activation buffers to Phase C/D, so scope the barrier to those resources
         // instead of flushing every buffer touched by independent DMMVs.
@@ -26099,7 +26099,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             next_attn_norm != null and
             canUseQwenMoeWeightedAccSharedGateF32NextNorm(engine, hidden_dim, cfg.n_experts_used, hidden_dim))
         {
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` graph-tail
+            // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset` graph-tail
             // fusion: the MoE finalizer already has the new hidden row in
             // registers, so also emit the next layer's attn/SSM norm row and
             // let the next layer skip its standalone RMSNorm dispatch.
@@ -26107,7 +26107,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, shared_down_buf, norm_input_buf, gate_inp_shexp.?, &engine.norm_buf, next_attn_norm.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset, hidden_scale);
             wrote_next_attn_norm = true;
         } else if (use_f32_shared_gate_acc) {
-            // Adapt vLLM's top-k weight+reduce finalization and llama.cpp's
+            // Adapt vLLM's top-k weight+reduce finalization and the reference implementation's
             // Metal fusion discipline: for Qwen3.6's one-row F32 shared gate,
             // fold the gate dot product and any layer output scale into the MoE
             // combine kernel instead of launching separate tail kernels.
@@ -26123,7 +26123,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         dispatchMoeWeightedAccOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, cfg.n_experts_used, hidden_dim);
     }
     if (wrote_next_attn_norm) {
-        // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: at this MoE tail
+        // Adapt the reference implementation `ggml_metal_op_concurrency_reset`: at this MoE tail
         // edge, the fused finalizer is the only queued producer left, so use a
         // scope barrier and avoid per-resource ObjC setup on every Qwen layer.
         profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.norm_buf});
@@ -26403,7 +26403,7 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
     if (n == 0) return;
 
     // Metal command queues execute command buffers in commit order. Mirroring
-    // llama.cpp's graph submission pattern, wait on the last dense chunk to
+    // the reference implementation's graph submission pattern, wait on the last dense chunk to
     // synchronize the token, then release the already-completed earlier chunks.
     const wait_ns = waitCommandProfiledMeasured(&cmds[n - 1], profile);
     if (profile) |p| {
@@ -26620,7 +26620,7 @@ fn recordDecodeAsyncSlotBarrierPhases(
 }
 
 fn decodeAsyncEncodeNsDelta(total: RuntimeProfile, prefix: RuntimeProfile) u64 {
-    // Mirrors llama.cpp `ggml_metal_graph_compute`'s split between graph
+    // Mirrors the reference implementation `ggml_metal_graph_compute`'s split between graph
     // encoding and queued command-buffer execution: these counters cover the
     // CPU-side dispatch/barrier recording work that happened while building a
     // chunk, while `decode_async_slot_gpu_ns` comes from Metal's GPU timestamps.
@@ -26688,7 +26688,7 @@ fn shouldSkipFinalPromptTail(
 ) bool {
     if (!using_external_shared_cmd or emit_logits or layer_idx + 1 != layer_count) return false;
 
-    // Adapt llama.cpp's graph materialization discipline: non-terminal prompt
+    // Adapt the reference implementation's graph materialization discipline: non-terminal prompt
     // tokens only need the last layer's K/V cache rows, not the final hidden
     // state or logits. Qwen SSM MoE already used this path; the dense Qwen35 9B
     // queued prefill shape has the same final full-attention layer, so its
@@ -26741,7 +26741,7 @@ fn runDecodeStep(
     const d_conv: u32 = cfg.ssm_d_conv;
     const use_dense_layer_cmd = canUseDenseSharedDecodeCommand(engine);
     const prefer_dense_gemma_scope_norm_join = preferDenseGemmaScopeNormJoin(engine);
-    // Adapted from llama.cpp `ggml_metal_op_concurrency_check/reset` graph-tail
+    // Adapted from the reference implementation `ggml_metal_op_concurrency_check/reset` graph-tail
     // fusion: the residual+RMS-norm+F32-router(+shared-gate) megakernel operates
     // on per-layer per-token state (hidden, norm_buf, router_output_buf,
     // router_logits_buf) and never touches the final logits buffer that
@@ -26751,9 +26751,9 @@ fn runDecodeStep(
     // fused path. The earlier `!emit_logits` restriction was historical from
     // when this fusion was developed for batched prompt processing only.
     const allow_prefill_f32_router_fusion = true;
-    // Dense Gemma follows llama.cpp's graph submission pattern: enqueue larger
+    // Dense Gemma follows the reference implementation's graph submission pattern: enqueue larger
     // ordered chunks asynchronously and wait once at the token boundary.
-    // llama.cpp's `ggml-metal-context.m::ggml_metal_set_n_cb` warns "optimal
+    // the reference implementation's `ggml-metal-context.m::ggml_metal_set_n_cb` warns "optimal
     // values for n_cb are 1 or 2" and that >2 "can degrade the performance",
     // because each extra command buffer adds queue scheduling latency and a
     // GPU clock-ramp window between submissions. Cycle 51 confirmed neither
@@ -26863,7 +26863,7 @@ fn runDecodeStep(
                 isGemma26A4BMoeShape(cfg) and
                 engine.copy_rms_norm_offset_pipe.handle != null;
             if (can_fuse_embed_norm) {
-                // Adapt llama.cpp's graph-edge materialization discipline
+                // Adapt the reference implementation's graph-edge materialization discipline
                 // (`ggml_metal_graph_compute`): the layer-0 attention norm has
                 // exactly the copied embedding as input, so materialize both
                 // consumers in one kernel before the Q/K/V projection barrier.
@@ -26886,7 +26886,7 @@ fn runDecodeStep(
                 initial_hidden_barrier_deferred = true;
             } else {
                 dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
-                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`
                 // (ggml-metal-common.cpp `ggml_mem_ranges_check_dst`): the only
                 // downstream consumer in this command buffer is layer 0's
                 // attn/ssm RMSNorm reading `hidden_buf`. Scope the barrier to
@@ -26928,7 +26928,7 @@ fn runDecodeStep(
     var prev_fused_attn_norm: bool = false;
     // When the same fused tail also wrote hidden_buf, defer that dependency to
     // the next residual join. The next layer's Q/K/V projections consume only
-    // norm_buf, so this mirrors llama.cpp's range fencing and lets attention
+    // norm_buf, so this mirrors the reference implementation's range fencing and lets attention
     // projection work overlap the previous hidden update.
     var prev_fused_hidden_barrier_deferred: bool = false;
     // Terminal dense FFN tail can materialize final_norm once and feed the LM
@@ -26992,7 +26992,7 @@ fn runDecodeStep(
                 initial_attn_norm_ready = false;
             } else if (!fuse_final_tail_attn_norm) {
                 dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
-                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`:
                 // the Q/K/V projection prep only consumes the normalized row, so
                 // order that resource instead of flushing all prior buffer writes.
                 profileFullAttnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
@@ -27000,12 +27000,12 @@ fn runDecodeStep(
             recordFullAttnDispatchDelta(profile, .norm, attn_norm_dispatch_before, cmd.dispatch_count);
             if (skip_final_prompt_tail) {
                 // Non-terminal prompt tokens only need the final layer's K/V
-                // state for future tokens. Adapt llama.cpp's Metal graph
+                // state for future tokens. Adapt the reference implementation's Metal graph
                 // materialization discipline (`ggml_metal_graph_compute`
                 // encodes only requested graph outputs): skip Q/gate and
                 // flash/output/MoE materialization for this prompt token.
                 try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim, fuse_final_tail_attn_norm);
-                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`:
                 // this tail write has no immediate in-encoder consumer. The
                 // later layer-local flash-attention read is ordered by the next
                 // real barrier on that path, or by command-buffer ordering
@@ -27038,7 +27038,7 @@ fn runDecodeStep(
             else
                 &o_tensor.gpu_buffer;
             const o_weight_offset: u32 = if (o_weight_buf == &o_tensor.gpu_buffer) tensorPageOffset(engine.model, o_tensor) else 0;
-            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` single-consumer
+            // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset` single-consumer
             // fusion to the Qwen3.6 full-attn gate edge: when apply_attn_gate is
             // true and the output projection is the Qwen-shape repacked Q8_0
             // (M=2048, K=4096), fold the standalone sigmoid_mul into the output
@@ -27063,7 +27063,7 @@ fn runDecodeStep(
             recordFullAttnDispatchDelta(profile, .out, out_dispatch_before, cmd.dispatch_count);
             const fence_deferred_hidden = prev_fused_hidden_barrier_deferred;
             if ((initial_hidden_barrier_deferred and layer_idx == 0) or fence_deferred_hidden) {
-                // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: this edge is
+                // Adapt the reference implementation `ggml_metal_op_concurrency_reset`: this edge is
                 // a true producer join. The following fused post-attn residual
                 // kernel consumes both pending writes (`down_buf` from O-proj and
                 // `hidden_buf` from the deferred residual), so there is no
@@ -27124,7 +27124,7 @@ fn runDecodeStep(
             if (can_fuse_post_attn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const gate_inp_shexp = lt.ffn_gate_inp_shexp orelse return error.MissingTensor;
-                // Adapt llama.cpp's dependency-edge fusion and vLLM's compact
+                // Adapt the reference implementation's dependency-edge fusion and vLLM's compact
                 // top-k materialization to Qwen full-attention prompt layers:
                 // post-attn norm, residual update, FFN norm, F32 router top-k,
                 // and the scalar shared-gate dot all consume the same row.
@@ -27162,7 +27162,7 @@ fn runDecodeStep(
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, 0)) {
                     const router_ref = routerWeightRef(engine, layer_idx, router_t);
-                    // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                    // Adapt the reference implementation's single-token Q8 `kernel_mul_mv_id`
                     // routed matvec shape at the attention MoE boundary too:
                     // hidden += attn_out, materialize the exact ffn_norm row,
                     // and produce compact top-k ids/weights in one dispatch.
@@ -27223,14 +27223,14 @@ fn runDecodeStep(
             }
             if (!is_moe and layer_shared_cmd != null) {
                 if (prefer_dense_gemma_scope_norm_join) {
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: this
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_reset`: this
                     // fused post-attn producer writes both hidden_buf and the
                     // FFN norm row in one dispatch, and dense Gemma has no
                     // independent in-flight branch at this edge. Avoid the hot
                     // single-resource barrier path before every dense gate/up.
                     profileDenseFfnBarrier(cmd, profile, .norm);
                 } else {
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_check`: dense
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_check`: dense
                     // gate/up consumes only the FFN norm row. Defer hidden_buf's
                     // dependency until the post-FFN residual join so the attention
                     // residual write can drain while the dense FFN DMMVs run.
@@ -27356,7 +27356,7 @@ fn runDecodeStep(
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
                 } else if (use_fused_f32_router) {
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`
                     // and vLLM `fused_experts_impl`: when the shared-gate row
                     // is present, materialize that scalar next to top-k so the
                     // MoE reducer consumes compact routing metadata instead of
@@ -27403,7 +27403,7 @@ fn runDecodeStep(
                         router_barrier_bufs[router_barrier_count] = &engine.residual_buf;
                         router_barrier_count += 1;
                     }
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: after
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_reset`: after
                     // the router/top-k dispatch there is no independent queued
                     // work left to preserve before MoE consumes the compact
                     // route row and norm row. Use the cheaper scope barrier
@@ -27475,7 +27475,7 @@ fn runDecodeStep(
                 &z_t.gpu_buffer;
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
-            // Analysis hook for the next structural speed path: llama.cpp's
+            // Analysis hook for the next structural speed path: the reference implementation's
             // `ggml_metal_op_mul_mat_id` batches same-input expert work once
             // the ids are mapped, while vLLM's `moe_align_block_size` shows
             // that single-token decode only has a small packed workset. For
@@ -27503,7 +27503,7 @@ fn runDecodeStep(
                 // `prepareQwenSsmPrefillProjectionChunk` already materialized
                 // hidden += layer0_ssm_out and the FFN norm for this token.
                 // MoE production can consume the precomputed norm row directly
-                // through input offsets, matching llama.cpp/vLLM's
+                // through input offsets, matching reference/vLLM's
                 // avoid-materializing discipline for intermediate MoE inputs.
                 // Dense FFN kernels read engine.norm_buf, so they keep the
                 // single-row copy path below.
@@ -27514,7 +27514,7 @@ fn runDecodeStep(
                     dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, engine.position * hidden_dim, 0);
                 }
             } else if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
-                // Adapt llama.cpp's `ggml_metal_op_concurrency_check` discipline:
+                // Adapt the reference implementation's `ggml_metal_op_concurrency_check` discipline:
                 // the layer-0 precompute command buffer already materialized this
                 // branch output, so read the token slice directly instead of
                 // inserting a copy dispatch plus in-encoder memory barrier.
@@ -27554,11 +27554,11 @@ fn runDecodeStep(
                 } else if (prev_fused_attn_norm) {
                     // The previous MoE finalizer materialized norm_buf with
                     // this layer's attn_norm weights. Reuse it here, mirroring
-                    // llama.cpp's graph-tail fusion, and skip the standalone
+                    // the reference implementation's graph-tail fusion, and skip the standalone
                     // RMSNorm dispatch/barrier before the SSM projections.
                     prev_fused_attn_norm = false;
                     if (canUseQwenSsmDualRepackedQ8K2048Conv1d(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim, d_conv, false)) {
-                        // Same llama.cpp `kernel_mul_mv_q8_0_f32_impl` two-row Q8
+                        // Same reference implementation `kernel_mul_mv_q8_0_f32_impl` two-row Q8
                         // geometry as the non-conv1d sibling, but the qkv slice
                         // also runs the per-channel `ssm_conv1d_qwen_d4` postlude
                         // inline — saves one dispatch + one `.qkv` barrier per
@@ -27568,14 +27568,14 @@ fn runDecodeStep(
                         z_projection_queued_before_conv = true;
                         conv1d_fused_into_qkv = true;
                     } else if (canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
-                        // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s fixed
+                        // Adapt the reference implementation `kernel_mul_mv_q8_0_f32_impl`'s fixed
                         // two-row Q8 geometry to the sibling Qwen SSM projections:
                         // QKV and gate share the same normalized row, so keep their
                         // private-repacked TG128 row grouping but encode one dispatch.
                         dispatchQwenSsmDualRepackedQ8K2048OnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
                     } else if (canUseQwen35SsmQ4Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
-                        // Adapt llama.cpp `ggml_metal_op_encode_impl` range
+                        // Adapt the reference implementation `ggml_metal_op_encode_impl` range
                         // batching to the all-Q4 SSM pair: qkv and gate read
                         // the same norm row and are joined by the same tail
                         // barrier, so the Q4 dual-row shader can replace the
@@ -27583,7 +27583,7 @@ fn runDecodeStep(
                         dispatchQwen35SsmQ4Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
                     } else if (canUseQwen35SsmQ6Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
-                        // Same same-input projection batching as llama.cpp
+                        // Same same-input projection batching as the reference implementation
                         // `ggml_metal_op_mul_mat_id`, but for dense Qwen3.6
                         // 27B's SSM qkv+gate pair instead of routed experts.
                         // M_q=0 routes Q4_K gate to gate_buf and Q6_K qkv to
@@ -27611,7 +27611,7 @@ fn runDecodeStep(
                     // non-conv1d fused-norm path by also running the
                     // `ssm_conv1d_qwen_d4` work inline for the qkv slice. Saves
                     // one dispatch + one `.qkv` barrier per SSM layer per
-                    // decode token; mirrors llama.cpp's single-consumer fusion
+                    // decode token; mirrors the reference implementation's single-consumer fusion
                     // discipline (ggml-metal-ops.cpp:159, 175) across the qkv
                     // → conv1d edge.
                     dispatchFusedNormDualQ8DmmvConv1dOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, &engine.ssm_conv_kernel_bufs.?[layer_idx], &engine.ssm_conv_state_bufs.?[layer_idx], &engine.swiglu_buf, conv_channels, d_inner, hidden_dim, conv_channels, d_conv);
@@ -27724,7 +27724,7 @@ fn runDecodeStep(
                 switch (tail_projection_mode) {
                     .none => profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{&engine.swiglu_buf}),
                     .z_alpha_beta_from_norm => {
-                        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                        // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`:
                         // conv only depends on qkv. The default Qwen path queues
                         // the independent tail projections before the QKV-only
                         // barrier; keep the fallback here for non-default future
@@ -27740,7 +27740,7 @@ fn runDecodeStep(
                                 dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
                             }
                         }
-                        // Adapt llama.cpp `ggml_metal_op_concurrency_reset`:
+                        // Adapt the reference implementation `ggml_metal_op_concurrency_reset`:
                         // once QKV conv plus Z/alpha/beta tail projections have
                         // all been queued, the fused delta/gated kernel consumes
                         // every producer. Use the true resource-scoped barrier
@@ -27868,7 +27868,7 @@ fn runDecodeStep(
                         p.ssm_delta_calls += 1;
                         p.ssm_gated_norm_calls += 1;
                     }
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_reset`:
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_reset`:
                     // after the conv/tail join there is no independent queued
                     // work left to preserve, so use the cheaper buffer-scope
                     // encoder barrier instead of building a one-resource array.
@@ -27958,7 +27958,7 @@ fn runDecodeStep(
                 const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
                 const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
-                // Adapt llama.cpp `ggml_metal_op_concurrency_check`: on the
+                // Adapt the reference implementation `ggml_metal_op_concurrency_check`: on the
                 // Qwen3.5/3.6 dense-hybrid paths, the next residual+norm join
                 // reads only the previous hidden row and the SSM out row. Keep
                 // unrelated SSM state/conv/tail writes out of this dependency
@@ -28010,7 +28010,7 @@ fn runDecodeStep(
                     const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                     if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, ssm_residual_offset)) {
                         const router_ref = routerWeightRef(engine, layer_idx, router_t);
-                        // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                        // Adapt the reference implementation's single-token Q8 `kernel_mul_mv_id`
                         // router discipline and vLLM's compact top-k finalize:
                         // materialize the exact token-major norm row and route
                         // ids in one dispatch, then feed the unchanged MoE path.
@@ -28229,7 +28229,7 @@ fn runDecodeStep(
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
                 } else if (use_fused_f32_router) {
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_check/reset`
                     // and vLLM `fused_experts_impl`: when the shared-gate row
                     // is present, materialize that scalar next to top-k so the
                     // MoE reducer consumes compact routing metadata instead of
@@ -28276,10 +28276,10 @@ fn runDecodeStep(
                         router_barrier_bufs[router_barrier_count] = &engine.residual_buf;
                         router_barrier_count += 1;
                     }
-                    // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: after
+                    // Adapt the reference implementation `ggml_metal_op_concurrency_reset`: after
                     // router/top-k, the next encoded work is the MoE block that
                     // consumes this route row, optional shared-gate scalar, and
-                    // norm row. A scope barrier matches llama.cpp's reset path
+                    // norm row. A scope barrier matches the reference implementation's reset path
                     // and avoids per-resource ObjC setup in the hot loop.
                     profileBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
                 }
@@ -28713,7 +28713,7 @@ fn runDecodeStep(
                 }
                 if (!fused_gate_up) {
                     if (use_hybrid_layer_cmd and qwen35DenseSsmResourceBarriersEnabled(cfg, engine.in_prefill_phase)) {
-                        // llama.cpp's `ggml_metal_op_concurrency_check` only
+                        // the reference implementation's `ggml_metal_op_concurrency_check` only
                         // resets when the next op conflicts with tracked
                         // resource ranges. SwiGLU reads gate/up only; the
                         // prior residual write to hidden_buf is joined later
@@ -28775,7 +28775,7 @@ fn runDecodeStep(
                 // Dense-down consumes only the activation row. On the Qwen3.6
                 // 27B hybrid and 9B queued-prompt paths, this command buffer
                 // also carries SSM/full-attn work from the same layer/token
-                // chunk, so adapt llama.cpp `ggml_metal_op_concurrency_check`:
+                // chunk, so adapt the reference implementation `ggml_metal_op_concurrency_check`:
                 // fence only the single consumer resource instead of flushing
                 // unrelated writes.
                 if (fused_down_acc) {
@@ -28812,7 +28812,7 @@ fn runDecodeStep(
                         // The post-FFN residual reads both down_buf and hidden_buf.
                         // hidden_buf was intentionally not fenced at the dense FFN input
                         // edge above because gate/up and down do not consume it. This is
-                        // now the actual join, so mirror llama.cpp's reset barrier rather
+                        // now the actual join, so mirror the reference implementation's reset barrier rather
                         // than paying a two-resource barrier on every dense layer.
                         profileDenseFfnBarrier(cmd, profile, .down);
                     }
@@ -28822,7 +28822,7 @@ fn runDecodeStep(
 
                 // Three-way fusion: post_ffn_norm + residual_add + next-attn-norm
                 // collapses two dispatches and two barriers into one. Adapted from
-                // the existing residual_rms_norm.metal pattern + llama.cpp
+                // the existing residual_rms_norm.metal pattern + the reference implementation
                 // `ggml_metal_op_rms_norm` op-fusion idea, extended with a second
                 // reduction. Saves ≈59 dispatches and ≈59 barriers per token on
                 // Gemma 31B's 60 dense full-attn layers. Now also folds
@@ -28855,7 +28855,7 @@ fn runDecodeStep(
                         if (can_fuse_final_norm_tail) p.dense_ffn_tail_final_norm_calls += 1;
                     }
                     if (can_fuse_final_norm_tail) {
-                        // Adapt llama.cpp `ggml_metal_op_concurrency_check`:
+                        // Adapt the reference implementation `ggml_metal_op_concurrency_check`:
                         // LM head consumes only the materialized final norm row.
                         final_norm_ready_from_dense_tail = true;
                     } else {
@@ -29052,7 +29052,7 @@ fn runDecodeStep(
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-            // Adapt llama.cpp `ggml_mem_ranges_check_dst`: LM head reads
+            // Adapt the reference implementation `ggml_mem_ranges_check_dst`: LM head reads
             // only the normalized row, so order norm_buf instead of fencing
             // unrelated buffer writes still draining in the concurrent encoder.
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});

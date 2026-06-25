@@ -1183,7 +1183,7 @@ pub const InferenceEngine = struct {
     // single dispatch (cycle-13 application of the cycle-8 fused_rms
     // pattern to a smaller M target). Disable with ZINC_FUSED_SSM_AB=0.
     use_fused_ssm_pre_norm: bool = false,
-    // Default-on when loaded. Uses a llama.cpp-style S=128 gated-delta-net
+    // Default-on when loaded. Uses a reference-style S=128 gated-delta-net
     // shape: eight 8-lane output-row clusters per wave64.
     use_ssm_delta_cols8: bool = false,
     // Opt-in via ZINC_SSM_DELTA_NORMED_QK=1. Normalizes SSM Q/K once per
@@ -2469,7 +2469,7 @@ pub const InferenceEngine = struct {
             log.info("Fused SSM pre-norm DISABLED by default on Intel SSM path (set ZINC_FUSED_SSM_AB=1 to enable experimental path)", .{});
         }
 
-        // SSM delta cols8: port of llama.cpp's GDN workgroup shape for
+        // SSM delta cols8: port of the reference implementation's GDN workgroup shape for
         // S=128 (8 output rows per wave64 via subgroupClusteredAdd). Disable
         // via ZINC_SSM_DELTA_COLS8=0 for A/B checks. Default-off on Intel SSM
         // models together with fused SSM pre-norm for correctness.
@@ -14797,7 +14797,7 @@ pub const InferenceEngine = struct {
         }
         @memcpy(conv_state[(d_conv_1 - 1) * conv_channels ..][0..conv_channels], qkv_cpu);
 
-        // Split Q/K/V from conv output — llama.cpp layout: [Q(n_group*d_state), K(n_group*d_state), V(d_inner)]
+        // Split Q/K/V from conv output — the reference implementation layout: [Q(n_group*d_state), K(n_group*d_state), V(d_inner)]
         const qk_dim = d_state * n_group;
         var q_ssm = conv_out[0..qk_dim];
         var k_ssm = conv_out[qk_dim .. 2 * qk_dim];
@@ -24467,7 +24467,7 @@ pub const InferenceEngine = struct {
     }
 };
 
-/// Dump top-5 logits for a given decode step (for comparing with llama.cpp).
+/// Dump top-5 logits for a given decode step (for comparing with the reference implementation).
 fn dumpTop5Logits(engine: *const InferenceEngine, step: u32) void {
     const vocab_size = engine.model.config.vocab_size;
     const logits_ptr: [*]const f32 = @ptrCast(@alignCast(engine.logits_staging.mapped.?));
@@ -24784,7 +24784,7 @@ pub fn generate(
         log.debug("decode[0]: token={d} pos={d} (from prefill logits)", .{
             first_token, state.position,
         });
-        // Dump top-5 logits from prefill for comparison with llama.cpp
+        // Dump top-5 logits from prefill for comparison with the reference implementation
         if (engine.logits_readback_enabled or engine.validation_diagnostics_enabled) dumpTop5Logits(engine, 0);
         generated = 1;
         if (first_token == eos_token_id) generated = effective_max_tokens; // stop early

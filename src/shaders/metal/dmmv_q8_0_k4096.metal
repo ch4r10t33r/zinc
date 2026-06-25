@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // Q8_0 DMMV specialization for Qwen3.6 SSM out projections (K=4096).
 //
-// Keep the accepted llama.cpp-style nr=2 row geometry and 128-thread dispatch
+// Keep the accepted reference-style nr=2 row geometry and 128-thread dispatch
 // used by the generic path, but bake the hot K=4096 shape so the inner loop
 // has fixed block count and row stride.
 kernel void main0(

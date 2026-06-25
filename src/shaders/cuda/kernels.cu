@@ -40,7 +40,7 @@ __device__ __forceinline__ float zinc_half_to_float(unsigned short h) {
     return __int_as_float((int)f);
 }
 
-// GGML Q4_K 6-bit scale/min unpack (j in 0..7), canonical llama.cpp form.
+// GGML Q4_K 6-bit scale/min unpack (j in 0..7), canonical the reference implementation form.
 __device__ __forceinline__ void zinc_q4k_scale_min(int j, const unsigned char* q,
                                                     unsigned char* d, unsigned char* m) {
     if (j < 4) {

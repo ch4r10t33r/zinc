@@ -1,6 +1,6 @@
 #version 460
 // ZINC — Tiled Q4_K dense GEMM (Effort-6 Step 1 of 5: foundation port).
-// First port of llama.cpp's mul_mm.comp #ifndef COOPMAT branch adapted to
+// First port of the reference implementation's mul_mm.comp #ifndef COOPMAT branch adapted to
 // ZINC's wave64 / Q4_K conventions. No MUL_MAT_ID variant yet — that comes
 // in Step 2 once this shader has correctness validation against the
 // per-token Q4_K DMMV. Pipeline registers at startup; no production

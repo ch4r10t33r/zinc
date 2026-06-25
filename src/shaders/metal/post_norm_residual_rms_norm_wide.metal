@@ -15,7 +15,7 @@ struct Params {
 #define N_SIMDGROUPS 32
 #define SIMD_WIDTH 32
 #define TG_SIZE (N_SIMDGROUPS * SIMD_WIDTH)
-// This variant is only dispatched for n=5376. Mirror llama.cpp's aligned
+// This variant is only dispatched for n=5376. Mirror the reference implementation's aligned
 // `kernel_rms_norm_fuse_impl<float4, ...>` path: operate on four contiguous
 // elements per lane so the two reductions and the final write use fewer loop
 // iterations and memory instructions. For n=5376, each thread owns at most two

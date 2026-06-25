@@ -83,7 +83,7 @@ kernel void main0(
     // reads x_cache4[local_id] that it itself wrote) goes through registers
     // instead of TG mem; cross-thread x_cache4 visibility for the SUBSEQUENT
     // router-GEMM and shared-gate phases is preserved by Phase 2's
-    // `x_cache4[vi] = nval` write and the line-107 barrier. Adapts llama.cpp's
+    // `x_cache4[vi] = nval` write and the line-107 barrier. Adapts the reference implementation's
     // `kernel_mul_mv_q4_K_f32_impl` (ggml-metal.metal:7763-7811) pattern that
     // keeps `yl[16]/yh[16]` in registers across the per-row reduction loop —
     // here applied across the inter-phase RMS reduction barrier. The
@@ -124,7 +124,7 @@ kernel void main0(
     // thread that wrote it in Phase 2) and can route through the register
     // instead of TG mem. The Phase 2 `x_cache4[vi] = nval` write + line-127
     // barrier still preserve cross-thread x_cache4 visibility for Phase 3
-    // (router GEMM uses lane-strided reads across simdgroups). Same llama.cpp
+    // (router GEMM uses lane-strided reads across simdgroups). Same reference implementation
     // `kernel_mul_mv_q4_K_f32_impl` register-resident-Y pattern adapted to
     // the SUBSEQUENT inter-phase boundary on hot kernel #1 (339 ms/req across
     // 1436 calls). Eliminates one TG mem read per active thread in Phase 4.

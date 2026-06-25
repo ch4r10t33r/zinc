@@ -3,7 +3,7 @@ using namespace metal;
 
 // Fused Q4_K MoE gate/up DMMV for separate gate and up expert tensors.
 //
-// This keeps the small-batch mul_mv_id shape used by llama.cpp: one grid row
+// This keeps the small-batch mul_mv_id shape used by the reference implementation: one grid row
 // per selected expert route.  The input vector is loaded once into
 // threadgroup memory, then both expert matrices are evaluated from that cache.
 

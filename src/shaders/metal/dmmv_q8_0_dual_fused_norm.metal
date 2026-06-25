@@ -16,7 +16,7 @@ struct DualQ8DmmvPush {
 //
 // Combines two Q8_0 matrix-vector multiplies that share the same input vector
 // (e.g. SSM qkv 8192x2048 + gate 4096x2048) with inline RMSNorm computation.
-// Each simdgroup handles four output rows, applying llama.cpp's adjacent-row
+// Each simdgroup handles four output rows, applying the reference implementation's adjacent-row
 // matvec discipline more aggressively for the exact Qwen3.6 SSM shape while
 // avoiding the intermediate norm_buf write and barrier.
 

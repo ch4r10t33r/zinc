@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // Exact even-row Qwen3.6 SSM Q8_0 repacked DMMV for K=4096.
 //
-// Keeps the accepted llama.cpp-style TG128/two-row geometry for ssm_out while
+// Keeps the accepted reference-style TG128/two-row geometry for ssm_out while
 // removing the generic tail-row branch. Production Qwen3.6 ssm_out rows are
 // even, so the guarded dispatch below keeps tail cases on the older shader.
 kernel void main0(

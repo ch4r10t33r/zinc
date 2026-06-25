@@ -16,7 +16,7 @@ struct DmmvPush {
 // Adapted from `dmmv_q8_0_repacked_k4096_qwen.metal` (the standalone SSM-out /
 // full-attn-out kernel). The full-attn path's sigmoid_mul kernel was an extra
 // dispatch + barrier between flash-attn and the output projection — mirroring
-// llama.cpp `ggml_metal_op_concurrency_check/reset` discipline, fuse it into
+// the reference implementation `ggml_metal_op_concurrency_check/reset` discipline, fuse it into
 // the output DMMV's input load so the read of `X * sigmoid(G)` happens inline
 // while we already have the X cache line resident. Removes one dispatch +
 // barrier per full-attn layer with attn_gate (10/token on Qwen3.6-35B), at no

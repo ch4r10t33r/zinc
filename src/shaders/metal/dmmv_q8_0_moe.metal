@@ -3,7 +3,7 @@ using namespace metal;
 
 // Q8_0 routed MoE DMMV for the rare Gemma expert-down layer stored as Q8_0.
 //
-// This is the small-batch branch of llama.cpp's Metal `mul_mat_id` idea: keep
+// This is the small-batch branch of the reference implementation's Metal `mul_mat_id` idea: keep
 // selected expert ids compact on device, then have each expert-slot workgroup
 // read `expert_ids[slot]` to choose the weight slice. The inner dot follows
 // `kernel_mul_mv_q8_0_f32_impl` / this repo's `dmmv_q8_0.metal` two-row

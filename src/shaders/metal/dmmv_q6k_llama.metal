@@ -17,8 +17,8 @@ inline float s8_to_f32(uint x) {
     return float((x < 128u) ? int(x) : (int(x) - 256));
 }
 
-// Port of llama.cpp's kernel_mul_mv_q6_K_f32 for dense single-token decode.
-// Default thread organization matches llama.cpp N_SG_Q6_K=2, N_R0_Q6_K=2:
+// Port of the reference implementation's kernel_mul_mv_q6_K_f32 for dense single-token decode.
+// Default thread organization matches the reference implementation's N_SG_Q6_K=2, N_R0_Q6_K=2:
 // 64 threads = 2 simdgroups, each simdgroup computes 2 rows. Exact M4
 // Qwen3.6 27B dense-down builds can override NSG at compile time to keep the
 // same per-simdgroup row-pair math while grouping more independent row pairs
@@ -74,7 +74,7 @@ kernel void main0(
     const uint q_offset_l = 64u * uint(ip) + uint(l0);
     const uint q_offset_h = 32u * uint(ip) + uint(l0);
 
-    // Keep the llama.cpp NR0=2 row pair as a vector accumulator. The inner
+    // Keep the reference implementation's NR0=2 row pair as a vector accumulator. The inner
     // loop already builds a float2 delta for row0/row1; carrying that shape to
     // the final simd reductions avoids a two-slot thread-private scalar array.
     float2 sumf = float2(0.0f);
@@ -232,7 +232,7 @@ kernel void main0(
         // Q6_K uses scale bytes sc[0,2,4,6] for this lane group. Read them
         // as two unaligned packed vectors per row instead of four scalar
         // byte loads, matching the packed-load discipline used by the
-        // llama.cpp-derived Q4_K row-pair kernels.
+        // reference-derived Q4_K row-pair kernels.
         const packed_char4 sc_lo_0 = *((device const packed_char4*)sc_0);
         const packed_char4 sc_hi_0 = *((device const packed_char4*)(sc_0 + 4));
         const packed_char4 sc_lo_1 = *((device const packed_char4*)sc_1);

@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // Repacked Q8_0 DMMV specialization for Qwen3.6 SSM qkv/gate projections.
 //
-// Adapts llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s two-row simdgroup geometry
+// Adapts the reference implementation `kernel_mul_mv_q8_0_f32_impl`'s two-row simdgroup geometry
 // to ZINC's repacked layout while baking K=2048 and the TG128/4-simdgroup
 // launch shape for the hot SSM path.
 kernel void main0(

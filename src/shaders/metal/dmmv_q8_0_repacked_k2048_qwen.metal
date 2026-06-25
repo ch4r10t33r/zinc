@@ -12,7 +12,7 @@ struct DmmvPush {
 // Qwen3.6 exact repacked Q8_0 DMMV for K=2048 and M%4==0.
 //
 // This is the tail-free sibling of dmmv_q8_0_repacked_k2048_quad.metal. It
-// follows llama.cpp's fixed row-group Q8 matvec discipline and is only selected
+// follows the reference implementation's fixed row-group Q8 matvec discipline and is only selected
 // for production Qwen SSM/full-attn projections whose row counts are multiples
 // of four; the generic quad kernel remains available for validation tail cases.
 kernel void main0(

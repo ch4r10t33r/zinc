@@ -7,7 +7,7 @@
 // workgroups whose expert has zero routed tokens. This shader produces that
 // `data_expert_count` buffer.
 //
-// Direct port of llama.cpp's count_experts.comp — same shader interface, same
+// Direct port of the reference implementation's count_experts.comp — same shader interface, same
 // reduction pattern (256-thread atomic-free shared-memory sum). Structurally
 // identical so a future Q4_K mul_mm_id port can drop in unchanged.
 //

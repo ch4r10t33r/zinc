@@ -71,7 +71,7 @@ void main() {
 
         // 16 sub-blocks of 16 elements each. Each qh byte covers 4 elements
         // across 4 of those sub-blocks; walk by the 32-element stride that
-        // llama.cpp's reference Q6_K kernel uses (two ql halves × two qh
+        // the reference implementation's reference Q6_K kernel uses (two ql halves × two qh
         // nibble-halves per 64-element chunk).
         for (uint j = 0u; j < 2u; j++) {
             uint ql_base = ql_off + j * 64u;

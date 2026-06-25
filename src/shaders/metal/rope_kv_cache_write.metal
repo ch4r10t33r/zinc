@@ -3,7 +3,7 @@
 using namespace metal;
 
 // Fused single-token RoPE-Q + RoPE-K + KV cache write. Adapted from
-// llama.cpp `ggml_metal_op_rope_set_rows` which folds rope output into the
+// the reference implementation `ggml_metal_op_rope_set_rows` which folds rope output into the
 // destination KV slot in one kernel; extended here to also rotate the Q
 // vector in the same dispatch so the dense Gemma decode path collapses
 // (Q-rope, K-rope+kv-write, V-norm+kv-write) into a single kernel,
@@ -25,7 +25,7 @@ using namespace metal;
 // subsumes the two standalone `dispatchRmsNormOnCmd` calls over q_buf and
 // k_buf that previously preceded the fused rope+kv-write dispatch — one
 // fewer dispatch per dense full-attn layer for Q-norm and one for K-norm
-// (≈60+60/token on Gemma 31B), extending llama.cpp `ggml_metal_op_rms_norm`
+// (≈60+60/token on Gemma 31B), extending the reference implementation `ggml_metal_op_rms_norm`
 // op-fusion to the attention prep path.
 
 struct RopeKvCacheWritePush {

@@ -16,7 +16,7 @@ struct DmmvPush {
 
 // E2M1 FP4 lookup table: maps 4-bit value to float
 // Sign (1 bit) | Exponent (2 bits) | Mantissa (1 bit)
-// Matches llama.cpp kvalues_mxfp4_f
+// Matches the reference implementation kvalues_mxfp4_f
 constant float kvalues_mxfp4[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -24,7 +24,7 @@ constant float kvalues_mxfp4[16] = {
 
 // E8M0 to float (full): equal to 2^(x-127) for x>=1.
 // Used with un-doubled E2M1 kvalues_mxfp4 table (0,0.5,1,...,6).
-// Note: llama.cpp uses halved E8M0 + doubled kvalues; product is identical.
+// Note: the reference implementation uses halved E8M0 + doubled kvalues; product is identical.
 static inline float e8m0_to_fp32(uchar x) {
     uint bits;
     if (x == 0u) {

@@ -1520,7 +1520,7 @@ fn selectFusedDualPipeline(ctx: ?*shim.MetalCtx, cols: u32, threadgroup_override
         .push_idx = 0,
         // Match production `dispatchFusedNormDualQ8DmmvOnCmd`: the fused
         // kernel maps one simdgroup to four output rows, so benchmark the same
-        // llama.cpp-style adjacent-row geometry before retuning hot Qwen shapes.
+        // reference-style adjacent-row geometry before retuning hot Qwen shapes.
         .rows_per_wg = (block_size / simd_width) * 4,
         .block_size = block_size,
     };

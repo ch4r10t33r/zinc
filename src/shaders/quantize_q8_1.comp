@@ -3,7 +3,7 @@
 //
 // Foundation step for the mul_mmq path (effort-6 Step 10a). Produces per-32-element
 // blocks of int8 values with an f16 scale `d` and an f16 precomputed sum-of-quants*d
-// (the "s" term llama.cpp stores in `ds.y` so the downstream integer matmul does not
+// (the "s" term the reference implementation stores in `ds.y` so the downstream integer matmul does not
 // have to recompute it).
 //
 // One prefill activation quantization pass feeds all four SSM proj matvecs
@@ -14,7 +14,7 @@
 //   uint qs[8];  // 32 int8 values packed 4-per-uint (little-endian)
 //   uint ds;     // packed f16vec2: low 16 bits = d, high 16 bits = d * sum(quants)
 //
-// Mirrors llama.cpp's block_q8_1_packed32 (non-x4 variant) so a future
+// Mirrors the reference implementation's block_q8_1_packed32 (non-x4 variant) so a future
 // dmmv_q*_q8_1 shader can use the same struct.
 
 #extension GL_EXT_control_flow_attributes : require
@@ -64,7 +64,7 @@ void quantize_block(uint wgid, uint tid) {
     const float d_inv = (d != 0.0) ? (1.0 / d) : 0.0;
     vals = round(vals * d_inv);
 
-    // Pack 4 int8 values into one u32 (little-endian, matching llama.cpp pack32(i8vec4)).
+    // Pack 4 int8 values into one u32 (little-endian, matching the reference implementation pack32(i8vec4)).
     i8vec4 q = i8vec4(vals);
     uint packed = (uint(uint8_t(q.x)))
                 | (uint(uint8_t(q.y)) << 8)
@@ -89,7 +89,7 @@ void quantize_block(uint wgid, uint tid) {
     // --- Step 4: thread 0 of each block writes ds (f16vec2) ---
     if (iqs == 0u) {
         const float sum = shmem[tid];
-        // llama.cpp layout: ds.x = d, ds.y = d * sum
+        // the reference implementation layout: ds.x = d, ds.y = d * sum
         f16vec2 ds = f16vec2(float16_t(d), float16_t(d * sum));
         uint ds_bits = packFloat2x16(ds);
         data_b[block_base_u32 + 8u] = ds_bits;

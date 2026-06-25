@@ -3,7 +3,7 @@ using namespace metal;
 
 // Fused RMSNorm + Q4_K matvec for the dense Gemma 31B final LM head.
 //
-// Adapts the llama.cpp `kernel_mul_mv_q4_K_f32` row layout
+// Adapts the reference implementation `kernel_mul_mv_q4_K_f32` row layout
 // (NSG=2, NR0=2, 64 threads/threadgroup) used by dmmv_q4k.metal,
 // folding the preceding `rms_norm_mul` (final_norm) into the same
 // dispatch — eliminating one dispatch + one barrier in the final phase
@@ -71,7 +71,7 @@ kernel void main0(
 
     // Step 2: Q4_K matvec, applying `norm_weight * rms_inv` to each X
     // chunk on load. Output offsets within a 256-element block are
-    // {0..7, 32..39, 128..135, 160..167} per the llama.cpp layout, so
+    // {0..7, 32..39, 128..135, 160..167} per the reference implementation layout, so
     // norm_weight is read at the matching offsets.
     device const uchar* x_base = src0 + (uint64_t)first_row * nb01;
     device const float* y = src1;

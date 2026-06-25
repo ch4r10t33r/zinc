@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // Repacked Q8_0 DMMV specialization for Qwen3.6 SSM out projections (K=4096).
 //
-// Adapted from llama.cpp `kernel_mul_mv_q8_0_f32_impl`: one simdgroup handles
+// Adapted from the reference implementation `kernel_mul_mv_q8_0_f32_impl`: one simdgroup handles
 // four adjacent rows that share the same activation vector. The weight layout
 // is ZINC's repacked Q8_0 format, so each lane reads contiguous scales and qs.
 kernel void main0(

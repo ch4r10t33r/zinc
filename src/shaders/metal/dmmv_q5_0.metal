@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Q5_0 DMMV kernel — ported from llama.cpp's optimized approach.
+// Q5_0 DMMV kernel — ported from the reference implementation's optimized approach.
 // Key optimization: factor out the 'd' scale and '-16' bias per block,
 // reducing float32 multiplications from 64 to ~36 per block and
 // improving accumulation precision.

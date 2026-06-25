@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // Exact even-row Qwen3.6 SSM Q8_0 repacked DMMV for K=2048.
 //
-// Keeps the accepted llama.cpp-style TG128/two-row geometry, but removes the
+// Keeps the accepted reference-style TG128/two-row geometry, but removes the
 // generic tail-row branch from dmmv_q8_0_repacked_k2048.metal. The production
 // Qwen SSM qkv/gate row counts are even and large, so this avoids a hot
 // predicate without changing the row grouping that measured best.

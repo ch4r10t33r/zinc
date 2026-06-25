@@ -2,7 +2,7 @@
 using namespace metal;
 
 // Q6_K GEMM kernel — dequantize-then-multiply using simdgroup matrix operations.
-// Port of llama.cpp kernel_mul_mm for Q6_K weights × f32 input → f32 output.
+// Port of the reference implementation's kernel_mul_mm for Q6_K weights × f32 input → f32 output.
 // Same tile structure as gemm_q4k.metal (64×32 output, 4 simdgroups, NK=32)
 // by default. ZINC_GEMM_Q6K_NR1/ZINC_GEMM_Q6K_THREADS allow the Qwen dense
 // prefill path to use a 64×48 tile for 33-48 token prompts.

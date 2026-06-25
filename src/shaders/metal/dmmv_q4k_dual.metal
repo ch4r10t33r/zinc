@@ -3,7 +3,7 @@ using namespace metal;
 
 // Dual Q4_K DMMV for same-input gate/up projections.
 //
-// This mirrors llama.cpp's merged gate_up MoE graph shape for the Gemma shared
+// This mirrors the reference implementation's merged gate_up MoE graph shape for the Gemma shared
 // expert: both matrices read the same input vector, so keep that vector in
 // threadgroup memory and compute the two projections in one dispatch.
 

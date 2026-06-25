@@ -2,7 +2,7 @@
 // ZINC - SSM delta-net cols8 variant for pre-normalized Q/K.
 //
 // Expects ssm_qk_norm.comp to have normalized the Q and K slices in conv_out.
-// This keeps the llama.cpp-style eight-row wave64 update, but removes the
+// This keeps the reference-style eight-row wave64 update, but removes the
 // per-row-block Q/K norm reductions and LDS staging from the hot delta kernel.
 
 #extension GL_KHR_shader_subgroup_basic : require

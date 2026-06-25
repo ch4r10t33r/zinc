@@ -191,7 +191,7 @@ pub const MetalCommand = struct {
                     self.resource_barrier_count += 1;
                     self.resource_barrier_resources += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
-                    // Mirror llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // Mirror the reference implementation `ggml_metal_op_concurrency_check/reset`
                     // (ggml-metal-common.cpp `ggml_mem_ranges_check`): when only
                     // one buffer is the join, use a true resource-scoped barrier
                     // so independent dispatches that touch OTHER buffers stay
@@ -202,7 +202,7 @@ pub const MetalCommand = struct {
                 return;
             }
 
-            // llama.cpp tracks resource ranges to decide whether a barrier is
+            // the reference implementation tracks resource ranges to decide whether a barrier is
             // needed, then resets dependency groups with a plain
             // `memoryBarrierWithScope:MTLBarrierScopeBuffers`
             // (`ggml_metal_op_concurrency_reset`). Follow that for generic

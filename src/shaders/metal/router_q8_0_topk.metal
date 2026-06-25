@@ -5,7 +5,7 @@ using namespace metal;
 // Fused Q8_0 router for Qwen3.6 MoE decode/prefill.
 //
 // This is the single-token analogue of vLLM's topk -> selected-experts device
-// path, with the Q8_0 row walk adapted from llama.cpp's
+// path, with the Q8_0 row walk adapted from the reference implementation's
 // ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl. It writes the compact routing
 // row consumed by ZINC's MoE DMMV kernels: [k expert ids][k f32 weights as u32].
 

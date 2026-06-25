@@ -10,10 +10,10 @@ struct DmmvPush {
     uint y_offset; // byte offset into output vector
 };
 
-// Port of llama.cpp's kernel_mul_mv_q4_K_f32 (non-ext variant).
+// Port of the reference implementation's kernel_mul_mv_q4_K_f32 (non-ext variant).
 // Matches the exact floating-point accumulation pattern for bit-identical results.
 //
-// Thread organization (matches llama.cpp with N_SG_Q4_K=2, N_R0_Q4_K=2):
+// Thread organization (matches the reference implementation with N_SG_Q4_K=2, N_R0_Q4_K=2):
 //   64 threads per threadgroup = 2 simdgroups x 32 threads
 //   Each simdgroup processes 2 rows => 4 rows per threadgroup
 //
@@ -69,7 +69,7 @@ kernel void main0(
 
     const int first_row = (r0 * NSG + sgitg) * NR0;
 
-    // nb01 in llama.cpp is the byte stride per row = nb * sizeof(block_q4_K)
+    // nb01 in the reference implementation is the byte stride per row = nb * sizeof(block_q4_K)
 #if ZINC_Q4K_FIXED_BLOCKS
     constexpr int nb01 = ZINC_Q4K_FIXED_BLOCKS * BLOCK_SIZE;
 #else
@@ -82,7 +82,7 @@ kernel void main0(
     device const uchar* x_base = src0 + (uint64_t)first_row * nb01;
     device const float* y = src1;
 
-    // Keep the llama.cpp NR0=2 row pair in a vector accumulator. The per-block
+    // Keep the reference implementation's NR0=2 row pair in a vector accumulator. The per-block
     // fold already produces a float2 delta; carrying that shape to the final
     // simd reductions avoids a two-slot thread-private scalar array.
     float2 sumf = float2(0.0f);

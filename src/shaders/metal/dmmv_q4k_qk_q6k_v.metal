@@ -6,7 +6,7 @@ using namespace metal;
 //   rows [M_q, M_q + M_k)     -> Q4_K K
 //   rows [M_q + M_k, end)     -> Q6_K V
 //
-// This preserves the llama.cpp-style 64-thread / 4-row geometry from
+// This preserves the reference-style 64-thread / 4-row geometry from
 // dmmv_q4k_qk_dual.metal and dmmv_q6k_llama.metal, but removes the separate
 // V dispatch before the same QKV barrier on dense Gemma 31B decode.
 
@@ -119,7 +119,7 @@ kernel void main0(
 
         device const float* x = X + (p.x_offset / 4);
         // Dense Gemma dispatches Q/K row counts as multiples of NSG*NR0, so
-        // keep the llama.cpp NR0=2 row pair in one vector accumulator instead
+        // keep the reference implementation NR0=2 row pair in one vector accumulator instead
         // of a thread-private scalar array. This matches the Q6_K V half below
         // and gives the compiler the same 2-wide reduction shape for the Q4_K
         // Q/K half of the fused attention projection.

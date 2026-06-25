@@ -6,7 +6,7 @@ using namespace metal;
 //
 // This is the fixed-K companion to residual_rms_norm_router_q8_0_topk.metal:
 // keep the accepted fusion, but specialize the router row walk the same way
-// llama.cpp specializes hot Q8 matvec shapes.
+// the reference implementation specializes hot Q8 matvec shapes.
 
 struct Params {
     uint n;

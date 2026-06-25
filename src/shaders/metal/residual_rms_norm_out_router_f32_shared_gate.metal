@@ -8,7 +8,7 @@ using namespace metal;
 //   routing = F32 router top-k(norm)
 //   shared_gate = dot(F32 shared-gate, norm)
 //
-// This keeps vLLM-style compact top-k metadata while applying llama.cpp's
+// This keeps vLLM-style compact top-k metadata while applying the reference implementation's
 // dependency-edge discipline: the SSM-out projection is the only command-level
 // producer this dispatch needs to wait for.
 

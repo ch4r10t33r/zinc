@@ -82,7 +82,7 @@ uint64_t mtl_command_gpu_duration_ns(MetalCmd* cmd);
 void mtl_commit_wait_restart(MetalCmd* cmd);
 
 // Residency set management (macOS 15+). Wires GPU buffers down so they don't
-// page-fault on cold access. Adapted from llama.cpp ggml-metal-device.m
+// page-fault on cold access. Adapted from the reference implementation ggml-metal-device.m
 // `ggml_metal_buffer_rset_init`. Returns NULL on systems where the API is
 // unavailable; all subsequent calls become no-ops in that case.
 MetalRSet* mtl_rset_create(MetalCtx* ctx, uint32_t initial_capacity);

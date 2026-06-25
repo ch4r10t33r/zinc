@@ -14,7 +14,7 @@ struct DmmvPush {
 // Q8_0 is the dominant path for SSM projections and lm_head on the target
 // Qwen3.6-35B-A3B model (72.5% of all DMMV data).
 //
-// Adapted from llama.cpp kernel_mul_mv_q8_0_f32 (ggml-metal.metal) which uses
+// Adapted from the reference implementation kernel_mul_mv_q8_0_f32 (ggml-metal.metal) which uses
 // N_R0_Q8_0 = 2: each simdgroup processes TWO output rows simultaneously,
 // sharing the L1-cached X vector (at most 16 KiB for K<=4096).  This doubles
 // useful compute per X fetch, improving pipeline utilization.

@@ -3,7 +3,7 @@ using namespace metal;
 
 // Q4_K gate/up GEMM fused with SwiGLU for dense Qwen3.5 9B queued prefill.
 //
-// This follows llama.cpp's Metal batched mul_mat shape: one 64 row x 32 token
+// This follows the reference implementation's Metal batched mul_mat shape: one 64 row x 32 token
 // tile per threadgroup using simdgroup matrix multiply. The difference is that
 // the gate and up matrices share the same f32 prompt tile, so the shader loads
 // B once, computes both projections, and writes SiLU(gate) * up directly.

@@ -4,7 +4,7 @@ using namespace metal;
 
 // Exact Qwen3.6 Q8_0 router for a private-repacked K=2048 weight layout.
 //
-// Adapts llama.cpp `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl`'s
+// Adapts the reference implementation `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl`'s
 // adjacent-row Q8 matvec discipline to ZINC's SIMD-coalesced repacked Q8_0
 // blocks, while keeping the existing compact top-k output contract.
 

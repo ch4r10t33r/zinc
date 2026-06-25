@@ -9135,7 +9135,7 @@ fn swiglu(gate: []const f32, up: []const f32, output: []f32) void {
 }
 
 /// Gemma 4 uses gelu(gate) * up (tanh-approx GELU matches GGML's gelu_quick).
-/// Matches llama.cpp build_ffn with LLM_FFN_GELU + LLM_FFN_PAR.
+/// Matches the reference implementation build_ffn with LLM_FFN_GELU + LLM_FFN_PAR.
 fn geluGate(gate: []const f32, up: []const f32, output: []f32) void {
     // tanh-approx GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     const k_sqrt_2_over_pi: f32 = 0.7978845608028654;

@@ -2,7 +2,7 @@
 using namespace metal;
 
 // Q4_K GEMM kernel — dequantize-then-multiply using simdgroup matrix operations.
-// Port of llama.cpp kernel_mul_mm for Q4_K weights × f32 input → f32 output.
+// Port of the reference implementation's kernel_mul_mm for Q4_K weights × f32 input → f32 output.
 //
 // Output tile: 64 rows × NR1 columns per threadgroup (64 weight rows × prompt tokens)
 // Threadgroup: 128 threads by default; ZINC_GEMM_Q4K_THREADS selects wider
@@ -40,7 +40,7 @@ struct block_q4_K {
 #define QK_K  256
 #define QK_NL 16    // number of dequant sub-blocks per Q4_K block
 
-// Match llama.cpp's kernel_mul_mm_q4_K_f32 pragma style: forces the compiler
+// Match the reference implementation's kernel_mul_mm_q4_K_f32 pragma style: forces the compiler
 // to fully unroll the constant-bound inner loops over the 16-element A-tile
 // store and the NK/8 simdgroup-multiply iterations. Unrolling these removes
 // branch overhead in the hot path and lets the scheduler interleave the

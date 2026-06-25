@@ -11,7 +11,7 @@ struct DmmvPush {
 
 // K <= 2048 specialization of Q8_0 DMMV — nr=2 multi-row, barrier-free.
 //
-// Adapted from llama.cpp kernel_mul_mv_q8_0_f32 (ggml-metal.metal) which uses
+// Adapted from the reference implementation kernel_mul_mv_q8_0_f32 (ggml-metal.metal) which uses
 // N_R0_Q8_0 = 2: each simdgroup processes TWO output rows simultaneously,
 // sharing the L1-cached X vector (4-8 KiB for K<=2048).  This doubles useful
 // compute per X fetch, improving pipeline utilization and bandwidth efficiency.

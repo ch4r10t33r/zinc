@@ -198,7 +198,7 @@ pub const QuantizeQ8_1Push = extern struct {
 };
 
 /// Push constants for `count_experts.comp` (effort-6 Step 3 helper). Mirrors
-/// llama.cpp's count_experts push so the shader is structurally identical
+/// the reference implementation's count_experts push so the shader is structurally identical
 /// to the upstream version. All strides are in u32 units (not bytes).
 ///
 /// For the prefill routing capture buffer with layout
@@ -512,7 +512,7 @@ pub const DmmvDispatch = struct {
     /// Packs a token-major route cache into expert-major active blocks.
     pipeline_moe_route_pack: ?Pipeline,
     /// Effort-6 Step 1 of 5 foundation: tiled Q4_K dense GEMM. First port
-    /// of llama.cpp's mul_mm.comp #ifndef COOPMAT branch adapted to ZINC's
+    /// of the reference implementation's mul_mm.comp #ifndef COOPMAT branch adapted to ZINC's
     /// wave64 / Q4_K conventions. WG produces a 32×16 output tile with 64
     /// threads; BK=32 (one Q4_K sub-block) per outer step. Pipeline loads
     /// at startup; this cycle wires it under ZINC_MUL_MM_LM_HEAD=1 to the

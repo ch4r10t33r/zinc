@@ -71,7 +71,7 @@ vec4 unpack_nibbles_hi(uint v) {
 }
 
 // Extract (d_sub, dmin_sub) for a 32-element sub-block within the Q4_K super-block.
-// Bit layout mirrors llama.cpp's get_scale_min_k4 and is shared by every Q4_K DMMV
+// Bit layout mirrors the reference implementation's get_scale_min_k4 and is shared by every Q4_K DMMV
 // variant in this tree. Inline to keep the register allocator's job simple.
 void decode_sb(uint bytes[12], uint sb, out float sc, out float mn) {
     if (sb < 4u) {

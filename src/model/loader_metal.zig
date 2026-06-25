@@ -652,7 +652,7 @@ pub fn load(
     }
 
     // Wire all weight buffers into a single MTLResidencySet so the OS can't
-    // page them out between layer dispatches. This mirrors llama.cpp's
+    // page them out between layer dispatches. This mirrors the reference implementation's
     // `ggml_metal_buffer_rset_init` and is the missing piece behind the
     // 130x bench-vs-real bandwidth gap on dense Gemma 31B: kernel microbench
     // sees 491 GB/s, real inference sees ~4 GB/s. Without residency hints,

@@ -2,7 +2,7 @@
 using namespace metal;
 
 // Qwen3.6 exact-shape Q5_K routed MoE down projection for K=512.
-// Two output rows share one simdgroup, mirroring llama.cpp's row-pair Q8
+// Two output rows share one simdgroup, mirroring the reference implementation's row-pair Q8
 // discipline where the input vector is reused while streaming adjacent rows.
 // The two Q5_K blocks are unrolled so the hot expert-down path does not pay the
 // generic K<=2048 loop overhead.
