@@ -47,6 +47,8 @@ __global__ void f32_to_f16_kernel(const float* in, __half* out, int n) {
     if (i < n) out[i] = __float2half(in[i]);
 }
 
+extern __global__ void mmq_v2_kernel_f16_only(const __half*, const __half*, float*, int, int, int);
+
 // MMQ v2 kernel (in mmq_v2_kernel.cu)
 extern __global__ void mmq_v2_kernel_q4k(
     const unsigned char* W_q4k, const float* X_f32, float* Y_f32, int M, int K, int T);
@@ -145,10 +147,17 @@ int main(int argc, char** argv) {
           });
 
     // 3. MMQ v2 (fused Q4_K dequant + wmma TC GEMM)
-    bench("3. mmq_v2 (fused Q4_K wmma)", M, K, T, iters,
+    bench("3. mmq_v2 fp32 act (fused Q4_K)", M, K, T, iters,
           [](int M, int K, int T, cudaStream_t s) {
-              dim3 grid((M + 63) / 64, (T + 63) / 64);
-              mmq_v2_kernel_q4k<<<grid, 128, 0, s>>>(g_W_q4k, g_X_f32, g_Y, M, K, T);
+              dim3 grid((M + 127) / 128, (T + 127) / 128);
+              mmq_v2_kernel_q4k<<<grid, 256, 0, s>>>(g_W_q4k, g_X_f32, g_Y, M, K, T);
+          });
+
+    // 4. DIAGNOSTIC: fp16-only wmma GEMM (no dequant)
+    bench("4. wmma fp16-only (no dequant)", M, K, T, iters,
+          [](int M, int K, int T, cudaStream_t s) {
+              dim3 grid((M + 127) / 128, (T + 127) / 128);
+              mmq_v2_kernel_f16_only<<<grid, 256, 0, s>>>(g_W_f16, g_X_f16, g_Y, M, K, T);
           });
 
     // Roofline
