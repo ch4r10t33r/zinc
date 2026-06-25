@@ -124,14 +124,43 @@ key MoE win: **each expert weight read ~once** instead of once-per-token.
 
 ## Implementation milestones
 
-### M0 — Microbench harness (this session)
+### M0 — Microbench harness ✅
 Isolated GEMM benchmark: allocate Q4_K [M, K] + fp32 [K, T], run kernel, measure
-TFLOPS + GB/s. Compare vs:
-- cuBLAS + dequant round-trip (ZINC's current path)
-- llama-bench pp128 / pp512 / pp1024 (reference target)
+TFLOPS + GB/s. Compare vs cuBLAS + dequant round-trip.
 
-### M1 — Baseline MMQ (fp16×fp16, no Q8_1, no cp.async)
-Port the core `gemm_q4k_tc` to 128×128 tile with mma.sync. No fancy pipeline.
+### M1 — Baseline wmma kernel ✅ (14.6 TFLOPS, 16% of cuBLAS)
+64×64 tile, BK=32, 4 warps, no bank-conflict padding. Naive per-element dequant.
+Bottleneck: 8% occupancy (misdiagnosed as ALU-bound; actually shared mem exceeded
+48KB limit in later BK=256 attempt).
+
+### M2 — Parity with dequant+cuBLAS ✅ (92→136 TFLOPS)
+Fixes: WSTRIDE=36 (bank-conflict-free), 9.2 KB shared (4 CTAs/SM, 33% occupancy).
+**Key result:** matches dequant+cuBLAS exactly at all T values. The fused kernel
+does the same DRAM traffic, so parity is expected without traffic reduction.
+
+### M3 — Warp specialization ✅ (experiment, no gain over M2)
+Tried producer-consumer split (4 warps dequant + 4 warps mma, double-buffered).
+**Finding:** no improvement. The GPU's warp scheduler already overlaps ALU and TC
+across warps naturally — explicit warp specialization adds thread/sync overhead
+without achieving additional overlap. The bottleneck is **total ALU instruction
+count** for the Q4_K dequant (~6 instr/element × 2048 elements/K-iter × 128
+K-iters = 1.6M instructions/CTA), not pipeline stalls.
+
+Tried `__launch_bounds__(128, 8)` (64 regs, 67% occupancy): also no gain. The
+grid provides only 4 CTAs/SM regardless, so extra register headroom is unused.
+
+**Conclusion:** to BEAT dequant+cuBLAS, must either:
+1. **Reduce DRAM traffic** — Q8_1 activation (halve activation reads, the llama.cpp approach)
+2. **Reduce dequant ALU** — vectorized byte access (uint32 loads), lookup table, or process
+   both nibble halves per byte read
+3. **Use mma.sync PTX** instead of wmma — finer-grained register control, potentially fewer
+   instructions per TC operation
+
+### M4 — Q8_1 activation quantization (next)
+Quantize fp32 activation to Q8_1 (1 byte/elem) before the GEMM. At bandwidth-bound
+sizes (T<256), this halves the activation DRAM traffic. Requires a fast quantization
+pre-pass + Q8_1→fp16 dequant in the GEMM inner loop. This is how llama.cpp achieves
+its edge over cuBLAS+dequant."
 **Gate:** must match cuBLAS+dequant throughput before adding complexity.
 
 ### M2 — cp.async 3-stage pipeline
@@ -146,6 +175,20 @@ Replace grid dispatch with persistent CTAs. Fuse MoE expert routing.
 ### M5 — Integrate into forward_cuda.zig
 Wire into `gemmDispatchPrefill`, gated by env (`ZINC_MMQ_V2=1`), default-on after
 validation.
+
+## Revised priorities (post-M3 findings)
+
+The warp specialization experiment (M3) proved that ALU/TC overlap is already
+maximized by the GPU's warp scheduler. The remaining levers are:
+
+1. **Q8_1 activation** (M4) — the proven llama.cpp approach. Halves activation
+   DRAM reads. Expected: +20-30% at T≤512 (bandwidth-bound regime).
+2. **Vectorized dequant** — read uint32 (4 bytes = 8 nibbles) instead of individual
+   bytes. Reduces load instruction count by 4×. Expected: +10-15%.
+3. **mma.sync PTX** — replace wmma with inline PTX `mma.sync.m16n8k16`. Gives
+   finer register control, avoids wmma overhead. Expected: +5-10%.
+4. **Larger 128×128 tile** — amortizes sync/launch overhead over 4× more work.
+   Now viable with the bank-conflict-free layout. Expected: +5%.
 
 ## Correctness gate
 - `validate_catalog.sh` 5/5 (fp16 TC is token-tolerance, not bit-identical — that's OK)
