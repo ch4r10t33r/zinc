@@ -49,9 +49,13 @@ __global__ void f32_to_f16_kernel(const float* in, __half* out, int n) {
 
 extern __global__ void mmq_v2_kernel_f16_only(const __half*, const __half*, float*, int, int, int);
 
-// MMQ v2 kernel (in mmq_v2_kernel.cu)
+// MMQ v2 kernels
+struct block_q8_1 { __half d; __half s; int8_t qs[32]; };
+extern "C" __global__ void quantize_q8_1_kernel(const float*, block_q8_1*, int, int);
 extern __global__ void mmq_v2_kernel_q4k(
     const unsigned char* W_q4k, const float* X_f32, float* Y_f32, int M, int K, int T);
+extern __global__ void mmq_v2_kernel_q4k_q81_int8(
+    const unsigned char* W_q4k, const block_q8_1* X_q8_1, float* Y_f32, int M, int K, int T);
 
 static cublasHandle_t g_cublas;
 
@@ -61,6 +65,7 @@ static __half* g_W_f16;
 static float* g_X_f32;
 static __half* g_X_f16;
 static float* g_Y;
+static block_q8_1* g_X_q8_1;
 
 static void bench(const char* label, int M, int K, int T, int iters,
                   void (*launch)(int, int, int, cudaStream_t))
@@ -118,6 +123,12 @@ int main(int argc, char** argv) {
         dequant_q4k_to_f16_bench<<<(M*K+255)/256, 256>>>(g_W_q4k, g_W_f16, pc); }
     // Pre-convert X to fp16 (for cuBLAS baselines)
     {   f32_to_f16_kernel<<<(K*T+255)/256, 256>>>(g_X_f32, g_X_f16, K * T); }
+    // Pre-quantize X to Q8_1 (for INT8 MMQ)
+    {
+        cudaMalloc(&g_X_q8_1, (size_t)T * (K/32) * sizeof(block_q8_1));
+        int nq8 = T * (K/32);
+        quantize_q8_1_kernel<<<(nq8+255)/256, 256>>>(g_X_f32, g_X_q8_1, K, T);
+    }
     cudaDeviceSynchronize();
 
     cublasCreate(&g_cublas);
@@ -146,18 +157,11 @@ int main(int argc, char** argv) {
                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
           });
 
-    // 3. MMQ v2 (fused Q4_K dequant + wmma TC GEMM)
-    bench("3. mmq_v2 fp32 act (fused Q4_K)", M, K, T, iters,
+    // 3. INT8 TC MMQ (Q4_K × Q8_1 via mma.sync.s32.s8.s8.s32 — 165 TOPS)
+    bench("3. mmq_v2 INT8 TC (Q4_K×Q8_1)", M, K, T, iters,
           [](int M, int K, int T, cudaStream_t s) {
-              dim3 grid((M + 127) / 128, (T + 127) / 128);
-              mmq_v2_kernel_q4k<<<grid, 256, 0, s>>>(g_W_q4k, g_X_f32, g_Y, M, K, T);
-          });
-
-    // 4. DIAGNOSTIC: fp16-only wmma GEMM (no dequant)
-    bench("4. wmma fp16-only (no dequant)", M, K, T, iters,
-          [](int M, int K, int T, cudaStream_t s) {
-              dim3 grid((M + 127) / 128, (T + 127) / 128);
-              mmq_v2_kernel_f16_only<<<grid, 256, 0, s>>>(g_W_f16, g_X_f16, g_Y, M, K, T);
+              dim3 grid((M + 63) / 64, (T + 63) / 64);
+              mmq_v2_kernel_q4k_q81_int8<<<grid, 128, 0, s>>>(g_W_q4k, g_X_q8_1, g_Y, M, K, T);
           });
 
     // Roofline
