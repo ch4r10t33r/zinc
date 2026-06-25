@@ -1314,6 +1314,10 @@ pub const ForwardCuda = struct {
         const ctx = self.ctx;
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
+        const profile = std.posix.getenv("ZINC_PREFILL_PROFILE") != null;
+        var prof_attn: i64 = 0;
+        var prof_ssm: i64 = 0;
+        var prof_ffn: i64 = 0;
         // cuBLAS dense-GEMM defaults (mirror the gemma path): on unless opted out.
         self.use_cublas = cublasDefaultOn();
         self.use_cublas_q5 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ5") == null;
@@ -1336,33 +1340,68 @@ pub const ForwardCuda = struct {
 
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) {
-                try self.attentionLayerBatched(L, T, b);
-            } else {
-                try self.ssmLayerBatched(L, T, b);
-            }
-            if (d.n_experts > 0) {
-                if (moe_batched and self.moeBatchedSupported(L)) {
-                    // Token-batched MoE FFN: one launch per step over all T tokens.
-                    try self.moeFfnBlockBatched(L, T, b);
+            if (profile) {
+                self.waitPending();
+                const t0 = std.time.milliTimestamp();
+                if (isFullAttn(L, d.full_attn_interval)) {
+                    try self.attentionLayerBatched(L, T, b);
                 } else {
-                    // Fallback: loop the proven per-token block, aliasing self.hidden
-                    // to each token's row (the routed/shared experts read the row's
-                    // norm and accumulate back into it).
-                    const saved_hidden = self.hidden;
-                    var t: u32 = 0;
-                    while (t < T) : (t += 1) {
-                        self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
-                        try self.moeFfnBlock(L);
-                        buffer.freeBuffer(&self.hidden);
-                    }
-                    self.hidden = saved_hidden;
+                    try self.ssmLayerBatched(L, T, b);
                 }
+                self.waitPending();
+                const dt0 = std.time.milliTimestamp() - t0;
+                if (isFullAttn(L, d.full_attn_interval)) prof_attn += dt0 else prof_ssm += dt0;
+                const t1 = std.time.milliTimestamp();
+                if (d.n_experts > 0) {
+                    if (moe_batched and self.moeBatchedSupported(L)) {
+                        try self.moeFfnBlockBatched(L, T, b);
+                    } else {
+                        const saved_hidden = self.hidden;
+                        var t: u32 = 0;
+                        while (t < T) : (t += 1) {
+                            self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
+                            try self.moeFfnBlock(L);
+                            buffer.freeBuffer(&self.hidden);
+                        }
+                        self.hidden = saved_hidden;
+                    }
+                } else {
+                    try self.ffnBlockBatched(L, T, b);
+                }
+                self.waitPending();
+                prof_ffn += std.time.milliTimestamp() - t1;
             } else {
-                try self.ffnBlockBatched(L, T, b);
+                if (isFullAttn(L, d.full_attn_interval)) {
+                    try self.attentionLayerBatched(L, T, b);
+                } else {
+                    try self.ssmLayerBatched(L, T, b);
+                }
+                if (d.n_experts > 0) {
+                    if (moe_batched and self.moeBatchedSupported(L)) {
+                        try self.moeFfnBlockBatched(L, T, b);
+                    } else {
+                        const saved_hidden = self.hidden;
+                        var t: u32 = 0;
+                        while (t < T) : (t += 1) {
+                            self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
+                            try self.moeFfnBlock(L);
+                            buffer.freeBuffer(&self.hidden);
+                        }
+                        self.hidden = saved_hidden;
+                    }
+                } else {
+                    try self.ffnBlockBatched(L, T, b);
+                }
             }
         }
         self.waitPending(); // drain every layer's async commands before the tail.
+
+        if (profile) {
+            const total = prof_attn + prof_ssm + prof_ffn;
+            std.log.info("PREFILL_PROFILE: attn={d}ms ssm={d}ms ffn={d}ms total={d}ms (T={d})", .{
+                prof_attn, prof_ssm, prof_ffn, total, T,
+            });
+        }
 
         // TAIL on the last token only: rms_norm → LM head → argmax.
         const last = T - 1;
