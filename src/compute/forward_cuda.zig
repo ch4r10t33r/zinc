@@ -75,6 +75,21 @@ const DeltaNetPush = extern struct {
     ab_stride_tok: u32,
     y_stride_tok: u32,
 };
+
+const DeltaNetWarpPush = extern struct {
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    ssm_a_is_f16: u32,
+    dt_bias_is_f16: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    n_tok: u32,
+    conv_stride_tok: u32,
+    ab_stride_tok: u32,
+    y_stride_tok: u32,
+};
 const GatedNormPush = extern struct {
     d_inner: u32,
     dt_rank: u32,
@@ -298,6 +313,7 @@ const Pipelines = struct {
     deinterleave: CudaPipeline,
     ssm_conv1d: CudaPipeline,
     ssm_delta_net: CudaPipeline,
+    ssm_delta_net_warp: CudaPipeline, // warp-level scan (no __syncthreads in hot loop)
     ssm_gated_norm: CudaPipeline,
     swiglu: CudaPipeline,
     argmax: CudaPipeline,
@@ -739,6 +755,7 @@ pub const ForwardCuda = struct {
         pipes.deinterleave = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate");
         pipes.ssm_conv1d = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d");
         pipes.ssm_delta_net = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net");
+        pipes.ssm_delta_net_warp = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net_warp");
         pipes.ssm_gated_norm = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm");
         pipes.swiglu = try pipeline.createPipeline(ctx, src.ptr, "swiglu");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
@@ -1515,10 +1532,9 @@ pub const ForwardCuda = struct {
         const conv = ConvBatchPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .n_tok = T, .state_offset = self.conv_off[L] };
         cmd.dispatch(&self.pipes.ssm_conv1d_batched, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.qkv, &wconv.gpu_buffer, &self.ssm_conv_state[L], &b.conv_out }, &conv, @sizeOf(ConvBatchPush), 0);
         self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1); // match the in-kernel advance
-        // Delta-net scan: ONE launch with n_tok=T (the kernel loops tokens
-        // internally, carrying the recurrent state → bit-identical to per-token).
-        const dn = DeltaNetPush{
-            .d_inner = d.d_inner,
+        // Delta-net scan: warp-level kernel (no __syncthreads in hot loop).
+        // Grid: (dt_rank, ceilDiv(head_v_dim, 4)). Block: (32, 4) = 4 warps.
+        const dn_warp = DeltaNetWarpPush{
             .dt_rank = d.dt_rank,
             .head_v_dim = d.head_v_dim,
             .d_state = d.d_state,
@@ -1532,7 +1548,7 @@ pub const ForwardCuda = struct {
             .ab_stride_tok = d.dt_rank,
             .y_stride_tok = d.d_inner,
         };
-        cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn, @sizeOf(DeltaNetPush), 0);
+        cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 0);
         // Batched gated norm: grid.y = T (stateless per token).
         const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
         const gn = GatedNormBatchPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head, .n_tok = T };

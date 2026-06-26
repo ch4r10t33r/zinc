@@ -58,6 +58,12 @@ __device__ __forceinline__ float zinc_warp_reduce_sum(float v) {
     return v;
 }
 
+// Warp reduce with broadcast — result valid in ALL lanes (no __syncthreads)
+__device__ __forceinline__ float zinc_warp_reduce_sum_all(float v) {
+    v = zinc_warp_reduce_sum(v);
+    return __shfl_sync(0xffffffffu, v, 0);
+}
+
 // Block reduce — valid result in thread 0. blockDim must be a multiple of 32.
 __device__ __forceinline__ float zinc_block_reduce_sum(float v) {
     __shared__ float sh[32];
@@ -1226,6 +1232,136 @@ extern "C" __global__ void ssm_delta_net(
         __syncthreads();
     }
     state[row_base + col] = rs;                             // write final state
+}
+
+// ---- ssm_delta_net_warp (warp-level scan — no __syncthreads in hot loop) -----
+// Port of llama.cpp's gated_delta_net_cuda approach: each WARP owns one column,
+// state elements spread across lanes (rows_per_lane = head_v_dim/warp_size).
+// ALL reductions use __shfl_down_sync (warp-level) — ZERO __syncthreads per
+// token iteration. Eliminates the 2048 barriers that made the old kernel 60%
+// of prefill time.
+//
+// Grid: (dt_rank, ceilDiv(head_v_dim, N_WARPS))
+// Block: (32, N_WARPS) = 128 threads
+// Each warp (threadIdx.y) owns column = blockIdx.y * N_WARPS + threadIdx.y.
+struct DeltaNetWarpPush {
+    unsigned dt_rank, head_v_dim, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned n_tok, conv_stride_tok, ab_stride_tok, y_stride_tok;
+};
+
+#define DN_WARP_SIZE 32
+#define DN_N_WARPS 4
+#define DN_MAX_ROWS_PER_LANE 4  // head_v_dim(128) / warp_size(32) = 4
+
+extern "C" __global__ void ssm_delta_net_warp(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    DeltaNetWarpPush pc)
+{
+    const unsigned h = blockIdx.x;
+    const unsigned col = blockIdx.y * DN_N_WARPS + threadIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
+
+    const unsigned hv = pc.head_v_dim;
+    const unsigned qk_dim = pc.d_state * pc.n_group;
+    const unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
+    const unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+    const unsigned rows_per_lane = hv / DN_WARP_SIZE;  // 128/32 = 4
+
+    // State[h][row][col] — each lane owns rows lane, lane+32, lane+64, lane+96
+    float s_shard[DN_MAX_ROWS_PER_LANE];
+    #pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        unsigned row = r * DN_WARP_SIZE + lane;
+        s_shard[r] = state[((size_t)h * hv + row) * hv + col];
+    }
+
+    // Precompute dt_bias and ssm_a (same for all tokens — per-head constants)
+    float dt_bias_val = 0.0f;
+    if (pc.has_dt_bias != 0u)
+        dt_bias_val = pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                                        : ((const float*)dt_bias)[h];
+    float ssm_a_val = 0.0f;
+    if (pc.has_ssm_a != 0u)
+        ssm_a_val = pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                                    : ((const float*)ssm_a)[h];
+
+    const float inv_sqrt_d_state = rsqrtf((float)pc.d_state);
+
+    for (unsigned t = 0; t < pc.n_tok; t++) {
+        const unsigned conv_base = t * pc.conv_stride_tok;
+        const unsigned q_off = conv_base + k_hi * pc.d_state;
+        const unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
+        const unsigned v_off = conv_base + 2u * qk_dim + h * hv;
+
+        // Load Q, K for this token (cached in registers)
+        float q_reg[DN_MAX_ROWS_PER_LANE], k_reg[DN_MAX_ROWS_PER_LANE];
+        float sumq = 0.0f, sumk = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            unsigned row = r * DN_WARP_SIZE + lane;
+            if (row < k_len) {
+                q_reg[r] = conv_out[q_off + row];
+                k_reg[r] = conv_out[k_off + row];
+                sumq += q_reg[r] * q_reg[r];
+                sumk += k_reg[r] * k_reg[r];
+            } else {
+                q_reg[r] = 0.0f;
+                k_reg[r] = 0.0f;
+            }
+        }
+
+        // Warp-level reduces for Q/K norms (broadcast to ALL lanes, NO __syncthreads!)
+        sumq = zinc_warp_reduce_sum_all(sumq);
+        sumk = zinc_warp_reduce_sum_all(sumk);
+        const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
+        const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+
+        // Gate and beta: all lanes compute independently (same h, t) — no broadcast needed
+        float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
+        float sp = logf(1.0f + expf(a));
+        float gate = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
+        float b = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+
+        // Load V for this column
+        float v_val = conv_out[v_off + col];
+
+        // State update (per-lane, no sync):
+        // 1. Decay: s_shard *= gate
+        // 2. sk = dot(state, k_normalized) — warp reduce (broadcast)
+        // 3. d = beta * (v - sk)
+        // 4. state += k_normalized * d — rank-1 update
+        float sk_partial = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] *= gate;
+            sk_partial += s_shard[r] * (k_reg[r] * k_rinv);
+        }
+        float sk = zinc_warp_reduce_sum_all(sk_partial);
+        float d = b * (v_val - sk);
+
+        // Readout: o = dot(state, q_normalized) — warp reduce (broadcast)
+        float o_partial = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] += (k_reg[r] * k_rinv) * d;  // rank-1 update
+            o_partial += s_shard[r] * (q_reg[r] * q_rinv);
+        }
+        float o = zinc_warp_reduce_sum_all(o_partial);
+
+        // Write output (one value per warp — lane 0 writes)
+        if (lane == 0)
+            out_data[t * pc.y_stride_tok + h * hv + col] = o;
+    }
+
+    // Write final state
+    #pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        unsigned row = r * DN_WARP_SIZE + lane;
+        state[((size_t)h * hv + row) * hv + col] = s_shard[r];
+    }
 }
 
 // ---- ssm_conv1d_seq (Effort 28 4c-2b: batched DECODE per-seq conv1d) ---------
