@@ -156,12 +156,11 @@ test "Vulkan batched projection kpar is allowed on Intel wave32" {
     try expectNotContains(src[start..end], "gpu_config.wave_size == 64");
 }
 
-test "Vulkan Qwen dense prefill padding covers Qwen 3.5 9B DP4a shapes" {
+test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {
     const src = @embedFile("compute/forward.zig");
     const marker = "fn qwen36DensePrefillPaddedTokenCount";
     try expectContainsNear(src, marker, "isQwenDenseHybridLayerMajorPrefillModel", 500);
-    try expectContainsNear(src, marker, "isQwen35DenseHybrid9B", 500);
-    try expectContainsNear(src, marker, "64 else 128", 500);
+    try expectContainsNear(src, marker, "const min_dp4a_tokens: u32 = 32;", 500);
 }
 
 test "Vulkan batched kpar shaders merge cross-subgroup partials" {

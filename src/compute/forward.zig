@@ -10931,10 +10931,10 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_hidden_scale_dsum == null) return false;
         const cfg = self.model.config;
         if ((cfg.hidden_dim & 255) != 0) return false;
-        // Threshold comes from qwenDenseFfnDp4aEnabled(): 128 tokens for the
-        // 27B dense hybrid, 64 tokens for the Qwen3.5 9B public long-draft
-        // prompt. That guarantees the fused shader's packed output is
-        // consumed by the downstream dense gate+up DP4a path.
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): both dense-hybrid
+        // Qwen suite core prompts have enough work to win by padding to the
+        // 64-column DP4a path. That guarantees the fused shader's packed
+        // output is consumed by the downstream dense gate+up DP4a path.
         if (self.isQwen36DenseHybrid27B()) {
             if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
                 if (std.mem.eql(u8, v, "0")) return false;
@@ -11549,12 +11549,12 @@ pub const InferenceEngine = struct {
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q5k != null)
         {
-                // Wide (BN=64) variant gated behind ZINC_WIDE_GEMM=1.
-                // Disabled by default: BN=64 halves WG count, reducing
-                // parallelism and latency hiding on this 64-CU GPU.
-                if (n_tokens >= 64 and
-                    std.posix.getenv("ZINC_WIDE_GEMM") != null and
-                    self.dmmv.pipeline_mul_mm_q5k_wide != null)
+            // Wide (BN=64) variant gated behind ZINC_WIDE_GEMM=1.
+            // Disabled by default: BN=64 halves WG count, reducing
+            // parallelism and latency hiding on this 64-CU GPU.
+            if (n_tokens >= 64 and
+                std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                self.dmmv.pipeline_mul_mm_q5k_wide != null)
             {
                 try self.dmmv.recordMulMmQ5KWide(
                     &self.decode_cmd,
@@ -15843,7 +15843,7 @@ pub const InferenceEngine = struct {
     fn qwen36DensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return n_tokens;
         if (!self.isAmdRdna()) return n_tokens;
-        const min_dp4a_tokens: u32 = if (self.isQwen35DenseHybrid9B()) 64 else 128;
+        const min_dp4a_tokens: u32 = 32;
         if (n_tokens < min_dp4a_tokens) return n_tokens;
         return (n_tokens + 31) & ~@as(u32, 31);
     }
@@ -15922,13 +15922,13 @@ pub const InferenceEngine = struct {
         }
 
         if (self.isQwen35DenseHybrid9B()) {
-            // Qwen3.5 9B has smaller FFN matrices than the 27B dense hybrid,
-            // so the DP4a crossover is worth testing at the 64-token public
-            // long-draft prompt instead of inheriting the 27B 128-token floor.
-            return n_tokens >= 64;
+            // Qwen3.5 9B's 36-token quick-chat suite case is dominated by
+            // the generic dense FFN path. Let it pad to the 64-column DP4a
+            // path, matching the already-good long-draft behavior.
+            return n_tokens >= 32;
         }
 
-        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 32;
     }
 
     fn qwenDenseSsmOutDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
@@ -15938,13 +15938,12 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
-            // The 9B SSM-out projection is Q5_K with K=d_inner=4096, and the
-            // public long-draft prompt is exactly 64 tokens. Use the same
-            // measured 9B crossover already accepted for dense FFN DP4a rather
-            // than inheriting the 27B-only 128-token floor.
-            return n_tokens >= 64;
+            // The 9B SSM-out projection is Q5_K with K=d_inner=4096. Use the
+            // same 32-token crossover as dense FFN rather than inheriting an
+            // older 27B-only 128-token floor.
+            return n_tokens >= 32;
         }
-        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 32;
     }
 
     fn qwenDenseSsmProjDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
@@ -15954,12 +15953,12 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
-            // Match the accepted 9B dense-FFN/SSM-out crossover: the public
-            // long-draft prefill prompt is 64 tokens, while shorter core
-            // prompts avoid the extra quantize+barrier setup.
-            return n_tokens >= 64;
+            // Match the accepted 9B dense-FFN/SSM-out crossover: the 36-token
+            // quick-chat prompt pads profitably to 64 columns, while shorter
+            // prompts still avoid the extra quantize+barrier setup.
+            return n_tokens >= 32;
         }
-        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 32;
     }
 
     fn qwenDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
@@ -15969,10 +15968,10 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
-            return n_tokens >= 64;
+            return n_tokens >= 32;
         }
 
-        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 32;
     }
 
     fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
@@ -16332,9 +16331,8 @@ pub const InferenceEngine = struct {
         dp4a_cols_out: *u32,
     ) !DenseGateUpDp4aResult {
         dp4a_cols_out.* = 0;
-        // Threshold comes from qwenDenseFfnDp4aEnabled(): 128 tokens for the
-        // 27B dense hybrid, 64 tokens for Qwen3.5 9B so the public long-draft
-        // prompt can exercise the dense-FFN DP4a path.
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): short dense-hybrid
+        // Qwen prompts are allowed to pad to the 64-column DP4a path.
         const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             gate_t.info.type_ == .q4_k and
             up_t.info.type_ == .q4_k and
@@ -16628,10 +16626,9 @@ pub const InferenceEngine = struct {
         // was fused so the caller can skip the separate scale_acc.
         accum_target: ?Buffer,
     ) !bool {
-        // Threshold comes from qwenDenseFfnDp4aEnabled(): the 27B path keeps
-        // its measured 128-token floor, while Qwen3.5 9B is allowed at the
-        // 64-token long-draft shape. Tiny prompts still fall back via
-        // full_cols==0 or the helper's threshold.
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): short dense-hybrid
+        // Qwen prompts are allowed to pad to the 64-column DP4a path. Tiny
+        // prompts still fall back via full_cols==0 or the helper's threshold.
         const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             down_t.info.type_ == .q6_k and
             (inter_dim & 255) == 0 and
@@ -17007,8 +17004,7 @@ pub const InferenceEngine = struct {
         input_pre_quantized_q8_1: bool,
         pre_quantized_cols: u32,
     ) !bool {
-        // Qwen3.5 9B gets the same 64-token crossover as its accepted dense FFN
-        // and SSM-out DP4a paths. The 27B path keeps the measured 128-token floor.
+        // Use the same 32-token crossover as dense FFN and SSM-out DP4a paths.
         const dp4a_ok_shared = input_pre_quantized_q8_1 and
             self.qwenDenseSsmProjDp4aEnabled(n_tokens) and
             (wqkv_t.info.type_ == .q6_k or wqkv_t.info.type_ == .q5_k) and
@@ -17226,8 +17222,7 @@ pub const InferenceEngine = struct {
         input_pre_quantized_q8_1: bool,
         pre_quantized_cols: u32,
     ) !bool {
-        // Qwen3.5 9B shares the 64-token crossover with the qkv side of this
-        // projection pair. The 27B dense hybrid keeps its 128-token floor.
+        // Share the 32-token crossover with the qkv side of this projection pair.
         const dp4a_ok = self.qwenDenseSsmProjDp4aEnabled(n_tokens) and
             z_t.info.type_ == .q4_k and
             (hidden_dim & 255) == 0 and
@@ -17367,10 +17362,8 @@ pub const InferenceEngine = struct {
         d_inner: u32,
         n_tokens: u32,
     ) !bool {
-        // The 27B path keeps its measured 128-token floor. Qwen3.5 9B has a
-        // smaller 4096x4096 Q5_K SSM-out shape and reaches the public
-        // long-draft prompt at 64 tokens, so qwenDenseSsmOutDp4aEnabled lowers
-        // only that exact-shape crossover.
+        // Dense-hybrid Qwen short prompts pad profitably to the 64-column DP4a
+        // path; smaller prompts still fall back through qwenDenseSsmOutDp4aEnabled.
         const dp4a_ok = self.qwenDenseSsmOutDp4aEnabled(n_tokens) and
             ssm_out_t.info.type_ == .q5_k and
             (d_inner & 255) == 0 and
