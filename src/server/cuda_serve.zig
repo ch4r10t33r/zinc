@@ -313,9 +313,13 @@ pub const ServeEngine = struct {
                 };
                 // Batched prefill: use prefillBatchedSlot (5× faster than per-token
                 // decodeBatch) for qwen. Falls back to per-token for gemma.
+                // Batched prefill: use prefillBatchedSlot (2-5× faster for longer
+                // prompts) for qwen. Falls back to per-token for gemma or short prompts.
+                // Threshold: batched GEMM overhead dominates below ~32 tokens.
                 // A/B toggle: ZINC_BATCHED_PREFILL=0 disables (uses per-token fallback).
-                const use_batched = std.posix.getenv("ZINC_BATCHED_PREFILL") == null or
-                    !std.mem.eql(u8, std.posix.getenv("ZINC_BATCHED_PREFILL").?, "0");
+                const use_batched = np >= 32 and
+                    (std.posix.getenv("ZINC_BATCHED_PREFILL") == null or
+                    !std.mem.eql(u8, std.posix.getenv("ZINC_BATCHED_PREFILL").?, "0"));
                 const batched_tok = if (use_batched)
                     (fwd.prefillSlot(req.prompt_tokens, slot_id) catch null)
                 else
