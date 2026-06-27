@@ -671,6 +671,11 @@ pub const ForwardCuda = struct {
     serve_wcache_on: bool = false,
     serve_wcache_force: ?bool = null,
     serve_wcache_bytes: usize = 0,
+
+    // When true, ssmLayerBatched uses the block-reduce kernel (state-compatible
+    // with the decode ssm_delta_net_seq kernel). Set by prefillBatchedSlot so
+    // the batched prefill's SSM state is bit-compatible with subsequent decode.
+    force_block_ssm: bool = false,
     serve_wcache_cap: usize = 24 * 1024 * 1024 * 1024,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
@@ -1485,6 +1490,9 @@ pub const ForwardCuda = struct {
         }
 
         // Run batched prefill — writes land in the slot's aliased state.
+        // Force block-reduce SSM: the warp kernel's FP reduction tree produces a
+        // state that's incompatible with the decode's ssm_delta_net_seq kernel.
+        self.force_block_ssm = true;
         const tok = self.prefillBatched(tokens) catch |err| {
             self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
             @memcpy(self.conv_off, saved_conv_off);
@@ -1492,6 +1500,7 @@ pub const ForwardCuda = struct {
         };
 
         self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
+        self.force_block_ssm = false;
         @memcpy(self.conv_off, saved_conv_off);
         return tok;
     }
@@ -1603,8 +1612,8 @@ pub const ForwardCuda = struct {
         // Delta-net scan: warp-level kernel (no __syncthreads in hot loop).
         // Grid: (dt_rank, ceilDiv(head_v_dim, 4)). Block: (32, 4) = 4 warps.
         // A/B toggle: ZINC_SSM_WARP=0 falls back to the old block-reduce kernel.
-        const use_warp = std.posix.getenv("ZINC_SSM_WARP") == null or
-            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0");
+        const use_warp = !self.force_block_ssm and (std.posix.getenv("ZINC_SSM_WARP") == null or
+            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
         if (use_warp) {
             const dn_warp = DeltaNetWarpPush{
                 .dt_rank = d.dt_rank,
