@@ -1446,7 +1446,69 @@ pub const ForwardCuda = struct {
         return tok;
     }
 
-    /// Token-major attention block: pre-norm + Q/K/V/O projections via batched
+    /// Batched prefill that writes KV cache + SSM state into the given slot's
+    /// per-sequence region (instead of the single-seq scratch). Used by the
+    /// serve engine so server-mode prefill gets the 5× batched-GEMM speedup
+    /// instead of falling back to per-token decodeBatch (B=1).
+    pub fn prefillBatchedSlot(self: *ForwardCuda, tokens: []const u32, slot: u32) !u32 {
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        const T: u32 = @intCast(tokens.len);
+        if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
+
+        // Save single-seq state pointers + conv offsets.
+        const saved_kv_k = self.kv_k;
+        const saved_kv_v = self.kv_v;
+        const saved_ssm = self.ssm_state;
+        const saved_conv = self.ssm_conv_state;
+        const saved_conv_off = try self.allocator.dupe(u32, self.conv_off);
+        defer self.allocator.free(saved_conv_off);
+        @memset(self.conv_off, 0);
+
+        // Alias KV/SSM state to the slot's per-sequence region.
+        var alias_err: ?anyerror = null;
+        L_alias: for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            if (isFullAttn(L, d.full_attn_interval)) {
+                const kv_off = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
+                self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
+                self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
+            } else {
+                self.ssm_state[L] = buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4) catch |e| { alias_err = e; break :L_alias; };
+                self.ssm_conv_state[L] = buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4) catch |e| { alias_err = e; break :L_alias; };
+            }
+        }
+        if (alias_err) |e| {
+            self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
+            @memcpy(self.conv_off, saved_conv_off);
+            return e;
+        }
+
+        // Run batched prefill — writes land in the slot's aliased state.
+        const tok = self.prefillBatched(tokens) catch |err| {
+            self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
+            @memcpy(self.conv_off, saved_conv_off);
+            return err;
+        };
+
+        self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
+        @memcpy(self.conv_off, saved_conv_off);
+        return tok;
+    }
+
+    fn restorePrefillAliases(self: *ForwardCuda, saved_kk: []CudaBuffer, saved_vv: []CudaBuffer, saved_ss: []CudaBuffer, saved_cc: []CudaBuffer, n_layers: u32) void {
+        var i: u32 = 0;
+        while (i < n_layers) : (i += 1) {
+            buffer.freeBuffer(&self.kv_k[i]);
+            buffer.freeBuffer(&self.kv_v[i]);
+            buffer.freeBuffer(&self.ssm_state[i]);
+            buffer.freeBuffer(&self.ssm_conv_state[i]);
+        }
+        self.kv_k = saved_kk;
+        self.kv_v = saved_vv;
+        self.ssm_state = saved_ss;
+        self.ssm_conv_state = saved_cc;
+    }
     /// GEMM over all T tokens; the deinterleave-gate, per-head q/k norm, RoPE,
     /// KV-write, causal attention and sigmoid-gate are each ONE batched launch
     /// over all T tokens (Effort 26 T0), bit-identical to the old per-token loop

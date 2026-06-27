@@ -70,6 +70,14 @@ pub const Forward = union(enum) {
             .qwen => |q| try q.resetSlot(slot),
         }
     }
+    /// Batched prefill that writes state into the slot's per-sequence region.
+    /// Falls back to per-token decodeBatch when unavailable (gemma or old build).
+    fn prefillSlot(self: Forward, tokens: []const u32, slot: u32) !u32 {
+        switch (self) {
+            .gemma => return error.PrefillSlotUnsupported,
+            .qwen => |q| return try q.prefillBatchedSlot(tokens, slot),
+        }
+    }
 };
 
 /// Per-request published-token channel. The handler thread that submitted the
@@ -295,9 +303,6 @@ pub const ServeEngine = struct {
             for (prefill_buf[0..npf]) |slot_id| {
                 const req = &self.sched.slots[slot_id].?;
                 const np = req.prompt_tokens.len;
-                var pos: u32 = 0;
-                var tok: u32 = 0;
-                var k: usize = 0;
                 const pf_t0 = if (timer_opt) |*tm| tm.read() else 0;
                 // Clear any accumulated state from this slot's previous request
                 // BEFORE prefilling the new one from pos=0 (qwen SSM recurrent state;
@@ -306,23 +311,20 @@ pub const ServeEngine = struct {
                     self.failSlot(slot_id);
                     continue;
                 };
-                while (k < np) : (k += 1) {
-                    var tk = [_]u32{req.prompt_tokens[k]};
-                    var ps = [_]u32{pos};
-                    var sl = [_]u32{slot_id};
-                    var ot = [_]u32{0};
-                    fwd.decodeBatch(&tk, &ps, &sl, &ot) catch {
-                        self.failSlot(slot_id);
-                        break;
-                    };
-                    tok = ot[0];
-                    pos += 1;
-                } else {
+                // Batched prefill: use prefillBatchedSlot (5× faster than per-token
+                // decodeBatch) for qwen. Falls back to per-token for gemma.
+                // A/B toggle: ZINC_BATCHED_PREFILL=0 disables (uses per-token fallback).
+                const use_batched = std.posix.getenv("ZINC_BATCHED_PREFILL") == null or
+                    !std.mem.eql(u8, std.posix.getenv("ZINC_BATCHED_PREFILL").?, "0");
+                const batched_tok = if (use_batched)
+                    (fwd.prefillSlot(req.prompt_tokens, slot_id) catch null)
+                else
+                    null;
+                if (batched_tok) |tok| {
                     if (timer_opt) |*tm| {
                         _ = self.prefill_wall_ns.fetchAdd(tm.read() - pf_t0, .monotonic);
                         _ = self.prefill_tokens.fetchAdd(np, .monotonic);
                     }
-                    // prefill ran to completion (no break)
                     req.appendToken(tok) catch {
                         self.failSlot(slot_id);
                         continue;
@@ -330,6 +332,35 @@ pub const ServeEngine = struct {
                     req.transition(.decoding) catch {};
                     self.publish(req.id, tok);
                     if (req.shouldStop(self.eos)) self.finishSlot(slot_id);
+                } else {
+                    // Fallback: per-token B=1 decodeBatch prefill (gemma or error).
+                    var pos: u32 = 0;
+                    var tok: u32 = 0;
+                    var k: usize = 0;
+                    while (k < np) : (k += 1) {
+                        var tk = [_]u32{req.prompt_tokens[k]};
+                        var ps = [_]u32{pos};
+                        var sl = [_]u32{slot_id};
+                        var ot = [_]u32{0};
+                        fwd.decodeBatch(&tk, &ps, &sl, &ot) catch {
+                            self.failSlot(slot_id);
+                            break;
+                        };
+                        tok = ot[0];
+                        pos += 1;
+                    } else {
+                        if (timer_opt) |*tm| {
+                            _ = self.prefill_wall_ns.fetchAdd(tm.read() - pf_t0, .monotonic);
+                            _ = self.prefill_tokens.fetchAdd(np, .monotonic);
+                        }
+                        req.appendToken(tok) catch {
+                            self.failSlot(slot_id);
+                            continue;
+                        };
+                        req.transition(.decoding) catch {};
+                        self.publish(req.id, tok);
+                        if (req.shouldStop(self.eos)) self.finishSlot(slot_id);
+                    }
                 }
             }
 
