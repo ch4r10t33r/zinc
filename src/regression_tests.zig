@@ -163,6 +163,14 @@ test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {
     try expectContainsNear(src, marker, "const min_dp4a_tokens: u32 = 32;", 500);
 }
 
+test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
+    const src = @embedFile("compute/dmmv.zig");
+    try expectContains(src, "const spec_k_5120 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 5120 }};");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64");
+    try expectContains(src, "K == 5120 and n_tile == 64");
+}
+
 test "Vulkan batched kpar shaders merge cross-subgroup partials" {
     const q4 = @embedFile("shaders/dmmv_q4k_batch_kpar.comp");
     const q6 = @embedFile("shaders/dmmv_q6k_batch_kpar.comp");
