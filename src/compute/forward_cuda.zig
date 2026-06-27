@@ -1499,10 +1499,16 @@ pub const ForwardCuda = struct {
     fn restorePrefillAliases(self: *ForwardCuda, saved_kk: []CudaBuffer, saved_vv: []CudaBuffer, saved_ss: []CudaBuffer, saved_cc: []CudaBuffer, n_layers: u32) void {
         var i: u32 = 0;
         while (i < n_layers) : (i += 1) {
-            buffer.freeBuffer(&self.kv_k[i]);
-            buffer.freeBuffer(&self.kv_v[i]);
-            buffer.freeBuffer(&self.ssm_state[i]);
-            buffer.freeBuffer(&self.ssm_conv_state[i]);
+            // Only free the buffers that were actually aliased (per layer type).
+            // Attention layers: kv_k/kv_v aliased; ssm_state/conv untouched.
+            // SSM layers: ssm_state/conv aliased; kv_k/kv_v untouched.
+            if (isFullAttn(i, self.d.full_attn_interval)) {
+                buffer.freeBuffer(&self.kv_k[i]);
+                buffer.freeBuffer(&self.kv_v[i]);
+            } else {
+                buffer.freeBuffer(&self.ssm_state[i]);
+                buffer.freeBuffer(&self.ssm_conv_state[i]);
+            }
         }
         self.kv_k = saved_kk;
         self.kv_v = saved_vv;
