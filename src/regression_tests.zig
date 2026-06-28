@@ -180,6 +180,16 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN64 specialization" {
     try expectContains(src, "N / n_tile");
 }
 
+test "Vulkan full-DP4a BN64 down shaders load every activation half tile" {
+    const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
+    const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
+    for ([_][]const u8{ q4, q6 }) |src| {
+        try expectContains(src, "layout(constant_id = 1) const uint SPEC_BN = 32u;");
+        try expectContains(src, "for (uint cbase = 0u; cbase < BN; cbase += 32u)");
+        try expectContains(src, "const uint col_local = cbase + tid / 2u;");
+    }
+}
+
 test "Vulkan batched kpar shaders merge cross-subgroup partials" {
     const q4 = @embedFile("shaders/dmmv_q4k_batch_kpar.comp");
     const q6 = @embedFile("shaders/dmmv_q6k_batch_kpar.comp");
