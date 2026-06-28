@@ -161,32 +161,46 @@ test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {
     const marker = "fn qwen36DensePrefillPaddedTokenCount";
     try expectContainsNear(src, marker, "isQwenDenseHybridLayerMajorPrefillModel", 500);
     try expectContainsNear(src, marker, "const min_dp4a_tokens: u32 = 32;", 500);
+    try expectContains(src, "fn qwen36DenseFfnPrefillPaddedTokenCount");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n40");
+    try expectContains(src, "return 40;");
 }
 
 test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_5120 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 5120 }};");
+    try expectContains(src, "const spec_k_5120_n40 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40");
+    try expectContains(src, "K == 5120 and n_tile == 40");
     try expectContains(src, "K == 5120 and n_tile == 64");
 }
 
-test "Vulkan Qwen dense-down DP4a keeps K17408 BN64 specialization" {
+test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
+    try expectContains(src, "const spec_k_17408_n40 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64");
+    try expectContains(src, "K == 17408 and n_tile == 40");
     try expectContains(src, "K == 17408 and n_tile == 64");
     try expectContains(src, "N / n_tile");
 }
 
-test "Vulkan full-DP4a BN64 down shaders load every activation half tile" {
+test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
     const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
     const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
-    for ([_][]const u8{ q4, q6 }) |src| {
+    const gate_q8 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8.comp");
+    const gate_q8_1 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1.comp");
+    for ([_][]const u8{ q4, q6, gate_q8, gate_q8_1 }) |src| {
         try expectContains(src, "layout(constant_id = 1) const uint SPEC_BN = 32u;");
         try expectContains(src, "for (uint cbase = 0u; cbase < BN; cbase += 32u)");
         try expectContains(src, "const uint col_local = cbase + tid / 2u;");
+        try expectContains(src, "if (col_local < BN)");
     }
 }
 

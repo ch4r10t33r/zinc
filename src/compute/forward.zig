@@ -10932,8 +10932,8 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if ((cfg.hidden_dim & 255) != 0) return false;
         // Threshold comes from qwenDenseFfnDp4aEnabled(): both dense-hybrid
-        // Qwen suite core prompts have enough work to win by padding to the
-        // 64-column DP4a path. That guarantees the fused shader's packed
+        // Qwen suite core prompts have enough work to win by padding to a
+        // full DP4a body. That guarantees the fused shader's packed
         // output is consumed by the downstream dense gate+up DP4a path.
         if (self.isQwen36DenseHybrid27B()) {
             if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
@@ -15848,6 +15848,18 @@ pub const InferenceEngine = struct {
         return (n_tokens + 31) & ~@as(u32, 31);
     }
 
+    fn qwen36DenseFfnPrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        if (self.isQwen36DenseHybrid27B() and n_tokens > 32 and n_tokens <= 40 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n40 != null and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40 != null and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n40 != null and
+            self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n40 != null)
+        {
+            return 40;
+        }
+        return self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+    }
+
     fn gemmaDensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return n_tokens;
@@ -16332,7 +16344,7 @@ pub const InferenceEngine = struct {
     ) !DenseGateUpDp4aResult {
         dp4a_cols_out.* = 0;
         // Threshold comes from qwenDenseFfnDp4aEnabled(): short dense-hybrid
-        // Qwen prompts are allowed to pad to the 64-column DP4a path.
+        // Qwen prompts are allowed to pad to a full dense-FFN DP4a body.
         const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             gate_t.info.type_ == .q4_k and
             up_t.info.type_ == .q4_k and
@@ -16404,8 +16416,8 @@ pub const InferenceEngine = struct {
             self.batched_scratch_swiglu_i8 != null and
             self.batched_scratch_swiglu_scale_dsum != null;
         var full_cols = floor_cols;
-        const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-        if (padded_cols > floor_cols and (padded_cols & 31) == 0) {
+        const padded_cols = self.qwen36DenseFfnPrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > floor_cols and ((padded_cols & 31) == 0 or padded_cols == 40)) {
             const padded_hidden_f32_bytes: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, hidden_dim) *
@@ -16462,10 +16474,10 @@ pub const InferenceEngine = struct {
         dp4a_cols_out.* = full_cols;
         if (!input_pre_quantized) {
             const gateup_quant_phase = self.beginProfilePhase();
-            // One-shot quantize of the f32 RMS-normed hidden. For long Qwen3.6
-            // prompts, scratch is over-allocated to a 32-token multiple so the
-            // full-tile DP4a GEMM can cover the ragged real-token tail and
-            // avoid an extra f32 tail GEMM per dense layer. Dummy padded columns
+            // One-shot quantize of the f32 RMS-normed hidden. Scratch is
+            // over-allocated to a supported dense-FFN DP4a body so the full-tile
+            // GEMM can cover the ragged real-token tail and avoid an extra f32
+            // tail GEMM per dense layer. Dummy padded columns
             // are never accumulated back into scratch_hidden.
             try self.dmmv.recordQuantizeActQ8_1(
                 &self.decode_cmd,
@@ -16627,7 +16639,7 @@ pub const InferenceEngine = struct {
         accum_target: ?Buffer,
     ) !bool {
         // Threshold comes from qwenDenseFfnDp4aEnabled(): short dense-hybrid
-        // Qwen prompts are allowed to pad to the 64-column DP4a path. Tiny
+        // Qwen prompts are allowed to pad to a full dense-down DP4a body. Tiny
         // prompts still fall back via full_cols==0 or the helper's threshold.
         const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             down_t.info.type_ == .q6_k and
@@ -16648,8 +16660,8 @@ pub const InferenceEngine = struct {
             if (swiglu_already_q8 and gateup_dp4a_cols > full_cols) {
                 full_cols = gateup_dp4a_cols;
             } else if (!swiglu_already_q8) {
-                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-                if (padded_cols > full_cols and (padded_cols & 31) == 0) {
+                const padded_cols = self.qwen36DenseFfnPrefillPaddedTokenCount(n_tokens);
+                if (padded_cols > full_cols and ((padded_cols & 31) == 0 or padded_cols == 40)) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_scale = self.batched_scratch_swiglu_scale.?;
                     const need_input: vk.c.VkDeviceSize =
@@ -16771,8 +16783,8 @@ pub const InferenceEngine = struct {
             if (swiglu_already_q8_1 and gateup_dp4a_cols > full_cols) {
                 full_cols = gateup_dp4a_cols;
             } else if (!swiglu_already_q8_1) {
-                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-                if (padded_cols > full_cols and (padded_cols & 31) == 0) {
+                const padded_cols = self.qwen36DenseFfnPrefillPaddedTokenCount(n_tokens);
+                if (padded_cols > full_cols and ((padded_cols & 31) == 0 or padded_cols == 40)) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
                     const need_input: vk.c.VkDeviceSize =

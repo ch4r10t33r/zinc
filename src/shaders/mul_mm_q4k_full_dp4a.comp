@@ -156,12 +156,14 @@ void main() {
             const uint k_in_tile = tile_half * 16u;
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
                 const uint col_local = cbase + tid / 2u;
-                const uint col_global = ic * BN + col_local;
-                const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
-                const uint base_b = col_local * SPACK + tile_half * 4u;
-                [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
-                if (tile_half == 0u) {
-                    buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
+                if (col_local < BN) {
+                    const uint col_global = ic * BN + col_local;
+                    const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
+                    const uint base_b = col_local * SPACK + tile_half * 4u;
+                    [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
+                    if (tile_half == 0u) {
+                        buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
+                    }
                 }
             }
         } else {

@@ -163,15 +163,17 @@ void main() {
             const uint k_in_tile = sub * 16u;
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
                 const uint col_local = cbase + tid / 2u;
-                const uint col_global = ic * BN + col_local;
-                const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;
-                const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
-                const uint base_b = col_local * SPACK + sub * 4u;
-                [[unroll]] for (uint p = 0u; p < 4u; p++) {
-                    buf_b[base_b + p] = col_ok ? b_packed[src + p] : 0u;
-                }
-                if (sub == 0u) {
-                    buf_bs[col_local] = col_ok ? b_scale[col_global * b_stride_scale + (k_outer >> 5)] : 0.0;
+                if (col_local < BN) {
+                    const uint col_global = ic * BN + col_local;
+                    const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;
+                    const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
+                    const uint base_b = col_local * SPACK + sub * 4u;
+                    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                        buf_b[base_b + p] = col_ok ? b_packed[src + p] : 0u;
+                    }
+                    if (sub == 0u) {
+                        buf_bs[col_local] = col_ok ? b_scale[col_global * b_stride_scale + (k_outer >> 5)] : 0.0;
+                    }
                 }
             }
         } else {
