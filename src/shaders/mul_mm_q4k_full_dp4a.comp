@@ -36,6 +36,7 @@ layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
 layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;
 layout(constant_id = 3) const uint SPEC_BK_STEP = 1u;
+layout(constant_id = 4) const uint SPEC_ACCUMULATE = 0u;
 
 const uint BN = SPEC_BN;
 const uint BK_STEP = SPEC_BK_STEP;
@@ -225,7 +226,12 @@ void main() {
             const uint row_g = ir * BM + tiwr * TM + m;
             const uint col_g = ic * BN + tiwc * TN + n;
             if ((BN >= 32u && SPEC_RAGGED_N == 0u) || col_g < N) {
-                d_data[d_offset + col_g * stride_d + row_g] = sums[m][n];
+                const uint out_idx = d_offset + col_g * stride_d + row_g;
+                if (SPEC_ACCUMULATE != 0u) {
+                    d_data[out_idx] += sums[m][n];
+                } else {
+                    d_data[out_idx] = sums[m][n];
+                }
             }
         }
     }

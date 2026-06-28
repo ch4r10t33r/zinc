@@ -11934,6 +11934,7 @@ pub const InferenceEngine = struct {
                     K,
                     0,
                     0,
+                    false,
                 );
                 if (tail_cols > 0) {
                     if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_tail8 != null) {
@@ -12704,6 +12705,7 @@ pub const InferenceEngine = struct {
                         inter_dim,
                         0,
                         0,
+                        false,
                     );
                 }
                 if (!use_ragged72 and dp4a_tail_cols > 0) {
@@ -12824,6 +12826,7 @@ pub const InferenceEngine = struct {
                     inter_dim,
                     0,
                     0,
+                    false,
                 );
                 if (dp4a_tail_cols > 0) {
                     if (q4_ragged_tail_cols > 0) {
@@ -16113,6 +16116,7 @@ pub const InferenceEngine = struct {
                     K,
                     0,
                     0,
+                    false,
                 );
                 if (pre_quantized_cols < n_tokens) {
                     try self.dmmv.recordMulMmQ4K(
@@ -16735,6 +16739,11 @@ pub const InferenceEngine = struct {
                     self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
                 }
                 const down_matmul_phase = self.beginProfilePhase();
+                const accumulate_down = accum_target != null and
+                    n_tokens == 64 and
+                    full_cols == n_tokens and
+                    self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null;
+                const down_out = if (accumulate_down) accum_target.? else scratch_down;
                 try self.dmmv.recordMulMmQ6KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -16744,13 +16753,14 @@ pub const InferenceEngine = struct {
                     swiglu_i8.size,
                     swiglu_scale.handle,
                     swiglu_scale.size,
-                    scratch_down.handle,
-                    scratch_down.size,
+                    down_out.handle,
+                    down_out.size,
                     hidden_dim,
                     full_cols,
                     inter_dim,
                     0,
                     0,
+                    accumulate_down,
                 );
                 if (full_cols < n_tokens) {
                     try self.dmmv.recordMulMmQ6K(
@@ -16773,7 +16783,7 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.endProfilePhase(.dense_ffn_down_matmul_q6, down_matmul_phase);
-                return false;
+                return accumulate_down;
             }
         }
         // Q4_K-down DP4a (effort-15 cycle-19). fuse_q8 only fires when down is
@@ -16862,6 +16872,11 @@ pub const InferenceEngine = struct {
                     self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
                 }
                 const down_matmul_phase = self.beginProfilePhase();
+                const accumulate_down = accum_target != null and
+                    n_tokens == 64 and
+                    full_cols == n_tokens and
+                    self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null;
+                const down_out = if (accumulate_down) accum_target.? else scratch_down;
                 try self.dmmv.recordMulMmQ4KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -16871,13 +16886,14 @@ pub const InferenceEngine = struct {
                     swiglu_i8.size,
                     swiglu_sd.handle,
                     swiglu_sd.size,
-                    scratch_down.handle,
-                    scratch_down.size,
+                    down_out.handle,
+                    down_out.size,
                     hidden_dim,
                     full_cols,
                     inter_dim,
                     0,
                     0,
+                    accumulate_down,
                 );
                 if (full_cols < n_tokens) {
                     // Ragged tail: f32 Q4_K row-parallel path on the untouched
@@ -16902,7 +16918,7 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.endProfilePhase(.dense_ffn_down_matmul_q4, down_matmul_phase);
-                return false;
+                return accumulate_down;
             }
         }
         // Fused-residual dense-down path: when an accumulate target is
@@ -17176,6 +17192,7 @@ pub const InferenceEngine = struct {
                 hidden_dim,
                 0,
                 0,
+                false,
             );
         }
         if (full_cols < n_tokens) {
@@ -17338,6 +17355,7 @@ pub const InferenceEngine = struct {
             hidden_dim,
             0,
             0,
+            false,
         );
         if (full_cols < n_tokens) {
             // Ragged tail: f32 Q4_K tiled GEMM on the untouched scratch_norm.
