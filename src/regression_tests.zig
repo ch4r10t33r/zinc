@@ -200,11 +200,13 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged");
     try expectContains(src, "K == 17408 and n_tile == 40");
@@ -214,6 +216,8 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(src, "K == 17408 and N > 64 and (N & 63) != 0");
     try expectContains(src, "N / n_tile");
     try expectContains(src, "(N + n_tile - 1) / n_tile");
+    try expectContains(src, "use_exact_n64_bm64_acc");
+    try expectContains(src, "if (use_exact_n64_bm64_acc) M / 64 else M / 32");
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_bk2", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_acc", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 2200);
@@ -251,6 +255,21 @@ test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
         try expectContains(src, "for (uint cbase = 0u; cbase < BN; cbase += 32u)");
         try expectContains(src, "const uint col_local = cbase + tid / 2u;");
         try expectContains(src, "if (col_local < BN)");
+    }
+}
+
+test "Vulkan exact-64 BM64 DP4a down shaders use 128-thread column loaders" {
+    const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a_bm64_n64_acc.comp");
+    const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a_bm64_n64_acc.comp");
+    for ([_][]const u8{ q4, q6 }) |src| {
+        try expectContains(src, "const uint BM = 64u;");
+        try expectContains(src, "const uint WG_SIZE = 128u;");
+        try expectContains(src, "layout(constant_id = 1) const uint SPEC_BN = 64u;");
+        try expectContains(src, "layout(constant_id = 3) const uint SPEC_BK_STEP = 2u;");
+        try expectContains(src, "layout(constant_id = 4) const uint SPEC_ACCUMULATE = 1u;");
+        try expectContains(src, "const uint col_local = tid / 2u;");
+        try expectNotContains(src, "for (uint cbase = 0u; cbase < BN; cbase += 32u)");
+        try expectContains(src, "d_data[out_idx] += sums[m][n];");
     }
 }
 
