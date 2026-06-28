@@ -1328,9 +1328,14 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
             }
         }
 
-        // Warp-level reduces for Q/K norms (broadcast to ALL lanes, NO __syncthreads!)
-        sumq = zinc_warp_reduce_sum_all(sumq);
-        sumk = zinc_warp_reduce_sum_all(sumk);
+        // Q/K norms: use BLOCK-level reduce (zinc_block_reduce_sum_all) to be
+        // bit-compatible with the decode kernel (ssm_delta_net_seq). This adds
+        // 2 __syncthreads per iteration but enables the warp kernel for server
+        // prefill (state compatible with decode). The state-dependent reduces
+        // (sk, o) stay warp-level — their FP differences are bounded by the
+        // rank-1 update structure and don't compound.
+        sumq = zinc_block_reduce_sum_all(sumq);
+        sumk = zinc_block_reduce_sum_all(sumk);
         const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
         const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
 
