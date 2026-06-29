@@ -1027,8 +1027,10 @@ function buildOpenAiPayload(caseDef) {
   };
 }
 
-function buildZincOpenAiPayload(caseDef) {
+export function buildZincOpenAiPayload(caseDef) {
   const payload = buildOpenAiPayload(caseDef);
+  // ZINC's server benchmark measures the GGUF loaded at process start; a
+  // request-level model id can activate managed-model routing instead.
   delete payload.model;
   return payload;
 }

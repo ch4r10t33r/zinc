@@ -5,6 +5,7 @@ import {
   buildArtifact,
   buildComparison,
   buildMeasurementPhases,
+  buildZincOpenAiPayload,
   benchmarkFailureReason,
   canonicalModelIdFromPath,
   compareModelsByName,
@@ -462,6 +463,34 @@ info(forward): Generated 32 tokens in 977.9 ms — 32.72 tok/s (30.6 ms/tok)
   expect(parsed.generatedTokens).toBe(32);
   expect(parsed.decodeTps).toBe(32.72);
   expect(parsed.outputPreview).toBe("Command shape");
+});
+
+test("RDNA ZINC server payload keeps the preloaded GGUF active", () => {
+  const raw = buildZincOpenAiPayload({
+    prompt_mode: "raw",
+    prompt: "The capital of France is",
+    max_tokens: 32,
+  });
+  expect(raw).toEqual({
+    prompt: "The capital of France is",
+    max_tokens: 32,
+    temperature: 0,
+    stream: false,
+  });
+  expect(raw).not.toHaveProperty("model");
+
+  const chat = buildZincOpenAiPayload({
+    prompt_mode: "chat",
+    prompt: "Tell me about C++",
+    max_tokens: 48,
+  });
+  expect(chat).toEqual({
+    messages: [{ role: "user", content: "Tell me about C++" }],
+    max_tokens: 48,
+    temperature: 0,
+    stream: false,
+  });
+  expect(chat).not.toHaveProperty("model");
 });
 
 test("parseLlamaCliOutput extracts prompt and decode timings", () => {

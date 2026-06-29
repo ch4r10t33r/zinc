@@ -213,11 +213,13 @@ batching should raise aggregate throughput materially without linear p95 growth.
 ```bash
 # Generate the benchmark artifact that powers /zinc/benchmarks.
 # Legacy "both" runs RDNA + Metal; use "all" to include the Intel Arc node.
-bun tools/performance_suite.mjs --target both --output /tmp/zinc-performance.json
+bun tools/performance_suite.mjs --target both --rdna-sync --rdna-build --rdna-start-llama --output /tmp/zinc-performance.json
 bun tools/performance_suite.mjs --target intel --output /tmp/zinc-intel-performance.json
 ```
 
 The generated target entries include the exact ZINC git version/commit for the machine that produced each target and the llama.cpp binary version/commit used for the baseline on that target. The public performance page renders the same provenance so benchmark rows are tied to a concrete source tree and baseline build.
+
+Use the RDNA suite's server-vs-server path for headline comparisons. One-shot CLI runs are diagnostics; do not compare them against a warmed baseline server when deciding whether a target is beaten.
 
 ### Hot decode kernel microbenchmarks
 

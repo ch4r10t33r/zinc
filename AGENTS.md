@@ -280,6 +280,13 @@ An RDNA4 test node (AMD Radeon AI PRO R9700, 32GB, 576 GB/s) is available via SS
 
 The reference baseline is llama.cpp server on the RDNA4 test node with this exact configuration. All ZINC numbers are compared against this.
 
+Headline RDNA comparisons must use the fair server-vs-server harness in
+`tools/performance_suite.mjs`: one reusable ZINC server per model, one reusable
+llama.cpp server per model, same GGUF, same scenario matrix, same warmup/run
+count, and server-side prefill/decode timings. Do not compare a one-shot ZINC
+CLI run against a warmed llama.cpp server when deciding whether a metric is
+beaten. CLI runs are diagnostics only.
+
 **Model**: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (20.7 GiB, MoE 35B/3B active)
 **Baseline result**: 107 tok/s decode (with reasoning), 223 tok/s prefill
 
@@ -333,7 +340,7 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
 # Expected: ~107 tok/s generation, ~220 tok/s prompt (runs 2-3, after warmup)
 ```
 
-### Measure ZINC
+### Measure ZINC CLI diagnostics
 
 ```bash
 source .env
@@ -352,6 +359,25 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && zig build -Doptimize=R
 # Key output lines:
 #   info(forward): Prefill complete: N tokens in X ms (Y tok/s)
 #   info(forward): Generated N tokens in X ms — Y tok/s (Z ms/tok)
+```
+
+Use this CLI path for quick engine checks only. For a fair RDNA ZINC-vs-llama.cpp
+claim, run the performance suite so both engines are measured through reusable
+servers:
+
+```bash
+source .env
+
+bun tools/performance_suite.mjs \
+  --target rdna \
+  --phase all \
+  --rdna-sync \
+  --rdna-build \
+  --rdna-start-llama \
+  --runs 3 \
+  --warmup 1 \
+  --no-site-write \
+  --output /tmp/zinc-rdna-suite-$(date +%Y%m%d-%H%M%S).json
 ```
 
 ### Measure ZINC API endpoints

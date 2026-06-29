@@ -8,6 +8,12 @@ The site at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmark
 
 Remote machine details are intentionally supplied by `.env` or CLI flags. Do not commit public hostnames, public IP addresses, private SSH ports, or one-off benchmark node aliases into this document or into published site data.
 
+### Fair comparison contract
+
+Use the suite's server-vs-server path for any headline "ZINC vs baseline" claim on RDNA. That means one reusable ZINC server per model, one reusable baseline server per model, the same GGUF, the same prompt matrix, the same warmup/run count, and server-side timing for prefill/decode. Do not compare a one-shot ZINC CLI run against a warmed baseline server and call that a result; the CLI path is useful for local engine diagnostics only.
+
+The RDNA ZINC requests intentionally omit the OpenAI `model` field. The model is selected by the server process at launch with `-m <gguf>`; sending `model: "q"` to ZINC can trigger managed-model routing instead of measuring the loaded GGUF.
+
 ```bash
 # Metal target (Apple Silicon, runs locally)
 bun tools/performance_suite.mjs --target metal
@@ -95,7 +101,9 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
 # medians in site/src/data/zinc-performance.json and on /zinc/benchmarks.
 ```
 
-## Measure ZINC (CLI)
+## Measure ZINC (CLI diagnostics only)
+
+Use this when you need quick engine logs, token traces, or a narrow sanity check. Do not use this path for published prefill/decode comparisons against a persistent baseline server.
 
 ```bash
 source .env
@@ -118,7 +126,7 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && zig build -Doptimize=R
 
 ## Measure ZINC (HTTP)
 
-Use the HTTP benchmarks for end-to-end API latency, queueing behavior, or to compare the chat endpoint against the raw completions path.
+Use the HTTP benchmarks for end-to-end API latency, queueing behavior, or to compare the chat endpoint against the raw completions path. For headline RDNA comparisons, prefer `tools/performance_suite.mjs`; it starts/stops both engines and extracts comparable server-side timings.
 
 Caveats:
 
