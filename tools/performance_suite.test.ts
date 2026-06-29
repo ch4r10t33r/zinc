@@ -25,6 +25,7 @@ import {
   parseLlamaCppVersionOutput,
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
+  parseZincServerOutput,
   parseZincVersionOutput,
   prefersChatPrompt,
   rdnaEnvValue,
@@ -445,6 +446,22 @@ info(zinc): Output tokens (8): first20={ 1, 2, 3 }
   expect(parsed.prefillTps).toBeNull();
   expect(parsed.decodeTps).toBe(130.32);
   expect(parsed.outputPreview).toContain("Paris.");
+});
+
+test("parseZincServerOutput combines OpenAI response usage with server log timings", () => {
+  const parsed = parseZincServerOutput(`{"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":" Command shape","finish_reason":"length"}],"usage":{"prompt_tokens":64,"completion_tokens":32,"total_tokens":96}}
+__ZINC_TIMING__
+info(forward): Prefill: 64 tokens in 183.1 ms (349.62 tok/s)
+info(forward): Generated 32 tokens in 977.9 ms — 32.72 tok/s (30.6 ms/tok)
+`);
+
+  expect(parsed.promptTokens).toBe(64);
+  expect(parsed.prefillTokens).toBe(64);
+  expect(parsed.prefillMs).toBe(183.1);
+  expect(parsed.prefillTps).toBe(349.62);
+  expect(parsed.generatedTokens).toBe(32);
+  expect(parsed.decodeTps).toBe(32.72);
+  expect(parsed.outputPreview).toBe("Command shape");
 });
 
 test("parseLlamaCliOutput extracts prompt and decode timings", () => {

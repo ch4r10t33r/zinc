@@ -353,6 +353,31 @@ export function parseZincCliOutput(text) {
   };
 }
 
+export function parseZincServerOutput(text) {
+  const marker = "\n__ZINC_TIMING__\n";
+  const markerIndex = text.lastIndexOf(marker);
+  if (markerIndex === -1) {
+    throw new Error("Could not parse ZINC server timing output");
+  }
+
+  const body = JSON.parse(text.slice(0, markerIndex).trim());
+  if (body.error) {
+    throw new Error(body.error.message ?? "ZINC server returned an error");
+  }
+
+  const parsed = parseZincCliOutput(text.slice(markerIndex + marker.length));
+  const content = body.choices?.[0]?.text ?? body.choices?.[0]?.message?.content ?? "";
+  const promptTokens = body.usage?.prompt_tokens ?? parsed.promptTokens;
+  const generatedTokens = body.usage?.completion_tokens ?? parsed.generatedTokens;
+  return {
+    ...parsed,
+    promptTokens,
+    prefillTokens: promptTokens ?? parsed.prefillTokens,
+    generatedTokens,
+    outputPreview: typeof content === "string" && content.trim() ? content.trim() : parsed.outputPreview,
+  };
+}
+
 export function parseLlamaCliOutput(text) {
   const prompt = text.match(/^\s*llama_print_timings:\s+prompt eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+tokens.*?,\s*([\d.]+)\s+tokens per second\)/m);
   const decode = text.match(/^\s*llama_print_timings:\s+eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+(?:runs|tokens).*?,\s*([\d.]+)\s+tokens per second\)/m);
@@ -1002,6 +1027,12 @@ function buildOpenAiPayload(caseDef) {
   };
 }
 
+function buildZincOpenAiPayload(caseDef) {
+  const payload = buildOpenAiPayload(caseDef);
+  delete payload.model;
+  return payload;
+}
+
 async function waitForHealthyServer(baseUrl, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1148,7 +1179,19 @@ async function stopRdnaLlamaServer(creds, port) {
   if (!port) return;
   try {
     await runShell(
-      rdnaRemoteCommand(`pkill -f 'llama-server --host ${creds.loopbackHost ?? "127.0.0.1"} --port ${port}' || true`, creds),
+      rdnaRemoteCommand(`pkill -f '[l]lama-server --host ${creds.loopbackHost ?? "127.0.0.1"} --port ${port}' || true`, creds),
+      { cwd: ROOT, timeoutMs: 30000 },
+    );
+  } catch {
+    // Best effort cleanup.
+  }
+}
+
+async function stopRdnaZincServer(creds, port) {
+  if (!port) return;
+  try {
+    await runShell(
+      rdnaRemoteCommand(`pkill -f '[z]ig-out/bin/zinc .*--port ${port}' || true`, creds),
       { cwd: ROOT, timeoutMs: 30000 },
     );
   } catch {
@@ -1215,6 +1258,41 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
   return { port, logPath };
 }
 
+async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
+  const port = await pickOpenPort();
+  const logPath = `/tmp/zinc-rdna-zinc-${port}.log`;
+  await lockRdnaDpmHigh(creds);
+
+  const cmd = [
+    "./zig-out/bin/zinc",
+    "-m", caseDef.model_path,
+    ...(caseDef.context_tokens != null ? ["--context", String(caseDef.context_tokens)] : []),
+    ...(creds.vkDevice != null ? ["-d", String(creds.vkDevice)] : []),
+    "--port", String(port),
+  ];
+  const launchScript = [
+    "import os, subprocess",
+    `cmd = ${JSON.stringify(cmd)}`,
+    "env = dict(os.environ)",
+    `env.update(${JSON.stringify({ RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) })})`,
+    `log = open(${JSON.stringify(logPath)}, "ab", buffering=0)`,
+    `subprocess.Popen(cmd, cwd=${JSON.stringify(creds.workdir)}, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)`,
+    'print("started")',
+  ].join("; ");
+  const remote = `python3 -c ${shellQuote(launchScript)}`;
+
+  await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
+
+  try {
+    await waitForHealthyRdnaServer(creds, port, logPath, Math.min(timeoutMs, 300000));
+  } catch (error) {
+    await stopRdnaZincServer(creds, port);
+    throw error;
+  }
+
+  return { port, logPath };
+}
+
 async function runOpenAiSeries({ label, warmupRuns, runs, baseUrl, caseDef, timeoutMs }) {
   const endpoint = caseDef.prompt_mode === "chat" ? `${baseUrl}/chat/completions` : `${baseUrl}/completions`;
   const payload = buildOpenAiPayload(caseDef);
@@ -1262,6 +1340,46 @@ async function runRdnaOpenAiSeries({ label, warmupRuns, runs, creds, port, caseD
     const result = await runShell(command, { cwd: ROOT, timeoutMs });
     const ended = performance.now();
     const parsed = parseOpenAiCompletionOutput(result.stdout);
+    parsed.totalLatencyMs = ended - started;
+    const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
+    parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
+    measured.push(parsed);
+  }
+
+  return measured;
+}
+
+async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, logPath, caseDef, timeoutMs }) {
+  const endpoint = caseDef.prompt_mode === "chat" ? `/v1/chat/completions` : `/v1/completions`;
+  const payload = buildZincOpenAiPayload(caseDef);
+  const host = creds.loopbackHost ?? "127.0.0.1";
+  const deadlineSeconds = Math.max(10, Math.ceil(timeoutMs / 1000) - 5);
+  const remoteScript = [
+    "set -euo pipefail",
+    `LOG=${shellQuote(logPath)}`,
+    `count_generated() { awk '/info\\(forward\\): Generated / { c++ } END { print c + 0 }' "$LOG" 2>/dev/null || printf '0\\n'; }`,
+    "before=$(count_generated)",
+    `curl -sS http://${host}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`,
+    "printf '\\n__ZINC_TIMING__\\n'",
+    `deadline=$((SECONDS + ${deadlineSeconds}))`,
+    "while [ \"$(count_generated)\" -le \"$before\" ]; do if [ \"$SECONDS\" -ge \"$deadline\" ]; then echo 'timing timeout waiting for ZINC server log' >&2; exit 124; fi; sleep 0.05; done",
+    "awk '/info\\(forward\\): Prefill:|info\\(forward\\): Generated / { lines[++n] = $0 } END { start = n > 1 ? n - 1 : 1; for (i = start; i <= n; i++) print lines[i] }' \"$LOG\"",
+  ].join("\n");
+  const command = rdnaRemoteCommand(remoteScript, creds);
+  const measured = [];
+
+  for (let i = 0; i < warmupRuns; i += 1) {
+    console.log(`  warmup ${i + 1}/${warmupRuns}: ${label}`);
+    const result = await runShell(command, { cwd: ROOT, timeoutMs });
+    parseZincServerOutput(result.stdout);
+  }
+
+  for (let i = 0; i < runs; i += 1) {
+    console.log(`  run ${i + 1}/${runs}: ${label}`);
+    const started = performance.now();
+    const result = await runShell(command, { cwd: ROOT, timeoutMs });
+    const ended = performance.now();
+    const parsed = parseZincServerOutput(result.stdout);
     parsed.totalLatencyMs = ended - started;
     const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
     parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
@@ -2426,6 +2544,9 @@ async function runRdnaTarget(args) {
     const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
+    let launchedZincServer = null;
+    let triedLaunchingZincServer = false;
+    let zincServerLaunchFailure = null;
     let launchedServer = null;
     let triedLaunchingServer = false;
     let serverLaunchFailure = null;
@@ -2435,19 +2556,28 @@ async function runRdnaTarget(args) {
         const caseDef = buildScenarioCase(entry, scenarioDef);
         if (phase.phase === "zinc") {
           let zinc = null;
+          if (!triedLaunchingZincServer) {
+            triedLaunchingZincServer = true;
+            try {
+              await verifyRdnaZincBackend(args, creds, { quiet: true });
+              launchedZincServer = await launchRdnaZincServer(entry, creds, args.timeoutMs);
+            } catch (error) {
+              launchedZincServer = null;
+              zincServerLaunchFailure = error;
+            }
+          }
           try {
-            await verifyRdnaZincBackend(args, creds, { quiet: true });
-            // The baseline server path pins RDNA DPM high before launch; do
-            // the same for one-shot ZINC CLI runs so short-prefill scenarios
-            // are not measured at idle memory clocks.
-            await lockRdnaDpmHigh(creds);
-            const zincRows = await runSeries({
-              label: `zinc ${entry.id} ${scenarioDef.id}`,
+            if (!launchedZincServer) {
+              throw zincServerLaunchFailure ?? new Error("ZINC server was not launched");
+            }
+            const zincRows = await runRdnaZincOpenAiSeries({
+              label: `zinc-server ${entry.id} ${scenarioDef.id}`,
               warmupRuns: args.warmupRuns,
               runs: args.runs,
-              command: rdnaZincCommand(caseDef, creds),
-              parser: parseZincCliOutput,
-              cwd: ROOT,
+              creds,
+              port: launchedZincServer.port,
+              logPath: launchedZincServer.logPath,
+              caseDef,
               timeoutMs: args.timeoutMs,
             });
             zinc = createStats("ZINC", zincRows);
@@ -2459,6 +2589,11 @@ async function runRdnaTarget(args) {
           }
           zincByScenario.set(scenarioDef.id, zinc);
           continue;
+        }
+
+        if (launchedZincServer) {
+          await stopRdnaZincServer(creds, launchedZincServer.port);
+          launchedZincServer = null;
         }
 
         if (!triedLaunchingServer && rdnaLlamaServer) {
@@ -2525,6 +2660,9 @@ async function runRdnaTarget(args) {
         baselineByScenario.set(scenarioDef.id, baseline);
       }
     } finally {
+      if (launchedZincServer) {
+        await stopRdnaZincServer(creds, launchedZincServer.port);
+      }
       if (launchedServer) {
         await stopRdnaLlamaServer(creds, launchedServer.port);
       }
@@ -2569,11 +2707,11 @@ async function runRdnaTarget(args) {
       llama_cpp: llamaCppProvenance,
     },
     methodology: {
-      runner: "ZINC CLI vs llama.cpp on the same RDNA node",
+      runner: "ZINC server vs llama.cpp server on the same RDNA node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
       notes: [
         "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
-        "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI with RADV cooperative matrix support enabled.",
+        "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through one reusable ZINC server per model with RADV cooperative matrix support enabled.",
         `ZINC RDNA backend: ${args.rdnaBackend}. Published RDNA runs default to Vulkan; zinc_rt is opt-in because it is a separate bring-up runtime.`,
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",

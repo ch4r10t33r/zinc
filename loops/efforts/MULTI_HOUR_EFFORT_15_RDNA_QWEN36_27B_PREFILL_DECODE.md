@@ -1,6 +1,6 @@
 # Effort 15 - RDNA4 Qwen 3.6 27B dense-hybrid prefill and decode
 
-> **Status:** plateaued · 94 cycles · best 65 tok/s (Coding Review harness) · board core 26% of llama (49 vs 186)
+> **Status:** server-vs-server harness fixed · Qwen3.6 27B now beating reference on the RDNA matrix · `decode-extended` prefill 325.20 vs 252.66 tok/s
 
 Date: 2026-05-18
 
@@ -18,22 +18,29 @@ Target model:
 
 ## Executive summary
 
-ZINC is not yet faster than llama.cpp on Qwen 3.6 27B. The gap is
-different from the 35B-A3B work because this is not a routed MoE model.
-The dominant decode bucket is dense FFN, then SSM. The dominant prefill
-problem is structural: the RDNA batched prefill path explicitly rejects
-SSM models, so 27B prompt processing still runs the full per-token
-decode-style loop.
+Latest checkpoint: the RDNA performance suite now measures ZINC through
+one reusable server per model, matching the reference server residency
+model. Under that server-vs-server contract, clean ZINC beats the
+reference on Qwen 3.6 27B overall and on the target `decode-extended`
+prefill metric. The earlier `~146 tok/s vs 252 tok/s` result was a
+mismatched harness comparison: one-shot ZINC CLI samples against a warmed
+persistent reference server.
 
-The next effort should be a structural prefill effort first, then a
-decode cleanup effort. Direct single-shader micro-fusions already tested
-on this exact model were mostly mixed or negative. The only prefill path
-with enough headroom is layer-major batching that preserves SSM and
-residual dependencies. Do not simply flip `canUseBatchedPrefillRdna` to
-allow `cfg.ssm_d_inner > 0`; an earlier SSM batched attempt reached GPU
-hard resets / `QueueSubmitFailed` and had a real dependency bug.
+The dominant kernel budget is still dense FFN, then SSM, and the
+single-shader micro-fusions tested on this exact model remain mostly
+mixed or negative. Do not treat the harness fix as proof that dense-down
+is fully optimized; treat it as the corrected measurement baseline.
 
-Targets needed to beat llama.cpp, using the latest measured matrix:
+Latest patched-suite artifact:
+
+| scenario | ZINC prefill | reference prefill | ZINC decode | reference decode |
+|---|---:|---:|---:|---:|
+| core | 216.63 | 184.01 | 32.02 | 30.64 |
+| context-medium | 391.40 | 75.60 | 31.78 | 30.48 |
+| context-long | 409.93 | 75.20 | 31.74 | 30.51 |
+| decode-extended | 325.20 | 252.66 | 31.62 | 30.41 |
+
+Historical target table from the pre-layer-major, CLI-measured baseline:
 
 | scenario | ZINC prefill | llama prefill | prefill uplift needed | ZINC decode | llama decode | decode uplift needed |
 |---|---:|---:|---:|---:|---:|---:|
@@ -380,12 +387,23 @@ Each cell is `prefill tok/s / decode tok/s`.
 
 2026-06-28 live session notes:
 
-- Current accepted comparison artifact for `decode-extended` prefill:
-  baseline median `252.70 tok/s` vs ZINC median `146.95 tok/s`.
+- Cold CLI-vs-server comparison artifact for `decode-extended` prefill:
+  baseline median `252.70 tok/s` vs ZINC CLI median `146.95 tok/s`.
+  This is no longer the decision metric because the two engines did not
+  have the same backend residency.
 - Clean current quick samples after rebuilding on RDNA for the exact
   64-token prompt: `178.04, 149.87, 150.80, 153.04, 151.51 tok/s`.
   Treat the first sample as warm cache/setup outlier; steady state remains
-  around `150-153 tok/s`, not a pass.
+  around `150-153 tok/s` for one-shot CLI.
+- Reference persistent-server probe on the same prompt reported
+  `cache_n=0` and log lines saying full prompt reprocessing was forced for
+  this hybrid/recurrent model, so the reference prefill number is not a
+  prompt-cache artifact.
+- ZINC persistent-server probe on the same prompt reached stable post-warm
+  prefill around `347-350 tok/s` with the current clean build. The patched
+  full suite now measures ZINC through one reusable server per model; the
+  `decode-extended` result is ZINC `325.20 tok/s` prefill vs reference
+  `252.66 tok/s`, and decode `31.62` vs `30.41 tok/s`.
 - Current clean profile for the same prompt: `64 tokens in 364.8 ms
   (175.43 tok/s)`, with GPU phase totals `dense_ffn=176.2 ms`,
   `ssm=121.0 ms`, `attn=22.6 ms`, `tail=2.2 ms`.
@@ -409,10 +427,14 @@ Each cell is `prefill tok/s / decode tok/s`.
   `LDS=19456`, and Q4_K BM64 accumulate reported `SGPRs=128`, `VGPRs=192`,
   `LDS=16384`. Since the low-register MMQ64 approximation was slower, do not
   assume VGPR reduction alone is enough; preserve exact A/B evidence.
-- The `decode-extended` gap remains unresolved after harness/DPM checks:
-  reference prefill median `252.70 tok/s`, current ZINC suite median
-  `141.85-146.95 tok/s`, and manual exact-prompt steady samples mostly
-  `~149-153 tok/s` with occasional first-run/cache outliers around `178-181`.
+- Single-command-buffer fusion of the SSM/attention prefix plus dense FFN
+  was tested and rejected: default-on after warm `148.92,147.78,146.31`
+  versus flag-off `149.92,148.25,146.16`; submit boundaries are not the
+  limiter for the cold CLI path.
+- Prefix-depth zero was tested and rejected: corrected prefix0 samples
+  `149.70,149.28,145.12` versus default control `150.94,152.07,147.21`.
+- BK4 exact dense-down specialization was tested and rejected: paired
+  clean median `149.36` versus BK4 median `148.32`.
 
 ## Measurement contract
 
