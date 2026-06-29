@@ -1635,94 +1635,82 @@ pub const ForwardCuda = struct {
         const wout = self.layer(L, "ssm_out.weight");
 
         const ssm_profile = std.posix.getenv("ZINC_SSM_PROFILE") != null;
+
+        // When NOT profiling, use a single command buffer (original behavior).
+        // When profiling, split into pre-scan / scan / post-scan for timing.
+        var cmd = try command.beginCommand(ctx);
+
+        // === Pre-scan: RMS norm + GEMMs + conv1d ===
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatchPrefill(&cmd, wqkv, &b.norm, &b.qkv, d.conv_channels, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wz, &b.norm, &b.z, d.d_inner, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, walpha, &b.norm, &b.alpha, d.dt_rank, d.n_embd, T);
+        self.gemmDispatchPrefill(&cmd, wbeta, &b.norm, &b.beta, d.dt_rank, d.n_embd, T);
+        const conv = ConvBatchPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .n_tok = T, .state_offset = self.conv_off[L] };
+        cmd.dispatch(&self.pipes.ssm_conv1d_batched, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.qkv, &wconv.gpu_buffer, &self.ssm_conv_state[L], &b.conv_out }, &conv, @sizeOf(ConvBatchPush), 0);
+        self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1);
+
+        if (ssm_profile) { self.submit(cmd); self.waitPending(); }
+
+        // === Delta-net scan ===
+        if (ssm_profile) cmd = try command.beginCommand(ctx);
+        const use_chunked = std.posix.getenv("ZINC_SSM_CHUNKED") != null and
+            std.mem.eql(u8, std.posix.getenv("ZINC_SSM_CHUNKED").?, "1");
+        const use_warp = !self.force_block_ssm and !use_chunked and
+            (std.posix.getenv("ZINC_SSM_WARP") == null or
+            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
         var prof_scan: i64 = 0;
-
-        // === Phase 1: pre-scan (RMS norm + GEMMs + conv1d) ===
-        {
-            var cmd = try command.beginCommand(ctx);
-            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-            cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
-            self.gemmDispatchPrefill(&cmd, wqkv, &b.norm, &b.qkv, d.conv_channels, d.n_embd, T);
-            self.gemmDispatchPrefill(&cmd, wz, &b.norm, &b.z, d.d_inner, d.n_embd, T);
-            self.gemmDispatchPrefill(&cmd, walpha, &b.norm, &b.alpha, d.dt_rank, d.n_embd, T);
-            self.gemmDispatchPrefill(&cmd, wbeta, &b.norm, &b.beta, d.dt_rank, d.n_embd, T);
-            const conv = ConvBatchPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .n_tok = T, .state_offset = self.conv_off[L] };
-            cmd.dispatch(&self.pipes.ssm_conv1d_batched, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.qkv, &wconv.gpu_buffer, &self.ssm_conv_state[L], &b.conv_out }, &conv, @sizeOf(ConvBatchPush), 0);
-            self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1);
-
-            if (ssm_profile) { self.submit(cmd); self.waitPending(); const t0 = std.time.milliTimestamp();
-                _ = t0; // pre-scan done; measure scan separately below
-            } else {
-                // Keep cmd open for fused dispatch below
-                self.submit(cmd);
-            }
+        if (use_chunked) {
+            const dn_ch = DeltaNetChunkedPush{
+                .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
+                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+            };
+            const smem_size = 64 * d.head_v_dim * @sizeOf(f32) + 64 * 64 * @sizeOf(f32) + 2 * 64 * @sizeOf(f32);
+            cmd.dispatch(&self.pipes.ssm_delta_net_chunked, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_ch, @sizeOf(DeltaNetChunkedPush), smem_size);
+        } else if (use_warp) {
+            const dn_warp = DeltaNetWarpPush{
+                .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
+                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+            };
+            cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 2 * T * @sizeOf(f32));
+        } else {
+            const dn = DeltaNetPush{
+                .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
+                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+            };
+            cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn, @sizeOf(DeltaNetPush), 0);
         }
 
-        // === Phase 2: delta-net scan ===
-        {
-            var cmd = try command.beginCommand(ctx);
-            const use_chunked = std.posix.getenv("ZINC_SSM_CHUNKED") != null and
-                std.mem.eql(u8, std.posix.getenv("ZINC_SSM_CHUNKED").?, "1");
-            const use_warp = !self.force_block_ssm and !use_chunked and
-                (std.posix.getenv("ZINC_SSM_WARP") == null or
-                !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
-            if (use_chunked) {
-                const dn_ch = DeltaNetChunkedPush{
-                    .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                    .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                    .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                    .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
-                };
-                const smem_size = 64 * d.head_v_dim * @sizeOf(f32) + 64 * 64 * @sizeOf(f32) + 2 * 64 * @sizeOf(f32);
-                cmd.dispatch(&self.pipes.ssm_delta_net_chunked, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_ch, @sizeOf(DeltaNetChunkedPush), smem_size);
-            } else if (use_warp) {
-                const dn_warp = DeltaNetWarpPush{
-                    .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                    .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                    .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                    .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
-                };
-                cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 2 * T * @sizeOf(f32));
-            } else {
-                const dn = DeltaNetPush{
-                    .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                    .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                    .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                    .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
-                };
-                cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn, @sizeOf(DeltaNetPush), 0);
-            }
-
-            if (ssm_profile) {
-                const t0 = std.time.milliTimestamp();
-                self.submit(cmd);
-                self.waitPending();
-                prof_scan = std.time.milliTimestamp() - t0;
-            } else {
-                self.submit(cmd);
-            }
+        if (ssm_profile) {
+            const t0 = std.time.milliTimestamp();
+            self.submit(cmd);
+            self.waitPending();
+            prof_scan = std.time.milliTimestamp() - t0;
+            cmd = try command.beginCommand(ctx);
         }
 
-        // === Phase 3: post-scan (gated norm + output GEMM + residual) ===
-        {
-            var cmd = try command.beginCommand(ctx);
-            const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
-            const gn = GatedNormBatchPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head, .n_tok = T };
-            cmd.dispatch(&self.pipes.ssm_gated_norm_batched, .{ d.dt_rank, T, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.delta_out, &b.z, &wnorm.gpu_buffer, &b.ssm_gn }, &gn, @sizeOf(GatedNormBatchPush), 0);
-            self.gemmDispatchPrefill(&cmd, wout, &b.ssm_gn, &b.o, d.n_embd, d.d_inner, T);
-            const add = AddPush{ .N = T * d.n_embd };
-            cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
+        // === Post-scan: gated norm + output GEMM + residual ===
+        const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+        const gn = GatedNormBatchPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head, .n_tok = T };
+        cmd.dispatch(&self.pipes.ssm_gated_norm_batched, .{ d.dt_rank, T, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.delta_out, &b.z, &wnorm.gpu_buffer, &b.ssm_gn }, &gn, @sizeOf(GatedNormBatchPush), 0);
+        self.gemmDispatchPrefill(&cmd, wout, &b.ssm_gn, &b.o, d.n_embd, d.d_inner, T);
+        const add = AddPush{ .N = T * d.n_embd };
+        cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
 
-            if (ssm_profile) {
-                const t0 = std.time.milliTimestamp();
-                self.submit(cmd);
-                self.waitPending();
-                const post_ms = std.time.milliTimestamp() - t0;
-                if (L == 0) // only print layer 0 to avoid spam
-                    log.info("SSM_PROFILE L0: scan={d}ms post={d}ms (T={d})", .{ prof_scan, post_ms, T });
-            } else {
-                self.submit(cmd);
-            }
+        if (ssm_profile) {
+            self.submit(cmd);
+            self.waitPending();
+            if (L == 0)
+                log.info("SSM_PROFILE L0: scan={d}ms (T={d})", .{ prof_scan, T });
+        } else {
+            self.submit(cmd);
         }
     }
 
@@ -1957,9 +1945,9 @@ pub const ForwardCuda = struct {
             shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), w_f16_handle, b.act_f16.handle, y.handle, 0.0);
             return;
         }
-        // Fallback: batched tiled GEMM for T >= 2 (reads weight once per tile
-        // instead of T times). Per-token DMMV for T=1 (decode — no tiling waste).
-        if (T >= 2 and idx < 4) {
+        // Fallback: batched tiled GEMM for T >= 32 (reads weight once per tile
+        // instead of Tx). Per-token DMMV for T < 32 (avoids 64-token tile waste).
+        if (T >= 32 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
         } else {
