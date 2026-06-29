@@ -995,6 +995,11 @@ function withTimeout(promise, timeoutMs, label) {
   });
 }
 
+export function zincServerTimingWaitSeconds(timeoutMs) {
+  const commandBudgetSeconds = Math.max(10, Math.ceil(timeoutMs / 1000) - 5);
+  return Math.min(60, commandBudgetSeconds);
+}
+
 async function httpJson(url, payload, timeoutMs) {
   const response = await withTimeout(fetch(url, {
     method: "POST",
@@ -1355,16 +1360,17 @@ async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, l
   const endpoint = caseDef.prompt_mode === "chat" ? `/v1/chat/completions` : `/v1/completions`;
   const payload = buildZincOpenAiPayload(caseDef);
   const host = creds.loopbackHost ?? "127.0.0.1";
-  const deadlineSeconds = Math.max(10, Math.ceil(timeoutMs / 1000) - 5);
+  const deadlineSeconds = zincServerTimingWaitSeconds(timeoutMs);
   const remoteScript = [
     "set -euo pipefail",
     `LOG=${shellQuote(logPath)}`,
     `count_generated() { awk '/info\\(forward\\): Generated / { c++ } END { print c + 0 }' "$LOG" 2>/dev/null || printf '0\\n'; }`,
     "before=$(count_generated)",
-    `curl -sS http://${host}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`,
-    "printf '\\n__ZINC_TIMING__\\n'",
+    `response=$(curl -sS http://${host}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))})`,
     `deadline=$((SECONDS + ${deadlineSeconds}))`,
-    "while [ \"$(count_generated)\" -le \"$before\" ]; do if [ \"$SECONDS\" -ge \"$deadline\" ]; then echo 'timing timeout waiting for ZINC server log' >&2; exit 124; fi; sleep 0.05; done",
+    "while [ \"$(count_generated)\" -le \"$before\" ]; do if [ \"$SECONDS\" -ge \"$deadline\" ]; then printf '%s\\n' \"$response\"; printf '\\n__ZINC_TIMING__\\n'; tail -n 40 \"$LOG\" 2>/dev/null || true; echo 'err(zinc-bench): no ZINC Generated log line after API response' >&2; exit 124; fi; sleep 0.05; done",
+    "printf '%s\\n' \"$response\"",
+    "printf '\\n__ZINC_TIMING__\\n'",
     "awk '/info\\(forward\\): Prefill:|info\\(forward\\): Generated / { lines[++n] = $0 } END { start = n > 1 ? n - 1 : 1; for (i = start; i <= n; i++) print lines[i] }' \"$LOG\"",
   ].join("\n");
   const command = rdnaRemoteCommand(remoteScript, creds);

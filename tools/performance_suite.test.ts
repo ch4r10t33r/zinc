@@ -37,6 +37,7 @@ import {
   rdnaDpmHighScript,
   summarizeValues,
   validateZincBackend,
+  zincServerTimingWaitSeconds,
 } from "./performance_suite.mjs";
 
 test("parseArgs reads suite options", () => {
@@ -491,6 +492,12 @@ test("RDNA ZINC server payload keeps the preloaded GGUF active", () => {
     stream: false,
   });
   expect(chat).not.toHaveProperty("model");
+});
+
+test("RDNA ZINC timing wait is bounded after the API response", () => {
+  expect(zincServerTimingWaitSeconds(12_000)).toBe(10);
+  expect(zincServerTimingWaitSeconds(65_000)).toBe(60);
+  expect(zincServerTimingWaitSeconds(1_800_000)).toBe(60);
 });
 
 test("parseLlamaCliOutput extracts prompt and decode timings", () => {
