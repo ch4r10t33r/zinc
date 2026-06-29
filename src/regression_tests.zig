@@ -188,13 +188,6 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_ragged_n64", 2200);
 }
 
-test "Vulkan Qwen dense FFN DP4a keeps exact ragged token counts" {
-    const src = @embedFile("compute/forward.zig");
-    try expectContains(src, "const candidate_cols = if (n_tokens > 64 and (n_tokens & 31) != 0)");
-    try expectContains(src, "candidate_cols == n_tokens and n_tokens > 64");
-    try expectContains(src, "dp4a_cols_out.* = full_cols;");
-}
-
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");

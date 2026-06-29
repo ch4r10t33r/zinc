@@ -16431,23 +16431,18 @@ pub const InferenceEngine = struct {
             self.batched_scratch_swiglu_i8 != null and
             self.batched_scratch_swiglu_scale_dsum != null;
         var full_cols = floor_cols;
-        const candidate_cols = if (n_tokens > 64 and (n_tokens & 31) != 0)
-            n_tokens
-        else
-            self.qwen36DenseFfnPrefillPaddedTokenCount(n_tokens);
-        const candidate_is_supported = (candidate_cols & 31) == 0 or candidate_cols == 40 or
-            (candidate_cols == n_tokens and n_tokens > 64);
-        if (candidate_cols > floor_cols and candidate_is_supported) {
+        const padded_cols = self.qwen36DenseFfnPrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > floor_cols and ((padded_cols & 31) == 0 or padded_cols == 40)) {
             const padded_hidden_f32_bytes: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, candidate_cols) *
+                @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, hidden_dim) *
                 @sizeOf(f32);
             const padded_hidden_i8_bytes: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, candidate_cols) *
+                @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, hidden_dim / 4) *
                 @sizeOf(u32);
             const padded_hidden_sd_bytes: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, candidate_cols) *
+                @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, hidden_dim / 32) *
                 2 *
                 @sizeOf(f32);
@@ -16457,18 +16452,18 @@ pub const InferenceEngine = struct {
                 (input_pre_quantized or scratch_norm.size >= padded_hidden_f32_bytes);
 
             const padded_inter_f32_bytes: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, candidate_cols) *
+                @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, inter_dim) *
                 @sizeOf(f32);
             const can_pad_output = if (fuse_q8) blk: {
                 const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                 const swiglu_scale = self.batched_scratch_swiglu_scale.?;
                 const need_i8: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, candidate_cols) *
+                    @as(vk.c.VkDeviceSize, padded_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 4) *
                     @sizeOf(u32);
                 const need_scale: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, candidate_cols) *
+                    @as(vk.c.VkDeviceSize, padded_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 32) *
                     @sizeOf(f32);
                 break :blk swiglu_i8.size >= need_i8 and swiglu_scale.size >= need_scale;
@@ -16476,11 +16471,11 @@ pub const InferenceEngine = struct {
                 const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                 const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
                 const need_i8: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, candidate_cols) *
+                    @as(vk.c.VkDeviceSize, padded_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 4) *
                     @sizeOf(u32);
                 const need_sd: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, candidate_cols) *
+                    @as(vk.c.VkDeviceSize, padded_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 32) *
                     2 *
                     @sizeOf(f32);
@@ -16488,7 +16483,7 @@ pub const InferenceEngine = struct {
             } else scratch_swiglu.size >= padded_inter_f32_bytes;
 
             if (can_pad_input and can_pad_output) {
-                full_cols = candidate_cols;
+                full_cols = padded_cols;
             }
         }
         dp4a_cols_out.* = full_cols;
@@ -16497,8 +16492,8 @@ pub const InferenceEngine = struct {
             // One-shot quantize of the f32 RMS-normed hidden. Scratch is
             // over-allocated to a supported dense-FFN DP4a body so the full-tile
             // GEMM can cover the ragged real-token tail and avoid an extra f32
-            // tail GEMM per dense layer. When a padded body is used, dummy
-            // columns are never accumulated back into scratch_hidden.
+            // tail GEMM per dense layer. Dummy padded columns
+            // are never accumulated back into scratch_hidden.
             try self.dmmv.recordQuantizeActQ8_1(
                 &self.decode_cmd,
                 push_fn,
