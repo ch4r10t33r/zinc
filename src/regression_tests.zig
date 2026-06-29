@@ -235,12 +235,14 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_ragged_n64", 2400);
 
     const forward = @embedFile("compute/forward.zig");
-    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null;");
-    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null;");
+    try expectContains(forward, "fn qwenDenseDownDp4aAccEligible(");
+    try expectContains(forward, "inter_dim != 17408 or n_tokens != 64 or full_cols != n_tokens");
+    try expectContains(forward, ".q4_k => has_q4_k17408_acc");
+    try expectContains(forward, ".q6_k => has_q6_k17408_acc");
+    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null");
+    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null");
     try expectContains(forward, "const down_out = if (accumulate_down) accum_target.? else scratch_down;");
     try expectContains(forward, "return accumulate_down;");
-    try expectContains(forward, "n_tokens == 64 and");
-    try expectContains(forward, "full_cols == n_tokens and");
 }
 
 test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {

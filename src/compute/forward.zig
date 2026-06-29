@@ -78,6 +78,25 @@ const kv_page_size_tokens: u32 = 16;
 const gemma_prefill_tail_topk_default: u32 = 4;
 const gemma_prefill_micro_prompt_topk: u32 = 1;
 const gemma_prefill_micro_prompt_tokens: u32 = 72;
+
+fn qwenDenseDownDp4aAccEligible(
+    tensor_type: GGMLType,
+    inter_dim: u32,
+    n_tokens: u32,
+    full_cols: u32,
+    has_q4_k17408_acc: bool,
+    has_q6_k17408_acc: bool,
+) bool {
+    // The fused DP4a residual-accumulate kernels currently exist only for the
+    // Qwen dense-hybrid 27B down-projection shape. Qwen 3.5 9B is K=12288, so
+    // it must use the overwrite DP4a path plus the regular residual add.
+    if (inter_dim != 17408 or n_tokens != 64 or full_cols != n_tokens) return false;
+    return switch (tensor_type) {
+        .q4_k => has_q4_k17408_acc,
+        .q6_k => has_q6_k17408_acc,
+        else => false,
+    };
+}
 const gemma_prefill_micro_prompt_guard_tokens: u32 = 8;
 const gemma_prefill_long_draft_prompt_min_tokens: u32 = 49;
 const gemma_prefill_long_draft_prompt_guard_tokens: u32 = 2;
@@ -2391,8 +2410,9 @@ pub const InferenceEngine = struct {
             config.n_experts > 0 and
             config.n_experts_used > gemma_prefill_tail_topk_default and
             is_amd_rdna_vendor and
-            gemma_topk_env == null)
-            gemma_prefill_tail_topk_default
+            gemma_topk_env != null and
+            gemma_topk_limit > 0)
+            gemma_topk_limit
         else
             0;
         const gemma_prefill_tail_topk_guard_tokens: u32 = if (gemma_prefill_tail_topk_limit > 0)
@@ -2415,6 +2435,8 @@ pub const InferenceEngine = struct {
                 gemma_prefill_short_prompt_topk,
                 config.n_experts_used,
             });
+        } else if (config.architecture == .gemma and config.n_experts > 0 and is_amd_rdna_vendor) {
+            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA (set ZINC_GEMMA_MOE_TOPK to opt in)", .{});
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
@@ -16740,9 +16762,14 @@ pub const InferenceEngine = struct {
                 }
                 const down_matmul_phase = self.beginProfilePhase();
                 const accumulate_down = accum_target != null and
-                    n_tokens == 64 and
-                    full_cols == n_tokens and
-                    self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null;
+                    qwenDenseDownDp4aAccEligible(
+                        down_t.info.type_,
+                        inter_dim,
+                        n_tokens,
+                        full_cols,
+                        false,
+                        self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null,
+                    );
                 const down_out = if (accumulate_down) accum_target.? else scratch_down;
                 try self.dmmv.recordMulMmQ6KFullDp4a(
                     &self.decode_cmd,
@@ -16873,9 +16900,14 @@ pub const InferenceEngine = struct {
                 }
                 const down_matmul_phase = self.beginProfilePhase();
                 const accumulate_down = accum_target != null and
-                    n_tokens == 64 and
-                    full_cols == n_tokens and
-                    self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null;
+                    qwenDenseDownDp4aAccEligible(
+                        down_t.info.type_,
+                        inter_dim,
+                        n_tokens,
+                        full_cols,
+                        self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null,
+                        false,
+                    );
                 const down_out = if (accumulate_down) accum_target.? else scratch_down;
                 try self.dmmv.recordMulMmQ4KFullDp4a(
                     &self.decode_cmd,
@@ -25494,6 +25526,18 @@ test "readMmapFloats f16 matches dequantRow f16" {
     for (0..4) |i| {
         try std.testing.expectEqual(out_mmap[i], out_dequant[i]);
     }
+}
+
+test "Qwen dense down DP4a accumulate is limited to K17408 exact64 kernels" {
+    try std.testing.expect(qwenDenseDownDp4aAccEligible(.q4_k, 17408, 64, 64, true, false));
+    try std.testing.expect(qwenDenseDownDp4aAccEligible(.q6_k, 17408, 64, 64, false, true));
+
+    // Qwen 3.5 9B dense-down is Q4_K with K=12288. Even at 64 prompt tokens
+    // it must not select the 27B-only K=17408 accumulate shader.
+    try std.testing.expect(!qwenDenseDownDp4aAccEligible(.q4_k, 12288, 64, 64, true, false));
+    try std.testing.expect(!qwenDenseDownDp4aAccEligible(.q4_k, 17408, 96, 96, true, false));
+    try std.testing.expect(!qwenDenseDownDp4aAccEligible(.q4_k, 17408, 64, 32, true, false));
+    try std.testing.expect(!qwenDenseDownDp4aAccEligible(.q4_k, 17408, 64, 64, false, false));
 }
 
 test "delta-net zero state produces beta*v*(k.q) output" {

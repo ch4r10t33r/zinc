@@ -15,6 +15,7 @@ const memory_plan = @import("../gpu/memory_plan.zig");
 const tool_format = @import("tool_format.zig");
 
 const log = std.log.scoped(.routes);
+const inference_timing_log = std.log.scoped(.forward);
 
 /// Cached three-state probe of `ZINC_TOOL_CALLING`. Negative = uncached;
 /// 0 = disabled; 1 = enabled. The check happens once per process, lazily.
@@ -812,6 +813,49 @@ const FinishReason = enum {
     length,
     tool_calls,
 };
+
+const TimingStats = struct {
+    ms: f64,
+    tps: f64,
+    ms_per_token: f64,
+};
+
+fn timingStats(token_count: usize, elapsed_ns: u64) TimingStats {
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    if (token_count == 0 or elapsed_ns == 0) {
+        return .{ .ms = elapsed_ms, .tps = 0.0, .ms_per_token = 0.0 };
+    }
+    const tokens_f = @as(f64, @floatFromInt(token_count));
+    const ns_f = @as(f64, @floatFromInt(elapsed_ns));
+    return .{
+        .ms = elapsed_ms,
+        .tps = tokens_f * 1_000_000_000.0 / ns_f,
+        .ms_per_token = elapsed_ms / tokens_f,
+    };
+}
+
+fn elapsedNs(start_ns: i128, end_ns: i128) u64 {
+    return if (end_ns > start_ns) @intCast(end_ns - start_ns) else 0;
+}
+
+fn logPrefillTiming(token_count: usize, start_ns: i128, end_ns: i128) void {
+    const stats = timingStats(token_count, elapsedNs(start_ns, end_ns));
+    inference_timing_log.info("Prefill: {d} tokens in {d:.1} ms ({d:.2} tok/s)", .{
+        token_count,
+        stats.ms,
+        stats.tps,
+    });
+}
+
+fn logGeneratedTiming(token_count: usize, start_ns: i128, end_ns: i128) void {
+    const stats = timingStats(token_count, elapsedNs(start_ns, end_ns));
+    inference_timing_log.info("Generated {d} tokens in {d:.1} ms — {d:.2} tok/s ({d:.1} ms/tok)", .{
+        token_count,
+        stats.ms,
+        stats.tps,
+        stats.ms_per_token,
+    });
+}
 
 fn completionFinishReason(requested_max_tokens: u32, effective_max_tokens: u32, produced_tokens: usize) FinishReason {
     if (requested_max_tokens > effective_max_tokens and produced_tokens >= @as(usize, effective_max_tokens)) {
@@ -2201,10 +2245,16 @@ fn handleChatCompletions(
         server_state.chat_reuse_cache.matchingPrefixLen(parsed.session_id, resources.model_path, prompt_tokens, std.time.nanoTimestamp())
     else
         0;
+    const prefill_start_ns = std.time.nanoTimestamp();
+    const prefill_work_tokens = if (reused_prefix_len > 0)
+        prompt_tokens.len - reused_prefix_len
+    else
+        prompt_tokens.len;
     if (reused_prefix_len > 0) {
         state.position = @intCast(reused_prefix_len);
         if (reused_prefix_len < prompt_tokens.len) {
-            engine.prefillBatched(&state, prompt_tokens[reused_prefix_len..]) catch {
+            engine.prefillBatched(&state, prompt_tokens[reused_prefix_len..]) catch |err| {
+                log.err("Chat prefill failed after cache hit: {s}", .{@errorName(err)});
                 server_state.clearChatReuseSession(parsed.session_id);
                 if (parsed.stream) {
                     conn.writeSseDone() catch {};
@@ -2221,7 +2271,8 @@ fn handleChatCompletions(
         });
     } else {
         if (parsed.session_id.len > 0) server_state.clearChatReuseSession(parsed.session_id);
-        engine.prefillBatched(&state, prompt_tokens) catch {
+        engine.prefillBatched(&state, prompt_tokens) catch |err| {
+            log.err("Chat prefill failed: {s}", .{@errorName(err)});
             if (parsed.stream) {
                 conn.writeSseDone() catch {};
             } else {
@@ -2230,6 +2281,8 @@ fn handleChatCompletions(
             return;
         };
     }
+    const prefill_end_ns = std.time.nanoTimestamp();
+    logPrefillTiming(prefill_work_tokens, prefill_start_ns, prefill_end_ns);
     server_state.setActiveContextTokens(state.position);
 
     if (parsed.stream) {
@@ -2265,10 +2318,12 @@ fn handleChatCompletions(
         }
         var any_tool_call_emitted = false;
         var tool_call_index: u32 = 0;
+        var generated: u32 = 0;
+        const decode_start_ns = std.time.nanoTimestamp();
 
         if (max_tokens > 0) {
             var prev_token = runtime.sample(engine, &state, sampling, random);
-            var generated: u32 = 0;
+            state.generated_tokens.append(allocator, prev_token) catch {};
 
             while (generated < max_tokens and !isEog(tokenizer, prev_token) and !stopped) {
                 if (conn.isPeerClosed()) return;
@@ -2284,6 +2339,7 @@ fn handleChatCompletions(
                         server_state.setActiveContextTokens(state.position);
                         if (conn.isPeerClosed()) return;
                         prev_token = runtime.sample(engine, &state, sampling, random);
+                        state.generated_tokens.append(allocator, prev_token) catch {};
                         generated += 1;
                         continue;
                     }
@@ -2404,6 +2460,7 @@ fn handleChatCompletions(
                     server_state.setActiveContextTokens(state.position);
                     if (conn.isPeerClosed()) return;
                     prev_token = runtime.sample(engine, &state, sampling, random);
+                    state.generated_tokens.append(allocator, prev_token) catch {};
                 } else break;
             }
 
@@ -2435,6 +2492,8 @@ fn handleChatCompletions(
                 }
             }
         }
+        const decode_end_ns = std.time.nanoTimestamp();
+        logGeneratedTiming(generated, decode_start_ns, decode_end_ns);
 
         if (forced_tool_name) |tool_name| {
             const args_json = try forcedToolArgumentsJsonAlloc(allocator, forced_tool_first_arg_name, gen_text_buf[0..gen_text_len]);
@@ -2480,8 +2539,10 @@ fn handleChatCompletions(
             }
         }.check;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
+        const decode_start_ns = std.time.nanoTimestamp();
         if (max_tokens > 0) {
             var prev = runtime.sample(engine, &state, sampling, random);
+            state.generated_tokens.append(allocator, prev) catch {};
             while (ns_gen < max_tokens and !nsIsEog(tokenizer, prev)) {
                 var decode_buf2: [256]u8 = undefined;
                 const tok_utf8 = tokenizer.decodeToken(prev, &decode_buf2);
@@ -2490,6 +2551,7 @@ fn handleChatCompletions(
                     processed_generated_tokens.append(allocator, prev) catch {};
                     server_state.setActiveContextTokens(state.position);
                     prev = runtime.sample(engine, &state, sampling, random);
+                    state.generated_tokens.append(allocator, prev) catch {};
                     continue;
                 }
                 text_buf.appendSlice(allocator, tok_utf8) catch break;
@@ -2504,11 +2566,14 @@ fn handleChatCompletions(
                 processed_generated_tokens.append(allocator, prev) catch {};
                 server_state.setActiveContextTokens(state.position);
                 prev = runtime.sample(engine, &state, sampling, random);
+                state.generated_tokens.append(allocator, prev) catch {};
             }
             if (!nsIsEog(tokenizer, prev) and ns_gen >= max_tokens and findStreamingStopStart(text_buf.items) == null) {
                 finish_reason = .length;
             }
         }
+        const decode_end_ns = std.time.nanoTimestamp();
+        logGeneratedTiming(ns_gen, decode_start_ns, decode_end_ns);
 
         // Escape the full text for JSON
         var structured_buf: [16384]u8 = undefined;
@@ -2663,7 +2728,8 @@ fn handleCompletions(
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "cmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "cmpl-0";
 
-    const output_tokens = forward_mod.generate(engine, prompt_tokens, max_tokens, tokenizer.eosId(), allocator) catch {
+    const output_tokens = forward_mod.generate(engine, prompt_tokens, max_tokens, tokenizer.eosId(), allocator) catch |err| {
+        log.err("Completion generation failed: {s}", .{@errorName(err)});
         try conn.sendError(500, "internal_error", "Generation failed");
         return;
     };
@@ -2996,6 +3062,18 @@ test "completionFinishReason reports clamped generations as length" {
     try std.testing.expectEqual(FinishReason.length, completionFinishReason(32, 0, 0));
     try std.testing.expectEqual(FinishReason.stop, completionFinishReason(256, 64, 12));
     try std.testing.expectEqual(FinishReason.stop, completionFinishReason(64, 64, 64));
+}
+
+test "timingStats handles normal and empty decode windows" {
+    const normal = timingStats(4, 2_000_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), normal.ms, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2000.0), normal.tps, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), normal.ms_per_token, 0.0001);
+
+    const empty = timingStats(0, 2_000_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), empty.ms, 0.0001);
+    try std.testing.expectEqual(@as(f64, 0.0), empty.tps);
+    try std.testing.expectEqual(@as(f64, 0.0), empty.ms_per_token);
 }
 
 test "ParsedRequest defaults" {
