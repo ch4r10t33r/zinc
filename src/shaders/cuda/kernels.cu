@@ -3480,7 +3480,133 @@ extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float*
     }
 }
 
-// ---- gemm_q6k_tiled_v2 — register-blocked prefill GEMM for Q6_K weights ------
+// ---- gemm_q4k_dp4a — DP4a int8 dot product Q4_K GEMM ------------------------
+// Key insight: Q4_K nibbles (0-15) are valid unsigned int8 values. Instead of
+// dequanting to float (20+ instructions/element), just extract nibbles and pack
+// 4 per int32 for __dp4a (1 instruction per 4 multiplies). Input activations
+// are quantized to int8 with a fixed scale. Weight scale (d*scale, dmin*min)
+// applied post-accumulation.
+//
+// Math: result = d_sc * sum(nib*in)/scale - dm_mn * sum(in)
+//   DP4a computes sum(nib * in_int8) = scale * sum(nib * in)
+//   So: result = d_sc * dp4a / scale - dm_mn * sum_input
+extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ int Ws_pk[BK/4 * BM];       // [8][64] packed nibble int32
+    __shared__ int As_pk[BK/4 * BT];       // [8][64] packed int8 input
+    __shared__ float W_dsc[BM], W_dmn[BM]; // per-row weight scales
+    __shared__ float A_inv[BT];            // per-token max_abs/127 (inverse scale)
+    __shared__ float A_sum[BT];            // per-token sum(input)
+
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT, bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x, tx=tid&15u, ty=tid>>4;
+    unsigned wid=tid>>5, lane=tid&31u;
+    unsigned a0=(pc.a_offset>>2);
+    const float* Ab=A+(pc.x_offset>>2);
+    float acc[4][4]; memset(acc,0,sizeof(acc));
+
+    for (unsigned c=0u; c<nchunk; c++) {
+        unsigned sbk=c>>3, sb8=c&7u;
+        // W: extract nibbles + store scales (same as before)
+        #pragma unroll
+        for (int u=0;u<8;u++){
+            unsigned r=wid+(unsigned)u*8u, row=m0+r;
+            if(row<pc.M){
+                unsigned blk=a0+row*bpr*36u+sbk*36u;
+                if(lane==0){
+                    unsigned dd=a_u32[blk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dm=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    W_dsc[r]=d*(float)s; W_dmn[r]=dm*(float)mn;
+                }
+                if(lane<8u){
+                    const unsigned char* qs=(const unsigned char*)(a_u32+blk+4u);
+                    unsigned off=(sb8>>1)*32u+lane*4u;
+                    unsigned q32=*((const unsigned*)(qs+off));
+                    Ws_pk[lane*BM+r]=(sb8&1u)==0u ? (int)(q32&0x0F0F0F0Fu) : (int)((q32>>4)&0x0F0F0F0Fu);
+                }
+            } else {
+                if(lane<8u) Ws_pk[lane*BM+r]=0;
+                if(lane==0){W_dsc[r]=0;W_dmn[r]=0;}
+            }
+        }
+        // A: dynamic per-token quantization with warp-reduce max_abs + sum
+        #pragma unroll
+        for (int u=0;u<8;u++){
+            unsigned t=wid+(unsigned)u*8u, tok=t0+t;
+            if(tok<pc.T){
+                // Each lane reads 1 value (lanes 0-31 → elements 0-31 of BK=32)
+                float val=Ab[(size_t)tok*pc.K+c*32u+lane];
+                float av=fabsf(val), sv=val;
+                // Warp reduce: max_abs and sum
+                for(int o=16;o>0;o>>=1){
+                    av=fmaxf(av,__shfl_xor_sync(0xFFFFFFFFu,av,o));
+                    sv+=__shfl_xor_sync(0xFFFFFFFFu,sv,o);
+                }
+                float scale=127.0f/fmaxf(av,1e-5f);
+                float inv_sc=fmaxf(av,1e-5f)/127.0f;
+                if(lane==0){A_inv[t]=inv_sc; A_sum[t]=sv;}
+                // Lanes 0-7: re-read 4 values, quantize, pack
+                if(lane<8u){
+                    float v0=Ab[(size_t)tok*pc.K+c*32u+lane*4u];
+                    float v1=Ab[(size_t)tok*pc.K+c*32u+lane*4u+1u];
+                    float v2=Ab[(size_t)tok*pc.K+c*32u+lane*4u+2u];
+                    float v3=Ab[(size_t)tok*pc.K+c*32u+lane*4u+3u];
+                    int pk=0;
+                    pk|=(max(-128,min(127,__float2int_rn(v0*scale)))&0xFF);
+                    pk|=(max(-128,min(127,__float2int_rn(v1*scale)))&0xFF)<<8;
+                    pk|=(max(-128,min(127,__float2int_rn(v2*scale)))&0xFF)<<16;
+                    pk|=(max(-128,min(127,__float2int_rn(v3*scale)))&0xFF)<<24;
+                    As_pk[lane*BT+t]=pk;
+                }
+            } else {
+                if(lane<8u) As_pk[lane*BT+t]=0;
+                if(lane==0){A_inv[t]=0;A_sum[t]=0;}
+            }
+        }
+        __syncthreads();
+        // DP4a multiply
+        int ia[4][4]; memset(ia,0,sizeof(ia));
+        #pragma unroll
+        for(unsigned kk4=0u;kk4<BK/4;kk4++){
+            int ar[4];
+            #pragma unroll
+            for(int j=0;j<4;j++) ar[j]=As_pk[kk4*BT+tx*4u+(unsigned)j];
+            #pragma unroll
+            for(int i=0;i<4;i++){
+                int w=Ws_pk[kk4*BM+ty*4u+(unsigned)i];
+                #pragma unroll
+                for(int j=0;j<4;j++) ia[i][j]=__dp4a(w,ar[j],ia[i][j]);
+            }
+        }
+        // Apply scales: acc += d_sc * dp4a * inv_sc - dmn * sum
+        #pragma unroll
+        for(int i=0;i<4;i++){
+            float dsc=W_dsc[ty*4u+(unsigned)i], dmn=W_dmn[ty*4u+(unsigned)i];
+            #pragma unroll
+            for(int j=0;j<4;j++){
+                unsigned ti=tx*4u+(unsigned)j;
+                acc[i][j]+=dsc*(float)ia[i][j]*A_inv[ti] - dmn*A_sum[ti];
+            }
+        }
+        __syncthreads();
+    }
+    // Write output
+    #pragma unroll
+    for(int i=0;i<4;i++){
+        unsigned row=m0+ty*4u+(unsigned)i;
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            unsigned tok=t0+tx*4u+(unsigned)j;
+            if(row<pc.M&&tok<pc.T){
+                unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
+                if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j];
+            }
+        }
+    }
+}
 // Mirror of gemm_q4k_tiled_v2 (64x64 tile, 256 threads, 4x4 register micro-tile,
 // BK=32) with the Q6_K dequant in the stage-to-shared step. Q6_K block = 210
 // bytes/256 elems: ql[0..127] low4, qh[128..191] high2, scales[192..207] int8,

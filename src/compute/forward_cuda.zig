@@ -308,6 +308,7 @@ const Pipelines = struct {
     gemm: [4]CudaPipeline, // q4k, q5k, q6k, q8_0 tiled_v2
     gemm_f32: CudaPipeline, // f32 weights (e.g. some ssm projections)
     gemm_q4k_tc: CudaPipeline, // tensor-core Q4_K GEMM (ZINC_PREFILL_TC=1)
+    gemm_q4k_dp4a: CudaPipeline, // DP4a int8 Q4_K GEMM (ZINC_PREFILL_DP4A=1)
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -830,6 +831,7 @@ pub const ForwardCuda = struct {
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
         pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
+        pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
@@ -1952,11 +1954,16 @@ pub const ForwardCuda = struct {
         // Tensor-core (wmma) variant for Q4_K is default-on (7% faster multiply,
         // not bit-identical due to fp16 rounding but token-correct). Opt out with
         // ZINC_PREFILL_TC=0.
-        const use_tc = idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
+        // ZINC_PREFILL_DP4A=1 selects DP4a int8 dot product (fastest dequant).
+        // ZINC_PREFILL_TC=0 opts out of tensor-core (default on).
+        const use_dp4a = idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
+        const use_tc = !use_dp4a and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
         if (T >= 32 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
-            if (use_tc) {
+            if (use_dp4a) {
+                cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (use_tc) {
                 cmd.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else {
                 cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
