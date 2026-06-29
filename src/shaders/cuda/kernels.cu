@@ -3412,23 +3412,35 @@ extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float*
     for (unsigned c = 0; c < nchunk; c++) {
         unsigned sbk = c >> 3, sb8 = c & 7u;   // superblock, sub-block 0..7
         // dequant W tile: BM*BK = 2048 elems / 256 threads = 8 each
+        // Optimized: each warp processes one row at a time. Lane 0 reads the
+        // Q4_K block header and broadcasts d*scale and dmin*min via __shfl_sync.
+        // This eliminates 31 redundant header reads + scale lookups per row.
+        unsigned warp_id = tid >> 5;  // 0..7
+        unsigned lane = tid & 31u;    // 0..31
         #pragma unroll
         for (int u = 0; u < 8; u++) {
-            unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
-            unsigned r = idx >> 5, l = idx & 31u;      // row 0..63, elem 0..31
+            unsigned r = warp_id + (unsigned)u * 8u;  // row (same for all lanes in warp)
+            unsigned l = lane;                          // element within sub-block
             unsigned row = m0 + r;
             float wv = 0.0f;
             if (row < pc.M) {
                 unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
-                unsigned dd = a_u32[blk];
-                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
-                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
-                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                float d_sc, dm_mn;
+                if (lane == 0) {
+                    unsigned dd = a_u32[blk];
+                    float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                    float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                    const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                    unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                    d_sc = d * (float)sc;
+                    dm_mn = dmin * (float)mn;
+                }
+                d_sc = __shfl_sync(0xFFFFFFFFu, d_sc, 0);
+                dm_mn = __shfl_sync(0xFFFFFFFFu, dm_mn, 0);
                 const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
-                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
                 unsigned char qb = qs[(sb8 >> 1) * 32u + l];
                 unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
-                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+                wv = d_sc * (float)nib - dm_mn;
             }
             Ws[l * BM + r] = wv;
         }
@@ -3441,18 +3453,16 @@ extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float*
             As[l * BT + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + c * 32u + l] : 0.0f;
         }
         __syncthreads();
-        // register-blocked multiply
+        // register-blocked multiply — vectorized float4 loads from shared memory
         #pragma unroll
         for (unsigned kk = 0; kk < BK; kk++) {
-            float wr[4], ar[4];
-            #pragma unroll
-            for (int i=0;i<4;i++) wr[i] = Ws[kk * BM + ty*4u + (unsigned)i];
-            #pragma unroll
-            for (int j=0;j<4;j++) ar[j] = As[kk * BT + tx*4u + (unsigned)j];
+            float4 wr4 = *((const float4*)(Ws + kk * BM + ty*4u));
+            float4 ar4 = *((const float4*)(As + kk * BT + tx*4u));
             #pragma unroll
             for (int i=0;i<4;i++)
                 #pragma unroll
-                for (int j=0;j<4;j++) acc[i][j] += wr[i]*ar[j];
+                for (int j=0;j<4;j++)
+                    acc[i][j] += ((&wr4.x)[i]) * ((&ar4.x)[j]);
         }
         __syncthreads();
     }
@@ -3699,25 +3709,34 @@ extern "C" __global__ void gemm_q4k_tc(const unsigned* a_u32, const float* A, fl
 
     for (unsigned c = 0; c < nchunk; c++) {
         unsigned sbk = c >> 3, sb8 = c & 7u;
-        // dequant W sub-block (64 rows x 32 elems) into Ws (m-major) — identical
-        // Q4_K unpack to gemm_q4k_tiled_v2, then cast to half.
+        // dequant W sub-block (64 rows x 32 elems) into Ws (m-major)
+        // Optimized: warp-broadcast header reads (same as gemm_q4k_tiled_v2)
+        unsigned warp_id = tid >> 5;
+        unsigned lane = tid & 31u;
         #pragma unroll
         for (int u = 0; u < 8; u++) {
-            unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
-            unsigned r = idx >> 5, l = idx & 31u;      // row 0..63, elem 0..31
+            unsigned r = warp_id + (unsigned)u * 8u;
+            unsigned l = lane;
             unsigned row = m0 + r;
             float wv = 0.0f;
             if (row < pc.M) {
                 unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
-                unsigned dd = a_u32[blk];
-                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
-                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
-                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                float d_sc, dm_mn;
+                if (lane == 0) {
+                    unsigned dd = a_u32[blk];
+                    float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                    float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                    const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                    unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                    d_sc = d * (float)sc;
+                    dm_mn = dmin * (float)mn;
+                }
+                d_sc = __shfl_sync(0xFFFFFFFFu, d_sc, 0);
+                dm_mn = __shfl_sync(0xFFFFFFFFu, dm_mn, 0);
                 const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
-                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
                 unsigned char qb = qs[(sb8 >> 1) * 32u + l];
                 unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
-                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+                wv = d_sc * (float)nib - dm_mn;
             }
             Ws[r * BK + l] = __float2half(wv);
         }
