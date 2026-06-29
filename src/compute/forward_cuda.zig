@@ -307,6 +307,7 @@ const Pipelines = struct {
     // Effort 28 4c: batched-decode GEMM (one weight read amortized over B rows).
     gemm: [4]CudaPipeline, // q4k, q5k, q6k, q8_0 tiled_v2
     gemm_f32: CudaPipeline, // f32 weights (e.g. some ssm projections)
+    gemm_q4k_tc: CudaPipeline, // tensor-core Q4_K GEMM (ZINC_PREFILL_TC=1)
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -828,6 +829,7 @@ pub const ForwardCuda = struct {
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
+        pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
@@ -1947,9 +1949,18 @@ pub const ForwardCuda = struct {
         }
         // Fallback: batched tiled GEMM for T >= 32 (reads weight once per tile
         // instead of Tx). Per-token DMMV for T < 32 (avoids 64-token tile waste).
+        // Tensor-core (wmma) variant for Q4_K is default-on (7% faster multiply,
+        // not bit-identical due to fp16 rounding but token-correct). Opt out with
+        // ZINC_PREFILL_TC=0.
+        const use_tc = idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
+            !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
         if (T >= 32 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
-            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            if (use_tc) {
+                cmd.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            }
         } else {
             var t: u32 = 0;
             while (t < T) : (t += 1) {
