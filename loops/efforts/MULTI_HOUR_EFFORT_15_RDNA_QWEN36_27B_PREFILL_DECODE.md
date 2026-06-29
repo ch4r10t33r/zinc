@@ -1,6 +1,6 @@
 # Effort 15 - RDNA4 Qwen 3.6 27B dense-hybrid prefill and decode
 
-> **Status:** server-vs-server harness fixed · Qwen3.6 27B now beating reference on the RDNA matrix · `decode-extended` prefill 325.20 vs 252.66 tok/s
+> **Status:** server-vs-server harness fixed · Qwen3.6 27B now beating reference on the RDNA matrix · post-reboot `decode-extended` prefill 324.37 vs 253.17 tok/s
 
 Date: 2026-05-18
 
@@ -32,6 +32,34 @@ mixed or negative. Do not treat the harness fix as proof that dense-down
 is fully optimized; treat it as the corrected measurement baseline.
 
 Latest patched-suite artifact:
+
+- `/tmp/zinc-rdna1-full-suite-20260629-082140.json`
+- ZINC provenance: `f719ccccb501`
+- Baseline provenance: `llama-server` `9725a313b`
+
+Post-reboot Qwen 3.6 27B:
+
+| scenario | ZINC prefill | reference prefill | ZINC decode | reference decode |
+|---|---:|---:|---:|---:|
+| core | 212.73 | 184.18 | 31.98 | 30.65 |
+| context-medium | 388.21 | 73.03 | 31.72 | 30.47 |
+| context-long | 408.64 | 74.83 | 31.71 | 30.50 |
+| decode-extended | 324.37 | 253.17 | 31.64 | 30.40 |
+
+Full RDNA1 post-reboot summary:
+
+| model | ZINC prefill | reference prefill | ZINC decode | reference decode | overall |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.6 35B-A3B | 546.21 | 397.22 | 167.06 | 108.18 | 152.7% |
+| Qwen 3.6 27B | 212.73 | 184.18 | 31.98 | 30.65 | 104.9% |
+| Qwen 3.5 9B | 735.53 | 549.17 | 97.30 | 85.49 | 114.8% |
+
+The two Gemma rows in this run are baseline-only because ZINC's server API
+returned without emitting the `Generated` timing log that the fair harness
+requires. The harness now records that as unavailable instead of waiting for
+the full command timeout.
+
+Previous patched-suite artifact:
 
 | scenario | ZINC prefill | reference prefill | ZINC decode | reference decode |
 |---|---:|---:|---:|---:|
@@ -435,6 +463,23 @@ Each cell is `prefill tok/s / decode tok/s`.
   `149.70,149.28,145.12` versus default control `150.94,152.07,147.21`.
 - BK4 exact dense-down specialization was tested and rejected: paired
   clean median `149.36` versus BK4 median `148.32`.
+
+2026-06-29 RDNA1 rebooted full-suite notes:
+
+- Rebooted the RDNA1 node before measuring.
+- First full run exposed a harness failure mode: Gemma server API responses
+  returned without a corresponding ZINC `Generated` timing log, so the
+  harness waited for the full remote command timeout.
+- Fixed and pushed bounded post-response timing waits in the suite
+  (`f719cccc`); missing timing logs now become clear unavailable rows with
+  the response/log tail attached.
+- Rebooted RDNA1 again and reran the full RDNA suite from clean `f719cccc`.
+- Artifact: `/tmp/zinc-rdna1-full-suite-20260629-082140.json`.
+- Qwen rows all beat the baseline overall: Qwen 3.6 35B-A3B `152.7%`,
+  Qwen 3.6 27B `104.9%`, Qwen 3.5 9B `114.8%`.
+- Target `decode-extended` on Qwen 3.6 27B remains ahead:
+  ZINC `324.37 tok/s` prefill and `31.64 tok/s` decode versus baseline
+  `253.17 tok/s` prefill and `30.40 tok/s` decode.
 
 ## Measurement contract
 
