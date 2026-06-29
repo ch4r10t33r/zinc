@@ -19282,7 +19282,7 @@ pub const InferenceEngine = struct {
             };
             // The fused token-loop variant wins on short prompts by reducing
             // workgroups, but long prompts need token-level parallelism.
-            const prefer_fused_gnorm = n_tokens <= 256;
+            const prefer_fused_gnorm = n_tokens <= 128;
             var tok_idx: u32 = 0;
             if (prefer_fused_gnorm and self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused != null) {
                 const fused_pip = &(self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused.?);

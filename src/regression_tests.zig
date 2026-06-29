@@ -629,8 +629,8 @@ test "Vulkan SSM gated norm keeps long prefill token-parallel" {
     // Long layer-major prefills need the token-batched grid; the fused
     // token-loop shader is only a short-prompt dispatch-overhead optimization.
     const src = @embedFile("compute/forward.zig");
-    try expectContains(src, "const prefer_fused_gnorm = n_tokens <= 256;");
-    try expectContainsNear(src, "const prefer_fused_gnorm = n_tokens <= 256;", "pipeline_ssm_gated_norm_batch_tok) |*batch_pip|", 1800);
+    try expectContains(src, "const prefer_fused_gnorm = n_tokens <= 128;");
+    try expectContainsNear(src, "const prefer_fused_gnorm = n_tokens <= 128;", "pipeline_ssm_gated_norm_batch_tok) |*batch_pip|", 1800);
     try expectContainsNear(src, "pipeline_ssm_gated_norm_batch_tok) |*batch_pip|", "dt_rank,\n                    n_tokens,\n                    1,", 1400);
 }
 
