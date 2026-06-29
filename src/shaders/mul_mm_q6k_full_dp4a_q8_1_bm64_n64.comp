@@ -1,5 +1,5 @@
 #version 460
-// ZINC — BM64 Q6_K DP4a dense-down prefill.
+// ZINC — BM64 Q6_K DP4a projection with Q8_1 activation input.
 //
 // The f32-FMA Q6_K GEMM (mul_mm_q6k_full.comp) is a tuned local optimum: cycle
 // 19 (occupancy-lift via f16 activations) and cycle 22 (better LDS:FMA via wide
@@ -15,8 +15,8 @@
 // new error is the standard W6A8 activation quant, scaled locally per 32 to stay
 // robust on the unnormalized SwiGLU output.
 //
-// Math: out[m,n] = sum_tiles ascale[n,tile] * (ws[m,sub0]*dot(q,qB)_sub0
-//                                              + ws[m,sub1]*dot(q,qB)_sub1)
+// Math: out[m,n] = sum_tiles ascale[n,tile].x * (ws[m,sub0]*dot(q,qB)_sub0
+//                                                + ws[m,sub1]*dot(q,qB)_sub1)
 // where ws[m,sub] = d * i8(q6k_scale) is the Q6_K weight scale (NOT folded into
 // the int8 weight), and the int dot uses the q-32 weights against int8 acts.
 //
@@ -68,7 +68,7 @@ layout(push_constant) uniform PushConstants {
 
 layout(set = 0, binding = 0) readonly buffer MatA  { uint8_t a_data[]; };
 layout(set = 0, binding = 1) readonly buffer ActB  { uint b_packed[]; };
-layout(set = 0, binding = 2) readonly buffer SclB  { float b_scale[]; };
+layout(set = 0, binding = 2) readonly buffer SclB  { vec2 b_scale_dsum[]; };
 layout(set = 0, binding = 3) writeonly buffer MatD { float d_data[]; };
 
 shared uint  buf_a[BK_STEP * BM * SPACK];   // packed int8 weights (q-32), 8 uints/row
@@ -182,7 +182,7 @@ void main() {
                     const uint scale_idx = (SPEC_INTERLEAVED_B != 0u)
                         ? block_b * N + col_global
                         : col_global * b_stride_scale + block_b;
-                    buf_bs[ks * BN + col_local] = b_scale[scale_idx];
+                    buf_bs[ks * BN + col_local] = b_scale_dsum[scale_idx].x;
                 }
             }
         }

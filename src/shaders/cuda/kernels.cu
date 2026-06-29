@@ -1535,6 +1535,208 @@ extern "C" __global__ void ssm_delta_net_seq(
     state[row_base + col] = rs;                          // write final state
 }
 
+// ---- ssm_delta_net_chunked (parallel intra-chunk delta-net) ------------------
+// v0: correct but suboptimal. Caches normalized K in shared memory,
+// builds Gram matrix, forward substitution, output, state update.
+// Same thread org as ssm_delta_net_warp: warp=column, lane=rows.
+
+struct DeltaNetChunkedPush {
+    unsigned dt_rank, head_v_dim, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned n_tok, conv_stride_tok, ab_stride_tok, y_stride_tok;
+};
+
+extern "C" __global__ __launch_bounds__(128, 4) void ssm_delta_net_chunked(
+    const float* conv_out, const unsigned char* dt_bias,
+    const float* alpha, const float* beta,
+    const unsigned char* ssm_a, float* state, float* out_data,
+    DeltaNetChunkedPush pc)
+{
+    const unsigned h = blockIdx.x;
+    const unsigned col = blockIdx.y * 4 + threadIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
+
+    const unsigned hv = pc.head_v_dim;
+    const unsigned T = pc.n_tok;
+    const unsigned qk_dim = pc.d_state * pc.n_group;
+    const unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
+    const unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+    const unsigned CS = 64;
+
+    float dt_bias_val = pc.has_dt_bias ?
+        (pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                           : ((const float*)dt_bias)[h]) : 0.0f;
+    float ssm_a_val = pc.has_ssm_a ?
+        (pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                         : ((const float*)ssm_a)[h]) : 0.0f;
+
+    // Shared memory: k_norm[CS*hv](32KB) + M[CS*CS](16KB) + g_cs[CS] + beta[CS]
+    extern __shared__ float smem[];
+    float* k_norm  = smem;                       // [CS * hv]
+    float* M_mat   = k_norm + CS * hv;           // [CS * CS]
+    float* g_cs_sh = M_mat + CS * CS;            // [CS]
+    float* beta_sh = g_cs_sh + CS;               // [CS]
+
+    // State: 4 rows per lane (registers)
+    float s_shard[4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        s_shard[r] = state[((size_t)h * hv + (r * 32 + lane)) * hv + col];
+
+    const unsigned n_chunks = (T + CS - 1) / CS;
+
+    for (unsigned chunk = 0; chunk < n_chunks; chunk++) {
+        const unsigned t0 = chunk * CS;
+        const unsigned cs = (t0 + CS <= T) ? CS : (T - t0);
+
+        // --- Gate cumsum + beta (warp 0, lane 0) ---
+        if (threadIdx.y == 0 && lane == 0) {
+            float gs = 0.0f;
+            for (unsigned t = 0; t < cs; t++) {
+                float a = alpha[(t0+t)*pc.ab_stride_tok + h] + dt_bias_val;
+                float sp = logf(1.0f + expf(a));
+                gs += (pc.has_ssm_a ? sp * ssm_a_val : -sp);
+                g_cs_sh[t] = gs;
+                beta_sh[t] = 1.0f / (1.0f + expf(-beta[(t0+t)*pc.ab_stride_tok + h]));
+            }
+        }
+        __syncthreads();
+
+        // --- Load + L2-normalize K vectors into shared memory ---
+        // 4 warps load 4 K vectors at a time (each warp = 1 vector, 32 lanes × 4 elements)
+        for (unsigned t_base = 0; t_base < cs; t_base += 4) {
+            unsigned t = t_base + threadIdx.y;
+            if (t < cs) {
+                float kr[4]; float ss = 0.0f;
+                unsigned base = (t0+t)*pc.conv_stride_tok + qk_dim + k_hi*pc.d_state;
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    unsigned d = r * 32 + lane;
+                    kr[r] = (d < k_len) ? conv_out[base + d] : 0.0f;
+                    ss += kr[r] * kr[r];
+                }
+                ss = zinc_warp_reduce_sum_all(ss);
+                float rinv = rsqrtf(fmaxf(ss, 1e-12f));
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    unsigned d = r * 32 + lane;
+                    k_norm[t * hv + d] = kr[r] * rinv;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- Build Gram matrix M[i][j] = beta[i]*exp(g_cs[i]-g_cs[j])*<ki,kj> ---
+        // Each warp computes rows of M. Dot products from shared k_norm.
+        for (unsigned i_base = 0; i_base < cs; i_base += 4) {
+            unsigned i = i_base + threadIdx.y;
+            if (i < cs && i > 0) {
+                float ki[4];
+                #pragma unroll
+                for (int r = 0; r < 4; r++)
+                    ki[r] = k_norm[i * hv + r * 32 + lane];
+                float gcs_i = g_cs_sh[i];  // g_cs[t] — includes gate[t]
+                for (unsigned j = 0; j < i; j++) {
+                    float dp = 0.0f;
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++)
+                        dp += ki[r] * k_norm[j * hv + r * 32 + lane];
+                    dp = zinc_warp_reduce_sum_all(dp);
+                    if (lane == 0)
+                        M_mat[i * CS + j] = beta_sh[i] * expf(gcs_i - g_cs_sh[j]) * dp;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- Forward substitution: d[t] = a[t] - sum_{s<t} M[t][s]*d[s] ---
+        float d_vals[64];
+        for (unsigned t = 0; t < cs; t++) {
+            // sk = <state, k_t> (warp reduce)
+            float skp = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 4; r++)
+                skp += s_shard[r] * k_norm[t * hv + r * 32 + lane];
+            float sk = zinc_warp_reduce_sum_all(skp);
+
+            // G(t,0) = exp(g_cs[t]) — includes gate[t], matching original kernel
+            // where rs *= gate happens BEFORE sk = dot(rs, k)
+            float g_state = expf(g_cs_sh[t]);
+            unsigned v_off = (t0+t)*pc.conv_stride_tok + 2u*qk_dim + h*hv + col;
+            float a_t = beta_sh[t] * (conv_out[v_off] - g_state * sk);
+
+            float d_t = a_t;
+            for (unsigned s = 0; s < t; s++)
+                d_t -= M_mat[t * CS + s] * d_vals[s];
+            d_vals[t] = d_t;  // broadcast: same across lanes in warp
+        }
+
+        // --- Output: o[t] = G(t,0)*sq + sum_{s<=t} G(s+1,t)*<ks,qt>*d[s] ---
+        // Note: S^t = P(0,t)*S_init + sum_{s=0}^{t} P(s+1,t)*k[s]@d[s]^T
+        // o[t] = P(0,t)*<S_init,qt> + sum_{s=0}^{t} P(s+1,t)*<ks,qt>*d[s]
+        // P(0,t) = exp(g_cs[t]), P(s+1,t) = exp(g_cs[t]-g_cs[s])
+        float inv_sq = rsqrtf((float)pc.d_state);
+        for (unsigned t = 0; t < cs; t++) {
+            // Load + normalize Q
+            float qr[4]; float qss = 0.0f;
+            unsigned qbase = (t0+t)*pc.conv_stride_tok + k_hi*pc.d_state;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                unsigned d = r * 32 + lane;
+                qr[r] = (d < k_len) ? conv_out[qbase + d] : 0.0f;
+                qss += qr[r] * qr[r];
+            }
+            qss = zinc_warp_reduce_sum_all(qss);
+            float qrinv = rsqrtf(fmaxf(qss, 1e-12f)) * inv_sq;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) qr[r] *= qrinv;
+
+            // sq = <state, q_norm>
+            float sqp = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) sqp += s_shard[r] * qr[r];
+            float sq = zinc_warp_reduce_sum_all(sqp);
+
+            float g_st = expf(g_cs_sh[t]);
+            float o = g_st * sq;
+
+            for (unsigned s = 0; s <= t; s++) {
+                float kqp = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 4; r++)
+                    kqp += k_norm[s * hv + r * 32 + lane] * qr[r];
+                float kq = zinc_warp_reduce_sum_all(kqp);
+                o += expf(g_cs_sh[t] - g_cs_sh[s]) * kq * d_vals[s];
+            }
+            if (lane == 0)
+                out_data[(t0+t)*pc.y_stride_tok + h*hv + col] = o;
+        }
+
+        // --- State update: S = G_total*S + sum_s G_last*k_s*d[s] ---
+        {
+            float g_total = expf(g_cs_sh[cs - 1]);
+            // Apply total gate decay first
+            #pragma unroll
+            for (int r = 0; r < 4; r++) s_shard[r] *= g_total;
+            // Accumulate rank-1 updates
+            for (unsigned s = 0; s < cs; s++) {
+                float g_last = expf(g_cs_sh[cs - 1] - g_cs_sh[s]);
+                float kd = g_last * d_vals[s];
+                #pragma unroll
+                for (int r = 0; r < 4; r++)
+                    s_shard[r] += k_norm[s * hv + r * 32 + lane] * kd;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write final state
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        state[((size_t)h * hv + (r * 32 + lane)) * hv + col] = s_shard[r];
+}
+
 // ---- dmmv_q4k_fast (perf research, 5090) — port of tuned Vulkan dmmv_q4k -----
 // 16 threads per Q4_K superblock: header read once/thread (not 256x), qs read
 // once total, x via float4. Block-reduce over the block = one output row.

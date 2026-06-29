@@ -37,6 +37,7 @@ layout(constant_id = 1) const uint SPEC_BN = 64u;
 layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;
 layout(constant_id = 3) const uint SPEC_BK_STEP = 2u;
 layout(constant_id = 4) const uint SPEC_ACCUMULATE = 0u;
+layout(constant_id = 5) const uint SPEC_INTERLEAVED_B = 0u;
 
 const uint BN = SPEC_BN;
 const uint BK_STEP = SPEC_BK_STEP;
@@ -162,13 +163,19 @@ void main() {
             const uint col_local = tid / 2u;
             if (col_local < BN) {
                 const uint col_global = ic * BN + col_local;
-                const uint src = col_global * b_stride_packed + ((k_step_base + k_in_tile) >> 2);
+                const uint block_b = k_step_base >> 5;
+                const uint src = (SPEC_INTERLEAVED_B != 0u)
+                    ? (block_b * N + col_global) * 8u + tile_half * 4u
+                    : col_global * b_stride_packed + ((k_step_base + k_in_tile) >> 2);
                 const uint base_b = ks * BN * SPACK + col_local * SPACK + tile_half * 4u;
                 [[unroll]] for (uint w = 0u; w < 4u; w++) {
                     buf_b[base_b + w] = b_packed[src + w];
                 }
                 if (tile_half == 0u) {
-                    buf_b_sd[ks * BN + col_local] = b_scale_dsum[col_global * b_stride_scale + (k_step_base >> 5)];
+                    const uint scale_idx = (SPEC_INTERLEAVED_B != 0u)
+                        ? block_b * N + col_global
+                        : col_global * b_stride_scale + block_b;
+                    buf_b_sd[ks * BN + col_local] = b_scale_dsum[scale_idx];
                 }
             }
         }

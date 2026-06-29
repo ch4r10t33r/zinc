@@ -46,6 +46,7 @@ layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
 layout(constant_id = 2) const uint ACTIVATION = 0u; // 0 = SwiGLU, 1 = GEGLU
 layout(constant_id = 3) const uint SPEC_RAGGED_N = 0u;
+layout(constant_id = 4) const uint SPEC_INTERLEAVED_OUT = 0u;
 
 const uint BN = SPEC_BN;
 const uint TPR_N = WG_SIZE / TPR_M;  // 8
@@ -299,9 +300,16 @@ void main() {
         // Each row group of 4 m-values maps to one packed uint at p = tiwr,
         // exactly the layout written by quantize_act_q8.comp.
         if ((BN >= 32u && SPEC_RAGGED_N == 0u) || col_g < N) {
-            d_packed[d_packed_offset + col_g * stride_d_packed + ir * (BM / 4u) + tiwr] = packed;
+            const uint block_g = ir * (BM / 32u) + q8_block;
+            const uint packed_idx = (SPEC_INTERLEAVED_OUT != 0u)
+                ? d_packed_offset + (block_g * N + col_g) * 8u + q8_lane
+                : d_packed_offset + col_g * stride_d_packed + ir * (BM / 4u) + tiwr;
+            d_packed[packed_idx] = packed;
             if (q8_lane == 0u) {
-                d_scale[d_scale_offset + col_g * stride_d_scale + ir * (BM / 32u) + q8_block] = scale;
+                const uint scale_idx = (SPEC_INTERLEAVED_OUT != 0u)
+                    ? d_scale_offset + block_g * N + col_g
+                    : d_scale_offset + col_g * stride_d_scale + ir * (BM / 32u) + q8_block;
+                d_scale[scale_idx] = scale;
             }
         }
     }
