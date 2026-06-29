@@ -2405,14 +2405,25 @@ pub const InferenceEngine = struct {
         const is_amd_rdna_vendor = gpu_config.vendor == .amd_rdna3 or
             gpu_config.vendor == .amd_rdna4 or
             gpu_config.vendor == .amd_rdna4_apu;
+        const gemma_prefill_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_PREFILL_TOPK");
+        const gemma_prefill_requested_topk: u32 = if (gemma_prefill_topk_env) |raw| blk: {
+            const parsed = std.fmt.parseInt(u32, raw, 10) catch 0;
+            if (parsed == 0 or parsed >= config.n_experts_used) break :blk 0;
+            break :blk @max(@as(u32, 1), parsed);
+        } else 0;
+        const gemma_prefill_base_topk_limit: u32 = if (gemma_prefill_topk_env != null)
+            gemma_prefill_requested_topk
+        else if (gemma_topk_env != null)
+            gemma_topk_limit
+        else
+            0;
         const gemma_prefill_tail_topk_guard_default: u32 = 16;
         const gemma_prefill_tail_topk_limit: u32 = if (config.architecture == .gemma and
             config.n_experts > 0 and
             config.n_experts_used > gemma_prefill_tail_topk_default and
             is_amd_rdna_vendor and
-            gemma_topk_env != null and
-            gemma_topk_limit > 0)
-            gemma_topk_limit
+            gemma_prefill_base_topk_limit > 0)
+            gemma_prefill_base_topk_limit
         else
             0;
         const gemma_prefill_tail_topk_guard_tokens: u32 = if (gemma_prefill_tail_topk_limit > 0)
@@ -2420,7 +2431,7 @@ pub const InferenceEngine = struct {
         else
             0;
         if (gemma_prefill_tail_topk_limit > 0) {
-            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} with final-token guard {d}, prompts {d}-{d} tokens tighten that guard to {d}, prompts <= {d} tokens use cap {d}, prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
+            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} with final-token guard {d}, prompts {d}-{d} tokens tighten that guard to {d}, prompts <= {d} tokens use cap {d}, prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_PREFILL_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
                 gemma_prefill_tail_topk_limit,
                 gemma_prefill_tail_topk_guard_tokens,
                 gemma_prefill_micro_prompt_tokens,
@@ -2436,7 +2447,7 @@ pub const InferenceEngine = struct {
                 config.n_experts_used,
             });
         } else if (config.architecture == .gemma and config.n_experts > 0 and is_amd_rdna_vendor) {
-            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA (set ZINC_GEMMA_MOE_TOPK to opt in)", .{});
+            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA (set ZINC_GEMMA_MOE_PREFILL_TOPK to opt in)", .{});
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
@@ -10073,10 +10084,21 @@ pub const InferenceEngine = struct {
                     (inter_dim <= 12288 or qwen36_row1_dense_eligible) and
                     (hidden_dim % 4) == 0 and
                     (hidden_dim % 256) == 0;
+                const gemma_dense_geglu_pair_eligible = self.use_fused_dense_ffn and
+                    self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair != null and
+                    config.architecture == .gemma and
+                    (!dense_prefill_validate_capture or self.dense_prefill_validate_production) and
+                    gate_tensor.info.type_ == .q4_k and
+                    up_tensor.info.type_ == .q4_k and
+                    (hidden_dim % 4) == 0 and
+                    (hidden_dim % 256) == 0;
 
                 const dense_ffn_gateup_phase = self.beginProfilePhase();
                 if (fused_dense_ffn_eligible) {
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
+                    self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
+                } else if (gemma_dense_geglu_pair_eligible) {
+                    try self.dispatchDmmvFusedGateUpGegluPair(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else {
                     const dense_ffn_gate_phase = self.beginProfilePhase();

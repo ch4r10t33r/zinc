@@ -188,6 +188,24 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_ragged_n64", 2200);
 }
 
+test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const gemma_dense_geglu_pair_eligible =";
+    try expectContainsNear(src, marker, "pipeline_q4k_fused_gate_up_geglu_pair != null", 500);
+    try expectContainsNear(src, marker, "config.architecture == .gemma", 500);
+    try expectContainsNear(src, marker, "gate_tensor.info.type_ == .q4_k", 600);
+    try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 1200);
+}
+
+test "Vulkan Gemma prefill top-k cap can be tested without decode top-k cap" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const gemma_prefill_topk_env =";
+    try expectContainsNear(src, marker, "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
+    try expectContainsNear(src, marker, "gemma_prefill_base_topk_limit", 900);
+    try expectContainsNear(src, marker, "else if (gemma_topk_env != null)", 900);
+    try expectContainsNear(src, "Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA", "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
+}
+
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");
