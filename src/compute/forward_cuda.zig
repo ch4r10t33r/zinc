@@ -639,7 +639,7 @@ pub const ForwardCuda = struct {
     use_cublas_q5: bool = false, // also route Q5_K dense GEMMs through cuBLAS (qwen attn_qkv/ssm_out)
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
     use_cublas_q8: bool = false, // also route Q8_0 dense GEMMs through cuBLAS (qwen36 shexp)
-    cublas_min_t: u32 = 1 << 30, // cuBLAS prefill disabled — tiled GEMM is 2x faster (no fp16 round-trip). Override with ZINC_CUBLAS_MIN_T
+    cublas_min_t: u32 = 256, // cuBLAS for T>=256 (fp16 dequant amortized over many tokens beats per-tile re-dequant). Override with ZINC_CUBLAS_MIN_T
     // T2 (qwen MoE port): route the routed gate/up experts through the single-launch
     // padded grouped Tensor-core GEMM (build_expert_order_padded +
     // gemm_q4k_experts_grouped_tc) instead of the dmmv_*_experts_batched matvec.
