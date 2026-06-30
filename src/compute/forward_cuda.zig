@@ -2011,7 +2011,7 @@ pub const ForwardCuda = struct {
             // Fall through to normal path if cache alloc failed
             }
         }
-        if (T >= 32 and idx < 4) {
+        if (T >= 32 and M >= 64 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             if (use_dp4a) {
                 cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
