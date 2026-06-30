@@ -1961,7 +1961,8 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_TC=0: opt out of tensor-core (default on).
         const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
         const use_dp4a = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
-        const use_lowsmem = !use_f16 and !use_dp4a and idx == 0 and std.posix.getenv("ZINC_PREFILL_LOWSMEM") != null;
+        const use_lowsmem = !use_f16 and !use_dp4a and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
+            !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_LOWSMEM").?, "0"));
         const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
 
