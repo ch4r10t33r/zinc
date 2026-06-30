@@ -3482,6 +3482,74 @@ extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float*
     }
 }
 
+// ---- gemm_q8_0_tc_lowsmem — 16KB-shared TC Q8_0 GEMM with float input ------
+// Same aliased-shared structure as gemm_q4k_tc_lowsmem but with Q8_0 dequant
+// (trivial: d * int8). Used for the 35B's Q8_0 shared-expert weights.
+extern "C" __global__ void gemm_q8_0_tc_lowsmem(const unsigned char* a, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float smem[BT*BM];
+    half* Ws = (half*)smem;
+    half* As = ((half*)smem) + (BM*BK);
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
+    unsigned bpr=pc.K>>5; // Q8_0: 32 elements per block
+    unsigned tid=threadIdx.x;
+    unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
+    unsigned wid=tid>>5, lane=tid&31u;
+    const float* Abase=A+(pc.x_offset>>2);
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0,c1;
+    wmma::fill_fragment(c0,0.0f); wmma::fill_fragment(c1,0.0f);
+
+    for (unsigned c=0u;c<bpr;c++){
+        // Dequant Q8_0 W block: 32 elements per block, 34 bytes each (2B scale + 32B int8)
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned r=wid+(unsigned)u*8u, l=lane;
+            unsigned row=m0+r, k=c*32u+l;
+            float wv=0.0f;
+            if(row<pc.M){
+                const unsigned char* blkp = a + (size_t)row * bpr * 34u + (size_t)c * 34u;
+                float d = zinc_half_to_float((unsigned short)((unsigned)blkp[0] | ((unsigned)blkp[1] << 8)));
+                wv = d * (float)((signed char)blkp[2u + l]);
+            }
+            Ws[r*BK+l]=__float2half(wv);
+        }
+        // Float→half A load
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned t=idx>>5,l=idx&31u,tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned ks=0;ks<2;ks++){
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f,a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f,&Ws[(fm*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(a1f,&Ws[((fm+2u)*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(bf,&As[(ks*16u)*BT+ft*16u],BT);
+            wmma::mma_sync(c0,a0f,bf,c0);
+            wmma::mma_sync(c1,a1f,bf,c1);
+        }
+        __syncthreads();
+    }
+    float* Cs=smem;
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+fm*16u],c0,BM,wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+(fm+2u)*16u],c1,BM,wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for(int u=0;u<16;u++){
+        unsigned idx=tid+(unsigned)u*256u;
+        unsigned r=idx%BM,t=idx/BM;
+        unsigned row=m0+r, tok=t0+t;
+        if(row<pc.M&&tok<pc.T){
+            unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
+            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*BM+r]; else Y[yi]=Cs[t*BM+r];
+        }
+    }
+}
+
 // ---- gemm_q4k_dp4a — DP4a int8 dot product Q4_K GEMM ------------------------
 // Key insight: Q4_K nibbles (0-15) are valid unsigned int8 values. Instead of
 // dequanting to float (20+ instructions/element), just extract nibbles and pack

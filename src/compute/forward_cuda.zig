@@ -311,6 +311,7 @@ const Pipelines = struct {
     gemm_q4k_dp4a: CudaPipeline, // DP4a int8 Q4_K GEMM (ZINC_PREFILL_DP4A=1)
     gemm_f16_tc: CudaPipeline, // fp16 pre-dequanted TC GEMM (ZINC_PREFILL_F16=1)
     gemm_q4k_tc_lowsmem: CudaPipeline, // 8KB-shared TC GEMM (3x occupancy)
+    gemm_q8_0_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q8_0 GEMM (shared experts)
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -837,6 +838,7 @@ pub const ForwardCuda = struct {
         pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
         pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
+        pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
@@ -918,11 +920,11 @@ pub const ForwardCuda = struct {
             self.layer_is_attn[li] = model.getLayer(L, "attn_q.weight") != null;
             if (li < 8) log.info("  layer {d}: {s}", .{ li, if (self.layer_is_attn[li]) "attention" else "SSM" });
             if (li == 0 and d.n_experts > 0) {
-                if (model.getLayer(L, "ffn_gate_exps.weight")) |w| log.info("  ffn_gate_exps: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
-                if (model.getLayer(L, "ffn_down_exps.weight")) |w| log.info("  ffn_down_exps: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
-                if (model.getLayer(L, "ffn_gate_shexp.weight")) |w| log.info("  ffn_gate_shexp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
-                if (model.getLayer(L, "ffn_down_shexp.weight")) |w| log.info("  ffn_down_shexp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
-                if (model.getLayer(L, "ffn_gate_inp.weight")) |w| log.info("  ffn_gate_inp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+                if (model.getLayer(L, "ffn_gate_exps.weight")) |w| log.info("  ffn_gate_exps: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
+                if (model.getLayer(L, "ffn_down_exps.weight")) |w| log.info("  ffn_down_exps: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
+                if (model.getLayer(L, "ffn_gate_shexp.weight")) |w| log.info("  ffn_gate_shexp: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
+                if (model.getLayer(L, "ffn_down_shexp.weight")) |w| log.info("  ffn_down_shexp: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
+                if (model.getLayer(L, "ffn_gate_inp.weight")) |w| log.info("  ffn_gate_inp: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
             }
             if (self.layer_is_attn[li]) {
                 self.kv_k[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
@@ -1534,11 +1536,23 @@ pub const ForwardCuda = struct {
             const L: u32 = @intCast(li);
             if (self.layer_is_attn[L]) {
                 const kv_off = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
-                self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
-                self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
+                self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| {
+                    alias_err = e;
+                    break :L_alias;
+                };
+                self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| {
+                    alias_err = e;
+                    break :L_alias;
+                };
             } else {
-                self.ssm_state[L] = buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4) catch |e| { alias_err = e; break :L_alias; };
-                self.ssm_conv_state[L] = buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4) catch |e| { alias_err = e; break :L_alias; };
+                self.ssm_state[L] = buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4) catch |e| {
+                    alias_err = e;
+                    break :L_alias;
+                };
+                self.ssm_conv_state[L] = buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4) catch |e| {
+                    alias_err = e;
+                    break :L_alias;
+                };
             }
         }
         if (alias_err) |e| {
@@ -1673,7 +1687,10 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.ssm_conv1d_batched, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.qkv, &wconv.gpu_buffer, &self.ssm_conv_state[L], &b.conv_out }, &conv, @sizeOf(ConvBatchPush), 0);
         self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1);
 
-        if (ssm_profile) { self.submit(cmd); self.waitPending(); }
+        if (ssm_profile) {
+            self.submit(cmd);
+            self.waitPending();
+        }
 
         // === Delta-net scan ===
         if (ssm_profile) cmd = try command.beginCommand(ctx);
@@ -1685,31 +1702,56 @@ pub const ForwardCuda = struct {
         // A/B toggle: ZINC_SSM_WARP=0 falls back to the block-reduce kernel.
         const use_warp = !self.force_block_ssm and !use_chunked and
             (std.posix.getenv("ZINC_SSM_WARP") == null or
-            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
+                !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
         var prof_scan: i64 = 0;
         if (use_chunked) {
             const dn_ch = DeltaNetChunkedPush{
-                .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = T,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
             };
             const smem_size = 64 * d.head_v_dim * @sizeOf(f32) + 64 * 64 * @sizeOf(f32) + 2 * 64 * @sizeOf(f32);
             cmd.dispatch(&self.pipes.ssm_delta_net_chunked, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_ch, @sizeOf(DeltaNetChunkedPush), smem_size);
         } else if (use_warp) {
             const dn_warp = DeltaNetWarpPush{
-                .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = T,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
             };
             cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 2 * T * @sizeOf(f32));
         } else {
             const dn = DeltaNetPush{
-                .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .n_group = d.n_group,
-                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16), .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                .has_dt_bias = 1, .has_ssm_a = 1, .n_tok = T,
-                .conv_stride_tok = d.conv_channels, .ab_stride_tok = d.dt_rank, .y_stride_tok = d.d_inner,
+                .d_inner = d.d_inner,
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = T,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
             };
             cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn, @sizeOf(DeltaNetPush), 0);
         }
@@ -1976,7 +2018,8 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_F16=1: use pre-dequanted fp16 weights (skip dequant entirely)
         // when a cached fp16 version exists. 10-30x faster GEMM.
         // ZINC_PREFILL_DP4A=1: DP4a int8 dot product.
-        // ZINC_PREFILL_TC=0: opt out of tensor-core (default on).
+        // ZINC_PREFILL_TC=0: opt out of Q4_K tensor-core (default on).
+        // ZINC_PREFILL_Q8_TC=0: opt out of the Q8_0 tensor-core shared-expert path.
         const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
         const use_dp4a = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
         const use_lowsmem = !use_f16 and !use_dp4a and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
@@ -1987,34 +2030,37 @@ pub const ForwardCuda = struct {
         // Check for cached fp16 weight when ZINC_PREFILL_F16 is set
         if (use_f16) {
             if (self.w_f16_cache) |*cache| {
-            const key = @intFromPtr(w.gpu_buffer.handle);
-            if (cache.getPtr(key)) |cached| {
-                // Cache HIT: dispatch fp16 TC GEMM (no dequant!)
-                const push = GemmPush{ .M = M, .K = K, .T = T, .a_offset = 0 };
-                cmd.dispatch(&self.pipes.gemm_f16_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ cached, x, y }, &push, @sizeOf(GemmPush), 0);
-                return;
-            }
-            // Cache MISS: dequant to fp16 and cache for future use
-            const new_buf = buffer.createBuffer(self.ctx, @as(usize, M) * K * @sizeOf(u16)) catch null;
-            if (new_buf) |dq_buf| {
-                if (idx == 0) {
-                    const dq = DequantQ4KPush{ .M = M, .K = K };
-                    cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ4KPush), 0);
-                    cache.put(key, dq_buf) catch {};
-                    if (cache.getPtr(key)) |cached| {
-                        const push = GemmPush{ .M = M, .K = K, .T = T, .a_offset = 0 };
-                        cmd.dispatch(&self.pipes.gemm_f16_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ cached, x, y }, &push, @sizeOf(GemmPush), 0);
-                        return;
+                const key = @intFromPtr(w.gpu_buffer.handle);
+                if (cache.getPtr(key)) |cached| {
+                    // Cache HIT: dispatch fp16 TC GEMM (no dequant!)
+                    const push = GemmPush{ .M = M, .K = K, .T = T, .a_offset = 0 };
+                    cmd.dispatch(&self.pipes.gemm_f16_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ cached, x, y }, &push, @sizeOf(GemmPush), 0);
+                    return;
+                }
+                // Cache MISS: dequant to fp16 and cache for future use
+                const new_buf = buffer.createBuffer(self.ctx, @as(usize, M) * K * @sizeOf(u16)) catch null;
+                if (new_buf) |dq_buf| {
+                    if (idx == 0) {
+                        const dq = DequantQ4KPush{ .M = M, .K = K };
+                        cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ4KPush), 0);
+                        cache.put(key, dq_buf) catch {};
+                        if (cache.getPtr(key)) |cached| {
+                            const push = GemmPush{ .M = M, .K = K, .T = T, .a_offset = 0 };
+                            cmd.dispatch(&self.pipes.gemm_f16_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ cached, x, y }, &push, @sizeOf(GemmPush), 0);
+                            return;
+                        }
                     }
                 }
-            }
-            // Fall through to normal path if cache alloc failed
+                // Fall through to normal path if cache alloc failed
             }
         }
         if (T >= 32 and M >= 64 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             if (use_dp4a) {
                 cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (idx == 3 and q8TcLowsmemOn()) {
+                // Q8_0: use dedicated lowsmem TC kernel (shared expert weights)
+                cmd.dispatch(&self.pipes.gemm_q8_0_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (use_lowsmem) {
                 cmd.dispatch(&self.pipes.gemm_q4k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (use_tc) {
@@ -3340,21 +3386,22 @@ pub const ForwardCuda = struct {
             var logits: [256]f32 = undefined;
             buffer.download(ctx, &self.router_logits_buf, std.mem.sliceAsBytes(logits[0..d.n_experts]));
             var router_out: [16]u32 = undefined;
-            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(router_out[0..n_used * 2]));
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(router_out[0 .. n_used * 2]));
             var max_logit: f32 = -1e30;
             var max_id: u32 = 0;
-            for (0..d.n_experts) |i| { if (logits[i] > max_logit) { max_logit = logits[i]; max_id = @intCast(i); } }
+            for (0..d.n_experts) |i| {
+                if (logits[i] > max_logit) {
+                    max_logit = logits[i];
+                    max_id = @intCast(i);
+                }
+            }
             log.info("MOE_DEBUG L{d}: max_logit={d:.4} at expert {d}, top-8 ids=[{d},{d},{d},{d},{d},{d},{d},{d}], weights=[{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}]", .{
-                L, max_logit, max_id,
-                router_out[0], router_out[1], router_out[2], router_out[3],
-                router_out[4], router_out[5], router_out[6], router_out[7],
-                @as(f32, @bitCast(router_out[n_used])),
-                @as(f32, @bitCast(router_out[n_used + 1])),
-                @as(f32, @bitCast(router_out[n_used + 2])),
-                @as(f32, @bitCast(router_out[n_used + 3])),
-                @as(f32, @bitCast(router_out[n_used + 4])),
-                @as(f32, @bitCast(router_out[n_used + 5])),
-                @as(f32, @bitCast(router_out[n_used + 6])),
+                L,                                          max_logit,                                  max_id,
+                router_out[0],                              router_out[1],                              router_out[2],
+                router_out[3],                              router_out[4],                              router_out[5],
+                router_out[6],                              router_out[7],                              @as(f32, @bitCast(router_out[n_used])),
+                @as(f32, @bitCast(router_out[n_used + 1])), @as(f32, @bitCast(router_out[n_used + 2])), @as(f32, @bitCast(router_out[n_used + 3])),
+                @as(f32, @bitCast(router_out[n_used + 4])), @as(f32, @bitCast(router_out[n_used + 5])), @as(f32, @bitCast(router_out[n_used + 6])),
                 @as(f32, @bitCast(router_out[n_used + 7])),
             });
         }
@@ -3425,8 +3472,12 @@ pub const ForwardCuda = struct {
             buffer.download(ctx, &self.gate_scalar_buf, std.mem.sliceAsBytes(gate_s[0..1]));
             log.info("MOE_DEBUG L{d} post: hidden[0..3]=[{d:.4},{d:.4},{d:.4},{d:.4}] gate_s={d:.4} sig={d:.4}", .{
                 L,
-                hidden_sample[0], hidden_sample[1], hidden_sample[2], hidden_sample[3],
-                gate_s[0], 1.0 / (1.0 + @exp(-gate_s[0])),
+                hidden_sample[0],
+                hidden_sample[1],
+                hidden_sample[2],
+                hidden_sample[3],
+                gate_s[0],
+                1.0 / (1.0 + @exp(-gate_s[0])),
             });
         }
     }
@@ -3591,6 +3642,14 @@ fn aliasRow(buf: *const CudaBuffer, t: u32, width: u32) !CudaBuffer {
 fn cublasDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
+}
+
+/// Q8_0 prefill tensor-core GEMM for shared-expert dense projections. DEFAULT-ON;
+/// opt out with ZINC_PREFILL_Q8_TC=0/off/false/no to fall back to gemm_q8_0_tiled_v2.
+fn q8TcLowsmemOn() bool {
+    const v = std.posix.getenv("ZINC_PREFILL_Q8_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 /// Effort 29 T3: the B>27 serving-decode cuBLAS GEMM path. DEFAULT-ON; opt out
