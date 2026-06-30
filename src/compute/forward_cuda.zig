@@ -310,6 +310,7 @@ const Pipelines = struct {
     gemm_q4k_tc: CudaPipeline, // tensor-core Q4_K GEMM (ZINC_PREFILL_TC=1)
     gemm_q4k_dp4a: CudaPipeline, // DP4a int8 Q4_K GEMM (ZINC_PREFILL_DP4A=1)
     gemm_f16_tc: CudaPipeline, // fp16 pre-dequanted TC GEMM (ZINC_PREFILL_F16=1)
+    gemm_q4k_tc_lowsmem: CudaPipeline, // 8KB-shared TC GEMM (3x occupancy)
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -834,6 +835,7 @@ pub const ForwardCuda = struct {
         pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
         pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
+        pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
@@ -1959,7 +1961,8 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_TC=0: opt out of tensor-core (default on).
         const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
         const use_dp4a = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
-        const use_tc = !use_f16 and !use_dp4a and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
+        const use_lowsmem = !use_f16 and !use_dp4a and idx == 0 and std.posix.getenv("ZINC_PREFILL_LOWSMEM") != null;
+        const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
 
         // Check for cached fp16 weight when ZINC_PREFILL_F16 is set
@@ -1993,6 +1996,8 @@ pub const ForwardCuda = struct {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             if (use_dp4a) {
                 cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (use_lowsmem) {
+                cmd.dispatch(&self.pipes.gemm_q4k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (use_tc) {
                 cmd.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else {

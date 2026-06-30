@@ -4670,6 +4670,94 @@ extern "C" __global__ void gemm_q4k_tc_f16a_lowsmem(const unsigned* a_u32, const
     }
 }
 
+// ---- gemm_q4k_tc_lowsmem — 8KB-shared TC Q4_K GEMM with float input ----------
+// Combines: lowsmem trick (8KB aliased shared, two-phase Cs output) + float A
+// input + warp-broadcast dequant. 3x better occupancy than gemm_q4k_tc (24KB).
+extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float smem[BT*32u];               // 8 KB aliased
+    half* Ws = (half*)smem;                       // [0,4096)
+    half* As = ((half*)smem) + (BM*BK);           // [4096,8192)
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
+    unsigned bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x;
+    unsigned wid=tid>>5, lane=tid&31u;
+    unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
+    unsigned a0=(pc.a_offset>>2);
+    const float* Abase=A+(pc.x_offset>>2);
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0,c1;
+    wmma::fill_fragment(c0,0.0f); wmma::fill_fragment(c1,0.0f);
+
+    for (unsigned c=0u;c<nchunk;c++){
+        unsigned sbk=c>>3, sb8=c&7u;
+        // Dequant W (standard pattern — not warp-broadcast for lowsmem compat)
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned r=idx>>5, l=idx&31u, row=m0+r;
+            float wv=0.0f;
+            if(row<pc.M){
+                unsigned blk=a0+row*bpr*36u+sbk*36u;
+                unsigned dd=a_u32[blk];
+                float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
+                unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                const unsigned char* qs=(const unsigned char*)(a_u32+blk+4u);
+                unsigned char qb=qs[(sb8>>1)*32u+l];
+                unsigned nib=(sb8&1u)==0u?(qb&0xFu):(unsigned)(qb>>4);
+                wv=d*(float)s*(float)nib-dmin*(float)mn;
+            }
+            Ws[r*BK+l]=__float2half(wv);
+        }
+        // Float→half A load
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned t=idx>>5,l=idx&31u,tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned ks=0;ks<2;ks++){
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f,a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f,&Ws[(fm*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(a1f,&Ws[((fm+2u)*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(bf,&As[(ks*16u)*BT+ft*16u],BT);
+            wmma::mma_sync(c0,a0f,bf,c0);
+            wmma::mma_sync(c1,a1f,bf,c1);
+        }
+        __syncthreads();
+    }
+    // Two-phase Cs output reusing shared
+    float* Cs=smem;
+    wmma::store_matrix_sync(&Cs[(ft*16u)*32u+fm*16u],c0,32u,wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for(int u=0;u<8;u++){
+        unsigned idx=tid+(unsigned)u*256u;
+        unsigned t=idx>>5,m=idx&31u,tok=t0+t,row=m0+m;
+        if(row<pc.M&&tok<pc.T){
+            unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
+            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*32u+m]; else Y[yi]=Cs[t*32u+m];
+        }
+    }
+    __syncthreads();
+    wmma::store_matrix_sync(&Cs[(ft*16u)*32u+(fm+2u)*16u],c1,32u,wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for(int u=0;u<8;u++){
+        unsigned idx=tid+(unsigned)u*256u;
+        unsigned t=idx>>5,m=idx&31u,tok=t0+t,row=m0+32u+m;
+        if(row<pc.M&&tok<pc.T){
+            unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
+            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*32u+m]; else Y[yi]=Cs[t*32u+m];
+        }
+    }
+}
+
 // ---- gemm_q4k_tc_f16a_m128_lowsmem — 12 KB-shared wider 128x64 M-tile TC Q4_K GEMM (cycle 17)
 // The SYNTHESIS of cycle 14 (wider M-tile) and cycle 15 (low-shared two-phase Cs):
 // it is gemm_q4k_tc_f16a_m128 in every wmma respect (same Q4_K dequant, same 16x16x16
