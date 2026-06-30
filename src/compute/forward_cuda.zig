@@ -3330,6 +3330,31 @@ pub const ForwardCuda = struct {
             buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
         }
 
+        // Debug: dump router state for first decode step at specific layers
+        if ((L == 0 or L == 3 or L == 39) and std.posix.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
+            self.waitPending();
+            var logits: [256]f32 = undefined;
+            buffer.download(ctx, &self.router_logits_buf, std.mem.sliceAsBytes(logits[0..d.n_experts]));
+            var router_out: [16]u32 = undefined;
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(router_out[0..n_used * 2]));
+            var max_logit: f32 = -1e30;
+            var max_id: u32 = 0;
+            for (0..d.n_experts) |i| { if (logits[i] > max_logit) { max_logit = logits[i]; max_id = @intCast(i); } }
+            log.info("MOE_DEBUG L{d}: max_logit={d:.4} at expert {d}, top-8 ids=[{d},{d},{d},{d},{d},{d},{d},{d}], weights=[{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}]", .{
+                L, max_logit, max_id,
+                router_out[0], router_out[1], router_out[2], router_out[3],
+                router_out[4], router_out[5], router_out[6], router_out[7],
+                @as(f32, @bitCast(router_out[n_used])),
+                @as(f32, @bitCast(router_out[n_used + 1])),
+                @as(f32, @bitCast(router_out[n_used + 2])),
+                @as(f32, @bitCast(router_out[n_used + 3])),
+                @as(f32, @bitCast(router_out[n_used + 4])),
+                @as(f32, @bitCast(router_out[n_used + 5])),
+                @as(f32, @bitCast(router_out[n_used + 6])),
+                @as(f32, @bitCast(router_out[n_used + 7])),
+            });
+        }
+
         // --- Routed experts → SwiGLU → down, slot-major into down_buf.
         {
             var cmd = try command.beginCommand(ctx);
@@ -3385,6 +3410,20 @@ pub const ForwardCuda = struct {
             const ss = SigmoidAccPush{ .N = d.n_embd };
             cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.gate_scalar_buf }, &ss, @sizeOf(SigmoidAccPush), 0);
             self.submit(cmd); // async: deferred like the dense path
+        }
+
+        // Debug: dump hidden state norm after MoE FFN
+        if ((L == 0 or L == 3 or L == 39) and std.posix.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
+            self.waitPending();
+            var hidden_sample: [8]f32 = undefined;
+            buffer.download(ctx, &self.hidden, std.mem.sliceAsBytes(hidden_sample[0..8]));
+            var gate_s: [1]f32 = undefined;
+            buffer.download(ctx, &self.gate_scalar_buf, std.mem.sliceAsBytes(gate_s[0..1]));
+            log.info("MOE_DEBUG L{d} post: hidden[0..3]=[{d:.4},{d:.4},{d:.4},{d:.4}] gate_s={d:.4} sig={d:.4}", .{
+                L,
+                hidden_sample[0], hidden_sample[1], hidden_sample[2], hidden_sample[3],
+                gate_s[0], 1.0 / (1.0 + @exp(-gate_s[0])),
+            });
         }
     }
 
