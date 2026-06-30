@@ -579,6 +579,31 @@ test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
     try expectContains(shader, "hidden_v4[idx] +=");
 }
 
+test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"mul_mm_q4k_gate_up_geglu_n1_dp4a_q8\"");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8: ?Pipeline");
+    try expectContains(dmmv, "mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.spv");
+    try expectContains(dmmv, "recordMulMmQ4KGateUpGegluN1Dp4aQ8");
+    try expectContains(dmmv, ".pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8");
+    try expectContains(dmmv, "if (self.pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContainsNear(forward, ".q6_k => {", "pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8", 1600);
+    try expectContainsNear(forward, "pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8", "recordMulMmQ4KGateUpGegluN1Dp4aQ8", 1200);
+
+    const shader = @embedFile("shaders/mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.comp");
+    try expectContains(shader, "layout(local_size_x = 64) in;");
+    try expectContains(shader, "const uint row_local = tid >> 1u;");
+    try expectContains(shader, "const uint tile_half = tid & 1u;");
+    try expectContains(shader, "subgroupMax(local_max)");
+    try expectContains(shader, "d_packed[d_packed_offset + row_block * 8u + pack_idx] = packed;");
+    try expectNotContains(shader, "const uint BN");
+}
+
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {
     const src = @embedFile("shaders/softmax_topk.comp");
     try expectContains(src, "shared float s_local_val[64];");
