@@ -4670,18 +4670,20 @@ extern "C" __global__ void gemm_q4k_tc_f16a_lowsmem(const unsigned* a_u32, const
     }
 }
 
-// ---- gemm_q4k_tc_lowsmem — 8KB-shared TC Q4_K GEMM with float input ----------
-// Combines: lowsmem trick (8KB aliased shared, two-phase Cs output) + float A
-// input + warp-broadcast dequant. 3x better occupancy than gemm_q4k_tc (24KB).
+// ---- gemm_q4k_tc_lowsmem — 16KB-shared TC Q4_K GEMM (50% better occupancy) ---
+// Aliases Ws[4KB half] + As[4KB half] within a 16KB float smem that doubles as
+// Cs[BT*BM] output buffer after the K-loop completes. 3 blocks/SM vs 2 for the
+// 24KB gemm_q4k_tc. Output uses stride BM=64 (same as gemm_q4k_tc — no column
+// overflow issues that plagued the 8KB two-phase attempt).
 extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
     const unsigned BM=64u, BT=64u, BK=32u;
-    __shared__ float smem[BT*32u];               // 8 KB aliased
-    half* Ws = (half*)smem;                       // [0,4096)
-    half* As = ((half*)smem) + (BM*BK);           // [4096,8192)
+    // 16KB shared: Ws+As occupy first 8KB during K-loop; full 16KB reused as Cs for output
+    __shared__ float smem[BT*BM];                    // 4096 floats = 16384 B
+    half* Ws = (half*)smem;                           // bytes [0, 4096)
+    half* As = ((half*)smem) + (BM*BK);               // bytes [4096, 8192)
     unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
     unsigned bpr=pc.K>>8, nchunk=pc.K>>5;
     unsigned tid=threadIdx.x;
-    unsigned wid=tid>>5, lane=tid&31u;
     unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
     unsigned a0=(pc.a_offset>>2);
     const float* Abase=A+(pc.x_offset>>2);
@@ -4691,7 +4693,7 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
 
     for (unsigned c=0u;c<nchunk;c++){
         unsigned sbk=c>>3, sb8=c&7u;
-        // Dequant W (standard pattern — not warp-broadcast for lowsmem compat)
+        // Dequant W sub-block into Ws (same Q4_K unpack as gemm_q4k_tc)
         #pragma unroll
         for(int u=0;u<8;u++){
             unsigned idx=tid+(unsigned)u*256u;
@@ -4731,29 +4733,20 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
         }
         __syncthreads();
     }
-    // Two-phase Cs output reusing shared
-    float* Cs=smem;
-    wmma::store_matrix_sync(&Cs[(ft*16u)*32u+fm*16u],c0,32u,wmma::mem_col_major);
+    // Output: store to Cs (= smem) with stride BM=64, then copy to Y.
+    // Same pattern as gemm_q4k_tc — single phase, all 64 rows at once.
+    float* Cs = smem;
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+fm*16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+(fm+2u)*16u], c1, BM, wmma::mem_col_major);
     __syncthreads();
     #pragma unroll
-    for(int u=0;u<8;u++){
+    for(int u=0;u<16;u++){
         unsigned idx=tid+(unsigned)u*256u;
-        unsigned t=idx>>5,m=idx&31u,tok=t0+t,row=m0+m;
+        unsigned r=idx%BM, t=idx/BM;
+        unsigned row=m0+r, tok=t0+t;
         if(row<pc.M&&tok<pc.T){
             unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
-            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*32u+m]; else Y[yi]=Cs[t*32u+m];
-        }
-    }
-    __syncthreads();
-    wmma::store_matrix_sync(&Cs[(ft*16u)*32u+(fm+2u)*16u],c1,32u,wmma::mem_col_major);
-    __syncthreads();
-    #pragma unroll
-    for(int u=0;u<8;u++){
-        unsigned idx=tid+(unsigned)u*256u;
-        unsigned t=idx>>5,m=idx&31u,tok=t0+t,row=m0+32u+m;
-        if(row<pc.M&&tok<pc.T){
-            unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
-            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*32u+m]; else Y[yi]=Cs[t*32u+m];
+            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*BM+r]; else Y[yi]=Cs[t*BM+r];
         }
     }
 }
