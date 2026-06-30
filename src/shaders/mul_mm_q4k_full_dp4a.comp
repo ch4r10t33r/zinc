@@ -202,10 +202,6 @@ void main() {
                 a_fb_reg[m] = buf_a_fb[ks * BM + tiwr * TM + m];
             }
             [[unroll]] for (uint n = 0u; n < TN; n++) {
-                const uint col_g = ic * BN + tiwc * TN + n;
-                if (SPEC_RAGGED_N != 0u && col_g >= N) {
-                    continue;
-                }
                 const uint acol = ks * BN * SPACK + (tiwc * TN + n) * SPACK;
                 uint breg[8];
                 [[unroll]] for (uint p = 0u; p < 8u; p++) breg[p] = buf_b[acol + p];

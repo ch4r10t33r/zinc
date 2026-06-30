@@ -212,10 +212,6 @@ void main() {
                 ws[m][1] = buf_aw[ks * BM * 2u + (tiwr * TM + m) * 2u + 1u];
             }
             [[unroll]] for (uint n = 0u; n < TN; n++) {
-                const uint col_g = ic * BN + tiwc * TN + n;
-                if (SPEC_RAGGED_N != 0u && col_g >= N) {
-                    continue;
-                }
                 const uint acol = ks * BN * SPACK + (tiwc * TN + n) * SPACK;
                 uint areg[8];
                 [[unroll]] for (uint p = 0u; p < 8u; p++) areg[p] = buf_b[acol + p];

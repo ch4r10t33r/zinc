@@ -1460,7 +1460,6 @@ pub const DmmvDispatch = struct {
         const spec_k_21504_n8 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
             .{ .id = 1, .value = 8 },
-            .{ .id = 2, .value = 1 },
         };
         const spec_k_21504_n72_ragged = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
@@ -1487,7 +1486,7 @@ pub const DmmvDispatch = struct {
         };
         const geglu_q8_k5376_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n64_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 64 }, .{ .id = 2, .value = 1 } };
-        const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 }, .{ .id = 3, .value = 1 } };
+        const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 } };
         const pipeline_mul_mm_q6k_full_dp4a_k12288 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_12288, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=12288 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;

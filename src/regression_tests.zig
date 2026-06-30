@@ -353,17 +353,10 @@ test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n8");
     try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
-    try expectContainsNear(dmmv, "const spec_k_21504_n8", ".{ .id = 2, .value = 1 }", 220);
 
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "self.gemmaDenseQ4RaggedTailDp4aEnabled(down_t, n_tokens)");
     try expectContains(forward, "try self.dmmv.recordMulMmQ4KTail8Dp4a(");
-
-    const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
-    const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
-    for ([_][]const u8{ q4, q6 }) |shader| {
-        try expectContains(shader, "if (SPEC_RAGGED_N != 0u && col_g >= N)");
-    }
 }
 
 test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
@@ -596,7 +589,6 @@ test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
     try expectContains(dmmv, "mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path_buf");
     try expectNotContains(dmmv, "std.fmt.bufPrint(&path_buf, \"{s}/mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.spv\"");
     try expectContains(dmmv, "mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.spv");
-    try expectContainsNear(dmmv, "const geglu_q8_k5376_n8_spec", ".{ .id = 3, .value = 1 }", 260);
     try expectContains(dmmv, "recordMulMmQ4KGateUpGegluN1Dp4aQ8");
     try expectContains(dmmv, ".pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8");
     try expectContains(dmmv, "if (self.pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8) |*p| p.deinit();");
@@ -613,12 +605,6 @@ test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
     try expectContains(shader, "subgroupMax(local_max)");
     try expectContains(shader, "d_packed[d_packed_offset + row_block * 8u + pack_idx] = packed;");
     try expectNotContains(shader, "const uint BN");
-
-    const gate_q8 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8.comp");
-    const gate_q8_1 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1.comp");
-    for ([_][]const u8{ gate_q8, gate_q8_1 }) |gate_shader| {
-        try expectContains(gate_shader, "if (SPEC_RAGGED_N != 0u && col_g >= N)");
-    }
 }
 
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {
