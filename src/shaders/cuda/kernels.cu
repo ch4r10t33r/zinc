@@ -1274,22 +1274,23 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
     DeltaNetWarpPush pc)
 {
     const unsigned h = blockIdx.x;
-    const unsigned col = blockIdx.y * DN_N_WARPS + threadIdx.y;
+    const unsigned row = blockIdx.y * DN_N_WARPS + threadIdx.y;
     const unsigned lane = threadIdx.x;
-    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
+    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
 
     const unsigned hv = pc.head_v_dim;
     const unsigned qk_dim = pc.d_state * pc.n_group;
     const unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
     const unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
-    const unsigned rows_per_lane = hv / DN_WARP_SIZE;  // 128/32 = 4
+    const unsigned cols_per_lane = hv / DN_WARP_SIZE;  // 128/32 = 4
 
-    // State[h][row][col] — each lane owns rows lane, lane+32, lane+64, lane+96
+    // State[h][row][col] — each lane owns cols lane, lane+32, lane+64, lane+96
+    // FIXED: warp owns ROW (not column) → computes S@k (row-wise) like block kernel
     float s_shard[DN_MAX_ROWS_PER_LANE];
     #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        unsigned row = r * DN_WARP_SIZE + lane;
-        s_shard[r] = state[((size_t)h * hv + row) * hv + col];
+    for (int r = 0; r < cols_per_lane; r++) {
+        unsigned col_idx = r * DN_WARP_SIZE + lane;
+        s_shard[r] = state[((size_t)h * hv + row) * hv + col_idx];
     }
 
     // Precompute dt_bias and ssm_a (same for all tokens — per-head constants)
@@ -1329,15 +1330,15 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         const unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
         const unsigned v_off = conv_base + 2u * qk_dim + h * hv;
 
-        // Load Q, K for this token (cached in registers)
+        // Load Q, K for this token — indexed by COLUMN (lane's cols)
         float q_reg[DN_MAX_ROWS_PER_LANE], k_reg[DN_MAX_ROWS_PER_LANE];
         float sumq = 0.0f, sumk = 0.0f;
         #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            unsigned row = r * DN_WARP_SIZE + lane;
-            if (row < k_len) {
-                q_reg[r] = conv_out[q_off + row];
-                k_reg[r] = conv_out[k_off + row];
+        for (int r = 0; r < cols_per_lane; r++) {
+            unsigned col_idx = r * DN_WARP_SIZE + lane;
+            if (col_idx < k_len) {
+                q_reg[r] = conv_out[q_off + col_idx];
+                k_reg[r] = conv_out[k_off + col_idx];
                 sumq += q_reg[r] * q_reg[r];
                 sumk += k_reg[r] * k_reg[r];
             } else {
@@ -1346,23 +1347,12 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
             }
         }
 
-        // Q/K norms: WARP-level reduce only. zinc_block_reduce_sum_all CANNOT be
-        // used in this kernel: it indexes warps via threadIdx.x >> 5, which is 0
-        // for ALL 4 warps in a (32,4) block → all write sh[0] → race condition.
-        // Each warp owns 32 lanes × 4 rows = 128 elements = the full Q/K vector,
-        // so warp_reduce_sum_all correctly sums all 128 elements.
-        //
-        // NOTE: The L2 norm costs 2 warp_reduce_sum_all + 2 rsqrt + 8 multiplies
-        // per iteration (~40% of per-iteration FLOPs). The comparable
-        // gated_delta_net path uses raw k/q with scale=1/sqrt(S_v).
-        // Keeping the normalization for correctness (the model may depend on it).
         sumq = zinc_warp_reduce_sum_all(sumq);
         sumk = zinc_warp_reduce_sum_all(sumk);
         float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
         float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
-        // Apply normalization to q_reg/k_reg (saves repeating rinv multiplies later)
         #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
+        for (int r = 0; r < cols_per_lane; r++) {
             q_reg[r] *= q_rinv;
             k_reg[r] *= k_rinv;
         }
@@ -1371,25 +1361,23 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         float gate = sh_gate[t];
         float b = sh_beta[t];
 
-        // Load V for this column
-        float v_val = conv_out[v_off + col];
+        // Load V for this row (indexed by ROW, not column)
+        float v_val = conv_out[v_off + row];
 
-        // State update (per-lane, no sync — q_reg/k_reg already normalized):
-        // 1. Decay: s_shard *= gate
-        // 2. sk = dot(state, k) — warp reduce (k already normalized)
+        // State update: sk = (S @ k_norm)[row] — warp reduce across COLUMNS
         float sk_partial = 0.0f;
         #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
+        for (int r = 0; r < cols_per_lane; r++) {
             s_shard[r] *= gate;
             sk_partial += s_shard[r] * k_reg[r];
         }
         float sk = zinc_warp_reduce_sum_all(sk_partial);
         float d = b * (v_val - sk);
 
-        // Readout: o = dot(state, q) — warp reduce (q already normalized)
+        // Readout: o = (S @ q_norm)[row] — warp reduce across COLUMNS
         float o_partial = 0.0f;
         #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
+        for (int r = 0; r < cols_per_lane; r++) {
             s_shard[r] += k_reg[r] * d;  // rank-1 update
             o_partial += s_shard[r] * q_reg[r];
         }
@@ -1397,14 +1385,14 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
 
         // Write output (one value per warp — lane 0 writes)
         if (lane == 0)
-            out_data[t * pc.y_stride_tok + h * hv + col] = o;
+            out_data[t * pc.y_stride_tok + h * hv + row] = o;
     }
 
     // Write final state
     #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        unsigned row = r * DN_WARP_SIZE + lane;
-        state[((size_t)h * hv + row) * hv + col] = s_shard[r];
+    for (int r = 0; r < cols_per_lane; r++) {
+        unsigned col_idx = r * DN_WARP_SIZE + lane;
+        state[((size_t)h * hv + row) * hv + col_idx] = s_shard[r];
     }
 }
 

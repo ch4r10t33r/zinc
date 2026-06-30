@@ -12,11 +12,13 @@
 //   barrier
 //   residual_rms_norm(hidden, residual -> norm_out)
 //
-// Dispatch: (n_tokens, 1, 1), local_size_x = 64.
+// Dispatch: (n_tokens, 1, 1), local_size_x = 256. This is a measured
+// exception to the normal wave64-sized elementwise dispatches: the kernel has
+// two full-vector reductions, so four wave64 subgroups cut per-lane loop work.
 
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
     uint  n;
@@ -52,11 +54,12 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint token = gl_WorkGroupID.x;
     uint base = token * n;
+    uint wg_size = gl_WorkGroupSize.x;
     uint n4 = n >> 2u;
     uint vec_tail = n4 << 2u;
 
     float residual_sum_sq = 0.0;
-    for (uint j = tid; j < n4; j += 64u) {
+    for (uint j = tid; j < n4; j += wg_size) {
         uint i = j << 2u;
         vec4 r = vec4(
             residual[base + i + 0u],
@@ -66,7 +69,7 @@ void main() {
         );
         residual_sum_sq += dot(r, r);
     }
-    for (uint i = vec_tail + tid; i < n; i += 64u) {
+    for (uint i = vec_tail + tid; i < n; i += wg_size) {
         float r_tail = residual[base + i];
         residual_sum_sq += r_tail * r_tail;
     }
@@ -75,7 +78,7 @@ void main() {
 
     float hidden_sum_sq = 0.0;
     bool apply_hidden_scale = hidden_scale != 1.0;
-    for (uint j = tid; j < n4; j += 64u) {
+    for (uint j = tid; j < n4; j += wg_size) {
         uint i = j << 2u;
         vec4 r = vec4(
             residual[base + i + 0u],
@@ -102,7 +105,7 @@ void main() {
         hidden[base + i + 3u] = h_store.w;
         hidden_sum_sq += dot(h, h);
     }
-    for (uint i = vec_tail + tid; i < n; i += 64u) {
+    for (uint i = vec_tail + tid; i < n; i += wg_size) {
         float r_norm = post_w[i] * residual[base + i] * residual_rms_inv;
         float h_tail = hidden[base + i] + r_norm;
         hidden[base + i] = apply_hidden_scale ? (h_tail * hidden_scale) : h_tail;
@@ -111,7 +114,7 @@ void main() {
     float hidden_total = reduce_sum(hidden_sum_sq);
     float hidden_rms_inv = inversesqrt((hidden_total / float(n)) + eps);
 
-    for (uint j = tid; j < n4; j += 64u) {
+    for (uint j = tid; j < n4; j += wg_size) {
         uint i = j << 2u;
         vec4 h = vec4(
             hidden[base + i + 0u],
@@ -132,7 +135,7 @@ void main() {
         norm_out[base + i + 2u] = out_v.z;
         norm_out[base + i + 3u] = out_v.w;
     }
-    for (uint i = vec_tail + tid; i < n; i += 64u) {
+    for (uint i = vec_tail + tid; i < n; i += wg_size) {
         float h_tail = hidden[base + i];
         if (apply_hidden_scale) h_tail = h_tail / hidden_scale;
         norm_out[base + i] = norm_w[i] * h_tail * hidden_rms_inv;

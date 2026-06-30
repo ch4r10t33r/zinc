@@ -598,7 +598,8 @@ test "Vulkan post_norm_residual_rms_norm shader folds Gemma layer scale" {
 
     const shader = @embedFile("shaders/post_norm_residual_rms_norm.comp");
     try expectContains(shader, "float hidden_scale;");
-    try expectContains(shader, "hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;");
+    try expectContains(shader, "vec4 h_store = apply_hidden_scale ? (h * hidden_scale) : h;");
+    try expectContains(shader, "hidden[base + i + 0u] = h_store.x;");
     try expectContains(shader, "if (apply_hidden_scale) h = h / hidden_scale;");
 }
 
