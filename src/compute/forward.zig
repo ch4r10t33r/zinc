@@ -1323,8 +1323,10 @@ pub const InferenceEngine = struct {
     // the DP4a Q8_1 activation layout and runs matching Q4_K LM heads through
     // the BN=8 int8 tiled GEMM.
     use_q4k_lm_head_dp4a: bool = false,
-    // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
-    // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
+    // Default-on for dense Gemma 31B RDNA4 decode, force-on elsewhere via
+    // ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation and runs
+    // Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs. Disable with
+    // ZINC_Q4K_Q8_1_DMMV=0/off/false/no.
     use_q4k_q8_1_dmmv: bool = false,
     // Opt-in via ZINC_Q8_SPEC_DMMV=1. Routes Q8_0 K=2048/4096 DMMVs through
     // pipelines with the block count baked as a specialization constant.
@@ -2858,15 +2860,35 @@ pub const InferenceEngine = struct {
         }
 
         const q4k_q8_1_env = std.posix.getenv("ZINC_Q4K_Q8_1_DMMV");
-        const q4k_q8_1_flag = q4k_q8_1_env != null and std.mem.eql(u8, q4k_q8_1_env.?, "1");
-        const q4k_q8_1_enabled = q4k_q8_1_flag and
+        const q4k_q8_1_explicitly_off = if (q4k_q8_1_env) |env|
+            std.mem.eql(u8, env, "0") or
+                std.ascii.eqlIgnoreCase(env, "off") or
+                std.ascii.eqlIgnoreCase(env, "false") or
+                std.ascii.eqlIgnoreCase(env, "no")
+        else
+            false;
+        const q4k_q8_1_forced_on = q4k_q8_1_env != null and !q4k_q8_1_explicitly_off;
+        const q4k_q8_1_default_on =
+            config.architecture == .gemma and
+            config.n_experts == 0 and
+            config.ssm_d_inner == 0 and
+            config.hidden_dim == 5376 and
+            gpu_config.vendor == .amd_rdna4;
+        const q4k_q8_1_requested = !q4k_q8_1_explicitly_off and (q4k_q8_1_forced_on or q4k_q8_1_default_on);
+        const q4k_q8_1_enabled = q4k_q8_1_requested and
             dmmv.pipeline_q4k_q8_1 != null and
             dmmv.pipeline_quantize_q8_1 != null and
             instance.push_descriptor_fn != null;
         if (q4k_q8_1_enabled) {
-            log.info("Q4_K x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
-        } else if (q4k_q8_1_flag) {
-            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
+            if (q4k_q8_1_forced_on) {
+                log.info("Q4_K x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV", .{});
+            } else {
+                log.info("Q4_K x Q8_1 DMMV path ENABLED for Gemma dense RDNA4 decode (set ZINC_Q4K_Q8_1_DMMV=0 to disable)", .{});
+            }
+        } else if (q4k_q8_1_requested) {
+            log.info("Q4_K x Q8_1 DMMV path requested but prerequisites are missing; using generic Q4_K DMMV", .{});
+        } else if (q4k_q8_1_explicitly_off) {
+            log.info("Q4_K x Q8_1 DMMV path DISABLED via ZINC_Q4K_Q8_1_DMMV=0", .{});
         }
 
         const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");

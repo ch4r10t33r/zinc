@@ -665,6 +665,14 @@ test "Vulkan Q4_K Q8_1 DMMV path stays gated and does not route Q6_K" {
 
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "ZINC_Q4K_Q8_1_DMMV");
+    try expectContains(forward, "q4k_q8_1_explicitly_off");
+    try expectContains(forward, "config.architecture == .gemma");
+    try expectContains(forward, "config.n_experts == 0");
+    try expectContains(forward, "config.hidden_dim == 5376");
+    try expectContains(forward, "gpu_config.vendor == .amd_rdna4");
+    try expectContains(forward, "std.ascii.eqlIgnoreCase(env, \"off\")");
+    try expectContains(forward, "std.ascii.eqlIgnoreCase(env, \"false\")");
+    try expectContains(forward, "std.ascii.eqlIgnoreCase(env, \"no\")");
     try expectContainsNear(forward, "if (self.use_q4k_q8_1_dmmv", "qt == .q4_k", 300);
     try expectNotContains(forward, "ZINC_GEMMA_Q4K_GEGLU_Q8_1");
     try expectNotContains(forward, "dispatchDmmvFusedGateUpGegluPairQ8_1");
