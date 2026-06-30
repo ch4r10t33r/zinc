@@ -1492,6 +1492,9 @@ async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, l
 
 function remoteCommand(commandText, creds) {
   const sshArgs = [];
+  if (creds.sshKey) {
+    sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+  }
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
@@ -1505,6 +1508,9 @@ function rdnaRemoteCommand(commandText, creds) {
 
 function remoteDetachedCommand(commandText, creds) {
   const sshArgs = ["-f"];
+  if (creds.sshKey) {
+    sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+  }
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
@@ -1518,6 +1524,9 @@ function rdnaDetachedCommand(commandText, creds) {
 
 function remoteSshTransport(creds) {
   const parts = ["ssh"];
+  if (creds.sshKey) {
+    parts.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+  }
   if (process.env.ZINC_SSH_STRICT === "no") {
     parts.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
@@ -2516,6 +2525,7 @@ async function buildRdnaCreds(args) {
   const host = rdnaEnvValue(dotEnv, args, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST");
   const user = rdnaEnvValue(dotEnv, args, "USER", "ZINC_RDNA_USER", "ZINC_USER");
   const port = rdnaEnvValue(dotEnv, args, "PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22";
+  const sshKey = rdnaEnvValue(dotEnv, args, "SSH_KEY", "ZINC_RDNA_SSH_KEY", "ZINC_SSH_KEY");
   if (!host || !user) {
     throw new Error("RDNA benchmarking needs node-specific ZINC_<NODE>_HOST/ZINC_<NODE>_USER, ZINC_RDNA_HOST/ZINC_RDNA_USER, or ZINC_HOST/ZINC_USER in the environment or .env");
   }
@@ -2523,6 +2533,7 @@ async function buildRdnaCreds(args) {
     host,
     user,
     port,
+    sshKey,
     workdir: args.rdnaWorkdir,
     env: { RADV_PERFTEST: "coop_matrix" },
     vkDevice: args.rdnaVkDevice ?? 1,
@@ -2534,6 +2545,7 @@ async function buildIntelConfig(args) {
   const host = envValue(dotEnv, "ZINC_INTEL_HOST");
   const user = envValue(dotEnv, "ZINC_INTEL_USER") ?? "tempuser";
   const port = envValue(dotEnv, "ZINC_INTEL_PORT") ?? "22";
+  const sshKey = envValue(dotEnv, "ZINC_INTEL_SSH_KEY", "ZINC_SSH_KEY");
   if (!host || !user) {
     throw new Error("Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env");
   }
@@ -2560,6 +2572,7 @@ async function buildIntelConfig(args) {
       host,
       user,
       port,
+      sshKey,
       workdir,
       env: remoteEnv,
     },
@@ -2847,6 +2860,7 @@ async function buildCudaCreds(args) {
   const host = cudaEnvValue(dotEnv, args, "HOST", "ZINC_CUDA_HOST", "ZINC_HOST");
   const user = cudaEnvValue(dotEnv, args, "USER", "ZINC_CUDA_USER", "ZINC_USER");
   const port = cudaEnvValue(dotEnv, args, "PORT", "ZINC_CUDA_PORT", "ZINC_PORT") ?? "22";
+  const sshKey = cudaEnvValue(dotEnv, args, "SSH_KEY", "ZINC_CUDA_SSH_KEY", "ZINC_SSH_KEY");
   if (!host || !user) {
     throw new Error("CUDA benchmarking needs ZINC_CUDA_HOST/ZINC_CUDA_USER (or ZINC_HOST/ZINC_USER) in the environment or .env");
   }
@@ -2863,6 +2877,7 @@ async function buildCudaCreds(args) {
     host,
     user,
     port,
+    sshKey,
     workdir,
     // CUDA_VISIBLE_DEVICES pins the target GPU by UUID for both the ZINC CLI and
     // the llama-server baseline (remoteEnvPrefix / the launch script inject it).

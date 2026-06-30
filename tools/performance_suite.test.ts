@@ -309,6 +309,25 @@ test("Intel ZINC command does not inject RDNA-specific environment", () => {
   expect(cmd).not.toContain("--chat");
 });
 
+test("Intel ZINC command can pin a temporary SSH key", () => {
+  const cmd = intelZincCommand({
+    model_path: "/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
+    prompt_mode: "raw",
+    prompt: "The capital of France is",
+    max_tokens: 8,
+    context_tokens: 512,
+  }, {
+    host: "intel.local",
+    user: "tempuser",
+    port: "8888",
+    sshKey: "/tmp/zinc_key",
+    workdir: "/home/tempuser/zinc",
+    env: {},
+  });
+
+  expect(cmd).toContain("ssh -i '/tmp/zinc_key' -o IdentitiesOnly=yes -p 8888 tempuser@intel.local");
+});
+
 test("RDNA startup failure detection spots unsupported model architecture logs", () => {
   const failure = detectRdnaServerStartupFailure(`
 llama_model_load: error loading model: error loading model architecture: unknown model architecture: 'gemma4'
