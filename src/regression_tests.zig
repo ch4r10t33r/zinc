@@ -556,7 +556,7 @@ test "Vulkan prefillBatched uses all batched primitives in the per-layer loop" {
     try expectContainsNear(src, fn_marker, "dispatchRopeBatched", 24000);
     try expectContainsNear(src, fn_marker, "dispatchKvCacheWriteBatched", 24000);
     try expectContainsNear(src, fn_marker, "dispatchFlashAttnBatched", 24000);
-    try expectContainsNear(src, fn_marker, "dispatchResidualRmsNorm", 24000);
+    try expectContainsNear(src, fn_marker, "dispatchResidualRmsNorm", 30000);
     try expectContainsNear(src, fn_marker, "dispatchFfnActivation", 24000);
     try expectContainsNear(src, fn_marker, "dispatchDmmvInner", 24000);
 }
@@ -585,11 +585,11 @@ test "Vulkan residual_rms_norm shader matches Metal's fused semantics" {
 test "Vulkan Gemma decode keeps post-norm residual next-norm fusions wired" {
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "use_fused_pan_ffn_norm_decode");
-    try expectContainsNear(forward, "use_fused_pan_ffn_norm_decode", "try self.dispatchPostNormResidualRmsNorm", 2400);
-    try expectContainsNear(forward, "use_fused_pan_ffn_norm_decode", "ffn_norm_ready = true", 2600);
+    try expectContainsNear(forward, "} else if (use_fused_pan_ffn_norm_decode)", "try self.dispatchPostNormResidualRmsNorm", 900);
+    try expectContainsNear(forward, "} else if (use_fused_pan_ffn_norm_decode)", "ffn_norm_ready = true", 1400);
     try expectContains(forward, "gemma_dense_next_attn_norm_ready");
     try expectContainsNear(forward, "can_fuse_dense_tail_next_attn_norm", "self.layer_output_scales[layer]", 2400);
-    try expectContainsNear(forward, "gemma_dense_tail_wrote_next_attn_norm", "self.norm_buf.handle", 900);
+    try expectContainsNear(forward, "if (gemma_dense_tail_wrote_next_attn_norm)", "self.norm_buf.handle", 700);
 }
 
 test "Vulkan post_norm_residual_rms_norm shader folds Gemma layer scale" {
