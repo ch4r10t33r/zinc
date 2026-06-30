@@ -174,6 +174,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q8_0_wide",
         "dmmv_q8_0_q8_1",
         "dmmv_q4k_q8_1",
+        "dmmv_q4k_pair_geglu_q8_1",
         "dmmv_q8_0_fused_pair",
         "dmmv_q5k",
         "dmmv_q6k",

@@ -1,0 +1,191 @@
+#version 460
+// ZINC - Q4_K gate/up pair with Q8_1 activation and inline GEGLU.
+//
+// Dispatch: ((M+1)/2, 1, 1). One wave computes two output rows from two
+// separate Q4_K matrices, using a pre-quantized Q8_1 activation vector:
+//   y[r] = gelu_tanh(W_gate[r] * x) * (W_up[r] * x)
+
+#include "dp4a_compat.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint a_offset;
+    uint x_offset;
+    uint y_offset;
+    uint acc_mode;
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixGate { uint gate_u32[]; };
+layout(set = 0, binding = 1) readonly buffer MatrixUp   { uint up_u32[]; };
+layout(set = 0, binding = 2) readonly buffer VectorXQ81 { uint x_q81[]; };
+layout(set = 0, binding = 3) buffer OutputY { float y_data[]; };
+
+const uint Q4K_BLOCK_U32 = 36u;
+const uint Q8_1_U32_PER_BLOCK = 9u;
+const uint NUM_ROWS = 2u;
+
+shared float s_sg_gate0[4];
+shared float s_sg_up0[4];
+shared float s_sg_gate1[4];
+shared float s_sg_up1[4];
+
+uint q4k_scale_byte(uint sc0, uint sc1, uint sc2, uint idx) {
+    uint word = (idx < 4u) ? sc0 : ((idx < 8u) ? sc1 : sc2);
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+void q4k_scale_min(uint sb, uint sc0, uint sc1, uint sc2, out float sc_val, out float mn_val) {
+    if (sb < 4u) {
+        const uint b0 = q4k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q4k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        sc_val = float(b0 & 63u);
+        mn_val = float(b4 & 63u);
+    } else {
+        const uint b = q4k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q4k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        const uint bm4 = q4k_scale_byte(sc0, sc1, sc2, sb - 4u);
+        sc_val = float((b4 & 0xFu) | ((bm4 >> 6) << 4));
+        mn_val = float(((b4 >> 4) & 0xFu) | ((b >> 6) << 4));
+    }
+}
+
+uint q4k_pack_nibbles(uint qs_word, bool high) {
+    if (high) qs_word >>= 4u;
+    const uint q0 = qs_word & 0xFu;
+    const uint q1 = (qs_word >> 8u) & 0xFu;
+    const uint q2 = (qs_word >> 16u) & 0xFu;
+    const uint q3 = (qs_word >> 24u) & 0xFu;
+    return q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
+}
+
+float geglu(float gate, float up) {
+    const float g3 = gate * gate * gate;
+    float inner = 0.7978845608 * (gate + 0.044715 * g3);
+    inner = clamp(inner, -15.0, 15.0);
+    return 0.5 * gate * (1.0 + tanh(inner)) * up;
+}
+
+void pair_block_dot(uint gate_row_u32, uint up_row_u32, uint q4_block, uint sb, uint x_block_u32,
+                    out float gate_part, out float up_part) {
+    const uint q_group = sb >> 1u;
+    const bool high = (sb & 1u) != 0u;
+
+    const uint gate_blk_u32 = gate_row_u32 + q4_block * Q4K_BLOCK_U32;
+    uint d_dmin = gate_u32[gate_blk_u32];
+    float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+    float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+    uint sc0 = gate_u32[gate_blk_u32 + 1u];
+    uint sc1 = gate_u32[gate_blk_u32 + 2u];
+    uint sc2 = gate_u32[gate_blk_u32 + 3u];
+    float gate_sc;
+    float gate_mn;
+    q4k_scale_min(sb, sc0, sc1, sc2, gate_sc, gate_mn);
+    const float gate_factor = d_val * gate_sc;
+    const float gate_bias = dmin_val * gate_mn;
+
+    const uint up_blk_u32 = up_row_u32 + q4_block * Q4K_BLOCK_U32;
+    d_dmin = up_u32[up_blk_u32];
+    d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+    dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+    sc0 = up_u32[up_blk_u32 + 1u];
+    sc1 = up_u32[up_blk_u32 + 2u];
+    sc2 = up_u32[up_blk_u32 + 3u];
+    float up_sc;
+    float up_mn;
+    q4k_scale_min(sb, sc0, sc1, sc2, up_sc, up_mn);
+    const float up_factor = d_val * up_sc;
+    const float up_bias = dmin_val * up_mn;
+
+    const uint gate_qs_base = gate_blk_u32 + 4u + q_group * 8u;
+    const uint up_qs_base = up_blk_u32 + 4u + q_group * 8u;
+    int gate_isum = 0;
+    int up_isum = 0;
+    [[unroll]] for (uint p = 0u; p < 8u; p++) {
+        const uint act_word = x_q81[x_block_u32 + p];
+        gate_isum = dotPacked4x8AccSatEXT(int(q4k_pack_nibbles(gate_u32[gate_qs_base + p], high)), int(act_word), gate_isum);
+        up_isum = dotPacked4x8AccSatEXT(int(q4k_pack_nibbles(up_u32[up_qs_base + p], high)), int(act_word), up_isum);
+    }
+
+    const vec2 ds = unpackHalf2x16(x_q81[x_block_u32 + 8u]);
+    gate_part = ds.x * gate_factor * float(gate_isum) - gate_bias * ds.y;
+    up_part = ds.x * up_factor * float(up_isum) - up_bias * ds.y;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * NUM_ROWS;
+    if (row0 >= M) return;
+    const uint row1 = row0 + 1u;
+    const bool row1_valid = row1 < M;
+
+    const uint blocks_per_row = K / 256u;
+    const uint a_base = a_offset / 4u;
+    const uint x_base_block = x_offset / 36u;
+    const uint y_base = y_offset / 4u;
+
+    const uint sb = tid & 7u;
+    const uint block_lane = tid >> 3u;
+
+    const uint gate_row0_u32 = a_base + row0 * blocks_per_row * Q4K_BLOCK_U32;
+    const uint gate_row1_u32 = a_base + row1 * blocks_per_row * Q4K_BLOCK_U32;
+    const uint up_row0_u32 = a_base + row0 * blocks_per_row * Q4K_BLOCK_U32;
+    const uint up_row1_u32 = a_base + row1 * blocks_per_row * Q4K_BLOCK_U32;
+
+    float gate0 = 0.0;
+    float up0 = 0.0;
+    float gate1 = 0.0;
+    float up1 = 0.0;
+    for (uint b = block_lane; b < blocks_per_row; b += 8u) {
+        const uint x_block_u32 = (x_base_block + b * 8u + sb) * Q8_1_U32_PER_BLOCK;
+        float gate_part;
+        float up_part;
+        pair_block_dot(gate_row0_u32, up_row0_u32, b, sb, x_block_u32, gate_part, up_part);
+        gate0 += gate_part;
+        up0 += up_part;
+        if (row1_valid) {
+            pair_block_dot(gate_row1_u32, up_row1_u32, b, sb, x_block_u32, gate_part, up_part);
+            gate1 += gate_part;
+            up1 += up_part;
+        }
+    }
+
+    gate0 = subgroupAdd(gate0);
+    up0 = subgroupAdd(up0);
+    gate1 = subgroupAdd(gate1);
+    up1 = subgroupAdd(up1);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            s_sg_gate0[gl_SubgroupID] = gate0;
+            s_sg_up0[gl_SubgroupID] = up0;
+            s_sg_gate1[gl_SubgroupID] = gate1;
+            s_sg_up1[gl_SubgroupID] = up1;
+        }
+        barrier();
+        if (tid == 0u) {
+            gate0 = s_sg_gate0[0];
+            up0 = s_sg_up0[0];
+            gate1 = s_sg_gate1[0];
+            up1 = s_sg_up1[0];
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                gate0 += s_sg_gate0[sg];
+                up0 += s_sg_up0[sg];
+                gate1 += s_sg_gate1[sg];
+                up1 += s_sg_up1[sg];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        y_data[y_base + row0] = geglu(gate0, up0);
+        if (row1_valid) y_data[y_base + row1] = geglu(gate1, up1);
+    }
+}

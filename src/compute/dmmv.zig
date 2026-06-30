@@ -354,6 +354,8 @@ pub const DmmvDispatch = struct {
     /// Q4_K x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
     /// buffer produced by pipeline_quantize_q8_1.
     pipeline_q4k_q8_1: ?Pipeline,
+    /// Gemma dense gate/up GEGLU over a pre-quantized Q8_1 activation vector.
+    pipeline_q4k_pair_geglu_q8_1: ?Pipeline,
     /// Fused Q8_0 pair DMMV. Five bindings: A0, A1, X, Y0, Y1. Used as an
     /// opt-in SSM projection experiment for wqkv + z/gate, whose matrices
     /// share the same normalized hidden vector.
@@ -871,6 +873,11 @@ pub const DmmvDispatch = struct {
         const q4_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_q8_1.spv", .{shader_dir}) catch unreachable;
         const pipeline_q4k_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q4_q81_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K x Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4_pair_geglu_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_pair_geglu_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_pair_geglu_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q4_pair_geglu_q81_path, 4, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K pair GEGLU x Q8_1 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_pair_push_size = @sizeOf(DmmvQ8PairPushConstants);
@@ -2069,6 +2076,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q8_0_wide = pipeline_q8_0_wide,
             .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
             .pipeline_q4k_q8_1 = pipeline_q4k_q8_1,
+            .pipeline_q4k_pair_geglu_q8_1 = pipeline_q4k_pair_geglu_q8_1,
             .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
             .pipeline_f16 = pipeline_f16,
             .pipeline_f32 = pipeline_f32,
@@ -5254,6 +5262,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q8_0_wide) |*p| p.deinit();
         if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
         if (self.pipeline_q4k_q8_1) |*p| p.deinit();
+        if (self.pipeline_q4k_pair_geglu_q8_1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
         if (self.pipeline_f16) |*p| p.deinit();
         if (self.pipeline_f32) |*p| p.deinit();

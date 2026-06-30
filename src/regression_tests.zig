@@ -194,7 +194,8 @@ test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
     try expectContainsNear(src, marker, "pipeline_q4k_fused_gate_up_geglu_pair != null", 500);
     try expectContainsNear(src, marker, "config.architecture == .gemma", 500);
     try expectContainsNear(src, marker, "gate_tensor.info.type_ == .q4_k", 600);
-    try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 2200);
+    try expectContainsNear(src, marker, "gemma_dense_geglu_q8_1_eligible", 900);
+    try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 4200);
 }
 
 test "Vulkan Gemma dense decode keeps BN8 DP4a packed GEGLU path" {
@@ -577,6 +578,30 @@ test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
     try expectContains(shader, "subgroupAdd");
     try expectContains(shader, "gl_NumSubgroups > 1u");
     try expectContains(shader, "hidden_v4[idx] +=");
+}
+
+test "Vulkan Gemma Q8_1 GEGLU experiment stays explicitly gated" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"dmmv_q4k_pair_geglu_q8_1\"");
+    try expectNotContains(build, "dmmv_q4k_q8_1_fused_gate_up_geglu_pair");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_q4k_pair_geglu_q8_1: ?Pipeline");
+    try expectContains(dmmv, "dmmv_q4k_pair_geglu_q8_1.spv");
+    try expectContains(dmmv, ".pipeline_q4k_pair_geglu_q8_1 = pipeline_q4k_pair_geglu_q8_1");
+    try expectContains(dmmv, "if (self.pipeline_q4k_pair_geglu_q8_1) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "ZINC_GEMMA_Q4K_GEGLU_Q8_1");
+    try expectContains(forward, "use_gemma_q4k_geglu_q8_1: bool = false");
+    try expectContains(forward, "dispatchDmmvFusedGateUpGegluPairQ8_1");
+
+    const shader = @embedFile("shaders/dmmv_q4k_pair_geglu_q8_1.comp");
+    try expectContains(shader, "layout(local_size_x = 64) in;");
+    try expectContains(shader, "dotPacked4x8AccSatEXT");
+    try expectContains(shader, "subgroupAdd(gate0)");
+    try expectContains(shader, "gelu_tanh");
 }
 
 test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
