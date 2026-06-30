@@ -10948,7 +10948,11 @@ pub const InferenceEngine = struct {
         n_tokens: u32,
         eps: f32,
     ) !void {
-        const pip = &(self.elementwise.pipeline_rms_norm_add orelse return error.ShaderNotLoaded);
+        const use_vec4 = (hidden_dim & 3) == 0 and self.elementwise.pipeline_rms_norm_add_vec4 != null;
+        const pip = if (use_vec4)
+            &(self.elementwise.pipeline_rms_norm_add_vec4 orelse return error.ShaderNotLoaded)
+        else
+            &(self.elementwise.pipeline_rms_norm_add orelse return error.ShaderNotLoaded);
         const push = RmsNormAddPush{ .n = hidden_dim, .eps = eps };
         if (pip.uses_push_descriptors) {
             self.pushDispatch3(
@@ -14418,53 +14422,6 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
     ) !void {
-        if (self.use_q4k_q8_1_dmmv and
-            (K & 31) == 0 and
-            self.dmmv.pipeline_q4k_q8_1_fused_gate_up_geglu_pair != null and
-            self.dmmv.pipeline_quantize_q8_1 != null)
-        {
-            const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
-            const q8_1_bytes = @as(vk.c.VkDeviceSize, (K + 31) / 32) * Q8_1_BLOCK_BYTES;
-            if (input_size >= input_bytes and self.q8_1_buf.size >= q8_1_bytes) {
-                try self.dmmv.recordQuantizeQ8_1(
-                    &self.decode_cmd,
-                    self.instance.push_descriptor_fn,
-                    input_buf.handle,
-                    input_size,
-                    self.q8_1_buf.handle,
-                    self.q8_1_buf.size,
-                    K,
-                );
-                self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
-
-                const pip_q81 = &(self.dmmv.pipeline_q4k_q8_1_fused_gate_up_geglu_pair orelse return error.ShaderNotLoaded);
-                const push_q81 = DmmvPushConstants{
-                    .M = M,
-                    .K = K,
-                    .a_offset = 0,
-                    .x_offset = 0,
-                    .y_offset = 0,
-                    .acc_mode = 0,
-                };
-                self.pushDispatch4(
-                    pip_q81,
-                    std.mem.asBytes(&push_q81),
-                    gate_tensor.gpu_buffer.handle,
-                    gate_tensor.gpu_buffer.size,
-                    up_tensor.gpu_buffer.handle,
-                    up_tensor.gpu_buffer.size,
-                    self.q8_1_buf.handle,
-                    self.q8_1_buf.size,
-                    geglu_buf.handle,
-                    geglu_buf.size,
-                    (M + 1) / 2,
-                    1,
-                    1,
-                );
-                return;
-            }
-        }
-
         const pip = &(self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair orelse return error.ShaderNotLoaded);
         const push = DmmvPushConstants{
             .M = M,

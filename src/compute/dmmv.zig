@@ -423,9 +423,6 @@ pub const DmmvDispatch = struct {
     /// Gemma shared-expert front-end fusion for separate Q4_K gate/up tensors.
     /// Same binding shape as the dense SwiGLU pair shader, but applies GEGLU.
     pipeline_q4k_fused_gate_up_geglu_pair: ?Pipeline,
-    /// Q8_1-backed Gemma front-end fusion for separate Q4_K gate/up tensors.
-    /// Same output as the f32-activation pair shader, with integer-dot matvecs.
-    pipeline_q4k_q8_1_fused_gate_up_geglu_pair: ?Pipeline,
     /// Gemma batched MoE front-end: reads CPU-selected expert ids from the
     /// routing buffer and writes GEGLU activations for all selected experts
     /// into contiguous activation slabs.
@@ -1050,11 +1047,6 @@ pub const DmmvDispatch = struct {
         const q4k_fused_gate_up_geglu_pair_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_geglu_pair.spv", .{shader_dir}) catch unreachable;
         const pipeline_q4k_fused_gate_up_geglu_pair = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_geglu_pair_path, 4, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K Gemma shared fused gate+up+GEGLU pair shader not loaded: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        const q4k_q8_1_fused_gate_up_geglu_pair_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_q8_1_fused_gate_up_geglu_pair.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_q8_1_fused_gate_up_geglu_pair = pipeline_mod.createFromSpirvWithOptions(instance, q4k_q8_1_fused_gate_up_geglu_pair_path, 4, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
-            log.warn("Q4_K x Q8_1 Gemma fused gate+up+GEGLU pair shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q4k_moe_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
@@ -2083,7 +2075,6 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_swiglu_row1 = pipeline_q4k_fused_gate_up_swiglu_row1,
             .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
             .pipeline_q4k_fused_gate_up_geglu_pair = pipeline_q4k_fused_gate_up_geglu_pair,
-            .pipeline_q4k_q8_1_fused_gate_up_geglu_pair = pipeline_q4k_q8_1_fused_gate_up_geglu_pair,
             .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
             .pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 = pipeline_q4k_moe_fused_gate_up_geglu_batch_top1,
             .pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_geglu_cols_top1,
@@ -5203,7 +5194,6 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_swiglu_row1) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_geglu_pair) |*p| p.deinit();
-        if (self.pipeline_q4k_q8_1_fused_gate_up_geglu_pair) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1) |*p| p.deinit();

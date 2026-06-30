@@ -454,6 +454,8 @@ pub const ElementwiseDispatch = struct {
     /// Fused RMS norm + residual-accumulate (hidden += weight * rmsnorm(src)),
     /// 3 bindings (hidden, src, weights). Used by Gemma's post_ffw_norm tail.
     pipeline_rms_norm_add: ?Pipeline,
+    /// Vec4 variant of pipeline_rms_norm_add for hidden dimensions divisible by 4.
+    pipeline_rms_norm_add_vec4: ?Pipeline,
     /// NORM ROPE pipeline: fused RMS norm + RoPE per head, 3 bindings (data, weight, freq).
     pipeline_norm_rope: ?Pipeline,
     /// Fused RMS norm + f32 router DMMV pipeline (5 bindings: hidden,
@@ -854,6 +856,11 @@ pub const ElementwiseDispatch = struct {
             log.warn("rms_norm_add shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const rms_norm_add_vec4_path = std.fmt.bufPrint(&path_buf, "{s}/rms_norm_add_vec4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_rms_norm_add_vec4 = pipeline_mod.createFromSpirvWithOptions(instance, rms_norm_add_vec4_path, 3, @sizeOf(RmsNormAddPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("rms_norm_add_vec4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         // rms_norm_dmmv_f32: fused RMS norm + f32 router DMMV, 5 bindings
         // (hidden, ffn_norm_w, router_w, ffn_norm_buf, router_logits_buf).
@@ -952,6 +959,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_post_norm_residual_rms_norm = pipeline_post_norm_residual_rms_norm,
             .pipeline_residual_rms_norm_quant_q8_1 = pipeline_residual_rms_norm_quant_q8_1,
             .pipeline_rms_norm_add = pipeline_rms_norm_add,
+            .pipeline_rms_norm_add_vec4 = pipeline_rms_norm_add_vec4,
             .pipeline_norm_rope = pipeline_norm_rope,
             .pipeline_rms_norm_dmmv_f32 = pipeline_rms_norm_dmmv_f32,
             .pipeline_rms_norm_scale_dmmv_f32 = pipeline_rms_norm_scale_dmmv_f32,
@@ -1484,6 +1492,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_post_norm_residual_rms_norm) |*p| p.deinit();
         if (self.pipeline_residual_rms_norm_quant_q8_1) |*p| p.deinit();
         if (self.pipeline_rms_norm_add) |*p| p.deinit();
+        if (self.pipeline_rms_norm_add_vec4) |*p| p.deinit();
         if (self.pipeline_norm_rope) |*p| p.deinit();
         if (self.pipeline_rms_norm_dmmv_f32) |*p| p.deinit();
         if (self.pipeline_rms_norm_scale_dmmv_f32) |*p| p.deinit();
