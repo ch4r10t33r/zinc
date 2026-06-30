@@ -1317,6 +1317,9 @@ pub const InferenceEngine = struct {
     // Opt-in via ZINC_Q8_1_LM_HEAD=1. Quantizes the final norm vector to Q8_1
     // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
+    // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
+    // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
+    use_q4k_q8_1_dmmv: bool = false,
     // Opt-in via ZINC_Q8_SPEC_DMMV=1. Routes Q8_0 K=2048/4096 DMMVs through
     // pipelines with the block count baked as a specialization constant.
     use_q8_spec_dmmv: bool = false,
@@ -1681,7 +1684,7 @@ pub const InferenceEngine = struct {
         var norm_buf = try Buffer.initDeviceLocal(instance, hidden_size, buf_usage);
         errdefer norm_buf.deinit();
 
-        const q8_1_blocks = (config.hidden_dim + 31) / 32;
+        const q8_1_blocks = (max_k + 31) / 32;
         const q8_1_size = @as(vk.c.VkDeviceSize, q8_1_blocks) * Q8_1_BLOCK_BYTES;
         var q8_1_buf = try Buffer.initDeviceLocal(instance, q8_1_size, buf_usage);
         errdefer q8_1_buf.deinit();
@@ -2827,6 +2830,18 @@ pub const InferenceEngine = struct {
             log.info("ZINC_Q8_1_LM_HEAD=1 requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
         }
 
+        const q4k_q8_1_env = std.posix.getenv("ZINC_Q4K_Q8_1_DMMV");
+        const q4k_q8_1_flag = q4k_q8_1_env != null and std.mem.eql(u8, q4k_q8_1_env.?, "1");
+        const q4k_q8_1_enabled = q4k_q8_1_flag and
+            dmmv.pipeline_q4k_q8_1 != null and
+            dmmv.pipeline_quantize_q8_1 != null and
+            instance.push_descriptor_fn != null;
+        if (q4k_q8_1_enabled) {
+            log.info("Q4_K x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
+        } else if (q4k_q8_1_flag) {
+            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
+        }
+
         const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");
         const q8_spec_enabled = q8_spec_env != null and std.mem.eql(u8, q8_spec_env.?, "1");
         if (q8_spec_enabled) {
@@ -3303,6 +3318,7 @@ pub const InferenceEngine = struct {
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
+            .use_q4k_q8_1_dmmv = q4k_q8_1_enabled,
             .use_q8_spec_dmmv = q8_spec_enabled,
             .use_fused_ssm_qkv_z = fused_ssm_qkv_z_enabled,
             .use_count_experts_prefill = count_experts_enabled,
@@ -15079,6 +15095,54 @@ pub const InferenceEngine = struct {
         };
 
         if (pip.uses_push_descriptors) {
+            if (self.use_q4k_q8_1_dmmv and
+                qt == .q4_k and
+                acc_mode == 0 and
+                x_offset == 0 and
+                (K & 31) == 0 and
+                self.dmmv.pipeline_q4k_q8_1 != null and
+                self.dmmv.pipeline_quantize_q8_1 != null)
+            {
+                const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
+                const q8_1_bytes = @as(vk.c.VkDeviceSize, (K + 31) / 32) * Q8_1_BLOCK_BYTES;
+                if (input_size >= input_bytes and self.q8_1_buf.size >= q8_1_bytes) {
+                    try self.dmmv.recordQuantizeQ8_1(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        input_buf.handle,
+                        input_size,
+                        self.q8_1_buf.handle,
+                        self.q8_1_buf.size,
+                        K,
+                    );
+                    self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
+
+                    const q4_q81_pip = &self.dmmv.pipeline_q4k_q8_1.?;
+                    const push_q4_q81 = DmmvPushConstants{
+                        .M = M,
+                        .K = K,
+                        .a_offset = a_offset,
+                        .x_offset = 0,
+                        .y_offset = y_offset,
+                        .acc_mode = acc_mode,
+                    };
+                    self.pushDispatch3(
+                        q4_q81_pip,
+                        std.mem.asBytes(&push_q4_q81),
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        self.q8_1_buf.handle,
+                        self.q8_1_buf.size,
+                        output_buf.handle,
+                        output_buf.size,
+                        (M + 1) / 2,
+                        1,
+                        1,
+                    );
+                    return;
+                }
+            }
+
             // Wide-vocab Q8_0 LM-head fast path. The Qwen 3.6 35B-A3B
             // output.weight is Q8_0 with M=248320, K=2048. This variant keeps
             // two rows/WG but shares each x-vector load across both rows.
