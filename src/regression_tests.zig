@@ -245,6 +245,11 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchFlashAttnBatched", 22000);
     try expectContains(src, "fn gemmaProjectionPrefillPaddedTokenCount");
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
+    try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 400);
+    try expectContainsNear(src, "fn gemmaDenseGegluDp4aEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 400);
+    try expectContainsNear(src, "fn gemmaDenseDownDp4aEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 400);
+    try expectContainsNear(src, "fn gemmaProjectionPrefillPaddedTokenCount", "isIntelGpuVendor(self.gpu_config.vendor)", 500);
+    try expectContainsNear(src, "fn gemmaDensePrefillPaddedTokenCount", "isIntelGpuVendor(self.gpu_config.vendor)", 500);
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aSupported", ".q8_0 => (K & 31) == 0", 1400);
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aSupported", "self.batched_scratch_norm_q8", 1500);
     try expectContainsNear(src, "fn dispatchGemmaProjectionBatchedDp4a", "recordMulMmQ8_0FullDp4a", 7000);
@@ -368,6 +373,21 @@ test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "self.gemmaDenseQ4RaggedTailDp4aEnabled(down_t, n_tokens)");
     try expectContains(forward, "try self.dmmv.recordMulMmQ4KTail8Dp4a(");
+}
+
+test "Vulkan Gemma 26B Q4_K LM-head DP4a path stays opt-in" {
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k2816_n8");
+    try expectContains(dmmv, "const spec_k_2816_n8");
+    try expectContainsNear(dmmv, "pub fn recordMulMmQ4KTail8Dp4a", "K == 2816", 1200);
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "ZINC_Q4K_LM_HEAD_DP4A");
+    try expectContains(forward, "q8_1_act_packed_buf");
+    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "K != 2816", 900);
+    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "try self.dmmv.recordQuantizeActQ8_1(", 2400);
+    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "try self.dmmv.recordMulMmQ4KTail8Dp4a(", 4200);
+    try expectContainsNear(forward, "const use_q8_1_lm_path =", "try self.dispatchQ4KLmHeadDp4a(", 700);
 }
 
 test "Vulkan full-DP4a wide shaders load every activation half tile safely" {

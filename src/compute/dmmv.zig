@@ -696,6 +696,8 @@ pub const DmmvDispatch = struct {
     /// layout as the gate+up variant; 4 bindings (A weights, B packed, B
     /// scale_dsum, D f32 out).
     pipeline_mul_mm_q4k_full_dp4a: ?Pipeline,
+    /// K=2816, BN=8 sibling for Gemma 26B Q4_K LM-head decode experiments.
+    pipeline_mul_mm_q4k_full_dp4a_k2816_n8: ?Pipeline,
     /// K=5120, BM=64/BN=64 exact SSM z prefill projection.
     pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64: ?Pipeline,
     /// K=5120, BN=64 guarded sibling for dense-hybrid 27B SSM z ragged bodies.
@@ -1457,6 +1459,10 @@ pub const DmmvDispatch = struct {
             .{ .id = 0, .value = 21504 },
             .{ .id = 1, .value = 64 },
         };
+        const spec_k_2816_n8 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 2816 },
+            .{ .id = 1, .value = 8 },
+        };
         const spec_k_21504_n8 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
             .{ .id = 1, .value = 8 },
@@ -1910,6 +1916,13 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_full_dp4a != null) {
             log.info("mul_mm_q4k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM z prefill)", .{});
         }
+        const pipeline_mul_mm_q4k_full_dp4a_k2816_n8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_2816_n8, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_full_dp4a K=2816 BN=8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_full_dp4a_k2816_n8 != null) {
+            log.info("mul_mm_q4k_full_dp4a K=2816 BN=8 pipeline loaded (Gemma 26B Q4_K LM-head decode)", .{});
+        }
         var mul_mm_q4k_full_dp4a_bm64_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mul_mm_q4k_full_dp4a_bm64_path = std.fmt.bufPrint(&mul_mm_q4k_full_dp4a_bm64_path_buf, "{s}/mul_mm_q4k_full_dp4a_bm64_n64_acc.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_5120_n64, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -2179,6 +2192,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_ragged_bm64 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_ragged_bm64,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40,
             .pipeline_mul_mm_q4k_full_dp4a = pipeline_mul_mm_q4k_full_dp4a,
+            .pipeline_mul_mm_q4k_full_dp4a_k2816_n8 = pipeline_mul_mm_q4k_full_dp4a_k2816_n8,
             .pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64 = pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64,
             .pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged = pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged,
             .pipeline_mul_mm_q4k_full_dp4a_k12288 = pipeline_mul_mm_q4k_full_dp4a_k12288,
@@ -5200,6 +5214,9 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
     ) !void {
         const pip = blk: {
+            if (K == 2816) {
+                if (self.pipeline_mul_mm_q4k_full_dp4a_k2816_n8) |*p| break :blk p;
+            }
             if (K == 21504) {
                 if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n8) |*p| break :blk p;
             }
@@ -5366,6 +5383,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_ragged_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_full_dp4a_k2816_n8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k12288) |*p| p.deinit();

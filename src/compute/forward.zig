@@ -1033,6 +1033,8 @@ pub const InferenceEngine = struct {
     residual_buf: Buffer, // scratch for residual ops
     norm_buf: Buffer, // RMS norm output
     q8_1_buf: Buffer, // quantized hidden/norm scratch for Q8_1 matvec paths
+    q8_1_act_packed_buf: Buffer, // DP4a Q8_1-style packed activation scratch
+    q8_1_act_scale_dsum_buf: Buffer, // DP4a Q8_1-style (scale, dsum) scratch
     logits_buf: Buffer, // output logits (vocab_size f32)
     logits_staging: Buffer, // pre-allocated logits readback staging
     argmax_partials_buf: Buffer, // per-workgroup argmax partials
@@ -1317,6 +1319,10 @@ pub const InferenceEngine = struct {
     // Opt-in via ZINC_Q8_1_LM_HEAD=1. Quantizes the final norm vector to Q8_1
     // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
+    // Opt-in via ZINC_Q4K_LM_HEAD_DP4A=1. Quantizes the final norm vector to
+    // the DP4a Q8_1 activation layout and runs the Q4_K LM head through the
+    // BN=8 int8 tiled GEMM. Initial target is Intel Gemma 26B (K=2816).
+    use_q4k_lm_head_dp4a: bool = false,
     // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
     // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
     use_q4k_q8_1_dmmv: bool = false,
@@ -1688,6 +1694,12 @@ pub const InferenceEngine = struct {
         const q8_1_size = @as(vk.c.VkDeviceSize, q8_1_blocks) * Q8_1_BLOCK_BYTES;
         var q8_1_buf = try Buffer.initDeviceLocal(instance, q8_1_size, buf_usage);
         errdefer q8_1_buf.deinit();
+        const q8_1_act_packed_size = @as(vk.c.VkDeviceSize, q8_1_blocks) * 8 * @sizeOf(u32);
+        const q8_1_act_scale_dsum_size = @as(vk.c.VkDeviceSize, q8_1_blocks) * 2 * @sizeOf(f32);
+        var q8_1_act_packed_buf = try Buffer.initDeviceLocal(instance, q8_1_act_packed_size, buf_usage);
+        errdefer q8_1_act_packed_buf.deinit();
+        var q8_1_act_scale_dsum_buf = try Buffer.initDeviceLocal(instance, q8_1_act_scale_dsum_size, buf_usage);
+        errdefer q8_1_act_scale_dsum_buf.deinit();
 
         const logits_size = @as(vk.c.VkDeviceSize, config.vocab_size) * @sizeOf(f32);
         var logits_buf = try Buffer.initDeviceLocal(instance, logits_size, vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -2832,6 +2844,19 @@ pub const InferenceEngine = struct {
             log.info("ZINC_Q8_1_LM_HEAD=1 requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
         }
 
+        const q4k_lm_head_dp4a_env = std.posix.getenv("ZINC_Q4K_LM_HEAD_DP4A");
+        const q4k_lm_head_dp4a_flag = q4k_lm_head_dp4a_env != null and std.mem.eql(u8, q4k_lm_head_dp4a_env.?, "1");
+        const q4k_lm_head_dp4a_enabled = q4k_lm_head_dp4a_flag and
+            dmmv.pipeline_mul_mm_q4k_full_dp4a_k2816_n8 != null and
+            dmmv.pipeline_quantize_act_q8_1 != null and
+            instance.caps.integer_dot_product and
+            instance.push_descriptor_fn != null;
+        if (q4k_lm_head_dp4a_enabled) {
+            log.info("Q4_K LM-head DP4a path ENABLED via ZINC_Q4K_LM_HEAD_DP4A=1", .{});
+        } else if (q4k_lm_head_dp4a_flag) {
+            log.info("ZINC_Q4K_LM_HEAD_DP4A=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
+        }
+
         const q4k_q8_1_env = std.posix.getenv("ZINC_Q4K_Q8_1_DMMV");
         const q4k_q8_1_flag = q4k_q8_1_env != null and std.mem.eql(u8, q4k_q8_1_env.?, "1");
         const q4k_q8_1_enabled = q4k_q8_1_flag and
@@ -3320,6 +3345,7 @@ pub const InferenceEngine = struct {
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
+            .use_q4k_lm_head_dp4a = q4k_lm_head_dp4a_enabled,
             .use_q4k_q8_1_dmmv = q4k_q8_1_enabled,
             .use_q8_spec_dmmv = q8_spec_enabled,
             .use_fused_ssm_qkv_z = fused_ssm_qkv_z_enabled,
@@ -3380,6 +3406,8 @@ pub const InferenceEngine = struct {
             .residual_buf = residual_buf,
             .norm_buf = norm_buf,
             .q8_1_buf = q8_1_buf,
+            .q8_1_act_packed_buf = q8_1_act_packed_buf,
+            .q8_1_act_scale_dsum_buf = q8_1_act_scale_dsum_buf,
             .logits_buf = logits_buf,
             .logits_staging = logits_staging,
             .argmax_partials_buf = argmax_partials_buf,
@@ -10674,7 +10702,9 @@ pub const InferenceEngine = struct {
             const use_q8_batch_lm_path = self.use_q8_batch_lm_head and
                 lm_tensor.info.type_ == .q8_0 and
                 self.dmmv.pipeline_q8_0_batch != null;
-            if (use_q8_1_lm_path) {
+            if (try self.dispatchQ4KLmHeadDp4a(lm_tensor, self.norm_buf, hidden_size, self.logits_buf, self.model.config.vocab_size, hidden_dim)) {
+                // Opt-in DP4a path recorded the final LM head.
+            } else if (use_q8_1_lm_path) {
                 try self.dmmv.recordQuantizeQ8_1(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
@@ -12017,7 +12047,7 @@ pub const InferenceEngine = struct {
 
     fn gemmaDenseGegluDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
@@ -12031,7 +12061,7 @@ pub const InferenceEngine = struct {
 
     fn gemmaDenseDownDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
@@ -12075,7 +12105,7 @@ pub const InferenceEngine = struct {
     fn gemmaDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.use_mul_mm_proj) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
@@ -15092,6 +15122,73 @@ pub const InferenceEngine = struct {
         );
     }
 
+    fn dispatchQ4KLmHeadDp4a(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output_buf: Buffer,
+        M: u32,
+        K: u32,
+    ) !bool {
+        if (!self.use_q4k_lm_head_dp4a) return false;
+        if (tensor.info.type_ != .q4_k) return false;
+        if (K != 2816) return false;
+        if (K == 0 or (K & 255) != 0) return false;
+        if (M == 0 or (M & 31) != 0) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+        if (self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k2816_n8 == null) return false;
+
+        const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
+        const output_bytes = @as(vk.c.VkDeviceSize, M) * @sizeOf(f32);
+        const q8_blocks = K / 32;
+        const packed_bytes = @as(vk.c.VkDeviceSize, q8_blocks) * 8 * @sizeOf(u32);
+        const scale_dsum_bytes = @as(vk.c.VkDeviceSize, q8_blocks) * 2 * @sizeOf(f32);
+        if (input_size < input_bytes or output_buf.size < output_bytes) return false;
+        if (self.q8_1_act_packed_buf.size < packed_bytes or self.q8_1_act_scale_dsum_buf.size < scale_dsum_bytes) return false;
+
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            input_buf.handle,
+            input_size,
+            self.q8_1_act_packed_buf.handle,
+            self.q8_1_act_packed_buf.size,
+            self.q8_1_act_scale_dsum_buf.handle,
+            self.q8_1_act_scale_dsum_buf.size,
+            1,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = self.q8_1_act_packed_buf.handle, .size = packed_bytes },
+            .{ .buffer = self.q8_1_act_scale_dsum_buf.handle, .size = scale_dsum_bytes },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+
+        try self.dmmv.recordMulMmQ4KTail8Dp4a(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            self.q8_1_act_packed_buf.handle,
+            self.q8_1_act_packed_buf.size,
+            self.q8_1_act_scale_dsum_buf.handle,
+            self.q8_1_act_scale_dsum_buf.size,
+            output_buf.handle,
+            output_buf.size,
+            M,
+            1,
+            K,
+            0,
+            0,
+            0,
+            0,
+        );
+        return true;
+    }
+
     /// Dispatch a DMMV with byte offset into stacked weight tensor (for MoE experts).
     fn dispatchDmmvWithOffset(
         self: *InferenceEngine,
@@ -16571,7 +16668,7 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
-        if (!self.isAmdRdna()) return n_tokens;
+        if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return n_tokens;
         if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
         if (n_tokens < 64) return 64;
         return (n_tokens + 31) & ~@as(u32, 31);
@@ -16581,7 +16678,7 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
-        if (!self.isAmdRdna()) return n_tokens;
+        if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return n_tokens;
         if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
         if (n_tokens < 64) return 64;
         return (n_tokens + 31) & ~@as(u32, 31);
@@ -26275,6 +26372,8 @@ pub const InferenceEngine = struct {
         self.argmax_partials_buf.deinit();
         self.logits_staging.deinit();
         self.logits_buf.deinit();
+        self.q8_1_act_scale_dsum_buf.deinit();
+        self.q8_1_act_packed_buf.deinit();
         self.q8_1_buf.deinit();
         self.norm_buf.deinit();
         self.residual_buf.deinit();
