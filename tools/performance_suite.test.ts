@@ -229,11 +229,22 @@ test("default RDNA cases include Gemma and current Qwen rows", () => {
 
 test("default Intel cases use the remote managed cache layout", () => {
   const cases = defaultIntelCases("/remote/cache");
+  expect(cases.map((entry) => entry.id)).toEqual([
+    "gemma4-26b-a4b-q4k-m",
+    "gemma4-31b-q4k-m",
+    "qwen35-9b-q4k-m",
+    "qwen36-35b-a3b-q4k-xl",
+    "qwen36-27b-q4k-m",
+  ]);
   const qwen = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
+  const gemma = cases.find((entry) => entry.id === "gemma4-26b-a4b-q4k-m");
 
   expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
   expect(qwen?.prompt_mode).toBe("raw");
   expect(qwen?.context_tokens).toBe(512);
+  expect(gemma?.model_path).toBe("/remote/cache/gemma4-26b-a4b-q4k-m/model.gguf");
+  expect(gemma?.prompt_mode).toBe("chat");
+  expect(gemma?.notes).toEqual(["Intel Arc Vulkan comparison against llama.cpp on the same host"]);
 });
 
 test("llama device args support Intel Vulkan0 and no-device modes", () => {

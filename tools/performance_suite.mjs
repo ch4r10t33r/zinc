@@ -2054,20 +2054,12 @@ export function defaultRdnaCases(modelRoot) {
 }
 
 export function defaultIntelCases(modelRoot) {
-  return [
-    {
-      id: "qwen35-9b-q4k-m",
-      label: "Qwen 3.5 9B Q4_K_M",
-      family: "Qwen 3.5",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen35-9b-q4k-m"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
-      context_tokens: defaultIntelContextTokensForModel("qwen35-9b-q4k-m"),
-      notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
-    },
-  ];
+  return defaultMetalCases(modelRoot).map((entry) => ({
+    ...entry,
+    model_path: modelPath(modelRoot, entry.id),
+    context_tokens: defaultIntelContextTokensForModel(entry.id),
+    notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
+  }));
 }
 
 function defaultIntelContextTokensForModel(_id) {
