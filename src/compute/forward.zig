@@ -1222,6 +1222,10 @@ pub const InferenceEngine = struct {
     // the SwiGLU fold which removes the gate_buf/up_buf write+read pair
     // entirely, a structurally distinct change.
     use_fused_dense_ffn: bool = false,
+    // Dense Gemma decode: fold post_attention_norm + residual add + FFN norm
+    // into one dispatch. This reuses the batched Gemma boundary-fusion shader
+    // for single-token decode and removes the standalone FFN RMS-norm dispatch.
+    use_gemma_decode_pan_ffn_norm: bool = false,
     // Default-on only for Qwen3.6-27B's wide dense FFN shape. Uses the
     // NUM_ROWS=1 specialization of the fused gate+up+SwiGLU Q4_K shader
     // instead of widening the regular NUM_ROWS=2 path that previously
@@ -2562,6 +2566,17 @@ pub const InferenceEngine = struct {
         } else if (fused_dense_ffn_explicitly_off) {
             log.info("Fused dense gate+up+SwiGLU DISABLED via ZINC_FUSED_DENSE_FFN=0", .{});
         }
+        const gemma_decode_pan_ffn_env = std.posix.getenv("ZINC_GEMMA_DECODE_PAN_FFN_NORM");
+        const gemma_decode_pan_ffn_explicitly_off = gemma_decode_pan_ffn_env != null and
+            std.mem.eql(u8, gemma_decode_pan_ffn_env.?, "0");
+        const gemma_decode_pan_ffn_enabled = !gemma_decode_pan_ffn_explicitly_off and
+            dmmv.pipeline_q4k_fused_gate_up_geglu_pair != null and
+            elementwise.pipeline_post_norm_residual_rms_norm != null;
+        if (gemma_decode_pan_ffn_enabled) {
+            log.info("Dense Gemma decode post-attn/FFN norm fusion ENABLED (default, set ZINC_GEMMA_DECODE_PAN_FFN_NORM=0 to disable)", .{});
+        } else if (gemma_decode_pan_ffn_explicitly_off) {
+            log.info("Dense Gemma decode post-attn/FFN norm fusion DISABLED via ZINC_GEMMA_DECODE_PAN_FFN_NORM=0", .{});
+        }
         const qwen36_dense_row1_env = std.posix.getenv("ZINC_QWEN36_27B_DENSE_FUSED_ROW1");
         const qwen36_dense_row1_explicitly_off = qwen36_dense_row1_env != null and
             std.mem.eql(u8, qwen36_dense_row1_env.?, "0");
@@ -3281,6 +3296,7 @@ pub const InferenceEngine = struct {
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
             .use_ssm_delta_normed_qk = ssm_delta_normed_qk_enabled,
             .use_fused_dense_ffn = fused_dense_ffn_enabled,
+            .use_gemma_decode_pan_ffn_norm = gemma_decode_pan_ffn_enabled,
             .use_qwen36_dense_fused_row1 = qwen36_dense_row1_enabled,
             .use_gemma_dense_decode_dp4a = gemma_dense_decode_dp4a_enabled,
             .use_fused_oproj_merge = fused_oproj_merge_enabled,
@@ -6553,6 +6569,7 @@ pub const InferenceEngine = struct {
                 self.prefill_active and
                 layer == layer_start and
                 self.partial_decode_ffn_norm_in != null;
+            var ffn_norm_ready_from_attention = false;
 
             // --- Input RMS norm: hidden_buf → norm_buf ---
             const attn_norm = if (!resume_from_ffn_norm) lt.attn_norm orelse {
@@ -7846,20 +7863,53 @@ pub const InferenceEngine = struct {
                             });
                             self.decode_cmd.transferToComputeBarrier();
                         } else if (use_fused_pan_decode) {
-                            // Fused Gemma post_attention_norm + residual add in one
-                            // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
                             const pan_tensor = lt.post_attention_norm.?;
-                            try self.dispatchRmsNormAdd(
-                                self.hidden_buf.handle,
-                                hidden_size,
-                                self.o_proj_buf.handle,
-                                hidden_size,
-                                pan_tensor.gpu_buffer.handle,
-                                pan_tensor.gpu_buffer.size,
-                                hidden_dim,
-                                1,
-                                rms_norm_eps,
-                            );
+                            const can_fuse_pan_ffn_norm =
+                                self.use_gemma_decode_pan_ffn_norm and
+                                !self.prefill_active and
+                                config.architecture == .gemma and
+                                config.n_experts == 0 and
+                                config.ssm_d_inner == 0 and
+                                lt.ffn_norm != null and
+                                self.elementwise.pipeline_post_norm_residual_rms_norm != null;
+                            if (can_fuse_pan_ffn_norm) {
+                                // Fused dense Gemma attention boundary:
+                                // hidden += post_attention_norm(o_proj), then
+                                // ffn_norm_buf = ffn_norm(hidden). The FFN
+                                // norm dispatch below is skipped for this layer.
+                                const ffn_norm_for_fusion = lt.ffn_norm.?;
+                                try self.dispatchPostNormResidualRmsNorm(
+                                    self.hidden_buf.handle,
+                                    hidden_size,
+                                    self.o_proj_buf.handle,
+                                    hidden_size,
+                                    pan_tensor.gpu_buffer.handle,
+                                    pan_tensor.gpu_buffer.size,
+                                    self.ffn_norm_buf.handle,
+                                    hidden_size,
+                                    ffn_norm_for_fusion.gpu_buffer.handle,
+                                    ffn_norm_for_fusion.gpu_buffer.size,
+                                    hidden_dim,
+                                    1,
+                                    rms_norm_eps,
+                                );
+                                ffn_norm_ready_from_attention = true;
+                            } else {
+                                // Fused Gemma post_attention_norm + residual
+                                // add in one dispatch:
+                                // hidden += pan_weight * rmsnorm(o_proj_buf).
+                                try self.dispatchRmsNormAdd(
+                                    self.hidden_buf.handle,
+                                    hidden_size,
+                                    self.o_proj_buf.handle,
+                                    hidden_size,
+                                    pan_tensor.gpu_buffer.handle,
+                                    pan_tensor.gpu_buffer.size,
+                                    hidden_dim,
+                                    1,
+                                    rms_norm_eps,
+                                );
+                            }
                             self.decode_cmd.computeBarrier();
                         } else {
                             // Attention residual: hidden_buf += o_proj_buf
@@ -8170,7 +8220,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
+            if (!resume_from_ffn_norm and !ffn_norm_ready_from_attention and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,

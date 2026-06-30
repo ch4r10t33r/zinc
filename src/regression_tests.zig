@@ -197,6 +197,18 @@ test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
     try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 2200);
 }
 
+test "Vulkan dense Gemma decode keeps post-attention to FFN norm fusion guarded" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "ZINC_GEMMA_DECODE_PAN_FFN_NORM");
+    try expectContainsNear(src, "const gemma_decode_pan_ffn_enabled =", "pipeline_post_norm_residual_rms_norm != null", 500);
+    try expectContainsNear(src, "const can_fuse_pan_ffn_norm =", "config.n_experts == 0", 800);
+    try expectContainsNear(src, "const can_fuse_pan_ffn_norm =", "config.ssm_d_inner == 0", 800);
+    try expectContainsNear(src, "const can_fuse_pan_ffn_norm =", "!self.prefill_active", 800);
+    try expectContainsNear(src, "const can_fuse_pan_ffn_norm =", "try self.dispatchPostNormResidualRmsNorm", 1800);
+    try expectContains(src, "ffn_norm_ready_from_attention = true");
+    try expectContains(src, "if (!resume_from_ffn_norm and !ffn_norm_ready_from_attention");
+}
+
 test "Vulkan Gemma dense decode keeps BN8 DP4a packed GEGLU path" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "ZINC_GEMMA_DENSE_DECODE_DP4A");
