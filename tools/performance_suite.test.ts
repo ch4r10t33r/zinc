@@ -18,6 +18,7 @@ import {
   defaultRdnaCases,
   defaultScenarioDefsForModel,
   guessFamily,
+  llamaDeviceArgs,
   localZincCommand,
   mergeArtifacts,
   parseArgs,
@@ -233,6 +234,12 @@ test("default Intel cases use the remote managed cache layout", () => {
   expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
   expect(qwen?.prompt_mode).toBe("raw");
   expect(qwen?.context_tokens).toBe(512);
+});
+
+test("llama device args support Intel Vulkan0 and no-device modes", () => {
+  expect(llamaDeviceArgs("Vulkan0")).toEqual(["--device", "Vulkan0"]);
+  expect(llamaDeviceArgs("none")).toEqual([]);
+  expect(llamaDeviceArgs(null)).toEqual([]);
 });
 
 test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {

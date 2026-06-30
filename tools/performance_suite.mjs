@@ -927,6 +927,10 @@ function remoteEnvPrefix(creds) {
   return entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
 }
 
+export function llamaDeviceArgs(device) {
+  return !device || device === "none" ? [] : ["--device", device];
+}
+
 async function captureGitProvenance(cwd = ROOT, timeoutMs = 10_000) {
   try {
     const version = await runShell("git describe --tags --always --dirty --abbrev=12", { cwd, timeoutMs });
@@ -2559,6 +2563,8 @@ async function buildIntelConfig(args) {
   const remoteZig = envValue(dotEnv, "ZINC_INTEL_ZIG_REMOTE");
   const remoteZigDir = envValue(dotEnv, "ZINC_INTEL_ZIG_DIR", "ZINC_INTEL_REMOTE_ZIG_DIR")
     ?? (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.local/zig/0.15.2`);
+  const llamaDevice = envValue(dotEnv, "ZINC_INTEL_LLAMA_DEVICE") ?? "Vulkan0";
+  const intelLlamaDeviceArgs = llamaDeviceArgs(llamaDevice);
   const remoteEnv = {
     PATH: `${remoteZigDir}:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin`,
   };
@@ -2575,6 +2581,8 @@ async function buildIntelConfig(args) {
       sshKey,
       workdir,
       env: remoteEnv,
+      serverDeviceArgs: intelLlamaDeviceArgs,
+      cliDeviceArgs: intelLlamaDeviceArgs,
     },
     remoteHome,
     xdgCacheHome,
