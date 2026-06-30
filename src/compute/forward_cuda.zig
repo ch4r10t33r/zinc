@@ -1679,9 +1679,12 @@ pub const ForwardCuda = struct {
         if (ssm_profile) cmd = try command.beginCommand(ctx);
         const use_chunked = std.posix.getenv("ZINC_SSM_CHUNKED") != null and
             std.mem.eql(u8, std.posix.getenv("ZINC_SSM_CHUNKED").?, "1");
-        const use_warp = !self.force_block_ssm and !use_chunked and
-            (std.posix.getenv("ZINC_SSM_WARP") == null or
-            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0"));
+        // Delta-net scan: block-level kernel (correct for multi-token prefill).
+        // The warp-level kernel (ssm_delta_net_warp) has a subtle numerical
+        // divergence that compounds across tokens — verified wrong for both 9B
+        // and 35B models. Opt in with ZINC_SSM_WARP=1 (correct for T=1 decode).
+        const use_warp = !self.force_block_ssm and !use_chunked and T == 1 and
+            !(std.posix.getenv("ZINC_SSM_WARP") == null);
         var prof_scan: i64 = 0;
         if (use_chunked) {
             const dn_ch = DeltaNetChunkedPush{
