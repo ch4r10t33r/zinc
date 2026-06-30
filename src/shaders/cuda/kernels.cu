@@ -4693,23 +4693,29 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
 
     for (unsigned c=0u;c<nchunk;c++){
         unsigned sbk=c>>3, sb8=c&7u;
-        // Dequant W sub-block into Ws (same Q4_K unpack as gemm_q4k_tc)
+        // Warp-broadcast dequant: lane 0 reads header, broadcasts d*scale + dmin*min
+        unsigned wid=tid>>5, lane=tid&31u;
         #pragma unroll
         for(int u=0;u<8;u++){
-            unsigned idx=tid+(unsigned)u*256u;
-            unsigned r=idx>>5, l=idx&31u, row=m0+r;
+            unsigned r=wid+(unsigned)u*8u, l=lane, row=m0+r;
             float wv=0.0f;
             if(row<pc.M){
                 unsigned blk=a0+row*bpr*36u+sbk*36u;
-                unsigned dd=a_u32[blk];
-                float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
-                float dmin=zinc_half_to_float((unsigned short)(dd>>16));
-                const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
-                unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                float d_sc,dm_mn;
+                if(lane==0){
+                    unsigned dd=a_u32[blk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    d_sc=d*(float)s; dm_mn=dmin*(float)mn;
+                }
+                d_sc=__shfl_sync(0xFFFFFFFFu,d_sc,0);
+                dm_mn=__shfl_sync(0xFFFFFFFFu,dm_mn,0);
                 const unsigned char* qs=(const unsigned char*)(a_u32+blk+4u);
                 unsigned char qb=qs[(sb8>>1)*32u+l];
                 unsigned nib=(sb8&1u)==0u?(qb&0xFu):(unsigned)(qb>>4);
-                wv=d*(float)s*(float)nib-dmin*(float)mn;
+                wv=d_sc*(float)nib-dm_mn;
             }
             Ws[r*BK+l]=__float2half(wv);
         }
