@@ -678,7 +678,7 @@ pub const ForwardCuda = struct {
     // the grouped-TC experts (more prompts hit the 29× row's biggest lever). Below 640
     // the proven _batched matvec stays (256 experts → <20 tok/64-tile = mostly-empty
     // padded tiles, the wasted wmma cancels the weight-traffic win).
-    moe_tc_min_t: u32 = 1,
+    moe_tc_min_t: u32 = 64,
     // Effort 29 T3: route the B>27 SERVING-decode dense GEMMs through the same
     // cuBLAS fp16-TC path (dequant W→fp16 + cublasGemmEx) instead of the f32
     // register-tiled gemm[idx]. btok covers B≤27 (bandwidth-bound, no round-trip);
