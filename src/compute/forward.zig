@@ -2497,17 +2497,15 @@ pub const InferenceEngine = struct {
             log.info("Fused FFN-norm + router DMMV DISABLED via ZINC_FUSED_RMS_ROUTER=0", .{});
         }
 
-        const intel_ssm_fast_paths_default_off = isIntelGpuVendor(gpu_config.vendor) and config.ssm_d_inner > 0;
-
         // Fused SSM pre-norm (cycle 13): merges (rms_norm_mul → alpha
         // DMMV → beta DMMV) into a single dispatch when alpha+beta are
         // f32 (Qwen 3.5/3.6 35B-A3B Q4_K_XL pack). Default-on whenever the
-        // rms_norm_dmmv_q4k_alpha_beta pipeline is loaded, except Intel SSM
-        // models where the fused-SSM + cols8-delta pair corrupts Qwen3.5/3.6
-        // output on BMG. Disable via ZINC_FUSED_SSM_AB=0; force on for A/B via
-        // ZINC_FUSED_SSM_AB=1. Per-call gates (architecture, weight type) are
-        // evaluated in the forward path so models that don't fit silently fall
-        // back.
+        // rms_norm_dmmv_q4k_alpha_beta pipeline is loaded. The shader now
+        // merges subgroup partials before writing RMS/alpha/beta, so it is
+        // safe on Intel wave32 as well as wave64 GPUs. Disable via
+        // ZINC_FUSED_SSM_AB=0. Per-call gates (architecture, weight type) are
+        // evaluated in the forward path so models that don't fit silently
+        // fall back.
         const fused_ssm_ab_env = std.posix.getenv("ZINC_FUSED_SSM_AB");
         const fused_ssm_ab_explicitly_off = fused_ssm_ab_env != null and std.mem.eql(u8, fused_ssm_ab_env.?, "0");
         const fused_ssm_ab_forced_on = fused_ssm_ab_env != null and !fused_ssm_ab_explicitly_off;
@@ -2516,26 +2514,21 @@ pub const InferenceEngine = struct {
         else if (fused_ssm_ab_explicitly_off)
             false
         else
-            !intel_ssm_fast_paths_default_off;
+            true;
         const fused_ssm_ab_enabled = fused_ssm_ab_policy_enabled and
             elementwise.pipeline_rms_norm_dmmv_q4k_alpha_beta != null and
             instance.push_descriptor_fn != null;
         if (fused_ssm_ab_enabled) {
-            if (intel_ssm_fast_paths_default_off and fused_ssm_ab_forced_on) {
-                log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED via ZINC_FUSED_SSM_AB=1 on Intel SSM path", .{});
-            } else {
-                log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)", .{});
-            }
+            log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)", .{});
         } else if (fused_ssm_ab_explicitly_off) {
             log.info("Fused SSM pre-norm DISABLED via ZINC_FUSED_SSM_AB=0", .{});
-        } else if (intel_ssm_fast_paths_default_off) {
-            log.info("Fused SSM pre-norm DISABLED by default on Intel SSM path (set ZINC_FUSED_SSM_AB=1 to enable experimental path)", .{});
         }
 
         // SSM delta cols8: port of the reference implementation's GDN workgroup shape for
         // S=128 (8 output rows per wave64 via subgroupClusteredAdd). Disable
-        // via ZINC_SSM_DELTA_COLS8=0 for A/B checks. Default-off on Intel SSM
-        // models together with fused SSM pre-norm for correctness.
+        // via ZINC_SSM_DELTA_COLS8=0 for A/B checks. The shader's Q/K norm
+        // and row mapping handle multiple subgroups per workgroup, so Intel
+        // wave32 executes the same logical rows as wave64 GPUs.
         const ssm_delta_cols8_env = std.posix.getenv("ZINC_SSM_DELTA_COLS8");
         const ssm_delta_cols8_explicitly_off = ssm_delta_cols8_env != null and std.mem.eql(u8, ssm_delta_cols8_env.?, "0");
         const ssm_delta_cols8_forced_on = ssm_delta_cols8_env != null and !ssm_delta_cols8_explicitly_off;
@@ -2544,19 +2537,13 @@ pub const InferenceEngine = struct {
         else if (ssm_delta_cols8_explicitly_off)
             false
         else
-            !intel_ssm_fast_paths_default_off;
+            true;
         const ssm_delta_cols8_enabled = ssm_delta_cols8_policy_enabled and
             elementwise.pipeline_ssm_delta_net_cols8 != null;
         if (ssm_delta_cols8_enabled) {
-            if (intel_ssm_fast_paths_default_off and ssm_delta_cols8_forced_on) {
-                log.info("SSM delta cols8 ENABLED via ZINC_SSM_DELTA_COLS8=1 on Intel SSM path", .{});
-            } else {
-                log.info("SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)", .{});
-            }
+            log.info("SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)", .{});
         } else if (ssm_delta_cols8_explicitly_off) {
             log.info("SSM delta cols8 DISABLED via ZINC_SSM_DELTA_COLS8=0", .{});
-        } else if (intel_ssm_fast_paths_default_off) {
-            log.info("SSM delta cols8 DISABLED by default on Intel SSM path (set ZINC_SSM_DELTA_COLS8=1 to enable experimental path)", .{});
         }
 
         const ssm_delta_normed_qk_env = std.posix.getenv("ZINC_SSM_DELTA_NORMED_QK");

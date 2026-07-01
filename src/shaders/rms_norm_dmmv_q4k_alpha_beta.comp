@@ -39,6 +39,7 @@
 //   5  alpha_out     (f32, M elements)
 //   6  beta_out      (f32, M elements)
 
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64) in;
@@ -59,7 +60,10 @@ layout(set = 0, binding = 6) writeonly buffer BetaOut      { float beta_out[];  
 
 const uint NUM_ROWS = 1u;
 
+shared float s_reduce[16];
 shared float s_rms_inv;
+shared float s_alpha_sum;
+shared float s_beta_sum;
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -76,6 +80,19 @@ void main() {
     }
     sum_sq = subgroupAdd(sum_sq);
 
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            s_reduce[gl_SubgroupID] = sum_sq;
+        }
+        barrier();
+        if (tid == 0u) {
+            float merged = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+                merged += s_reduce[sg];
+            }
+            sum_sq = merged;
+        }
+    }
     if (tid == 0u) {
         s_rms_inv = inversesqrt(sum_sq / float(K) + eps);
     }
@@ -121,6 +138,26 @@ void main() {
 
         sum_alpha = subgroupAdd(sum_alpha);
         sum_beta  = subgroupAdd(sum_beta);
+        if (gl_NumSubgroups > 1u) {
+            if (gl_SubgroupInvocationID == 0u) {
+                s_reduce[gl_SubgroupID] = sum_alpha;
+                s_reduce[gl_SubgroupID + 8u] = sum_beta;
+            }
+            barrier();
+            if (tid == 0u) {
+                float merged_alpha = 0.0;
+                float merged_beta = 0.0;
+                for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+                    merged_alpha += s_reduce[sg];
+                    merged_beta += s_reduce[sg + 8u];
+                }
+                s_alpha_sum = merged_alpha;
+                s_beta_sum = merged_beta;
+            }
+            barrier();
+            sum_alpha = s_alpha_sum;
+            sum_beta = s_beta_sum;
+        }
         if (tid == 0u) {
             alpha_out[row] = sum_alpha;
             beta_out [row] = sum_beta;

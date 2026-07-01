@@ -21,6 +21,10 @@ layout(push_constant) uniform PushConstants {
     uint qk_dim;
 };
 
+shared float s_reduce[16];
+shared float s_q_sum;
+shared float s_k_sum;
+
 void main() {
     uint group = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
@@ -36,6 +40,26 @@ void main() {
 
     float q_sum = subgroupAdd(q0 * q0 + q1 * q1);
     float k_sum = subgroupAdd(k0 * k0 + k1 * k1);
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) {
+            s_reduce[gl_SubgroupID] = q_sum;
+            s_reduce[gl_SubgroupID + 8u] = k_sum;
+        }
+        barrier();
+        if (tid == 0u) {
+            float merged_q = 0.0;
+            float merged_k = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+                merged_q += s_reduce[sg];
+                merged_k += s_reduce[sg + 8u];
+            }
+            s_q_sum = merged_q;
+            s_k_sum = merged_k;
+        }
+        barrier();
+        q_sum = s_q_sum;
+        k_sum = s_k_sum;
+    }
     float q_scale = inversesqrt(max(q_sum, 1e-12)) / sqrt(float(d_state));
     float k_scale = inversesqrt(max(k_sum, 1e-12));
 

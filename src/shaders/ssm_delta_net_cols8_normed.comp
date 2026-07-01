@@ -72,8 +72,9 @@ const uint COLS_PER_LANE = 16u;
 void main() {
     uint h = gl_WorkGroupID.x;
     uint row_block = gl_WorkGroupID.y;
-    uint lane = gl_SubgroupInvocationID % LANES_PER_ROW;
-    uint row_slot = gl_SubgroupInvocationID / LANES_PER_ROW;
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LANES_PER_ROW;
+    uint row_slot = tid / LANES_PER_ROW;
     uint row = row_block * ROWS_PER_WG + row_slot;
 
     if (h >= dt_rank || row >= head_v_dim) return;

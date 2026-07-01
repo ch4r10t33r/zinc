@@ -546,13 +546,32 @@ test "Vulkan Intel batched prefill keeps chunk override for fallback debugging" 
     try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
 }
 
-test "Vulkan Intel SSM fast paths are default-off with env opt-in" {
+test "Vulkan Intel SSM fast paths are wave32-safe by default" {
     const src = @embedFile("compute/forward.zig");
-    try expectContains(src, "const intel_ssm_fast_paths_default_off = isIntelGpuVendor(gpu_config.vendor) and config.ssm_d_inner > 0;");
     try expectContainsNear(src, "const fused_ssm_ab_policy_enabled", "fused_ssm_ab_forced_on", 500);
     try expectContainsNear(src, "const ssm_delta_cols8_policy_enabled", "ssm_delta_cols8_forced_on", 500);
-    try expectContainsNear(src, "Fused SSM pre-norm DISABLED by default on Intel SSM path", "ZINC_FUSED_SSM_AB=1", 200);
-    try expectContainsNear(src, "SSM delta cols8 DISABLED by default on Intel SSM path", "ZINC_SSM_DELTA_COLS8=1", 200);
+    try expectContainsNear(src, "const fused_ssm_ab_policy_enabled", "else\n            true;", 500);
+    try expectContainsNear(src, "const ssm_delta_cols8_policy_enabled", "else\n            true;", 500);
+    try expectContains(src, "Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)");
+    try expectContains(src, "SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)");
+
+    const alpha_beta = @embedFile("shaders/rms_norm_dmmv_q4k_alpha_beta.comp");
+    try expectContains(alpha_beta, "GL_KHR_shader_subgroup_basic");
+    try expectContains(alpha_beta, "gl_NumSubgroups > 1u");
+    try expectContains(alpha_beta, "s_reduce[gl_SubgroupID + 8u] = sum_beta;");
+
+    const qk_norm = @embedFile("shaders/ssm_qk_norm.comp");
+    try expectContains(qk_norm, "gl_NumSubgroups > 1u");
+    try expectContains(qk_norm, "s_reduce[gl_SubgroupID + 8u] = k_sum;");
+
+    const cols8 = @embedFile("shaders/ssm_delta_net_cols8.comp");
+    try expectContains(cols8, "uint lane = tid % LANES_PER_ROW;");
+    try expectContains(cols8, "uint row_slot = tid / LANES_PER_ROW;");
+    try expectContains(cols8, "gl_NumSubgroups > 1u");
+
+    const cols8_normed = @embedFile("shaders/ssm_delta_net_cols8_normed.comp");
+    try expectContains(cols8_normed, "uint tid = gl_LocalInvocationID.x;");
+    try expectContains(cols8_normed, "uint row_slot = tid / LANES_PER_ROW;");
 }
 
 test "Vulkan Qwen 3.6 MoE top-k caps default to full metadata top-k on Intel" {
