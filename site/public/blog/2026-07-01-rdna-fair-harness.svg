@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Fair RDNA benchmark harness for ZINC and llama.cpp</title>
+  <desc id="desc">A flow diagram showing the fair benchmark setup: same RDNA node, same GGUF files, reusable ZINC and llama.cpp servers, four prompt scenarios, one warmup run discarded, three measured runs, medians published to the benchmark dashboard.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#1c2618"/>
+    </linearGradient>
+    <linearGradient id="box" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#142238"/>
+      <stop offset="1" stop-color="#172f2b"/>
+    </linearGradient>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .title { fill: #f8fbff; font-size: 34px; font-weight: 820; }
+      .muted { fill: #a9b8c9; font-size: 15px; }
+      .boxTitle { fill: #f7fbff; font-size: 18px; font-weight: 760; }
+      .boxCopy { fill: #b9c7d7; font-size: 13px; }
+      .arrow { stroke: #66e6a3; stroke-width: 4; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+      .split { stroke: #39516c; stroke-width: 2; stroke-dasharray: 8 9; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#66e6a3"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="620" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">How we measure the AMD numbers</text>
+  <text x="56" y="96" class="muted">The harness exists to avoid the old mistake: comparing a cold one-shot CLI path against a warm server.</text>
+
+  <g transform="translate(40 144)">
+    <rect x="0" y="0" width="210" height="118" rx="10" fill="url(#box)" stroke="#36506b"/>
+    <text x="22" y="34" class="boxTitle">One clean RDNA node</text>
+    <text x="22" y="62" class="boxCopy">Radeon AI PRO R9700</text>
+    <text x="22" y="84" class="boxCopy">32 GB VRAM, 576 GB/s</text>
+    <text x="22" y="106" class="boxCopy">No competing GPU jobs</text>
+
+    <path class="arrow" d="M230 59 H268" marker-end="url(#arrowhead)"/>
+
+    <rect x="290" y="-58" width="245" height="118" rx="10" fill="url(#box)" stroke="#36506b"/>
+    <text x="312" y="-24" class="boxTitle">ZINC server</text>
+    <text x="312" y="4" class="boxCopy">Current source tree</text>
+    <text x="312" y="26" class="boxCopy">zig build -Doptimize=ReleaseFast</text>
+    <text x="312" y="48" class="boxCopy">Reusable server per model</text>
+
+    <rect x="290" y="116" width="245" height="118" rx="10" fill="url(#box)" stroke="#36506b"/>
+    <text x="312" y="150" class="boxTitle">llama.cpp server</text>
+    <text x="312" y="178" class="boxCopy">Same host, same model files</text>
+    <text x="312" y="200" class="boxCopy">Reusable baseline server</text>
+    <text x="312" y="222" class="boxCopy">Same prompt matrix</text>
+
+    <path class="split" d="M270 59 C282 59 280 1 290 1"/>
+    <path class="split" d="M270 59 C282 59 280 175 290 175"/>
+
+    <path class="arrow" d="M557 1 H593" marker-end="url(#arrowhead)"/>
+    <path class="arrow" d="M557 175 H593" marker-end="url(#arrowhead)"/>
+
+    <rect x="615" y="40" width="220" height="134" rx="10" fill="url(#box)" stroke="#36506b"/>
+    <text x="637" y="74" class="boxTitle">Four real scenarios</text>
+    <text x="637" y="102" class="boxCopy">Quick Chat</text>
+    <text x="637" y="124" class="boxCopy">Coding Review</text>
+    <text x="637" y="146" class="boxCopy">Incident Context</text>
+    <text x="637" y="168" class="boxCopy">Long Coding Draft</text>
+
+    <path class="arrow" d="M857 107 H875" marker-end="url(#arrowhead)"/>
+
+    <rect x="895" y="40" width="260" height="134" rx="10" fill="url(#box)" stroke="#36506b"/>
+    <text x="917" y="74" class="boxTitle">Published medians</text>
+    <text x="917" y="102" class="boxCopy">1 warmup discarded</text>
+    <text x="917" y="124" class="boxCopy">3 measured runs</text>
+    <text x="917" y="146" class="boxCopy">Prefill, decode, latency</text>
+    <text x="917" y="168" class="boxCopy">Provenance in JSON</text>
+  </g>
+
+  <g transform="translate(92 468)">
+    <rect x="0" y="0" width="1016" height="86" rx="10" fill="#101b2b" stroke="#2a4057"/>
+    <text x="24" y="34" fill="#f7fbff" font-size="18" font-weight="760">The percent score is time-based, not a vanity average.</text>
+    <text x="24" y="62" fill="#a9b8c9" font-size="14">For each comparable row: phase seconds = prompt tokens / prefill TPS + generated tokens / decode TPS. Overall percent = llama.cpp phase seconds / ZINC phase seconds.</text>
+  </g>
+</svg>

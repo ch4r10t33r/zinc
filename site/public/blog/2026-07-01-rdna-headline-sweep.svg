@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">ZINC RDNA headline benchmark sweep against llama.cpp</title>
+  <desc id="desc">A heatmap of the July 1 ZINC RDNA benchmark artifact. The five headline rows all show ZINC above llama.cpp for prefill, decode, end-to-end throughput, and phase-combined overall.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="1" stop-color="#13271f"/>
+    </linearGradient>
+    <linearGradient id="cell" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#41e29a"/>
+      <stop offset="1" stop-color="#9df26e"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .muted { fill: #a7b6c7; font-size: 15px; }
+      .label { fill: #f7fbff; font-size: 17px; font-weight: 760; }
+      .small { fill: #9aacbd; font-size: 13px; }
+      .cellText { fill: #062015; font-size: 21px; font-weight: 820; text-anchor: middle; dominant-baseline: central; }
+      .cellSub { fill: #0d3524; font-size: 11px; font-weight: 700; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="760" fill="url(#bg)"/>
+  <g transform="translate(56 54)">
+    <text x="0" y="0" fill="#f8fbff" font-size="34" font-weight="820">AMD RDNA: ZINC is ahead on every headline dimension</text>
+    <text x="0" y="34" class="muted">Current public artifact: Radeon AI PRO R9700, same GGUF files, reusable ZINC and llama.cpp servers, medians after warmup.</text>
+    <text x="0" y="58" class="muted">Cells show ZINC as percent of llama.cpp. 100% means parity. Above 100% means ZINC is faster.</text>
+  </g>
+
+  <g transform="translate(56 136)" filter="url(#shadow)">
+    <rect x="0" y="0" width="1088" height="540" rx="10" fill="#0c1726" stroke="#294059"/>
+
+    <text x="28" y="48" class="small">Model</text>
+    <text x="530" y="48" class="small" text-anchor="middle">Prefill</text>
+    <text x="710" y="48" class="small" text-anchor="middle">Decode</text>
+    <text x="890" y="48" class="small" text-anchor="middle">End-to-end</text>
+    <text x="1030" y="48" class="small" text-anchor="middle">Overall</text>
+
+    <line x1="28" x2="1060" y1="72" y2="72" stroke="#263b52"/>
+
+    <g transform="translate(28 98)">
+      <text x="0" y="25" class="label">Gemma 4 26B-A4B MoE</text>
+      <text x="0" y="47" class="small">Q4_K_M - sparse Gemma row</text>
+      <rect x="430" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="496" y="25" class="cellText">163%</text>
+      <text x="496" y="44" class="cellSub">809 vs 497</text>
+      <rect x="610" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="676" y="25" class="cellText">111%</text>
+      <text x="676" y="44" class="cellSub">114 vs 102</text>
+      <rect x="790" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="856" y="25" class="cellText">110%</text>
+      <text x="856" y="44" class="cellSub">130 vs 119</text>
+      <rect x="970" y="0" width="72" height="58" rx="8" fill="url(#cell)"/>
+      <text x="1006" y="30" class="cellText" font-size="18">115%</text>
+    </g>
+
+    <g transform="translate(28 180)">
+      <text x="0" y="25" class="label">Gemma 4 31B Dense</text>
+      <text x="0" y="47" class="small">Q4_K_M - dense Gemma row</text>
+      <rect x="430" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="496" y="25" class="cellText">125%</text>
+      <text x="496" y="44" class="cellSub">249 vs 200</text>
+      <rect x="610" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="676" y="25" class="cellText">101%</text>
+      <text x="676" y="44" class="cellSub">28.8 vs 28.5</text>
+      <rect x="790" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="856" y="25" class="cellText">101%</text>
+      <text x="856" y="44" class="cellSub">38.7 vs 38.2</text>
+      <rect x="970" y="0" width="72" height="58" rx="8" fill="url(#cell)"/>
+      <text x="1006" y="30" class="cellText" font-size="18">103%</text>
+    </g>
+
+    <g transform="translate(28 262)">
+      <text x="0" y="25" class="label">Qwen 3.5 9B Dense</text>
+      <text x="0" y="47" class="small">Q4_K_M - small interactive model</text>
+      <rect x="430" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="496" y="25" class="cellText">135%</text>
+      <text x="496" y="44" class="cellSub">739 vs 549</text>
+      <rect x="610" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="676" y="25" class="cellText">114%</text>
+      <text x="676" y="44" class="cellSub">97.5 vs 85.5</text>
+      <rect x="790" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="856" y="25" class="cellText">113%</text>
+      <text x="856" y="44" class="cellSub">107 vs 94</text>
+      <rect x="970" y="0" width="72" height="58" rx="8" fill="url(#cell)"/>
+      <text x="1006" y="30" class="cellText" font-size="18">115%</text>
+    </g>
+
+    <g transform="translate(28 344)">
+      <text x="0" y="25" class="label">Qwen 3.6 27B Dense</text>
+      <text x="0" y="47" class="small">Q4_K_M - larger dense Qwen row</text>
+      <rect x="430" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="496" y="25" class="cellText">116%</text>
+      <text x="496" y="44" class="cellSub">213 vs 184</text>
+      <rect x="610" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="676" y="25" class="cellText">104%</text>
+      <text x="676" y="44" class="cellSub">32.0 vs 30.7</text>
+      <rect x="790" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="856" y="25" class="cellText">106%</text>
+      <text x="856" y="44" class="cellSub">39.2 vs 36.9</text>
+      <rect x="970" y="0" width="72" height="58" rx="8" fill="url(#cell)"/>
+      <text x="1006" y="30" class="cellText" font-size="18">105%</text>
+    </g>
+
+    <g transform="translate(28 426)">
+      <text x="0" y="25" class="label">Qwen 3.6 35B A3B MoE</text>
+      <text x="0" y="47" class="small">Q4_K_XL - fastest measured RDNA decode</text>
+      <rect x="430" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="496" y="25" class="cellText">136%</text>
+      <text x="496" y="44" class="cellSub">540 vs 397</text>
+      <rect x="610" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="676" y="25" class="cellText">154%</text>
+      <text x="676" y="44" class="cellSub">166.8 vs 108.5</text>
+      <rect x="790" y="0" width="132" height="58" rx="8" fill="url(#cell)"/>
+      <text x="856" y="25" class="cellText">142%</text>
+      <text x="856" y="44" class="cellSub">156 vs 110</text>
+      <rect x="970" y="0" width="72" height="58" rx="8" fill="url(#cell)"/>
+      <text x="1006" y="30" class="cellText" font-size="18">151%</text>
+    </g>
+  </g>
+
+  <text x="56" y="716" fill="#8fa2b7" font-size="13">Overall is phase-combined prompt+decode throughput, computed from prompt tokens / prefill TPS plus output tokens / decode TPS. Source: site/src/data/zinc-performance.json generated 2026-07-01.</text>
+</svg>
