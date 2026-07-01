@@ -10,25 +10,25 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
 
 <BaseLayout
   title="Stepan Zolotukhin"
-  description="Building ZINC — a Zig + Vulkan LLM inference engine for AMD RDNA3/RDNA4 consumer GPUs. Writing about local AI, GPU programming, and systems engineering."
-  keywords="Stepan Zolotukhin, ZINC, LLM inference, AMD GPU, RDNA4, RDNA3, Vulkan compute, Zig, TurboQuant, local AI, GPU programming"
+  description="Building ZINC — a local LLM inference engine for consumer GPUs. Writing about local AI, GPU programming, and systems engineering."
+  keywords="Stepan Zolotukhin, ZINC, LLM inference, consumer GPU inference, AMD GPU, Apple Silicon, NVIDIA RTX, Intel Arc, Vulkan compute, Metal, CUDA, Zig, TurboQuant, local AI, GPU programming"
   jsonLd={{
     '@context': 'https://schema.org',
     '@type': 'WebSite',
     name: 'Stepan Zolotukhin',
     url: 'https://zolotukhin.ai',
-    description: 'Building ZINC — a local LLM inference engine for AMD GPUs and Apple Silicon.',
+    description: 'Building ZINC — a local LLM inference engine for consumer GPUs.',
   }}
 >
   <section class="hero">
     <h1>Stepan Zolotukhin</h1>
-    <p>I'm building <a href="/zinc/">ZINC</a>, a local LLM inference engine for AMD GPUs and Apple Silicon. This site is where I write about the work — GPU kernels, Vulkan and Metal compute, quantization, and the systems engineering underneath.</p>
+    <p>I'm building <a href="/zinc/">ZINC</a>, a local LLM inference engine for consumer GPUs. This site is where I write about the work — GPU kernels, Vulkan, Metal, CUDA, quantization, and the systems engineering underneath.</p>
   </section>
 
   <section class="project-highlight">
     <a href="/zinc/" class="project-card">
       <h2>ZINC</h2>
-      <p>Local LLM inference on AMD GPUs and Apple Silicon — hand-tuned Vulkan and Metal shaders, no ROCm, no MLX, one binary. 37.95 tok/s on RDNA4 with a 35B model, native Apple Silicon support via Metal.</p>
+      <p>Local LLM inference for consumer GPUs — AMD Radeon via Vulkan, Apple Silicon via Metal, NVIDIA RTX via CUDA experiments, and Intel Arc bring-up. The current strongest measured path is AMD RDNA4, where ZINC beats llama.cpp across the five-model headline sweep.</p>
       <span class="project-link">Learn more &rarr;</span>
     </a>
   </section>

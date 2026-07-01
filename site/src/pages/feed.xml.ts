@@ -8,7 +8,7 @@ export async function GET(context: APIContext) {
 
   return rss({
     title: 'Stepan Zolotukhin — zolotukhin.ai',
-    description: 'Writing about ZINC, local LLM inference on AMD GPUs, Vulkan compute, Zig, and systems engineering.',
+    description: 'Writing about ZINC, local LLM inference on consumer GPUs, GPU compute, Zig, and systems engineering.',
     site: context.site!.toString(),
     items: posts.map(post => ({
       title: post.data.title,
