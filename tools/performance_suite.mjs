@@ -927,6 +927,23 @@ function remoteEnvPrefix(creds) {
   return entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
 }
 
+const REMOTE_ZINC_TUNING_ENV_KEYS = [
+  "ZINC_BATCHED_PREFILL",
+  "ZINC_INTEL_BATCHED_PREFILL",
+  "ZINC_INTEL_BATCHED_PREFILL_CHUNK",
+  "ZINC_MUL_MM_PROJ",
+  "ZINC_PREFILL_PROFILE",
+];
+
+function collectRemoteZincTuningEnv(dotEnv) {
+  const env = {};
+  for (const key of REMOTE_ZINC_TUNING_ENV_KEYS) {
+    const value = process.env[key] ?? dotEnv[key];
+    if (value != null && value !== "") env[key] = value;
+  }
+  return env;
+}
+
 export function llamaDeviceArgs(device) {
   return !device || device === "none" ? [] : ["--device", device];
 }
@@ -2559,6 +2576,7 @@ async function buildIntelConfig(args) {
   const intelLlamaDeviceArgs = llamaDeviceArgs(llamaDevice);
   const remoteEnv = {
     PATH: `${remoteZigDir}:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin`,
+    ...collectRemoteZincTuningEnv(dotEnv),
   };
   const llamaSearchRoots = [
     `${remoteHome}/llama.cpp`,
