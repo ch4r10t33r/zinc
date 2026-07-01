@@ -1814,12 +1814,13 @@ __device__ __forceinline__ float zinc_dmmv_q4k_fast_sum(const unsigned* a_u32, u
 
 extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x;
+    unsigned tok = blockIdx.y;
     if (row >= pc.M) return;
     unsigned bpr = pc.K >> 8;
     unsigned a_base = (pc.a_offset >> 2) + row * bpr * 36u;
-    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2) + (size_t)tok * pc.K);
     float sum = zinc_dmmv_q4k_fast_sum(a_u32, a_base, xv, bpr);
-    if (threadIdx.x == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    if (threadIdx.x == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
 
 // ---- dmmv_q4k_fast_dual — fuse two same-input Q4_K matvecs into ONE launch ----
@@ -1845,10 +1846,11 @@ extern "C" __global__ void dmmv_q4k_fast_dual(const unsigned* a0, const unsigned
 // ---- dmmv_q6k_fast (perf research) — port of tuned Vulkan dmmv_q6k -----------
 extern "C" __global__ void dmmv_q6k_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x;
+    unsigned tok = blockIdx.y;
     if (row >= pc.M) return;
     unsigned bpr = pc.K >> 8;
     const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 210u;
-    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2) + (size_t)tok * pc.K);
     unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
     unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
     unsigned xvib = (half_id * 128u + e_start) >> 2, ngrp = blockDim.x >> 4;
@@ -1873,15 +1875,16 @@ extern "C" __global__ void dmmv_q6k_fast(const unsigned char* a, const float* x,
         }
     }
     sum = zinc_block_reduce_sum(sum);
-    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
 
 // ---- dmmv_q5k_fast (perf research) — q4k_fast + Q5_K qh high-bit promote -----
 extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
+    unsigned tok = blockIdx.y;
     unsigned bpr = pc.K >> 8;
     unsigned a_base = (pc.a_offset >> 2) + row * bpr * 44u;       // 176 bytes/block
-    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2) + (size_t)tok * pc.K);
     unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
     unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
     unsigned l0 = 4u * (2u * ir + v_in);
@@ -1909,7 +1912,7 @@ extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, 
         #undef Q5
     }
     sum = zinc_block_reduce_sum(sum);
-    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
 // ---- batched MoE expert matvecs ---------------------------------------------
 // One launch over ALL n_used experts: block `g` handles (expert e=g/M, row=g%M).
@@ -2896,9 +2899,10 @@ extern "C" __global__ void gemm_q6k_experts_grouped_tc(const unsigned char* a, c
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
+    unsigned tok = blockIdx.y;
     unsigned bpr = pc.K >> 5;
     const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 34u;
-    unsigned xb0 = pc.x_offset >> 2, tid = threadIdx.x;
+    unsigned xb0 = (pc.x_offset >> 2) + (size_t)tok * pc.K, tid = threadIdx.x;
     float sum = 0.0f;
     for (unsigned b = tid; b < bpr; b += blockDim.x) {
         const unsigned char* blk = arow + (size_t)b * 34u;
@@ -2909,7 +2913,7 @@ extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x
         for (unsigned j = 0; j < 8u; j++) { float4 xx = xb[j]; sum += d * ((float)qs[j*4]*xx.x + (float)qs[j*4+1]*xx.y + (float)qs[j*4+2]*xx.z + (float)qs[j*4+3]*xx.w); }
     }
     sum = zinc_block_reduce_sum(sum);
-    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
 
 // ---- dmmv_q4k multi-row (perf research, agenda 1: small/mid-M occupancy) -----

@@ -2118,13 +2118,14 @@ pub const ForwardCuda = struct {
                 cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             }
         } else {
-            var t: u32 = 0;
-            while (t < T) : (t += 1) {
-                const push = DmmvPush{ .M = M, .K = K, .x_offset = t * K * 4, .y_offset = t * M * 4 };
-                if (idx < 4) {
-                    cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
-                } else {
-                    cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+            const push = DmmvPush{ .M = M, .K = K };
+            if (idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, T, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+            } else {
+                var t: u32 = 0;
+                while (t < T) : (t += 1) {
+                    const tp = DmmvPush{ .M = M, .K = K, .x_offset = t * K * 4, .y_offset = t * M * 4 };
+                    cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &tp, @sizeOf(DmmvPush), 0);
                 }
             }
         }
