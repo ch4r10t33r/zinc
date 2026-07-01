@@ -918,17 +918,24 @@ const LayerTensors = struct {
 /// guards the env flag so enabling it on an unsupported model is a no-op.
 fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
     // Intel Arc can compile the serial Q4_K/Q6_K batch shaders, but the BMG
-    // G31 path can still fence-fail under the full prefill graph. Keep it
-    // opt-in until the Intel batched path is validated end-to-end.
+    // G31 path can still fence-fail under the full prefill graph. Keep the
+    // broad Intel path opt-in, but allow dense Gemma by default with the
+    // Intel chunking guard below; that is the supported Intel benchmark case.
     const vendor = engine.gpu_config.vendor;
     const is_amd = vendor == .amd_rdna3 or vendor == .amd_rdna4 or vendor == .amd_rdna4_apu;
     const is_intel = isIntelGpuVendor(vendor);
     if (!is_amd and !is_intel) return false;
+    const cfg = engine.model.config;
     if (is_intel) {
         const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
-        if (intel_batched_env == null or !std.mem.eql(u8, intel_batched_env.?, "1")) return false;
+        const intel_batched_explicitly_on = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
+        const intel_batched_explicitly_off = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "0");
+        const intel_dense_gemma_default =
+            cfg.architecture == .gemma and
+            cfg.n_experts == 0 and
+            cfg.ssm_d_inner == 0;
+        if (intel_batched_explicitly_off or (!intel_batched_explicitly_on and !intel_dense_gemma_default)) return false;
     }
-    const cfg = engine.model.config;
     if (cfg.n_experts > 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
     if (cfg.architecture == .gpt_oss) return false;
@@ -996,7 +1003,7 @@ fn isIntelGpuVendor(vendor: GpuVendor) bool {
 
 fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
     if (!isIntelGpuVendor(vendor)) return 0;
-    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 0;
+    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 96;
     if (std.mem.eql(u8, raw, "0")) return 0;
     return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
@@ -24765,9 +24772,14 @@ pub const InferenceEngine = struct {
                 cfg.rope_freq_base_swa
             else
                 cfg.rope_freq_base;
+            const use_fused_qk_kv_batched = self.use_fused_qk_kv and
+                !(isIntelGpuVendor(self.gpu_config.vendor) and
+                    cfg.architecture == .gemma and
+                    cfg.n_experts == 0 and
+                    cfg.ssm_d_inner == 0);
 
             var fused_qk_rope_kv = false;
-            if (self.use_fused_qk_kv and
+            if (use_fused_qk_kv_batched and
                 layer_is_swa_rope and
                 apply_v_unit_norm and
                 lt.attn_q_norm != null and
@@ -24816,7 +24828,10 @@ pub const InferenceEngine = struct {
             }
 
             if (!fused_qk_rope_kv) {
-                const fused_full_kv = try self.dispatchGemmaFullAttnKvFusedBatched(layer_idx, scratch_q, scratch_k, layer_head_dim, layer_rope_dim, layer_n_kv_heads, n_tokens, base_token, eps);
+                const fused_full_kv = if (use_fused_qk_kv_batched)
+                    try self.dispatchGemmaFullAttnKvFusedBatched(layer_idx, scratch_q, scratch_k, layer_head_dim, layer_rope_dim, layer_n_kv_heads, n_tokens, base_token, eps)
+                else
+                    false;
                 if (!fused_full_kv) {
                     const have_head_norms = apply_v_unit_norm or lt.attn_q_norm != null or lt.attn_k_norm != null;
                     const attention_head_norms_phase = if (have_head_norms) self.beginProfilePhase() else null;

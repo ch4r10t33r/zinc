@@ -31,6 +31,11 @@ function formatMultiplier(zinc: number | null | undefined, baseline: number | nu
   return `${(zinc / baseline).toFixed(2)}x`;
 }
 
+function formatPercent(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return 'n/a';
+  return `${Math.round(value)}%`;
+}
+
 function formatRefreshDate(iso: string | null | undefined) {
   return iso?.slice(0, 10) ?? 'latest';
 }
@@ -58,9 +63,9 @@ const rdna35Decode = metricMedian(rdna35?.zinc?.decode_tps);
 const rdna35BaselineDecode = metricMedian(rdna35?.baseline?.decode_tps);
 const metal35Decode = metricMedian(metal35?.zinc?.decode_tps);
 
-const homeDescription = `Local LLM inference on AMD Radeon GPUs (RX 9070 XT, RX 7900 XTX, Radeon AI PRO R9700) and Apple Silicon. ${formatTokNumber(rdna35Decode)} tok/s on RDNA4 — ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same card, no ROCm.`;
-const appDescription = `LLM inference engine for AMD Radeon GPUs (RDNA4/RDNA3) and Apple Silicon, built with Zig, Vulkan compute shaders, and Metal. ${formatTokNumber(rdna35Decode)} tok/s on RDNA4 for Qwen3.6-35B-A3B, ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same card.`;
-const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL - ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same machine. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
+const homeDescription = `Fastest measured local LLM inference for AMD Radeon GPUs. ZINC beats llama.cpp across the current five-model RDNA4 suite, led by ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B — ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp, no ROCm.`;
+const appDescription = `LLM inference engine for AMD Radeon GPUs (RDNA4/RDNA3) and Apple Silicon, built with Zig, Vulkan compute shaders, and Metal. The current RDNA4 sweep beats llama.cpp on all five published models.`;
+const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL - ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same machine. The current RDNA4 suite is ahead of llama.cpp on decode, prefill, and model-level overall across all five published models. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
 
 function ratioX(zinc: number | null | undefined, baseline: number | null | undefined) {
   if (zinc == null || baseline == null || Number.isNaN(zinc) || Number.isNaN(baseline) || baseline <= 0) return null;
@@ -95,6 +100,8 @@ function buildBoard(target: any, ids: string[]) {
       baselineDecode: metricMedian(model.baseline?.decode_tps),
       zincPrefill: metricMedian(model.zinc?.prefill_tps),
       baselinePrefill: metricMedian(model.baseline?.prefill_tps),
+      overallPct: model.comparison?.overall_pct_of_baseline ?? null,
+      endToEndPct: model.comparison?.end_to_end_pct_of_baseline ?? null,
     }));
   const decodeMax = Math.max(0, ...rows.flatMap((r) => [r.zincDecode, r.baselineDecode]).filter((v): v is number => v != null && !Number.isNaN(v)));
   const prefillMax = Math.max(0, ...rows.flatMap((r) => [r.zincPrefill, r.baselinePrefill]).filter((v): v is number => v != null && !Number.isNaN(v)));
@@ -117,10 +124,10 @@ const metalBoard = buildBoard(metalTarget, [
   'qwen36-27b-q4k-m',
 ]);
 
-const rdnaFlagshipRatio = ratioX(rdna35Decode, rdna35BaselineDecode);
-const benchmarkedModelCount = new Set(
-  benchmarkData.targets.flatMap((t: any) => (t.models ?? []).map((m: any) => m.id)),
-).size;
+const rdnaModelCount = rdnaBoard.rows.length;
+const rdnaDecodeWins = rdnaBoard.rows.filter((row) => (ratioX(row.zincDecode, row.baselineDecode) ?? 0) >= 1).length;
+const rdnaPrefillWins = rdnaBoard.rows.filter((row) => (ratioX(row.zincPrefill, row.baselinePrefill) ?? 0) >= 1).length;
+const rdnaOverallWins = rdnaBoard.rows.filter((row) => (row.overallPct ?? 0) >= 100).length;
 
 const jsonLd = {
   '@context': 'https://schema.org',
@@ -199,7 +206,7 @@ const jsonLd = {
 ---
 
 <BaseLayout
-  title="ZINC — LLM Inference Engine for AMD GPUs & Apple Silicon"
+  title="ZINC — Fastest Measured AMD LLM Inference Without ROCm"
   description={homeDescription}
   keywords="ZINC, AMD GPU LLM inference, AMD inference engine, Radeon LLM inference, RDNA4 inference, RDNA3 inference, run LLM on AMD GPU without ROCm, RX 9070 XT, RX 9070, RX 7900 XTX, RX 7900 XT, RX 7800 XT, RX 7700 XT, RX 7600, Radeon AI PRO R9700, Vulkan compute, Zig, TurboQuant, KV cache compression, vLLM alternative, llama.cpp alternative, ROCm alternative, OpenAI compatible API, local AI, Apple Silicon Metal inference, GGUF, Qwen, Gemma"
   jsonLd={jsonLd}
@@ -207,9 +214,10 @@ const jsonLd = {
   <Breadcrumbs items={breadcrumbItems} />
   <section class="hero">
     <img src="/zinc-logo.png" alt="ZINC inference engine logo — lightning bolt on circuit board" class="logo" width="120" height="120" />
-    <h1>ZINC — LLM Inference Engine for AMD GPUs &amp; Apple Silicon</h1>
-    <p class="tagline">Fast local LLM inference on AMD Radeon GPUs (RDNA4 &amp; RDNA3) and Apple Silicon. Hand-tuned Vulkan and Metal shaders — no ROCm, no MLX.</p>
-    <p class="hero-platforms"><strong>Runs on:</strong> Linux (AMD Radeon, Intel Arc Xe2 — experimental) or macOS (Apple Silicon M1–M5). <strong>Windows is not supported.</strong></p>
+    <p class="hero-eyebrow">AMD RDNA4 local LLM inference</p>
+    <h1>Fastest measured local inference for AMD GPUs</h1>
+    <p class="tagline">ZINC beats llama.cpp across the current five-model RDNA4 headline sweep: decode, prefill, end-to-end, and model-level overall. Hand-tuned Vulkan shaders, no ROCm.</p>
+    <p class="hero-platforms"><strong>Runs on:</strong> Linux (AMD Radeon, Intel Arc Xe2 — experimental) and macOS (Apple Silicon M1–M5). <strong>Windows is not supported.</strong></p>
     <div class="hero-links">
       <a href="https://github.com/zolotukhin/zinc" class="hero-link">
         <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -224,6 +232,69 @@ const jsonLd = {
         Join ZINC Discord
       </a>
     </div>
+  </section>
+
+  <section class="amd-sweep" aria-labelledby="amd-sweep-heading">
+    <div class="sweep-header">
+      <div>
+        <p class="section-kicker">Current public sweep</p>
+        <h2 id="amd-sweep-heading">AMD RDNA4 — Radeon AI PRO R9700</h2>
+      </div>
+      <span class="sweep-machine">32 GB VRAM · 576 GB/s · {formatRefreshDate(rdnaTarget?.generated_at)}</span>
+    </div>
+
+    <div class="perf-stats">
+      <article class="perf-stat highlight">
+        <strong>{rdnaDecodeWins}/{rdnaModelCount}</strong>
+        <span>decode wins</span>
+        <small>ZINC vs llama.cpp</small>
+      </article>
+      <article class="perf-stat">
+        <strong>{rdnaPrefillWins}/{rdnaModelCount}</strong>
+        <span>prefill wins</span>
+        <small>same prompts, same weights</small>
+      </article>
+      <article class="perf-stat">
+        <strong>{rdnaOverallWins}/{rdnaModelCount}</strong>
+        <span>overall wins</span>
+        <small>phase wall-time basis</small>
+      </article>
+      <article class="perf-stat">
+        <strong>{formatTokNumber(rdna35Decode, 1)}</strong>
+        <span>tok/s top decode</span>
+        <small>Qwen3.6 35B A3B</small>
+      </article>
+    </div>
+
+    <div class="perf-board rdna-showcase" role="img" aria-label="ZINC vs llama.cpp throughput on AMD RDNA4">
+      <div class="perf-board-legend">
+        <span><i class="perf-swatch zinc"></i>ZINC</span>
+        <span><i class="perf-swatch baseline"></i>llama.cpp</span>
+        <span class="perf-board-note">decode tok/s · higher is better</span>
+      </div>
+      {rdnaBoard.rows.map((row) => (
+        <article class="perf-bench-row">
+          <div class="perf-bench-head">
+            <strong>{row.label}</strong>
+            <span class:list={['perf-ratio', ratioTone(row.zincDecode, row.baselineDecode)]}>{formatRatioX(row.zincDecode, row.baselineDecode)} llama.cpp</span>
+          </div>
+          <div class="perf-bar">
+            <span class="perf-bar-tag">ZINC</span>
+            <div class="perf-track"><i class="perf-fill zinc" style={`width:${barPct(row.zincDecode, rdnaBoard.decodeMax)}%`}></i></div>
+            <span class="perf-bar-val">{formatTok(row.zincDecode, 1)}</span>
+          </div>
+          <div class="perf-bar">
+            <span class="perf-bar-tag muted">llama</span>
+            <div class="perf-track"><i class="perf-fill baseline" style={`width:${barPct(row.baselineDecode, rdnaBoard.decodeMax)}%`}></i></div>
+            <span class="perf-bar-val">{formatTok(row.baselineDecode, 1)}</span>
+          </div>
+          <p class="perf-prefill">
+            Prefill <strong>{formatTok(row.zincPrefill, 0)}</strong> ZINC · {formatTok(row.baselinePrefill, 0)} llama.cpp · Overall <strong>{formatPercent(row.overallPct)}</strong>
+          </p>
+        </article>
+      ))}
+    </div>
+    <p class="perf-caption">Measured with the fair server-vs-server suite: one reusable ZINC server per model, one reusable llama.cpp server per model, same GGUF files, same scenario matrix, same warmup/run count, and server-side timing. We are still cooking: the next work is widening the narrow Gemma 31B margin and extending the sweep across more scenarios.</p>
   </section>
 
   <section class="demo-panel">
@@ -260,61 +331,9 @@ const jsonLd = {
       </tbody>
     </table>
 
-    <h2>Performance</h2>
+    <h2>Other measured targets</h2>
 
-    <p>Every number below is a measured median from the public perf suite, with ZINC and llama.cpp built and run back-to-back on the same machine (<code>zig build -Doptimize=ReleaseFast</code>) — not a projected target. Full breakdown with prefill latency, scenarios, and run provenance lives on <a href="/zinc/benchmarks/">the benchmarks dashboard</a>.</p>
-
-    <div class="perf-stats">
-      <article class="perf-stat">
-        <strong>{formatTokNumber(rdna35Decode, 1)}</strong>
-        <span>tok/s decode</span>
-        <small>Qwen3.6-35B-A3B · RDNA4</small>
-      </article>
-      <article class="perf-stat highlight">
-        <strong>{rdnaFlagshipRatio ? `${rdnaFlagshipRatio.toFixed(2)}x` : 'n/a'}</strong>
-        <span>vs llama.cpp</span>
-        <small>same R9700, decode</small>
-      </article>
-      <article class="perf-stat">
-        <strong>2</strong>
-        <span>GPU backends</span>
-        <small>AMD Vulkan + Apple Metal</small>
-      </article>
-      <article class="perf-stat">
-        <strong>{benchmarkedModelCount}</strong>
-        <span>models benchmarked</span>
-        <small>Qwen 3 / 3.5 / 3.6 + Gemma 4</small>
-      </article>
-    </div>
-
-    <h3 class="perf-heading">AMD RDNA4 — Radeon AI PRO R9700 <span class="perf-sub">32 GB · 576 GB/s · {formatRefreshDate(rdnaTarget?.generated_at)}</span></h3>
-    <div class="perf-board" role="img" aria-label="ZINC vs llama.cpp decode throughput on AMD RDNA4">
-      <div class="perf-board-legend">
-        <span><i class="perf-swatch zinc"></i>ZINC</span>
-        <span><i class="perf-swatch baseline"></i>llama.cpp</span>
-        <span class="perf-board-note">decode tok/s · higher is better</span>
-      </div>
-      {rdnaBoard.rows.map((row) => (
-        <article class="perf-bench-row">
-          <div class="perf-bench-head">
-            <strong>{row.label}</strong>
-            <span class:list={['perf-ratio', ratioTone(row.zincDecode, row.baselineDecode)]}>{formatRatioX(row.zincDecode, row.baselineDecode)} llama.cpp</span>
-          </div>
-          <div class="perf-bar">
-            <span class="perf-bar-tag">ZINC</span>
-            <div class="perf-track"><i class="perf-fill zinc" style={`width:${barPct(row.zincDecode, rdnaBoard.decodeMax)}%`}></i></div>
-            <span class="perf-bar-val">{formatTok(row.zincDecode, 1)}</span>
-          </div>
-          <div class="perf-bar">
-            <span class="perf-bar-tag muted">llama</span>
-            <div class="perf-track"><i class="perf-fill baseline" style={`width:${barPct(row.baselineDecode, rdnaBoard.decodeMax)}%`}></i></div>
-            <span class="perf-bar-val">{formatTok(row.baselineDecode, 1)}</span>
-          </div>
-          <p class="perf-prefill">Prefill <strong>{formatTok(row.zincPrefill, 0)}</strong> ZINC · {formatTok(row.baselinePrefill, 0)} llama.cpp</p>
-        </article>
-      ))}
-    </div>
-    <p class="perf-caption">Median across the RDNA suite with <code>RADV_PERFTEST=coop_matrix</code>. ZINC leads on the flagship Qwen3.6-35B-A3B MoE and Qwen 3.5 9B decode; prefill remains the active optimization target across the dense and hybrid rows.</p>
+    <p>The AMD board above is the headline path. We also keep publishing the younger Apple Silicon backend with the same benchmark data format, so the gaps are visible instead of hidden. Full breakdown with scenarios and run provenance lives on <a href="/zinc/benchmarks/">the benchmarks dashboard</a>.</p>
 
     <h3 class="perf-heading">Apple Silicon — Mac Studio (M4 Max) <span class="perf-sub">40-core GPU · 64 GB unified · {formatRefreshDate(metalTarget?.generated_at)}</span></h3>
     <div class="perf-board" role="img" aria-label="ZINC vs llama.cpp decode throughput on Apple M4 Max">
@@ -390,20 +409,35 @@ const jsonLd = {
 <style>
   .hero {
     text-align: center;
-    padding: var(--space-xl) 0;
+    padding: var(--space-lg) 0 var(--space-md);
   }
 
   .logo {
-    border-radius: 12px;
-    margin-bottom: var(--space-md);
+    border-radius: 8px;
+    margin-bottom: var(--space-sm);
+  }
+
+  .hero-eyebrow,
+  .section-kicker {
+    margin: 0 0 0.35rem;
+    color: var(--color-accent);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
   }
 
   .hero h1 {
-    font-size: 2rem;
-    margin-bottom: var(--space-xs);
+    max-width: 880px;
+    margin: 0 auto var(--space-sm);
+    font-size: 3.25rem;
+    line-height: 1.02;
+    letter-spacing: 0;
   }
 
   .tagline {
+    max-width: 760px;
+    margin: 0 auto var(--space-xs);
     font-size: 1.1rem;
     color: var(--color-text-muted);
   }
@@ -464,6 +498,29 @@ const jsonLd = {
     border-color: var(--color-accent);
   }
 
+  .amd-sweep {
+    margin: 0 0 var(--space-xl);
+  }
+
+  .sweep-header {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: var(--space-md);
+    margin-bottom: var(--space-sm);
+  }
+
+  .sweep-header h2 {
+    margin: 0;
+  }
+
+  .sweep-machine {
+    flex: 0 0 auto;
+    color: var(--color-text-muted);
+    font-size: 0.82rem;
+    font-variant-numeric: tabular-nums;
+  }
+
   .demo-panel {
     text-align: center;
     margin-bottom: var(--space-xl);
@@ -472,7 +529,7 @@ const jsonLd = {
   .demo-gif {
     width: 100%;
     max-width: 720px;
-    border-radius: 12px;
+    border-radius: 8px;
     border: 1px solid var(--color-border);
     margin-bottom: var(--space-sm);
   }
@@ -531,7 +588,7 @@ const jsonLd = {
 
   .perf-stat {
     border: 1px solid var(--color-border);
-    border-radius: 12px;
+    border-radius: 8px;
     padding: 0.85rem 0.9rem;
     background: var(--color-bg-alt);
     display: flex;
@@ -579,11 +636,18 @@ const jsonLd = {
 
   .perf-board {
     border: 1px solid var(--color-border);
-    border-radius: 12px;
+    border-radius: 8px;
     padding: var(--space-md);
     display: grid;
     gap: 0.9rem;
     margin: var(--space-sm) 0;
+  }
+
+  .rdna-showcase {
+    background: #09090b;
+    border-color: #27272a;
+    color: #f4f4f5;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
   }
 
   .perf-board-legend {
@@ -595,6 +659,11 @@ const jsonLd = {
     color: var(--color-text-muted);
     padding-bottom: 0.5rem;
     border-bottom: 1px solid var(--color-border);
+  }
+
+  .rdna-showcase .perf-board-legend {
+    color: #a1a1aa;
+    border-bottom-color: #27272a;
   }
 
   .perf-board-legend span {
@@ -615,7 +684,7 @@ const jsonLd = {
   }
 
   .perf-swatch.zinc {
-    background: linear-gradient(90deg, #b45309, #f59e0b);
+    background: linear-gradient(90deg, #c2410c, #f59e0b);
   }
 
   .perf-swatch.baseline {
@@ -639,6 +708,11 @@ const jsonLd = {
     font-size: 0.92rem;
   }
 
+  .rdna-showcase .perf-bench-head strong {
+    color: #f4f4f5;
+    font-size: 0.98rem;
+  }
+
   .perf-ratio {
     font-size: 0.72rem;
     font-weight: 700;
@@ -653,6 +727,12 @@ const jsonLd = {
     color: #15803d;
     background: color-mix(in srgb, #22c55e 16%, transparent);
     border-color: color-mix(in srgb, #22c55e 35%, transparent);
+  }
+
+  .rdna-showcase .perf-ratio.win {
+    color: #22c55e;
+    background: rgba(34, 197, 94, 0.14);
+    border-color: rgba(34, 197, 94, 0.36);
   }
 
   .perf-ratio.close {
@@ -680,9 +760,17 @@ const jsonLd = {
     color: var(--color-text);
   }
 
+  .rdna-showcase .perf-bar-tag {
+    color: #f4f4f5;
+  }
+
   .perf-bar-tag.muted {
     color: var(--color-text-muted);
     font-weight: 400;
+  }
+
+  .rdna-showcase .perf-bar-tag.muted {
+    color: #a1a1aa;
   }
 
   .perf-track {
@@ -690,6 +778,11 @@ const jsonLd = {
     border-radius: 999px;
     background: color-mix(in srgb, var(--color-text) 8%, var(--color-bg-alt));
     overflow: hidden;
+  }
+
+  .rdna-showcase .perf-track {
+    height: 14px;
+    background: #27272a;
   }
 
   .perf-fill {
@@ -700,7 +793,7 @@ const jsonLd = {
   }
 
   .perf-fill.zinc {
-    background: linear-gradient(90deg, #b45309, #f59e0b);
+    background: linear-gradient(90deg, #c2410c, #f59e0b);
   }
 
   .perf-fill.baseline {
@@ -712,6 +805,10 @@ const jsonLd = {
     text-align: right;
     font-variant-numeric: tabular-nums;
     color: var(--color-text);
+  }
+
+  .rdna-showcase .perf-bar-val {
+    color: #f4f4f5;
   }
 
   .perf-prefill {
@@ -726,14 +823,53 @@ const jsonLd = {
     font-variant-numeric: tabular-nums;
   }
 
+  .rdna-showcase .perf-prefill {
+    color: #a1a1aa;
+  }
+
+  .rdna-showcase .perf-prefill strong {
+    color: #f4f4f5;
+  }
+
   .perf-caption {
     font-size: 0.82rem;
     color: var(--color-text-muted);
   }
 
   @media (max-width: 560px) {
+    .hero h1 {
+      font-size: 2.35rem;
+    }
+
+    .sweep-header {
+      align-items: start;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .sweep-machine {
+      white-space: normal;
+    }
+
     .perf-stats {
       grid-template-columns: repeat(2, 1fr);
+    }
+
+    .perf-board {
+      padding: 0.9rem;
+    }
+
+    .perf-board-note {
+      width: 100%;
+      margin-left: 0;
+    }
+
+    .perf-bench-head {
+      align-items: flex-start;
+    }
+
+    .perf-bench-head strong {
+      max-width: 100%;
     }
 
     .perf-bar {

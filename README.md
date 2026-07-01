@@ -23,13 +23,27 @@
   </a>
 </p>
 
-> Local LLM inference on consumer GPUs and Apple Silicon — no ROCm, no MLX, one binary.
+> Fastest measured local LLM inference for AMD GPUs. ZINC beats llama.cpp across the current five-model RDNA4 headline sweep — decode, prefill, end-to-end, and model-level overall — with no ROCm.
 
 <p align="center">
   <img src="assets/zinc-chat-demo.gif" alt="ZINC Chat Demo — streaming inference on AMD RDNA4" width="720">
   <br>
   <em>35B parameter model running locally — Zig + Vulkan/Metal, no ROCm, no MLX</em>
 </p>
+
+## AMD RDNA4 Benchmark Sweep
+
+Latest checked-in artifact: 2026-07-01 UTC, Radeon AI PRO R9700, 32 GB VRAM, 576 GB/s. The fair harness runs one reusable ZINC server and one reusable llama.cpp server per model, with the same GGUF, same scenario matrix, same warmup/run count, and server-side timings.
+
+| Model | Decode | Prefill | Overall |
+|-------|-------:|--------:|--------:|
+| Qwen 3.6 35B A3B UD Q4_K_XL | **166.8** vs 108.5 tok/s (**1.54x**) | **540** vs 397 tok/s (**1.36x**) | **151%** |
+| Qwen 3.5 9B Q4_K_M | **97.5** vs 85.5 tok/s (**1.14x**) | **739** vs 549 tok/s (**1.35x**) | **115%** |
+| Qwen 3.6 27B Dense Q4_K_M | **32.0** vs 30.7 tok/s (**1.04x**) | **213** vs 184 tok/s (**1.16x**) | **105%** |
+| Gemma 4 26B-A4B MoE Q4_K_M | **113.7** vs 102.1 tok/s (**1.11x**) | **809** vs 497 tok/s (**1.63x**) | **115%** |
+| Gemma 4 31B Q4_K_M | **28.8** vs 28.5 tok/s (**1.01x**) | **249** vs 200 tok/s (**1.25x**) | **103%** |
+
+Overall is the suite's phase wall-time metric. The narrow row is Gemma 4 31B decode, and the next work is widening that margin while extending the same sweep across more scenarios. We are still cooking.
 
 ## Supported Platforms
 
@@ -51,7 +65,7 @@ Latest checked-in benchmark artifact, same machine, same weights, same prompt:
 
 | Platform | Compared models | Decode vs llama.cpp | Prefill vs llama.cpp | Read this as |
 |----------|----------------:|--------------------:|---------------------:|--------------|
-| AMD RDNA4 / Vulkan | 5 | 117% avg, 5 model wins | 135% avg, 5 model wins | Current RDNA suite is ahead overall; long-context dense decode remains close |
+| AMD RDNA4 / Vulkan | 5 | 117% avg, 5/5 model wins | 135% avg, 5/5 model wins | Clean current sweep: every published RDNA model is ahead on decode, prefill, end-to-end, and model-level overall |
 | Apple Silicon / Metal | 5 | 87% avg, 1 model win | 54% avg, 1 model win | Mixed by model; Gemma 31B and Qwen 35B are closest |
 | Intel Arc / Vulkan | 5 | 102% avg, 3 model wins | 59% avg, 1 model win | Decode is viable; prefill still trails on most rows |
 
@@ -263,11 +277,11 @@ The tables below are pulled directly from the published benchmark data at [zolot
 
 | Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen 3.6 35B A3B UD Q4_K_XL | **488.34** | 394.91 | **124%** | **165.10** | 108.54 | **154%** |
-| Qwen 3.5 9B Q4_K_M | **740.07** | 547.96 | **135%** | **96.79** | 85.43 | **114%** |
-| Gemma 4 26B-A4B MoE Q4_K_M | **808.18** | 497.94 | **162%** | **113.75** | 102.03 | **111%** |
-| Qwen 3.6 27B Dense Q4_K_M | **212.65** | 183.58 | **116%** | **31.97** | 30.65 | **104%** |
-| Gemma 4 31B Q4_K_M | **248.26** | 199.65 | **124%** | **28.82** | 28.55 | **101%** |
+| Qwen 3.6 35B A3B UD Q4_K_XL | **540.33** | 397.08 | **136%** | **166.80** | 108.54 | **154%** |
+| Qwen 3.5 9B Q4_K_M | **738.97** | 549.04 | **135%** | **97.46** | 85.47 | **114%** |
+| Qwen 3.6 27B Dense Q4_K_M | **212.79** | 183.76 | **116%** | **31.97** | 30.65 | **104%** |
+| Gemma 4 26B-A4B MoE Q4_K_M | **809.16** | 496.83 | **163%** | **113.74** | 102.08 | **111%** |
+| Gemma 4 31B Q4_K_M | **248.58** | 199.58 | **125%** | **28.81** | 28.54 | **101%** |
 
 ### Apple Silicon M4 Max (Metal)
 
@@ -300,9 +314,9 @@ For local benchmark commands, harnesses, and methodology, see:
 | Native BPE tokenizer (from GGUF) | Done |
 | GLSL compute shaders (16) | Done |
 | Compute graph + architecture builders | Done |
-| Forward pass (decode loop) | Working — 165.10 tok/s on RDNA4 and 33.86 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
-| Forward pass (prefill loop) | Working — 488.34 tok/s on RDNA4 for Qwen 3.6 35B-A3B; Metal prefill is fast on Qwen 3 8B and Gemma 4 31B but uneven across the catalog |
-| GPU SSM shaders + cmd batching | Done — RDNA decode is 165.10 tok/s on Qwen 3.6 35B |
+| Forward pass (decode loop) | Working — 166.80 tok/s on RDNA4 and 33.86 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
+| Forward pass (prefill loop) | Working — 540.33 tok/s on RDNA4 for Qwen 3.6 35B-A3B; Metal prefill is fast on Qwen 3 8B and Gemma 4 31B but uneven across the catalog |
+| GPU SSM shaders + cmd batching | Done — RDNA decode is 166.80 tok/s on Qwen 3.6 35B |
 | HTTP server + OpenAI API | Done — Qwen 35B-A3B raw API ~100 tok/s on RDNA4 and Metal server path in progress |
 | Continuous batching | Phase 4 |
 | TurboQuant KV compression | Phase 5 |
