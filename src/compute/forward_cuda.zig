@@ -170,6 +170,7 @@ const GemmPush = extern struct {
     x_offset: u32 = 0,
     y_offset: u32 = 0,
     acc_mode: u32 = 0,
+    q8_stride: u32 = 0,
 };
 const ArgmaxPush = extern struct { N: u32 };
 const EmbedPush = extern struct { K: u32, vocab: u32 };
@@ -2069,20 +2070,17 @@ pub const ForwardCuda = struct {
         if (T >= 32 and M >= 64 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
             if (use_q8) {
-                // Pre-quant DP4a path: quantize input to Q8_0, then DP4a multiply
+                // Pre-quant tiled DP4a: quantize input to Q8_0, then tiled DP4a GEMM
                 if (self.batch) |b| {
-                    // Quantize input to Q8_0
                     const qp = QuantActPush{ .K = K };
                     cmd.dispatch(&self.pipes.quantize_act_q8, .{ ceilDiv(K, 256), T, 1 }, .{ 256, 1, 1 }, &.{ x, &b.act_q8 }, &qp, @sizeOf(QuantActPush), 0);
-                    // DP4a GEMM
-                    const q8push = GemmQ8Push{ .M = M, .K = K, .T = T, .a_offset = 0, .x_q8_stride = K / 32 * 34 };
-                    cmd.dispatch(&self.pipes.gemm_q4k_q8_dp4a, .{ ceilDiv(M, 64), T, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.act_q8, y }, &q8push, @sizeOf(GemmQ8Push), 0);
+                    const q8push = GemmPush{ .M = M, .K = K, .T = T, .q8_stride = K / 32 * 34 };
+                    cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, &b.act_q8, y }, &q8push, @sizeOf(GemmPush), 0);
                 } else {
-                    // Fallback to lowsmem if batch scratch not available
                     cmd.dispatch(&self.pipes.gemm_q4k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
                 }
             } else if (use_dp4a) {
-                cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+                cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (idx == 3 and q8TcLowsmemOn()) {
                 cmd.dispatch(&self.pipes.gemm_q8_0_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (idx == 2) {

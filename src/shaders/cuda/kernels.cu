@@ -3333,7 +3333,7 @@ extern "C" __global__ void dmmv_q5k_mr2(const unsigned* a_u32, const float* x, f
 // thread owns one Y[tok,row], mm=warp, tt=lane). W (dequant) reused 32x across
 // tokens, A reused 8x across rows -> both operands served from shared memory.
 // fp32 accumulate (correctness-first; tensor-core inner product is the next step).
-struct GemmPush { unsigned M, K, T, a_offset, x_offset, y_offset, acc_mode; };
+struct GemmPush { unsigned M, K, T, a_offset, x_offset, y_offset, acc_mode, q8_stride; };
 extern "C" __global__ void gemm_q4k_tiled(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
     __shared__ float Ws[256 * 8];   // Ws[e*8 + mm]  (8 rows)
     __shared__ float As[256 * 32];  // As[e*32 + tt] (32 tokens)
@@ -3796,7 +3796,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void gemm_q4k_q8_dp4a(
 // Math: result = d_sc * sum(nib*in)/scale - dm_mn * sum(in)
 //   DP4a computes sum(nib * in_int8) = scale * sum(nib * in)
 //   So: result = d_sc * dp4a / scale - dm_mn * sum_input
-extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A,
+    const unsigned char* Ab_q8, float* Y, GemmPush pc) {
     const unsigned BM=64u, BT=64u, BK=32u;
     __shared__ int Ws_pk[BK/4 * BM];       // [8][64] packed nibble int32
     __shared__ int As_pk[BK/4 * BT];       // [8][64] packed int8 input
@@ -3839,33 +3840,49 @@ extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A, 
             }
         }
         // A: dynamic per-token quantization with warp-reduce max_abs + sum
+        // OR: read pre-quantized Q8_0 if pc.q8_stride > 0
         #pragma unroll
         for (int u=0;u<8;u++){
             unsigned t=wid+(unsigned)u*8u, tok=t0+t;
             if(tok<pc.T){
-                // Each lane reads 1 value (lanes 0-31 → elements 0-31 of BK=32)
-                float val=Ab[(size_t)tok*pc.K+c*32u+lane];
-                float av=fabsf(val), sv=val;
-                // Warp reduce: max_abs and sum
-                for(int o=16;o>0;o>>=1){
-                    av=fmaxf(av,__shfl_xor_sync(0xFFFFFFFFu,av,o));
-                    sv+=__shfl_xor_sync(0xFFFFFFFFu,sv,o);
-                }
-                float scale=127.0f/fmaxf(av,1e-5f);
-                float inv_sc=fmaxf(av,1e-5f)/127.0f;
-                if(lane==0){A_inv[t]=inv_sc; A_sum[t]=sv;}
-                // Lanes 0-7: re-read 4 values, quantize, pack
-                if(lane<8u){
-                    float v0=Ab[(size_t)tok*pc.K+c*32u+lane*4u];
-                    float v1=Ab[(size_t)tok*pc.K+c*32u+lane*4u+1u];
-                    float v2=Ab[(size_t)tok*pc.K+c*32u+lane*4u+2u];
-                    float v3=Ab[(size_t)tok*pc.K+c*32u+lane*4u+3u];
-                    int pk=0;
-                    pk|=(max(-128,min(127,__float2int_rn(v0*scale)))&0xFF);
-                    pk|=(max(-128,min(127,__float2int_rn(v1*scale)))&0xFF)<<8;
-                    pk|=(max(-128,min(127,__float2int_rn(v2*scale)))&0xFF)<<16;
-                    pk|=(max(-128,min(127,__float2int_rn(v3*scale)))&0xFF)<<24;
-                    As_pk[lane*BT+t]=pk;
+                if (pc.q8_stride != 0u) {
+                    // Pre-quantized Q8_0 path: read scale + packed int8 directly
+                    const unsigned char* ab = Ab_q8 + (size_t)tok * pc.q8_stride + (size_t)c * 34u;
+                    float d = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
+                    float sv = 0.0f;
+                    if(lane<8u){
+                        int pk = *((const int*)(ab + 2u + lane * 4u));
+                        As_pk[lane*BT+t] = pk;
+                        // Sum of 32 int8 values (each lane sums 4)
+                        sv = (float)((signed char)(pk & 0xFF)) + (float)((signed char)((pk >> 8) & 0xFF))
+                           + (float)((signed char)((pk >> 16) & 0xFF)) + (float)((signed char)((pk >> 24) & 0xFF));
+                    }
+                    // Warp-reduce sum across 8 lanes
+                    for(int o=4;o>0;o>>=1) sv += __shfl_xor_sync(0xFFFFFFFFu, sv, o);
+                    if(lane==0){A_inv[t]=d; A_sum[t]=sv;}
+                } else {
+                    // Dynamic quantization from float input
+                    float val=Ab[(size_t)tok*pc.K+c*32u+lane];
+                    float av=fabsf(val), sv=val;
+                    for(int o=16;o>0;o>>=1){
+                        av=fmaxf(av,__shfl_xor_sync(0xFFFFFFFFu,av,o));
+                        sv+=__shfl_xor_sync(0xFFFFFFFFu,sv,o);
+                    }
+                    float scale=127.0f/fmaxf(av,1e-5f);
+                    float inv_sc=fmaxf(av,1e-5f)/127.0f;
+                    if(lane==0){A_inv[t]=inv_sc; A_sum[t]=sv;}
+                    if(lane<8u){
+                        float v0=Ab[(size_t)tok*pc.K+c*32u+lane*4u];
+                        float v1=Ab[(size_t)tok*pc.K+c*32u+lane*4u+1u];
+                        float v2=Ab[(size_t)tok*pc.K+c*32u+lane*4u+2u];
+                        float v3=Ab[(size_t)tok*pc.K+c*32u+lane*4u+3u];
+                        int pk=0;
+                        pk|=(max(-128,min(127,__float2int_rn(v0*scale)))&0xFF);
+                        pk|=(max(-128,min(127,__float2int_rn(v1*scale)))&0xFF)<<8;
+                        pk|=(max(-128,min(127,__float2int_rn(v2*scale)))&0xFF)<<16;
+                        pk|=(max(-128,min(127,__float2int_rn(v3*scale)))&0xFF)<<24;
+                        As_pk[lane*BT+t]=pk;
+                    }
                 }
             } else {
                 if(lane<8u) As_pk[lane*BT+t]=0;
