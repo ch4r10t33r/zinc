@@ -297,9 +297,7 @@ const jsonLd = {
     <p class="perf-caption">Measured with the fair server-vs-server suite: one reusable ZINC server per model, one reusable llama.cpp server per model, same GGUF files, same scenario matrix, same warmup/run count, and server-side timing. We are still cooking: the next work is widening the narrow Gemma 31B margin and extending the sweep across more scenarios.</p>
   </section>
 
-  <section class="demo-panel">
-    <img src="/zinc-chat-demo.gif" alt="ZINC Chat — streaming LLM inference on an AMD Radeon RDNA4 GPU via Vulkan" class="demo-gif" />
-    <p class="demo-caption">A 35B-parameter Qwen3.6 model running locally on a single AMD Radeon GPU — Zig + Vulkan, no ROCm, no MLX</p>
+  <section class="start-panel" aria-label="ZINC documentation links">
     <div class="start-links">
       <a href="/zinc/docs/getting-started/">Getting Started</a>
       <a href="/zinc/docs/hardware-requirements/">Hardware Requirements</a>
@@ -519,25 +517,6 @@ const jsonLd = {
     color: var(--color-text-muted);
     font-size: 0.82rem;
     font-variant-numeric: tabular-nums;
-  }
-
-  .demo-panel {
-    text-align: center;
-    margin-bottom: var(--space-xl);
-  }
-
-  .demo-gif {
-    width: 100%;
-    max-width: 720px;
-    border-radius: 8px;
-    border: 1px solid var(--color-border);
-    margin-bottom: var(--space-sm);
-  }
-
-  .demo-caption {
-    font-size: 0.85rem;
-    color: var(--color-text-muted);
-    margin-bottom: var(--space-md);
   }
 
   .start-panel {

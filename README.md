@@ -26,9 +26,7 @@
 > Fastest measured local LLM inference for AMD GPUs. ZINC beats llama.cpp across the current five-model RDNA4 headline sweep — decode, prefill, end-to-end, and model-level overall — with no ROCm.
 
 <p align="center">
-  <img src="assets/zinc-chat-demo.gif" alt="ZINC Chat Demo — streaming inference on AMD RDNA4" width="720">
-  <br>
-  <em>35B parameter model running locally — Zig + Vulkan/Metal, no ROCm, no MLX</em>
+  <img src="assets/amd-rdna4-benchmark-sweep.svg" alt="AMD RDNA4 benchmark sweep chart showing ZINC ahead of llama.cpp across five models" width="760">
 </p>
 
 ## AMD RDNA4 Benchmark Sweep
