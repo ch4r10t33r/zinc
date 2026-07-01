@@ -312,6 +312,8 @@ const Pipelines = struct {
     gemm_f16_tc: CudaPipeline, // fp16 pre-dequanted TC GEMM (ZINC_PREFILL_F16=1)
     gemm_q4k_tc_lowsmem: CudaPipeline, // 8KB-shared TC GEMM (3x occupancy)
     gemm_q8_0_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q8_0 GEMM (shared experts)
+    gemm_q6k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q6_K GEMM
+    gemm_q5k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q5_K GEMM
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -839,6 +841,8 @@ pub const ForwardCuda = struct {
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
         pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
         pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
+        pipes.gemm_q6k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_lowsmem");
+        pipes.gemm_q5k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tc_lowsmem");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past
@@ -2059,8 +2063,11 @@ pub const ForwardCuda = struct {
             if (use_dp4a) {
                 cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (idx == 3 and q8TcLowsmemOn()) {
-                // Q8_0: use dedicated lowsmem TC kernel (shared expert weights)
                 cmd.dispatch(&self.pipes.gemm_q8_0_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (idx == 2) {
+                cmd.dispatch(&self.pipes.gemm_q6k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (idx == 1) {
+                cmd.dispatch(&self.pipes.gemm_q5k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (use_lowsmem) {
                 cmd.dispatch(&self.pipes.gemm_q4k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (use_tc) {
