@@ -57,6 +57,8 @@ test("parseArgs reads suite options", () => {
     "/tmp/llama-server",
     "--phase",
     "zinc",
+    "--scenarios",
+    "core,decode-extended",
     "--no-site-write",
   ]);
 
@@ -67,6 +69,7 @@ test("parseArgs reads suite options", () => {
   expect(args.llamaServer).toBe("/tmp/llama-server");
   expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
+  expect(args.scenarios && [...args.scenarios]).toEqual(["core", "decode-extended"]);
   expect(args.models && [...args.models]).toEqual(["gemma4-26b-a4b-q4k-m", "qwen35-9b-q4k-m"]);
 });
 
@@ -408,6 +411,29 @@ test("benchmark suite can split ZINC and baseline phases for clean reboot runs",
 
   const baselineOnly = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is", "baseline");
   expect(baselineOnly.map((phase) => phase.phase)).toEqual(["baseline", "baseline", "baseline", "baseline"]);
+});
+
+test("benchmark suite can filter scenarios for targeted optimization runs", () => {
+  const phases = buildMeasurementPhases(
+    "qwen35-9b-q4k-m",
+    "raw",
+    "The capital of France is",
+    "all",
+    new Set(["core", "decode-extended"]),
+  );
+  expect(phases.map((phase) => `${phase.phase}:${phase.scenarioDef.id}`)).toEqual([
+    "zinc:core",
+    "zinc:decode-extended",
+    "baseline:core",
+    "baseline:decode-extended",
+  ]);
+  expect(() => buildMeasurementPhases(
+    "qwen35-9b-q4k-m",
+    "raw",
+    "The capital of France is",
+    "all",
+    new Set(["unknown"]),
+  )).toThrow(/Unknown scenario/);
 });
 
 test("parseDotEnv handles export lines and quotes", () => {

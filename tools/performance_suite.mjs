@@ -89,6 +89,7 @@ export function parseArgs(argv) {
     runs: 3,
     warmupRuns: 1,
     phase: "all",
+    scenarios: null,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     models: null,
     buildLocal: true,
@@ -161,6 +162,9 @@ export function parseArgs(argv) {
         args.phase = value;
         break;
       }
+      case "--scenarios":
+        args.scenarios = new Set((argv[++i] ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+        break;
       case "--timeout-ms":
         args.timeoutMs = parseInteger(argv[++i], "--timeout-ms");
         break;
@@ -284,6 +288,7 @@ function usage() {
   --runs <n>                  Measured runs per model (default: 3)
   --warmup <n>                Warmup runs per model (default: 1)
   --phase <all|zinc|baseline> Measure both phases, only ZINC, or only llama.cpp (default: all)
+  --scenarios <ids>           Comma-separated scenario ids: core,context-medium,context-long,decode-extended
   --timeout-ms <ms>           Per-command timeout (default: 900000)
   --models <ids>              Comma-separated model ids to benchmark
   --discover-models           Benchmark every discovered local model cache entry
@@ -942,6 +947,16 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_PREFILL_LOWSMEM",
   "ZINC_PREFILL_TC",
   "ZINC_PREFILL_Q8_TC",
+  "ZINC_PREFILL_GATE_UP_SWIGLU",
+  "ZINC_CUDA_GRAPH",
+  "ZINC_BATCH_GRAPH",
+  "ZINC_BATCH_B1_MATVEC",
+  "ZINC_BATCH_MROW",
+  "ZINC_BATCH_MOE_SHARED",
+  "ZINC_SERVE_CUBLAS",
+  "ZINC_SERVE_CUBLAS_MINB",
+  "ZINC_SERVE_WCACHE",
+  "ZINC_SERVE_WCACHE_MB",
 ];
 
 function collectRemoteZincTuningEnv(dotEnv) {
@@ -1974,12 +1989,26 @@ export function defaultScenarioDefsForModel(modelId, promptMode, basePrompt) {
   ];
 }
 
+export function filterScenarioDefs(scenarios, selectedIds = null) {
+  if (!selectedIds || selectedIds.size === 0) return scenarios;
+  const selected = scenarios.filter((scenario) => selectedIds.has(scenario.id));
+  const known = new Set(scenarios.map((scenario) => scenario.id));
+  const unknown = [...selectedIds].filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown scenario id(s): ${unknown.join(", ")}`);
+  }
+  if (selected.length === 0) {
+    throw new Error("No benchmark scenarios selected");
+  }
+  return selected;
+}
+
 function phaseEnabled(requestedPhase, phase) {
   return requestedPhase === "all" || requestedPhase === phase;
 }
 
-export function buildMeasurementPhases(modelId, promptMode, basePrompt, requestedPhase = "all") {
-  const scenarios = defaultScenarioDefsForModel(modelId, promptMode, basePrompt);
+export function buildMeasurementPhases(modelId, promptMode, basePrompt, requestedPhase = "all", selectedScenarios = null) {
+  const scenarios = filterScenarioDefs(defaultScenarioDefsForModel(modelId, promptMode, basePrompt), selectedScenarios);
   const phases = [
     ...scenarios.map((scenarioDef) => ({ phase: "zinc", scenarioDef })),
     ...scenarios.map((scenarioDef) => ({ phase: "baseline", scenarioDef })),
@@ -2359,8 +2388,8 @@ async function runMetalTarget(args) {
 
   for (const entry of filtered) {
     console.log(`[metal] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
-    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -2681,8 +2710,8 @@ async function runRdnaTarget(args) {
 
   for (const entry of cases) {
     console.log(`[rdna] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
-    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedZincServer = null;
@@ -3022,8 +3051,8 @@ async function runCudaTarget(args) {
 
   for (const entry of cases) {
     console.log(`[cuda] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
-    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -3216,8 +3245,8 @@ async function runIntelTarget(args) {
 
   for (const entry of cases) {
     console.log(`[intel] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
-    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
