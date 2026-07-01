@@ -169,6 +169,15 @@ test "Vulkan Intel Gemma decode uses split-K at short sequence lengths" {
     try expectContainsNear(src, marker, "self.fa_split_k_forced or intel_gemma_split_k_short_seq or attn_seq_len", 400);
 }
 
+test "Vulkan Intel Qwen MoE defaults fused SSM QKV plus Z projection" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const fused_ssm_qkv_z_default_on =";
+    try expectContainsNear(src, marker, "qwen36_like_f32_ssm", 160);
+    try expectContainsNear(src, marker, "isIntelGpuVendor(gpu_config.vendor)", 160);
+    try expectContainsNear(src, marker, "ZINC_FUSED_SSM_QKV_Z=0", 900);
+    try expectContainsNear(src, marker, "pipeline_q8_0_fused_pair != null", 500);
+}
+
 test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {
     const src = @embedFile("compute/forward.zig");
     const marker = "fn qwen36DensePrefillPaddedTokenCount";

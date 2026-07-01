@@ -2892,15 +2892,25 @@ pub const InferenceEngine = struct {
         }
 
         const fused_ssm_qkv_z_env = std.posix.getenv("ZINC_FUSED_SSM_QKV_Z");
-        const fused_ssm_qkv_z_flag = fused_ssm_qkv_z_env != null and std.mem.eql(u8, fused_ssm_qkv_z_env.?, "1");
-        const fused_ssm_qkv_z_enabled = fused_ssm_qkv_z_flag and
+        const fused_ssm_qkv_z_explicitly_off = fused_ssm_qkv_z_env != null and std.mem.eql(u8, fused_ssm_qkv_z_env.?, "0");
+        const fused_ssm_qkv_z_forced_on = fused_ssm_qkv_z_env != null and !fused_ssm_qkv_z_explicitly_off;
+        const fused_ssm_qkv_z_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const fused_ssm_qkv_z_requested = !fused_ssm_qkv_z_explicitly_off and
+            (fused_ssm_qkv_z_forced_on or fused_ssm_qkv_z_default_on);
+        const fused_ssm_qkv_z_enabled = fused_ssm_qkv_z_requested and
             dmmv.pipeline_q8_0_fused_pair != null and
             instance.push_descriptor_fn != null and
             (config.hidden_dim & 31) == 0;
         if (fused_ssm_qkv_z_enabled) {
-            log.info("SSM fused Q8_0 wqkv+z projection ENABLED via ZINC_FUSED_SSM_QKV_Z=1", .{});
-        } else if (fused_ssm_qkv_z_flag) {
-            log.info("ZINC_FUSED_SSM_QKV_Z=1 requested but prerequisites missing; using separate SSM projections", .{});
+            if (fused_ssm_qkv_z_forced_on) {
+                log.info("SSM fused Q8_0 wqkv+z projection ENABLED via ZINC_FUSED_SSM_QKV_Z", .{});
+            } else {
+                log.info("SSM fused Q8_0 wqkv+z projection ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_FUSED_SSM_QKV_Z=0 to disable)", .{});
+            }
+        } else if (fused_ssm_qkv_z_explicitly_off) {
+            log.info("SSM fused Q8_0 wqkv+z projection DISABLED via ZINC_FUSED_SSM_QKV_Z=0", .{});
+        } else if (fused_ssm_qkv_z_requested) {
+            log.info("SSM fused Q8_0 wqkv+z projection requested but prerequisites missing; using separate SSM projections", .{});
         }
 
         // Effort-6 Step 5 prerequisite: count_experts wire-in. When
