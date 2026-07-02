@@ -10067,10 +10067,27 @@ pub const InferenceEngine = struct {
                             cpu_gate_shexp.?.info.type_ == .q4_k and
                             cpu_up_shexp.?.info.type_ == .q4_k and
                             self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair != null;
+                        const shared_q8_geglu_enabled = if (std.posix.getenv("ZINC_GEMMA_Q8_GEGLU_FUSED")) |raw| !std.mem.eql(u8, raw, "0") else true;
+                        const shared_front_q8_geglu =
+                            shared_q8_geglu_enabled and
+                            config.architecture == .gemma and
+                            cpu_gate_shexp.?.info.type_ == .q8_0 and
+                            cpu_up_shexp.?.info.type_ == .q8_0 and
+                            self.dmmv.pipeline_q8_0_fused_gate_up_geglu != null;
 
                         const shared_proj_phase = self.beginProfilePhase();
                         if (shared_front_fused) {
                             try self.dispatchDmmvFusedGateUpGegluPair(
+                                cpu_gate_shexp.?,
+                                cpu_up_shexp.?,
+                                self.ffn_norm_buf,
+                                hidden_size,
+                                self.swiglu_buf,
+                                shexp_inter_dim,
+                                hidden_dim,
+                            );
+                        } else if (shared_front_q8_geglu) {
+                            try self.dispatchDmmvFusedGateUpGegluQ8_0(
                                 cpu_gate_shexp.?,
                                 cpu_up_shexp.?,
                                 self.ffn_norm_buf,
@@ -10137,7 +10154,7 @@ pub const InferenceEngine = struct {
                             try self.decode_cmd.begin();
                         }
 
-                        if (!shared_front_fused) {
+                        if (!shared_front_fused and !shared_front_q8_geglu) {
                             const shared_swiglu_phase = self.beginProfilePhase();
                             try self.dispatchFfnActivation(
                                 self.gate_buf.handle,
@@ -15080,6 +15097,44 @@ pub const InferenceEngine = struct {
                 1,
             );
         }
+    }
+
+    /// Gemma Q8_0 shared-expert front-end fusion:
+    /// computes GEGLU(W_gate*x, W_up*x) directly into geglu_buf.
+    fn dispatchDmmvFusedGateUpGegluQ8_0(
+        self: *InferenceEngine,
+        gate_tensor: *const LoadedTensor,
+        up_tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        geglu_buf: Buffer,
+        M: u32,
+        K: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q8_0_fused_gate_up_geglu orelse return error.ShaderNotLoaded);
+        const push = DmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = 0,
+            .x_offset = 0,
+            .y_offset = 0,
+            .acc_mode = 0,
+        };
+        self.pushDispatch4(
+            pip,
+            std.mem.asBytes(&push),
+            gate_tensor.gpu_buffer.handle,
+            gate_tensor.gpu_buffer.size,
+            up_tensor.gpu_buffer.handle,
+            up_tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            geglu_buf.handle,
+            geglu_buf.size,
+            (M + 1) / 2,
+            1,
+            1,
+        );
     }
 
     /// Fused Q8_0 pair DMMV. Used by the SSM path to compute wqkv and z/gate

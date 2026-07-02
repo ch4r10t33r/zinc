@@ -250,6 +250,35 @@ test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
     try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 2200);
 }
 
+test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"dmmv_q8_0_fused_gate_up_geglu\"");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_q8_0_fused_gate_up_geglu: ?Pipeline");
+    try expectContains(dmmv, "dmmv_q8_0_fused_gate_up_geglu.spv");
+    try expectContains(dmmv, ".pipeline_q8_0_fused_gate_up_geglu = pipeline_q8_0_fused_gate_up_geglu");
+    try expectContains(dmmv, "if (self.pipeline_q8_0_fused_gate_up_geglu) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    const marker = "const shared_front_q8_geglu =";
+    try expectContains(forward, "ZINC_GEMMA_Q8_GEGLU_FUSED");
+    try expectContainsNear(forward, marker, "shared_q8_geglu_enabled and", 160);
+    try expectContainsNear(forward, marker, "config.architecture == .gemma", 400);
+    try expectContainsNear(forward, marker, "cpu_gate_shexp.?.info.type_ == .q8_0", 400);
+    try expectContainsNear(forward, marker, "cpu_up_shexp.?.info.type_ == .q8_0", 500);
+    try expectContainsNear(forward, marker, "pipeline_q8_0_fused_gate_up_geglu != null", 600);
+    try expectContainsNear(forward, marker, "try self.dispatchDmmvFusedGateUpGegluQ8_0", 1200);
+    try expectContainsNear(forward, "if (!shared_front_fused and !shared_front_q8_geglu)", "try self.dispatchFfnActivation", 500);
+
+    const shader = @embedFile("shaders/dmmv_q8_0_fused_gate_up_geglu.comp");
+    try expectContains(shader, "layout(local_size_x = 64) in;");
+    try expectContains(shader, "uint8_t a_gate_data[]");
+    try expectContains(shader, "uint8_t a_up_data[]");
+    try expectContains(shader, "float geglu(float gate, float up)");
+}
+
 test "Vulkan Gemma dense decode keeps BN8 DP4a packed GEGLU path" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "ZINC_GEMMA_DENSE_DECODE_DP4A");
