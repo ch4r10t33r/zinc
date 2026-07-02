@@ -40,6 +40,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64) in;
@@ -61,6 +62,8 @@ layout(set = 0, binding = 3) readonly buffer MoeRouting { uint routing_data[]; }
 
 const uint NUM_ROWS = 4u;
 const uint Q4K_BLOCK_U32 = 36u;
+
+shared float s_sg_sums[8];
 
 vec4 unpack_nibbles_lo(uint v) {
     return vec4(float(v & 0xFu), float((v >> 8) & 0xFu),
@@ -167,6 +170,16 @@ void main() {
             }
 
             sum = subgroupAdd(sum);
+            if (gl_NumSubgroups > 1u) {
+                if (subgroupElect()) s_sg_sums[gl_SubgroupID] = sum;
+                barrier();
+                if (tid == 0u) {
+                    for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                        sum += s_sg_sums[sg];
+                    }
+                }
+                barrier();
+            }
             row_acc += w * sum;
         }
 

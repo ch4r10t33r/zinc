@@ -575,6 +575,19 @@ test "Vulkan Q4_K MoE fused gate-up shaders merge cross-subgroup partials" {
     }
 }
 
+test "Vulkan MoE fused down-acc shaders merge cross-subgroup partials" {
+    const q4 = @embedFile("shaders/dmmv_q4k_moe_fused_down_acc.comp");
+    const q5 = @embedFile("shaders/dmmv_q5k_moe_fused_down_acc.comp");
+    for ([_][]const u8{ q4, q5 }) |src| {
+        try expectContains(src, "GL_KHR_shader_subgroup_basic");
+        try expectContains(src, "gl_NumSubgroups > 1u");
+        try expectContains(src, "subgroupElect()");
+        try expectContains(src, "gl_SubgroupID");
+        try expectContains(src, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
+        try expectContains(src, "barrier();");
+    }
+}
+
 test "Vulkan Q4_K wide LM-head shader merges cross-subgroup partials" {
     const src = @embedFile("shaders/dmmv_q4k_wide.comp");
     try expectContains(src, "GL_KHR_shader_subgroup_basic");

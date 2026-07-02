@@ -26,6 +26,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : require
 
@@ -47,7 +48,10 @@ layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 layout(set = 0, binding = 3) readonly buffer MoeRouting { uint routing_data[]; };
 
 const uint NUM_ROWS = 4u;
+const uint MAX_SUBGROUPS = 8u;
 const uint Q5K_BLOCK_U32 = 44u;
+
+shared float s_sg_sums[NUM_ROWS * MAX_SUBGROUPS];
 
 vec4 unpack_nibbles_lo(uint v) {
     return vec4(float(v & 0xFu), float((v >> 8) & 0xFu),
@@ -186,7 +190,20 @@ void main() {
         }
 
         [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
-            row_acc[r] += w * subgroupAdd(sums[r]);
+            float reduced = subgroupAdd(sums[r]);
+            if (gl_NumSubgroups > 1u) {
+                if (subgroupElect()) {
+                    s_sg_sums[r * MAX_SUBGROUPS + gl_SubgroupID] = reduced;
+                }
+                barrier();
+                if (tid == 0u) {
+                    for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                        reduced += s_sg_sums[r * MAX_SUBGROUPS + sg];
+                    }
+                }
+                barrier();
+            }
+            row_acc[r] += w * reduced;
         }
     }
 
