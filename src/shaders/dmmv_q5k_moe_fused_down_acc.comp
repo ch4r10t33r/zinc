@@ -26,6 +26,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : require
 
@@ -48,6 +49,10 @@ layout(set = 0, binding = 3) readonly buffer MoeRouting { uint routing_data[]; }
 
 const uint NUM_ROWS = 4u;
 const uint Q5K_BLOCK_U32 = 44u;
+
+// One 64-thread workgroup may execute as multiple hardware subgroups on Intel
+// Xe. Keep all subgroup partials before the single hidden_buf write.
+shared float s_sg_sums[32];
 
 vec4 unpack_nibbles_lo(uint v) {
     return vec4(float(v & 0xFu), float((v >> 8) & 0xFu),
@@ -185,8 +190,32 @@ void main() {
             }
         }
 
+        float reduced[NUM_ROWS];
         [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
-            row_acc[r] += w * subgroupAdd(sums[r]);
+            reduced[r] = subgroupAdd(sums[r]);
+        }
+
+        if (gl_NumSubgroups > 1u) {
+            if (subgroupElect()) {
+                [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+                    s_sg_sums[gl_SubgroupID * NUM_ROWS + r] = reduced[r];
+                }
+            }
+            barrier();
+            if (tid == 0u) {
+                [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+                    float merged = s_sg_sums[r];
+                    for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                        merged += s_sg_sums[sg * NUM_ROWS + r];
+                    }
+                    row_acc[r] += w * merged;
+                }
+            }
+            barrier();
+        } else if (tid == 0u) {
+            [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+                row_acc[r] += w * reduced[r];
+            }
         }
     }
 

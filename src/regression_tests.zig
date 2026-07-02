@@ -540,6 +540,22 @@ test "Vulkan batched kpar shaders merge cross-subgroup partials" {
     }
 }
 
+test "Vulkan fused MoE down accumulators merge cross-subgroup partials" {
+    const q4 = @embedFile("shaders/dmmv_q4k_moe_fused_down_acc.comp");
+    try expectContains(q4, "GL_KHR_shader_subgroup_basic");
+    try expectContains(q4, "shared float s_sg_sums[8];");
+    try expectContains(q4, "gl_NumSubgroups > 1u");
+    try expectContains(q4, "subgroupElect()");
+    try expectContains(q4, "row_acc += w * sum;");
+
+    const q5 = @embedFile("shaders/dmmv_q5k_moe_fused_down_acc.comp");
+    try expectContains(q5, "GL_KHR_shader_subgroup_basic");
+    try expectContains(q5, "shared float s_sg_sums[32];");
+    try expectContains(q5, "s_sg_sums[gl_SubgroupID * NUM_ROWS + r] = reduced[r];");
+    try expectContains(q5, "merged += s_sg_sums[sg * NUM_ROWS + r];");
+    try expectContains(q5, "row_acc[r] += w * merged;");
+}
+
 test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContainsNear(src, "const q4k_batch_kpar_path", "effective_wave64_options", 700);
