@@ -1149,6 +1149,9 @@ pub const InferenceEngine = struct {
     profile_enabled: bool = false,
     logits_readback_enabled: bool = false,
     validation_diagnostics_enabled: bool = false,
+    force_cpu_argmax: bool = false,
+    force_cpu_ssm: bool = false,
+    force_cpu_moe: bool = false,
     // Gated by ZINC_MOE_KPAR=1. When set and the Q4_K MoE kpar shader pipeline
     // is available, the MoE gate/up/down DMMVs for Q4_K expert weights use the
     // K-parallel subgroupAdd variant instead of the serial per-row shader.
@@ -2671,6 +2674,29 @@ pub const InferenceEngine = struct {
             log.info("softmax_topk v2 DISABLED via ZINC_TOPK_V1=1; using v1 shared-mem scan", .{});
         }
 
+        const force_cpu_argmax = blk: {
+            if (std.posix.getenv("ZINC_FORCE_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (std.posix.getenv("ZINC_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            break :blk false;
+        };
+        if (force_cpu_argmax) {
+            log.info("CPU greedy argmax forced via ZINC_FORCE_CPU_ARGMAX; full logits will be read back every sampled token", .{});
+        }
+        const force_cpu_ssm = blk: {
+            if (std.posix.getenv("ZINC_FORCE_CPU_SSM")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            break :blk false;
+        };
+        if (force_cpu_ssm) {
+            log.info("CPU SSM fallback forced via ZINC_FORCE_CPU_SSM", .{});
+        }
+        const force_cpu_moe = blk: {
+            if (std.posix.getenv("ZINC_FORCE_CPU_MOE")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            break :blk false;
+        };
+        if (force_cpu_moe) {
+            log.info("CPU MoE fallback forced via ZINC_FORCE_CPU_MOE", .{});
+        }
+
         // Split-K flash attention. Default-on with N_I_CHUNKS=4. The
         // attention.zig init resolves ZINC_FA_SPLIT_K and creates the pair
         // of pipelines (split, merge); we just mirror the active count here
@@ -3483,6 +3509,9 @@ pub const InferenceEngine = struct {
             .instance = instance,
             .allocator = allocator,
             .max_context_tokens = max_ctx,
+            .force_cpu_argmax = force_cpu_argmax,
+            .force_cpu_ssm = force_cpu_ssm,
+            .force_cpu_moe = force_cpu_moe,
             .modeled_decode_bytes_per_token = modeled_decode_bytes_per_token,
             .timestamp_query_pool = timestamp_pool,
             .timestamp_period_ns = timestamp_period_ns,
@@ -8129,7 +8158,8 @@ pub const InferenceEngine = struct {
                     // === SSM / LINEAR ATTENTION LAYER ===
                     // Use GPU SSM when all three shaders are available (conv1d, delta-net, gated norm).
                     // Falls back to CPU for platforms missing any shader.
-                    const use_gpu_ssm = self.elementwise.pipeline_ssm_conv1d != null and
+                    const use_gpu_ssm = !self.force_cpu_ssm and
+                        self.elementwise.pipeline_ssm_conv1d != null and
                         self.elementwise.pipeline_ssm_delta_net != null and
                         self.elementwise.pipeline_ssm_gated_norm != null;
                     if (state.position == 0 and layer == 0) {
@@ -8657,7 +8687,8 @@ pub const InferenceEngine = struct {
                 // (pre_ffw_norm_2, ffn_gate_inp.scale, ffn_down_exps.scale, post_ffw_norm_1/2, etc.)
                 // that are simpler/safer to execute via CPU-routed sequential expert dispatch.
                 // Matches Metal's canUseGpuRoutedBatchedMoe (forward_metal.zig:4068-4070).
-                const use_gpu_moe = config.architecture != .gemma and
+                const use_gpu_moe = !self.force_cpu_moe and
+                    config.architecture != .gemma and
                     config.architecture != .gpt_oss and
                     fused_gate_up == null and
                     self.dmmv.moePipelineForType(gate_quant) != null and
@@ -10768,7 +10799,8 @@ pub const InferenceEngine = struct {
         // embedding upload before needing any derived state.
         const have_gpu_argmax = self.argmax.pipeline != null and self.argmax_descriptor_set != null;
         const allow_final_tail = !partial_layer_decode or self.partial_decode_allow_final_tail;
-        const need_logits_readback = collect_output and allow_final_tail and (self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax);
+        const use_gpu_argmax = have_gpu_argmax and !self.force_cpu_argmax;
+        const need_logits_readback = collect_output and allow_final_tail and (self.logits_readback_enabled or self.validation_diagnostics_enabled or self.force_cpu_argmax or !have_gpu_argmax);
         if (collect_output and allow_final_tail) {
             const final_tail_phase = self.beginProfilePhase();
 
@@ -10895,7 +10927,6 @@ pub const InferenceEngine = struct {
             }
             self.endProfilePhase(.final_lm_head, final_lm_head_phase);
 
-            const use_gpu_argmax = have_gpu_argmax;
             const final_argmax_phase = self.beginProfilePhase();
             if (use_gpu_argmax) {
                 self.decode_cmd.computeBarrier();
@@ -25140,7 +25171,8 @@ pub const InferenceEngine = struct {
         // sampled from a stale buffer and emitted garbage even though the
         // logits matched the per-token path bit-for-bit.
         const have_gpu_argmax = self.argmax.pipeline != null and self.argmax_descriptor_set != null;
-        if (have_gpu_argmax) {
+        const use_gpu_argmax = have_gpu_argmax and !self.force_cpu_argmax;
+        if (use_gpu_argmax) {
             const final_argmax_phase = self.beginProfilePhase();
             try self.argmax.record(
                 &self.decode_cmd,
@@ -25162,11 +25194,11 @@ pub const InferenceEngine = struct {
             .dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT,
         };
         vk.c.vkCmdPipelineBarrier(self.decode_cmd.handle, vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null);
-        if (have_gpu_argmax) {
+        if (use_gpu_argmax) {
             const token_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = @sizeOf(u32) };
             vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle, self.argmax_result_staging.handle, 1, &token_region);
         }
-        const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax;
+        const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or self.force_cpu_argmax or !have_gpu_argmax;
         if (need_logits_readback) {
             const logits_size = @as(vk.c.VkDeviceSize, cfg.vocab_size) * @sizeOf(f32);
             const logits_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = logits_size };
@@ -25907,7 +25939,7 @@ pub const InferenceEngine = struct {
     /// Sample a token greedily. Uses GPU argmax when available, otherwise falls back to CPU scan.
     /// @returns The vocabulary index of the highest-logit token.
     pub fn sampleGreedy(self: *const InferenceEngine) u32 {
-        if (self.argmax.pipeline != null and self.argmax_descriptor_set != null) {
+        if (!self.force_cpu_argmax and self.argmax.pipeline != null and self.argmax_descriptor_set != null) {
             const token_ptr: [*]const u32 = @ptrCast(@alignCast(self.argmax_result_staging.mapped.?));
             return token_ptr[0];
         }

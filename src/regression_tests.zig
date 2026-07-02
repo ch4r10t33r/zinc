@@ -559,6 +559,22 @@ test "Vulkan batched kpar shaders merge cross-subgroup partials" {
     }
 }
 
+test "Vulkan Q4_K MoE fused gate-up shaders merge cross-subgroup partials" {
+    const gate_up = @embedFile("shaders/dmmv_q4k_fused_gate_up_moe.comp");
+    const gate_up_swiglu = @embedFile("shaders/dmmv_q4k_fused_gate_up_swiglu_moe.comp");
+    for ([_][]const u8{ gate_up, gate_up_swiglu }) |src| {
+        try expectContains(src, "GL_KHR_shader_subgroup_basic");
+        try expectContains(src, "shared float s_sg_gate[8];");
+        try expectContains(src, "shared float s_sg_up[8];");
+        try expectContains(src, "gl_NumSubgroups > 1u");
+        try expectContains(src, "subgroupElect()");
+        try expectContains(src, "s_sg_gate[gl_SubgroupID]");
+        try expectContains(src, "s_sg_up[gl_SubgroupID]");
+        try expectContains(src, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
+        try expectContains(src, "barrier();");
+    }
+}
+
 test "Vulkan Q4_K wide LM-head shader merges cross-subgroup partials" {
     const src = @embedFile("shaders/dmmv_q4k_wide.comp");
     try expectContains(src, "GL_KHR_shader_subgroup_basic");
@@ -642,11 +658,37 @@ test "Vulkan prefillBatched threads base_token through RoPE, KV write, flash att
 
 test "Vulkan prefillBatched avoids full logits copy for greedy GPU argmax" {
     const src = @embedFile("compute/forward.zig");
-    const marker = "// Read back only what the sampler needs.";
-    try expectContainsNear(src, marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle", 1200);
-    try expectContainsNear(src, marker, "const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax;", 1600);
-    try expectContainsNear(src, marker, "if (need_logits_readback) {", 1800);
-    try expectContainsNear(src, marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.logits_buf.handle", 2200);
+    const argmax_marker = "// GPU argmax path";
+    const readback_marker = "// Read back only what the sampler needs.";
+    try expectContains(src, "ZINC_FORCE_CPU_ARGMAX");
+    try expectContainsNear(src, "const force_cpu_argmax = blk:", "ZINC_CPU_ARGMAX", 300);
+    try expectContainsNear(src, "pub fn sampleGreedy(self: *const InferenceEngine) u32 {", "!self.force_cpu_argmax", 260);
+    try expectContainsNear(src, argmax_marker, "const use_gpu_argmax = have_gpu_argmax and !self.force_cpu_argmax;", 650);
+    try expectContainsNear(src, readback_marker, "if (use_gpu_argmax) {", 800);
+    try expectContainsNear(src, readback_marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle", 1200);
+    try expectContainsNear(src, readback_marker, "const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or self.force_cpu_argmax or !have_gpu_argmax;", 1700);
+    try expectContainsNear(src, readback_marker, "if (need_logits_readback) {", 1800);
+    try expectContainsNear(src, readback_marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.logits_buf.handle", 2200);
+}
+
+test "Vulkan decode forced CPU argmax reads logits instead of stale GPU token" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "// === Final norm + LM head (after all layers) ===";
+    const argmax_marker = "self.endProfilePhase(.final_lm_head, final_lm_head_phase);";
+    const copy_marker = "// Read back the 4-byte token id result every token";
+    try expectContainsNear(src, marker, "const use_gpu_argmax = have_gpu_argmax and !self.force_cpu_argmax;", 1400);
+    try expectContainsNear(src, marker, "self.force_cpu_argmax or !have_gpu_argmax", 1500);
+    try expectContainsNear(src, argmax_marker, "if (use_gpu_argmax) {", 400);
+    try expectContainsNear(src, copy_marker, "if (use_gpu_argmax) {", 1100);
+    try expectContainsNear(src, copy_marker, "if (need_logits_readback) {", 1300);
+}
+
+test "Vulkan diagnostic CPU fallbacks can disable SSM and MoE GPU paths" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "ZINC_FORCE_CPU_SSM");
+    try expectContains(src, "ZINC_FORCE_CPU_MOE");
+    try expectContainsNear(src, "const use_gpu_ssm =", "!self.force_cpu_ssm", 160);
+    try expectContainsNear(src, "const use_gpu_moe =", "!self.force_cpu_moe", 180);
 }
 
 test "Vulkan batched KV write shader uses page_table with base_token offset" {

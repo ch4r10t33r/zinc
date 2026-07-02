@@ -29,6 +29,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -60,6 +61,9 @@ layout(set = 0, binding = 5) readonly buffer MoeRouting   { uint routing_data[];
 
 const uint NUM_ROWS = 2u;
 const uint Q4K_BLOCK_U32 = 36u;  // 144 bytes / 4
+
+shared float s_sg_gate[8];
+shared float s_sg_up[8];
 
 vec4 unpack_nibbles_lo(uint v) {
     return vec4(float(v & 0xFu), float((v >> 8) & 0xFu),
@@ -221,6 +225,20 @@ void main() {
 
         sum_gate = subgroupAdd(sum_gate);
         sum_up = subgroupAdd(sum_up);
+        if (gl_NumSubgroups > 1u) {
+            if (subgroupElect()) {
+                s_sg_gate[gl_SubgroupID] = sum_gate;
+                s_sg_up[gl_SubgroupID] = sum_up;
+            }
+            barrier();
+            if (tid == 0u) {
+                for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                    sum_gate += s_sg_gate[sg];
+                    sum_up += s_sg_up[sg];
+                }
+            }
+            barrier();
+        }
         if (tid == 0u) {
             y_gate[y_base + row] = sum_gate;
             y_up[y_base + row] = sum_up;
