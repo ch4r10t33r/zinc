@@ -1319,7 +1319,8 @@ pub const InferenceEngine = struct {
     // batched projection still on the slower dmmv path. Disable with
     // ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM=0.
     use_qwen36_q5_ssm_out_mul_mm: bool = false,
-    // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
+    // Default-on for Intel Qwen 3.6 MoE; force on elsewhere with
+    // ZINC_Q8_WIDE_LM_HEAD=1 or disable with =0. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
     use_q8_wide_lm_head: bool = false,
@@ -2836,12 +2837,21 @@ pub const InferenceEngine = struct {
         }
 
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
-        const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
-        const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
+        const q8_wide_lm_explicitly_off = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "0");
+        const q8_wide_lm_forced_on = q8_wide_lm_env != null and !q8_wide_lm_explicitly_off;
+        const q8_wide_lm_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const q8_wide_lm_requested = !q8_wide_lm_explicitly_off and (q8_wide_lm_forced_on or q8_wide_lm_default_on);
+        const q8_wide_lm_enabled = q8_wide_lm_requested and dmmv.pipeline_q8_0_wide != null;
         if (q8_wide_lm_enabled) {
-            log.info("Q8_0 wide LM-head path ENABLED via ZINC_Q8_WIDE_LM_HEAD=1", .{});
-        } else if (q8_wide_lm_flag) {
+            if (q8_wide_lm_forced_on) {
+                log.info("Q8_0 wide LM-head path ENABLED via ZINC_Q8_WIDE_LM_HEAD", .{});
+            } else {
+                log.info("Q8_0 wide LM-head path ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_Q8_WIDE_LM_HEAD=0 to disable)", .{});
+            }
+        } else if (q8_wide_lm_requested) {
             log.info("ZINC_Q8_WIDE_LM_HEAD=1 requested but the Q8_0 wide pipeline is missing; using generic Q8_0 DMMV", .{});
+        } else if (q8_wide_lm_explicitly_off) {
+            log.info("Q8_0 wide LM-head path DISABLED via ZINC_Q8_WIDE_LM_HEAD=0", .{});
         }
 
         const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");

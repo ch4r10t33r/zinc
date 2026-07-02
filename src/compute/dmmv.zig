@@ -1446,6 +1446,11 @@ pub const DmmvDispatch = struct {
             .{ .id = 1, .value = 64 },
             .{ .id = 3, .value = 1 },
         };
+        const spec_k_5120_n64_q6_q8_1_ragged = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 5120 },
+            .{ .id = 1, .value = 64 },
+            .{ .id = 2, .value = 1 },
+        };
         const spec_k_12288 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 12288 }};
         const spec_k_12288_n64_ragged = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 12288 },
@@ -1700,7 +1705,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n64_bm64 != null) {
             log.info("mul_mm_q6k_full_dp4a_q8_1 K=5120 BM64 BN64 pipeline loaded (Qwen dense-hybrid 27B SSM wqkv prefill)", .{});
         }
-        const pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n64_ragged = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_q8_1_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_5120_n64_ragged, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n64_ragged = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_q8_1_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_5120_n64_q6_q8_1_ragged, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a_q8_1 K=5120 BN=64 ragged shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };

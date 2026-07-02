@@ -387,6 +387,8 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
 
 test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
+    try expectContains(src, "const spec_k_5120_n64_q6_q8_1_ragged = [_]pipeline_mod.SpecConst{");
+    try expectContainsNear(src, "const spec_k_5120_n64_q6_q8_1_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 2, .value = 1 },", 260);
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged");
@@ -608,6 +610,21 @@ test "Vulkan Q4_K wide LM-head shader merges cross-subgroup partials" {
     try expectContains(src, "subgroupElect()");
     try expectContains(src, "s_sg_sums[gl_SubgroupID]");
     try expectContains(src, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
+}
+
+test "Vulkan Intel Qwen MoE enables Q8 wide LM-head by default" {
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "const q8_wide_lm_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);");
+    try expectContains(forward, "const q8_wide_lm_requested = !q8_wide_lm_explicitly_off and (q8_wide_lm_forced_on or q8_wide_lm_default_on);");
+    try expectContains(forward, "Q8_0 wide LM-head path ENABLED by default on Intel Qwen 3.6 MoE");
+    try expectContains(forward, "ZINC_Q8_WIDE_LM_HEAD=0");
+    try expectContainsNear(forward, "if (self.use_q8_wide_lm_head", "qt == .q8_0 and M >= 100_000", 240);
+
+    const shader = @embedFile("shaders/dmmv_q8_0_wide.comp");
+    try expectContains(shader, "GL_KHR_shader_subgroup_basic");
+    try expectContains(shader, "gl_NumSubgroups > 1u");
+    try expectContains(shader, "subgroupElect()");
+    try expectContains(shader, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
 }
 
 test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
