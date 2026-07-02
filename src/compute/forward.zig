@@ -2857,15 +2857,9 @@ pub const InferenceEngine = struct {
         const q8_wide_lm_rows_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD_ROWS");
         var q8_wide_lm_rows: u32 = 2;
         if (q8_wide_lm_enabled) {
+            const q8_wide_lm_rows4_default_on = q8_wide_lm_default_on and dmmv.pipeline_q8_0_wide4 != null;
             if (q8_wide_lm_rows_env) |raw_rows| {
-                if (std.mem.eql(u8, raw_rows, "8")) {
-                    if (dmmv.pipeline_q8_0_wide8 != null) {
-                        q8_wide_lm_rows = 8;
-                        log.info("Q8_0 wide8 LM-head path ENABLED via ZINC_Q8_WIDE_LM_HEAD_ROWS=8", .{});
-                    } else {
-                        log.info("ZINC_Q8_WIDE_LM_HEAD_ROWS=8 requested but the Q8_0 wide8 pipeline is missing; using two-row wide path", .{});
-                    }
-                } else if (std.mem.eql(u8, raw_rows, "4")) {
+                if (std.mem.eql(u8, raw_rows, "4")) {
                     if (dmmv.pipeline_q8_0_wide4 != null) {
                         q8_wide_lm_rows = 4;
                         log.info("Q8_0 wide4 LM-head path ENABLED via ZINC_Q8_WIDE_LM_HEAD_ROWS=4", .{});
@@ -2875,6 +2869,9 @@ pub const InferenceEngine = struct {
                 } else if (!std.mem.eql(u8, raw_rows, "2")) {
                     log.info("Ignoring unsupported ZINC_Q8_WIDE_LM_HEAD_ROWS={s}; using two-row wide path", .{raw_rows});
                 }
+            } else if (q8_wide_lm_rows4_default_on) {
+                q8_wide_lm_rows = 4;
+                log.info("Q8_0 wide4 LM-head path ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_Q8_WIDE_LM_HEAD_ROWS=2 to use two-row wide)", .{});
             }
         }
 
@@ -15460,31 +15457,6 @@ pub const InferenceEngine = struct {
             // Keep it limited to tall overwrite DMMVs so smaller SSM/shared
             // projections stay on the generic path.
             if (self.use_q8_wide_lm_head and qt == .q8_0 and M >= 100_000 and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide != null) {
-                if (self.q8_wide_lm_head_rows == 8 and self.dmmv.pipeline_q8_0_wide8 != null) {
-                    const wide8_pip = &self.dmmv.pipeline_q8_0_wide8.?;
-                    const push_wide8 = DmmvPushConstants{
-                        .M = M,
-                        .K = K,
-                        .a_offset = a_offset,
-                        .x_offset = x_offset,
-                        .y_offset = y_offset,
-                        .acc_mode = acc_mode,
-                    };
-                    self.pushDispatch3(
-                        wide8_pip,
-                        std.mem.asBytes(&push_wide8),
-                        tensor.gpu_buffer.handle,
-                        tensor.gpu_buffer.size,
-                        input_buf.handle,
-                        input_size,
-                        output_buf.handle,
-                        output_buf.size,
-                        (M + 7) / 8,
-                        1,
-                        1,
-                    );
-                    return;
-                }
                 if (self.q8_wide_lm_head_rows == 4 and self.dmmv.pipeline_q8_0_wide4 != null) {
                     const wide4_pip = &self.dmmv.pipeline_q8_0_wide4.?;
                     const push_wide4 = DmmvPushConstants{

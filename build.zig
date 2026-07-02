@@ -173,7 +173,6 @@ pub fn build(b: *std.Build) void {
         "dmmv_q8_0_kpar_batch",
         "dmmv_q8_0_wide",
         "dmmv_q8_0_wide4",
-        "dmmv_q8_0_wide8",
         "dmmv_q8_0_q8_1",
         "dmmv_q4k_q8_1",
         "dmmv_q8_0_fused_pair",
