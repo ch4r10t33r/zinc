@@ -276,6 +276,9 @@ test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
     try expectContainsNear(forward, marker, "try self.dispatchDmmvFusedGateUpGegluQ8_0", 1200);
     try expectContains(forward, "ZINC_GEMMA_Q8_GEGLU_ROWS");
     try expectContains(forward, "pipeline_q8_0_fused_gate_up_geglu4");
+    try expectContains(forward, "ZINC_GEMMA_Q8_WIDE4_DMMV");
+    try expectContains(forward, "config.architecture == .gemma and config.n_experts > 0 and isIntelGpuVendor(gpu_config.vendor)");
+    try expectContains(forward, "K == self.model.config.hidden_dim");
     try expectContainsNear(forward, "if (!shared_front_fused and !shared_front_q8_geglu)", "try self.dispatchFfnActivation", 500);
 
     const shader = @embedFile("shaders/dmmv_q8_0_fused_gate_up_geglu.comp");

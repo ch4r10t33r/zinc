@@ -1328,6 +1328,9 @@ pub const InferenceEngine = struct {
     // Default-on for Intel Gemma when the four-row Q8 GEGLU pipeline is
     // available. Set ZINC_GEMMA_Q8_GEGLU_ROWS=2 to use the original path.
     gemma_q8_geglu_rows: u32 = 2,
+    // Experimental Intel Gemma path: route medium/large Q8_0 projections
+    // through the existing four-row DMMV shader.
+    use_gemma_q8_wide4_dmmv: bool = false,
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
@@ -2902,6 +2905,25 @@ pub const InferenceEngine = struct {
             log.info("Gemma Q8_0 shared GEGLU four-row path ENABLED by default on Intel (set ZINC_GEMMA_Q8_GEGLU_ROWS=2 to disable)", .{});
         }
 
+        const gemma_q8_wide4_env = std.posix.getenv("ZINC_GEMMA_Q8_WIDE4_DMMV");
+        const gemma_q8_wide4_explicitly_off = gemma_q8_wide4_env != null and std.mem.eql(u8, gemma_q8_wide4_env.?, "0");
+        const gemma_q8_wide4_forced_on = gemma_q8_wide4_env != null and !gemma_q8_wide4_explicitly_off;
+        const gemma_q8_wide4_default_on = config.architecture == .gemma and config.n_experts > 0 and isIntelGpuVendor(gpu_config.vendor);
+        const gemma_q8_wide4_requested = !gemma_q8_wide4_explicitly_off and
+            (gemma_q8_wide4_forced_on or gemma_q8_wide4_default_on);
+        const gemma_q8_wide4_enabled = gemma_q8_wide4_requested and dmmv.pipeline_q8_0_wide4 != null;
+        if (gemma_q8_wide4_enabled) {
+            if (gemma_q8_wide4_forced_on) {
+                log.info("Gemma Q8_0 four-row DMMV path ENABLED via ZINC_GEMMA_Q8_WIDE4_DMMV", .{});
+            } else {
+                log.info("Gemma Q8_0 four-row DMMV path ENABLED by default on Intel (set ZINC_GEMMA_Q8_WIDE4_DMMV=0 to disable)", .{});
+            }
+        } else if (gemma_q8_wide4_requested) {
+            log.info("Gemma Q8_0 four-row DMMV requested but the pipeline is missing; using generic Q8_0 DMMV", .{});
+        } else if (gemma_q8_wide4_explicitly_off) {
+            log.info("Gemma Q8_0 four-row DMMV path DISABLED via ZINC_GEMMA_Q8_WIDE4_DMMV=0", .{});
+        }
+
         const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");
         const q8_batch_lm_flag = q8_batch_lm_env != null and std.mem.eql(u8, q8_batch_lm_env.?, "1");
         const q8_batch_lm_enabled = q8_batch_lm_flag and dmmv.pipeline_q8_0_batch != null;
@@ -3455,6 +3477,7 @@ pub const InferenceEngine = struct {
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .q8_wide_lm_head_rows = q8_wide_lm_rows,
             .gemma_q8_geglu_rows = gemma_q8_geglu_rows,
+            .use_gemma_q8_wide4_dmmv = gemma_q8_wide4_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
             .use_q4k_lm_head_dp4a = q4k_lm_head_dp4a_enabled,
@@ -15588,6 +15611,32 @@ pub const InferenceEngine = struct {
                     output_buf.handle,
                     output_buf.size,
                     (M + 1) / 2,
+                    1,
+                    1,
+                );
+                return;
+            }
+
+            if (self.use_gemma_q8_wide4_dmmv and qt == .q8_0 and M >= 1024 and K == self.model.config.hidden_dim and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
+                const wide4_pip = &self.dmmv.pipeline_q8_0_wide4.?;
+                const push_wide4 = DmmvPushConstants{
+                    .M = M,
+                    .K = K,
+                    .a_offset = a_offset,
+                    .x_offset = x_offset,
+                    .y_offset = y_offset,
+                    .acc_mode = acc_mode,
+                };
+                self.pushDispatch3(
+                    wide4_pip,
+                    std.mem.asBytes(&push_wide4),
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    input_buf.handle,
+                    input_size,
+                    output_buf.handle,
+                    output_buf.size,
+                    (M + 3) / 4,
                     1,
                     1,
                 );
