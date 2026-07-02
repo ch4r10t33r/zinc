@@ -1325,6 +1325,9 @@ pub const InferenceEngine = struct {
     // x-vector loads across rows.
     use_q8_wide_lm_head: bool = false,
     q8_wide_lm_head_rows: u32 = 2,
+    // Default-on for Intel Gemma when the four-row Q8 GEGLU pipeline is
+    // available. Set ZINC_GEMMA_Q8_GEGLU_ROWS=2 to use the original path.
+    gemma_q8_geglu_rows: u32 = 2,
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
@@ -2875,6 +2878,30 @@ pub const InferenceEngine = struct {
             }
         }
 
+        var gemma_q8_geglu_rows: u32 = 2;
+        const gemma_q8_geglu_rows_env = std.posix.getenv("ZINC_GEMMA_Q8_GEGLU_ROWS");
+        if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor) and dmmv.pipeline_q8_0_fused_gate_up_geglu4 != null) {
+            gemma_q8_geglu_rows = 4;
+        }
+        if (gemma_q8_geglu_rows_env) |raw_rows| {
+            if (std.mem.eql(u8, raw_rows, "4")) {
+                if (dmmv.pipeline_q8_0_fused_gate_up_geglu4 != null) {
+                    gemma_q8_geglu_rows = 4;
+                    log.info("Gemma Q8_0 shared GEGLU four-row path ENABLED via ZINC_GEMMA_Q8_GEGLU_ROWS=4", .{});
+                } else {
+                    gemma_q8_geglu_rows = 2;
+                    log.info("ZINC_GEMMA_Q8_GEGLU_ROWS=4 requested but the four-row pipeline is missing; using two-row path", .{});
+                }
+            } else if (std.mem.eql(u8, raw_rows, "2")) {
+                gemma_q8_geglu_rows = 2;
+                log.info("Gemma Q8_0 shared GEGLU two-row path ENABLED via ZINC_GEMMA_Q8_GEGLU_ROWS=2", .{});
+            } else {
+                log.info("Ignoring unsupported ZINC_GEMMA_Q8_GEGLU_ROWS={s}; using {d}-row path", .{ raw_rows, gemma_q8_geglu_rows });
+            }
+        } else if (gemma_q8_geglu_rows == 4) {
+            log.info("Gemma Q8_0 shared GEGLU four-row path ENABLED by default on Intel (set ZINC_GEMMA_Q8_GEGLU_ROWS=2 to disable)", .{});
+        }
+
         const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");
         const q8_batch_lm_flag = q8_batch_lm_env != null and std.mem.eql(u8, q8_batch_lm_env.?, "1");
         const q8_batch_lm_enabled = q8_batch_lm_flag and dmmv.pipeline_q8_0_batch != null;
@@ -3427,6 +3454,7 @@ pub const InferenceEngine = struct {
             .use_qwen36_q5_ssm_out_mul_mm = qwen36_q5_ssm_out_mul_mm_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .q8_wide_lm_head_rows = q8_wide_lm_rows,
+            .gemma_q8_geglu_rows = gemma_q8_geglu_rows,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
             .use_q4k_lm_head_dp4a = q4k_lm_head_dp4a_enabled,
@@ -15111,7 +15139,11 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
     ) !void {
-        const pip = &(self.dmmv.pipeline_q8_0_fused_gate_up_geglu orelse return error.ShaderNotLoaded);
+        const use_four_row = self.gemma_q8_geglu_rows == 4 and self.dmmv.pipeline_q8_0_fused_gate_up_geglu4 != null;
+        const pip = if (use_four_row)
+            &(self.dmmv.pipeline_q8_0_fused_gate_up_geglu4.?)
+        else
+            &(self.dmmv.pipeline_q8_0_fused_gate_up_geglu orelse return error.ShaderNotLoaded);
         const push = DmmvPushConstants{
             .M = M,
             .K = K,
@@ -15131,7 +15163,7 @@ pub const InferenceEngine = struct {
             input_size,
             geglu_buf.handle,
             geglu_buf.size,
-            (M + 1) / 2,
+            if (use_four_row) (M + 3) / 4 else (M + 1) / 2,
             1,
             1,
         );

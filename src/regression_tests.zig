@@ -257,9 +257,13 @@ test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
 
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_q8_0_fused_gate_up_geglu: ?Pipeline");
+    try expectContains(dmmv, "pipeline_q8_0_fused_gate_up_geglu4: ?Pipeline");
     try expectContains(dmmv, "dmmv_q8_0_fused_gate_up_geglu.spv");
+    try expectContains(dmmv, "dmmv_q8_0_fused_gate_up_geglu4.spv");
     try expectContains(dmmv, ".pipeline_q8_0_fused_gate_up_geglu = pipeline_q8_0_fused_gate_up_geglu");
+    try expectContains(dmmv, ".pipeline_q8_0_fused_gate_up_geglu4 = pipeline_q8_0_fused_gate_up_geglu4");
     try expectContains(dmmv, "if (self.pipeline_q8_0_fused_gate_up_geglu) |*p| p.deinit();");
+    try expectContains(dmmv, "if (self.pipeline_q8_0_fused_gate_up_geglu4) |*p| p.deinit();");
 
     const forward = @embedFile("compute/forward.zig");
     const marker = "const shared_front_q8_geglu =";
@@ -270,6 +274,8 @@ test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
     try expectContainsNear(forward, marker, "cpu_up_shexp.?.info.type_ == .q8_0", 500);
     try expectContainsNear(forward, marker, "pipeline_q8_0_fused_gate_up_geglu != null", 600);
     try expectContainsNear(forward, marker, "try self.dispatchDmmvFusedGateUpGegluQ8_0", 1200);
+    try expectContains(forward, "ZINC_GEMMA_Q8_GEGLU_ROWS");
+    try expectContains(forward, "pipeline_q8_0_fused_gate_up_geglu4");
     try expectContainsNear(forward, "if (!shared_front_fused and !shared_front_q8_geglu)", "try self.dispatchFfnActivation", 500);
 
     const shader = @embedFile("shaders/dmmv_q8_0_fused_gate_up_geglu.comp");
@@ -277,6 +283,12 @@ test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
     try expectContains(shader, "uint8_t a_gate_data[]");
     try expectContains(shader, "uint8_t a_up_data[]");
     try expectContains(shader, "float geglu(float gate, float up)");
+
+    const shader4 = @embedFile("shaders/dmmv_q8_0_fused_gate_up_geglu4.comp");
+    try expectContains(shader4, "const uint NUM_ROWS = 4u;");
+    try expectContains(shader4, "shared float s_sum_gate[32];");
+    try expectContains(shader4, "gl_NumSubgroups > 1u");
+    try expectContains(shader4, "for (uint sg = 1u; sg < gl_NumSubgroups && sg < MAX_SUBGROUPS; sg++)");
 }
 
 test "Vulkan Gemma dense decode keeps BN8 DP4a packed GEGLU path" {

@@ -1,0 +1,149 @@
+#version 460
+// ZINC - Q8_0 fused gate+up DMMV with inline GEGLU, four rows/WG.
+//
+// Gemma 4 26B-A4B stores the shared expert gate/up projections as separate
+// Q8_0 tensors. This variant widens the existing two-row fusion to four rows
+// per workgroup and batches the cross-subgroup merge for all rows.
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint a_offset;
+    uint x_offset;
+    uint y_offset;
+    uint acc_mode;
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixAGate { uint8_t a_gate_data[]; };
+layout(set = 0, binding = 1) readonly buffer MatrixAUp   { uint8_t a_up_data[];   };
+layout(set = 0, binding = 2) readonly buffer VectorX     { vec4 x_data[];         };
+layout(set = 0, binding = 3) writeonly buffer Geglu      { float y[];             };
+
+const uint NUM_ROWS = 4u;
+const uint MAX_SUBGROUPS = 8u;
+const uint Q8_0_BLOCK_SIZE = 32u;
+const uint Q8_0_BYTES = 34u;
+
+shared float s_sum_gate[32];
+shared float s_sum_up[32];
+
+void dot_q8_block_pair(
+    const uint gate_qs_off,
+    const uint up_qs_off,
+    const uint x_base_v4,
+    out float gate_sum,
+    out float up_sum
+) {
+    gate_sum = 0.0;
+    up_sum = 0.0;
+    for (uint i = 0u; i < 8u; i++) {
+        const uint gate_q_off = gate_qs_off + i * 4u;
+        const uint up_q_off = up_qs_off + i * 4u;
+        const vec4 xv = x_data[x_base_v4 + i];
+        const ivec4 gate_qv = ivec4(
+            int(int8_t(a_gate_data[gate_q_off + 0u])),
+            int(int8_t(a_gate_data[gate_q_off + 1u])),
+            int(int8_t(a_gate_data[gate_q_off + 2u])),
+            int(int8_t(a_gate_data[gate_q_off + 3u]))
+        );
+        const ivec4 up_qv = ivec4(
+            int(int8_t(a_up_data[up_q_off + 0u])),
+            int(int8_t(a_up_data[up_q_off + 1u])),
+            int(int8_t(a_up_data[up_q_off + 2u])),
+            int(int8_t(a_up_data[up_q_off + 3u]))
+        );
+        gate_sum += dot(vec4(gate_qv), xv);
+        up_sum += dot(vec4(up_qv), xv);
+    }
+}
+
+float geglu(float gate, float up) {
+    float g3 = gate * gate * gate;
+    float inner = 0.7978845608 * (gate + 0.044715 * g3);
+    inner = clamp(inner, -15.0, 15.0);
+    float gelu_g = 0.5 * gate * (1.0 + tanh(inner));
+    return gelu_g * up;
+}
+
+void write_row(uint row, float gate, float up, uint y_base) {
+    if (row < M) y[y_base + row] = geglu(gate, up);
+}
+
+void main() {
+    uint wg_id = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint row_base = wg_id * NUM_ROWS;
+    uint blocks_per_row = K / Q8_0_BLOCK_SIZE;
+
+    float sum_gate[NUM_ROWS];
+    float sum_up[NUM_ROWS];
+    for (uint r = 0u; r < NUM_ROWS; r++) {
+        sum_gate[r] = 0.0;
+        sum_up[r] = 0.0;
+    }
+
+    for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
+        uint x_base_v4 = x_offset / 16u + blk * 8u;
+
+        for (uint r = 0u; r < NUM_ROWS; r++) {
+            uint row = row_base + r;
+            if (row >= M) break;
+
+            uint byte_off_g = a_offset + row * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
+            uint d_bits_g = uint(a_gate_data[byte_off_g]) | (uint(a_gate_data[byte_off_g + 1u]) << 8);
+            float d_g = unpackHalf2x16(d_bits_g).x;
+
+            uint byte_off_u = a_offset + row * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
+            uint d_bits_u = uint(a_up_data[byte_off_u]) | (uint(a_up_data[byte_off_u + 1u]) << 8);
+            float d_u = unpackHalf2x16(d_bits_u).x;
+            float gate_block_sum;
+            float up_block_sum;
+            dot_q8_block_pair(byte_off_g + 2u, byte_off_u + 2u, x_base_v4, gate_block_sum, up_block_sum);
+            sum_gate[r] += d_g * gate_block_sum;
+            sum_up[r] += d_u * up_block_sum;
+        }
+    }
+
+    uint y_base = y_offset / 4u;
+    if (gl_NumSubgroups > 1u) {
+        for (uint r = 0u; r < NUM_ROWS; r++) {
+            float gate = subgroupAdd(sum_gate[r]);
+            float up = subgroupAdd(sum_up[r]);
+            if (subgroupElect()) {
+                uint idx = gl_SubgroupID * NUM_ROWS + r;
+                s_sum_gate[idx] = gate;
+                s_sum_up[idx] = up;
+            }
+        }
+        barrier();
+
+        if (tid < NUM_ROWS) {
+            uint row = row_base + tid;
+            if (row < M) {
+                float gate = s_sum_gate[tid];
+                float up = s_sum_up[tid];
+                for (uint sg = 1u; sg < gl_NumSubgroups && sg < MAX_SUBGROUPS; sg++) {
+                    uint idx = sg * NUM_ROWS + tid;
+                    gate += s_sum_gate[idx];
+                    up += s_sum_up[idx];
+                }
+                write_row(row, gate, up, y_base);
+            }
+        }
+    } else {
+        for (uint r = 0u; r < NUM_ROWS; r++) {
+            uint row = row_base + r;
+            if (row >= M) break;
+            float gate = subgroupAdd(sum_gate[r]);
+            float up = subgroupAdd(sum_up[r]);
+            if (tid == 0u) write_row(row, gate, up, y_base);
+        }
+    }
+}
