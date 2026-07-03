@@ -11687,17 +11687,17 @@
         "warmup_runs": 1
       },
       "summary": {
-        "fastest_model_id": "qwen36-35b-a3b-q4k-xl",
-        "fastest_model_label": "Qwen 3.6 35B A3B UD Q4_K_XL",
-        "fastest_decode_tps": 62.78,
+        "fastest_model_id": "gemma4-26b-a4b-q4k-m",
+        "fastest_model_label": "Gemma 4 26B-A4B MoE Q4_K_M",
+        "fastest_decode_tps": 58.66,
         "benchmarked_models": 5,
-        "successful_models": 5,
-        "average_decode_tps": 43.19799999999999,
-        "average_prompt_tps": 117.672,
-        "average_end_to_end_tps": 21.57395618798653,
-        "average_total_latency_ms": 10044.993083200034,
-        "compared_models": 5,
-        "average_pct_of_llama": 113.10304396951732
+        "successful_models": 4,
+        "average_decode_tps": 38.302499999999995,
+        "average_prompt_tps": 126.4225,
+        "average_end_to_end_tps": 18.01734220828684,
+        "average_total_latency_ms": 9413.819426999995,
+        "compared_models": 4,
+        "average_pct_of_llama": 114.68047681484201
       },
       "models": [
         {

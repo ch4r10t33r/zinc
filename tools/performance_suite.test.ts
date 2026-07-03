@@ -21,6 +21,7 @@ import {
   llamaDeviceArgs,
   localZincCommand,
   mergeArtifacts,
+  outputQualityStatus,
   parseArgs,
   parseDotEnv,
   parseLlamaCliOutput,
@@ -965,4 +966,73 @@ test("buildArtifact writes only the incoming targets", () => {
     zinc: { version: "zinc", commit: "zinc-commit" },
     llama_cpp: { binary: "llama-server", version: "42", commit: "xyz" },
   });
+});
+
+test("output quality status flags malformed benchmark previews", () => {
+  expect(outputQualityStatus("<|im_end|>", 2).tone).toBe("caution");
+  expect(outputQualityStatus("2\n</think>\n<|im_start|>0.\n<|im_end|>", 96).tone).toBe("caution");
+  expect(outputQualityStatus("##\n<think>first</think>\n<think>second", 128).tone).toBe("caution");
+  expect(outputQualityStatus("This implementation plan explains the command shape and warmup policy.", 96).tone).toBe("positive");
+});
+
+test("artifact target summary excludes preview-flagged rows from headline stats", () => {
+  const artifact = buildArtifact([
+    {
+      id: "intel",
+      label: "Intel",
+      models: [
+        {
+          id: "bad-fast",
+          label: "Bad Fast",
+          scenarios: [{
+            id: "core",
+            label: "Core",
+            max_tokens: 96,
+            zinc: {
+              prompt_tokens: 10,
+              generated_tokens: 96,
+              output_preview: "2\n</think>\n<|im_start|>0.\n<|im_end|>",
+              prefill_tps: { median: 100, avg: 100 },
+              decode_tps: { median: 200, avg: 200 },
+            },
+            baseline: {
+              prompt_tokens: 10,
+              generated_tokens: 96,
+              prefill_tps: { median: 100, avg: 100 },
+              decode_tps: { median: 100, avg: 100 },
+            },
+          }],
+        },
+        {
+          id: "good-slower",
+          label: "Good Slower",
+          scenarios: [{
+            id: "core",
+            label: "Core",
+            max_tokens: 96,
+            zinc: {
+              prompt_tokens: 10,
+              generated_tokens: 96,
+              output_preview: "This implementation plan explains the command shape and warmup policy.",
+              prefill_tps: { median: 90, avg: 90 },
+              decode_tps: { median: 50, avg: 50 },
+            },
+            baseline: {
+              prompt_tokens: 10,
+              generated_tokens: 96,
+              prefill_tps: { median: 90, avg: 90 },
+              decode_tps: { median: 45, avg: 45 },
+            },
+          }],
+        },
+      ],
+    },
+  ]);
+
+  const intel = artifact.targets[0];
+  expect(intel?.models.find((model) => model.id === "bad-fast")?.zinc?.decode_tps.median).toBe(200);
+  expect(intel?.summary.fastest_model_id).toBe("good-slower");
+  expect(intel?.summary.fastest_decode_tps).toBe(50);
+  expect(intel?.summary.successful_models).toBe(1);
+  expect(intel?.summary.compared_models).toBe(1);
 });

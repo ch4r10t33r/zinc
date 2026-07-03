@@ -463,23 +463,59 @@ function outputQualityStatus(scenario: any) {
     };
   }
 
+  if (/<\|[^>\n]{1,64}\|>/.test(preview)) {
+    return {
+      tone: 'caution',
+      label: 'Preview flagged',
+      note: 'ZINC completed numerically, but the preview contains raw chat control tokens.',
+    };
+  }
+
+  if ((preview.match(/<think>/g) ?? []).length > 1 || /<\/?parameter>/.test(preview)) {
+    return {
+      tone: 'caution',
+      label: 'Preview flagged',
+      note: 'ZINC completed numerically, but the preview contains repeated reasoning/control tags.',
+    };
+  }
+
   if (/(?:^|[\s:])(?:\d+\.){12,}/.test(preview)) {
     return {
       tone: 'caution',
       label: 'Preview flagged',
-      note: 'ZINC completed numerically, but the preview shows a repeated numeric pattern.',
+      note: 'ZINC completed numerically, but the preview shows a repeated pattern.',
+    };
+  }
+
+  if (/([#*_=-])\1{31,}/.test(preview) || /\b([A-Za-z]{3,})\1{8,}\b/.test(preview)) {
+    return {
+      tone: 'caution',
+      label: 'Preview flagged',
+      note: 'ZINC completed numerically, but the preview shows a repeated pattern.',
     };
   }
 
   return {
     tone: 'positive',
     label: 'Preview OK',
-    note: 'The captured preview does not show an obvious stop-token or repetition failure.',
+    note: 'The captured preview does not show an obvious stop-token, control-token, or repetition failure.',
   };
 }
 
 function isReviewOutputScenario(scenario: any) {
   return outputQualityStatus(scenario).tone === 'caution';
+}
+
+function scenarioComparableForPrimary(scenario: any) {
+  const comparison = scenario?.comparison;
+  return !comparison || comparison.overall_comparable !== false;
+}
+
+function selectPrimaryScenario(scenarios: any[]) {
+  if (!Array.isArray(scenarios) || scenarios.length === 0) return null;
+  const core = scenarios.find((scenario: any) => scenario.id === 'core') ?? null;
+  if (core && scenarioComparableForPrimary(core)) return core;
+  return scenarios.find(scenarioComparableForPrimary) ?? core ?? scenarios[0];
 }
 
 function scenarioStatus(scenario: any) {
@@ -518,12 +554,19 @@ function normalizeTarget(target: any) {
       scenarios: ensureScenarios(model),
     }));
 
-  const successful = visibleModels.filter((model: any) => model?.zinc?.decode_tps);
+  const primaryRows = visibleModels
+    .map((model: any) => {
+      const scenarios = ensureScenarios(model).filter((scenario: any) => !isReviewOutputScenario(scenario));
+      const primary = selectPrimaryScenario(scenarios);
+      return primary ? { model, scenario: primary } : null;
+    })
+    .filter(Boolean);
+  const successful = primaryRows.filter((row: any) => row.scenario?.zinc?.decode_tps);
   const allScenarios = visibleModels.flatMap((model: any) => ensureScenarios(model));
   const summaryScenarios = allScenarios.filter((scenario: any) => !isReviewOutputScenario(scenario));
   const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => !isReviewOutputScenario(scenario) && overallRatioValue(scenario) != null));
   const fastest = successful.length > 0
-    ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg ?? 0) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg ?? 0))[0]
+    ? [...successful].sort((a: any, b: any) => (b.scenario.zinc.decode_tps.median ?? b.scenario.zinc.decode_tps.avg ?? 0) - (a.scenario.zinc.decode_tps.median ?? a.scenario.zinc.decode_tps.avg ?? 0))[0]
     : null;
 
   return {
@@ -531,14 +574,14 @@ function normalizeTarget(target: any) {
     models: visibleModels,
     summary: {
       ...(target.summary ?? {}),
-      fastest_model_id: fastest?.id ?? null,
-      fastest_model_label: fastest?.label ?? null,
-      fastest_decode_tps: fastest ? (fastest.zinc.decode_tps.median ?? fastest.zinc.decode_tps.avg ?? null) : null,
+      fastest_model_id: fastest?.model?.id ?? null,
+      fastest_model_label: fastest?.model?.label ?? null,
+      fastest_decode_tps: fastest ? (fastest.scenario.zinc.decode_tps.median ?? fastest.scenario.zinc.decode_tps.avg ?? null) : null,
       benchmarked_models: visibleModels.length,
-      successful_models: successful.length,
+      successful_models: new Set(successful.map((row: any) => row.model.id)).size,
       compared_models: compared.length,
-      average_decode_tps: mean(successful.map((model: any) => model.zinc.decode_tps.median ?? model.zinc.decode_tps.avg ?? null)),
-      average_prompt_tps: mean(successful.map((model: any) => model.zinc.prefill_tps?.median ?? model.zinc.prefill_tps?.avg ?? null)),
+      average_decode_tps: mean(successful.map((row: any) => row.scenario.zinc.decode_tps.median ?? row.scenario.zinc.decode_tps.avg ?? null)),
+      average_prompt_tps: mean(successful.map((row: any) => row.scenario.zinc.prefill_tps?.median ?? row.scenario.zinc.prefill_tps?.avg ?? null)),
       average_pct_of_llama: aggregateOverallRatio(summaryScenarios),
     },
   };
