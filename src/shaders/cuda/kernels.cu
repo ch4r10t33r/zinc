@@ -5144,22 +5144,23 @@ __device__ __forceinline__ void mma_m16n8k16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-// Load A[16,16] fp16 row-major fragment from shared memory into 4 packed u32.
-// stride is in fp16 elements. Uses the mma.sync.m16n8k16.row thread mapping.
+// Load A[16,16] fp16 row-major fragment using ldmatrix.x4 (matches mma.sync layout).
+// smem layout: Ws[row * stride + col]. Each thread provides one row address.
 __device__ __forceinline__ void load_a_frag(
     unsigned& a0, unsigned& a1, unsigned& a2, unsigned& a3,
     const half* smem, unsigned base, unsigned stride) {
     const unsigned lane = threadIdx.x & 31u;
-    const unsigned r0 = lane >> 2;           // 0-7
-    const unsigned r1 = r0 + 8u;             // 8-15
-    const unsigned c0 = (lane & 3u) << 1;    // 0,2,4,6
-    const unsigned c1 = c0 + 8u;             // 8,10,12,14
-    // Each read: 2 adjacent fp16 = 4 bytes = 1 u32 (4-byte aligned since c0,c1 even)
-    const unsigned* p = (const unsigned*)(smem + base);
-    a0 = p[(r0 * stride + c0) >> 1];
-    a1 = p[(r0 * stride + c1) >> 1];
-    a2 = p[(r1 * stride + c0) >> 1];
-    a3 = p[(r1 * stride + c1) >> 1];
+    // ldmatrix.x4: 4 matrices of 8×8. Threads 0-7: matrix0 rows, 8-15: matrix1, etc.
+    // Matrix layout for [16,16] tile:
+    //   mat0 = [0:8, 0:8], mat1 = [0:8, 8:16], mat2 = [8:16, 0:8], mat3 = [8:16, 8:16]
+    unsigned row = lane % 8u;
+    unsigned mat = lane / 8u;
+    unsigned k_row = row + (mat / 2u) * 8u;  // 0-7 or 8-15
+    unsigned k_col = (mat % 2u) * 8u;         // 0 or 8
+    const half* ptr = smem + base + k_row * stride + k_col;
+    unsigned addr = (unsigned)__cvta_generic_to_shared(ptr);
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
 }
 
 // Load B[16,8] fp16 fragment using ldmatrix.x2.trans (handles col-major transposition).
@@ -5169,16 +5170,12 @@ __device__ __forceinline__ void load_b_frag_ldm(
     unsigned& b0, unsigned& b1,
     const half* smem, unsigned base, unsigned stride) {
     const unsigned lane = threadIdx.x & 31u;
-    const unsigned n = lane >> 2;            // column 0-7
-    const unsigned k0 = (lane & 3u) << 1;    // row 0,2,4,6
-    const unsigned short* p = (const unsigned short*)(smem + base);
-    // For .col B: b0 = pack(B[k][n], B[k+1][n])
-    unsigned short h0 = p[k0 * stride + n];
-    unsigned short h1 = p[(k0+1u) * stride + n];
-    b0 = (unsigned)h0 | ((unsigned)h1 << 16);
-    unsigned short h2 = p[(k0+8u) * stride + n];
-    unsigned short h3 = p[(k0+9u) * stride + n];
-    b1 = (unsigned)h2 | ((unsigned)h3 << 16);
+    // ldmatrix.x2.trans: threads 0-15 provide row addresses for 2 8×8 matrices.
+    // Matrix 0 = K-rows 0-7, Matrix 1 = K-rows 8-15, both reading N-cols 0-7.
+    const half* row_ptr = smem + base + (lane & 15u) * stride;
+    unsigned addr = (unsigned)__cvta_generic_to_shared(row_ptr);
+    asm volatile("ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(b0), "=r"(b1) : "r"(addr));
 }
 
 // ---- gemm_q4k_mma_lowsmem — inline-PTX fp16 MMA Q4_K GEMM (fixes wmma bug) ----
