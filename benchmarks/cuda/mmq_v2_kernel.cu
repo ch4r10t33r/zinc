@@ -1,4 +1,4 @@
-// mmq_v2_kernel.cu — M7: INT8 tensor-core MMQ (the llama.cpp approach).
+// mmq_v2_kernel.cu — M7: INT8 tensor-core MMQ (reference-style approach).
 //
 // Uses mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 — INT8 TC at 165 TOPS
 // on the 4090 (2× the FP16 TC at 82.6 TFLOPS that capped M2-M6 at 93 TFLOPS).

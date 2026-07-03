@@ -939,6 +939,33 @@ test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
     try expectNotContains(shader, "const uint BN");
 }
 
+test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1\"");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1: ?Pipeline");
+    try expectContains(dmmv, "dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.spv");
+    try expectContains(dmmv, "recordQwenTop1GateUpSwigluColsDispatchIndirect");
+    try expectContains(dmmv, ".pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1");
+    try expectContains(dmmv, "if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1", 9200);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "self.use_moe_fused_gate_up_swiglu", 9200);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 18000);
+
+    const shader = @embedFile("shaders/dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp");
+    try expectContains(shader, "layout(local_size_x = 64) in;");
+    try expectContains(shader, "MatrixAGate");
+    try expectContains(shader, "MatrixAUp");
+    try expectContains(shader, "ActiveBlocks");
+    try expectContains(shader, "x_route_divisor");
+    try expectContains(shader, "float swiglu(float gate, float up)");
+    try expectContains(shader, "exp(-g)");
+}
+
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {
     const src = @embedFile("shaders/softmax_topk.comp");
     try expectContains(src, "shared float s_local_val[64];");

@@ -49,7 +49,7 @@ struct MetalCmd {
 
 // Residency set wrapper. The `id` is held as `void *` so this header compiles
 // on SDKs where MTLResidencySet is unavailable; the @available check at runtime
-// gates actual API usage. Adapted from llama.cpp ggml-metal-device.m.
+// gates actual API usage. Adapted from the upstream GGML Metal device path.
 struct MetalRSet {
     id<MTLDevice> device;
     void *rset; // id<MTLResidencySet> on macOS 15+, nil otherwise
@@ -343,7 +343,7 @@ MetalCmd* mtl_begin_command_mode(MetalCtx* ctx, uint8_t serial) {
     if (!ctx) return NULL;
 
     // Use unretained references to avoid buffer retain/release overhead during
-    // command encoding — matches llama.cpp's ggml-metal-context.m approach.
+    // command encoding, matching the upstream GGML Metal context approach.
     // Safe because all Metal buffers are owned by the InferenceEngine and
     // outlive every command buffer.
     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBufferWithUnretainedReferences];
@@ -360,7 +360,7 @@ MetalCmd* mtl_begin_command_mode(MetalCtx* ctx, uint8_t serial) {
         return NULL;
     }
 
-    // Match llama.cpp's ggml_metal_graph_compute submission pattern: enqueue
+    // Match the upstream GGML graph submission pattern: enqueue
     // command buffers before the caller records the graph work, then commit
     // after encoding. On Apple GPUs this lets the command queue establish order
     // early for the dense decode chunks that are committed asynchronously.
@@ -685,7 +685,7 @@ void mtl_commit_wait_restart(MetalCmd* cmd) {
 
 // --- Residency sets (macOS 15+) ---
 //
-// Mirrors llama.cpp `ggml_metal_buffer_rset_init` / `_rset_free`: build a
+// Mirrors the upstream GGML residency-set path: build a
 // residency set covering all model weight buffers, commit + request residency
 // once, and rely on Metal to keep them wired down. Without this, on real
 // inference workloads the OS may evict the 17 GB of weights between layer

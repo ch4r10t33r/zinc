@@ -19225,6 +19225,9 @@ pub const InferenceEngine = struct {
         const up_stride = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
         const down_stride = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
         if (gate_stride != up_stride) return inactive;
+        const use_fused_gate_up_cols =
+            self.use_moe_fused_gate_up_swiglu and
+            self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null;
         const suffix_route_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_route_count) *
             @as(vk.c.VkDeviceSize, inter_dim) *
@@ -19395,80 +19398,112 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
         const gate_up_phase = self.beginProfilePhase();
-        try self.dmmv.recordMoeColsDispatchIndirect(
-            &self.decode_cmd,
-            self.instance.push_descriptor_fn,
-            .q4_k,
-            gate_exps.gpu_buffer.handle,
-            gate_exps.gpu_buffer.size,
-            scratch_norm.handle,
-            scratch_norm.size,
-            scratch_gate.handle,
-            prefix_inter_bytes,
-            counts.handle,
-            counts_bytes,
-            ids.handle,
-            ids_bytes,
-            active_blocks.handle,
-            active_blocks_bytes,
-            dispatch_args.handle,
-            0,
-            inter_dim,
-            hidden_dim,
-            gate_stride,
-            ids_stride,
-            1,
-            0,
-            0,
-            0,
-            false,
-        );
-        try self.dmmv.recordMoeColsDispatchIndirect(
-            &self.decode_cmd,
-            self.instance.push_descriptor_fn,
-            .q4_k,
-            up_exps.gpu_buffer.handle,
-            up_exps.gpu_buffer.size,
-            scratch_norm.handle,
-            scratch_norm.size,
-            scratch_up.handle,
-            prefix_inter_bytes,
-            counts.handle,
-            counts_bytes,
-            ids.handle,
-            ids_bytes,
-            active_blocks.handle,
-            active_blocks_bytes,
-            dispatch_args.handle,
-            0,
-            inter_dim,
-            hidden_dim,
-            up_stride,
-            ids_stride,
-            1,
-            0,
-            0,
-            0,
-            false,
-        );
+        if (use_fused_gate_up_cols) {
+            try self.dmmv.recordQwenTop1GateUpSwigluColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_exps.gpu_buffer.handle,
+                gate_exps.gpu_buffer.size,
+                up_exps.gpu_buffer.handle,
+                up_exps.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_swiglu.handle,
+                prefix_inter_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                0,
+                inter_dim,
+                hidden_dim,
+                gate_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+            );
+        } else {
+            try self.dmmv.recordMoeColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                .q4_k,
+                gate_exps.gpu_buffer.handle,
+                gate_exps.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_gate.handle,
+                prefix_inter_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                0,
+                inter_dim,
+                hidden_dim,
+                gate_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+                0,
+                false,
+            );
+            try self.dmmv.recordMoeColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                .q4_k,
+                up_exps.gpu_buffer.handle,
+                up_exps.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_up.handle,
+                prefix_inter_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                0,
+                inter_dim,
+                hidden_dim,
+                up_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+                0,
+                false,
+            );
+        }
         self.endProfilePhase(.moe_gate_up, gate_up_phase);
 
-        const gate_up_ranges = [_]CommandBuffer.BufferRange{
-            .{ .buffer = scratch_gate.handle, .size = prefix_inter_bytes },
-            .{ .buffer = scratch_up.handle, .size = prefix_inter_bytes },
-        };
-        self.decode_cmd.computeBuffersBarrier(&gate_up_ranges);
-        const swiglu_phase = self.beginProfilePhase();
-        try self.dispatchFfnActivation(
-            scratch_gate.handle,
-            scratch_gate.size,
-            scratch_up.handle,
-            scratch_up.size,
-            scratch_swiglu.handle,
-            scratch_swiglu.size,
-            prefix_tokens * inter_dim,
-        );
-        self.endProfilePhase(.moe_swiglu, swiglu_phase);
+        if (!use_fused_gate_up_cols) {
+            const gate_up_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_gate.handle, .size = prefix_inter_bytes },
+                .{ .buffer = scratch_up.handle, .size = prefix_inter_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&gate_up_ranges);
+            const swiglu_phase = self.beginProfilePhase();
+            try self.dispatchFfnActivation(
+                scratch_gate.handle,
+                scratch_gate.size,
+                scratch_up.handle,
+                scratch_up.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                prefix_tokens * inter_dim,
+            );
+            self.endProfilePhase(.moe_swiglu, swiglu_phase);
+        }
 
         self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, prefix_inter_bytes);
         const down_phase = self.beginProfilePhase();
@@ -19532,80 +19567,112 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
             const suffix_gate_up_phase = self.beginProfilePhase();
-            try self.dmmv.recordMoeColsDispatchIndirect(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                .q4_k,
-                gate_exps.gpu_buffer.handle,
-                gate_exps.gpu_buffer.size,
-                scratch_norm.handle,
-                scratch_norm.size,
-                scratch_gate.handle,
-                suffix_route_inter_bytes,
-                counts.handle,
-                counts_bytes,
-                ids.handle,
-                ids_bytes,
-                active_blocks.handle,
-                active_blocks_bytes,
-                dispatch_args.handle,
-                0,
-                inter_dim,
-                hidden_dim,
-                gate_stride,
-                suffix_route_count,
-                suffix_k,
-                0,
-                0,
-                0,
-                false,
-            );
-            try self.dmmv.recordMoeColsDispatchIndirect(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                .q4_k,
-                up_exps.gpu_buffer.handle,
-                up_exps.gpu_buffer.size,
-                scratch_norm.handle,
-                scratch_norm.size,
-                scratch_up.handle,
-                suffix_route_inter_bytes,
-                counts.handle,
-                counts_bytes,
-                ids.handle,
-                ids_bytes,
-                active_blocks.handle,
-                active_blocks_bytes,
-                dispatch_args.handle,
-                0,
-                inter_dim,
-                hidden_dim,
-                up_stride,
-                suffix_route_count,
-                suffix_k,
-                0,
-                0,
-                0,
-                false,
-            );
+            if (use_fused_gate_up_cols) {
+                try self.dmmv.recordQwenTop1GateUpSwigluColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_exps.gpu_buffer.handle,
+                    gate_exps.gpu_buffer.size,
+                    up_exps.gpu_buffer.handle,
+                    up_exps.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_swiglu.handle,
+                    suffix_route_inter_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    gate_stride,
+                    suffix_route_count,
+                    suffix_k,
+                    0,
+                    0,
+                );
+            } else {
+                try self.dmmv.recordMoeColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    .q4_k,
+                    gate_exps.gpu_buffer.handle,
+                    gate_exps.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_gate.handle,
+                    suffix_route_inter_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    gate_stride,
+                    suffix_route_count,
+                    suffix_k,
+                    0,
+                    0,
+                    0,
+                    false,
+                );
+                try self.dmmv.recordMoeColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    .q4_k,
+                    up_exps.gpu_buffer.handle,
+                    up_exps.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_up.handle,
+                    suffix_route_inter_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    up_stride,
+                    suffix_route_count,
+                    suffix_k,
+                    0,
+                    0,
+                    0,
+                    false,
+                );
+            }
             self.endProfilePhase(.moe_gate_up, suffix_gate_up_phase);
 
-            const suffix_gate_up_ranges = [_]CommandBuffer.BufferRange{
-                .{ .buffer = scratch_gate.handle, .size = suffix_route_inter_bytes },
-                .{ .buffer = scratch_up.handle, .size = suffix_route_inter_bytes },
-            };
-            self.decode_cmd.computeBuffersBarrier(&suffix_gate_up_ranges);
-            const suffix_swiglu_phase = self.beginProfilePhase();
-            try self.dispatchFfnActivation(
-                scratch_gate.handle,
-                scratch_gate.size,
-                scratch_up.handle,
-                scratch_up.size,
-                scratch_swiglu.handle,
-                scratch_swiglu.size,
-                suffix_route_count * inter_dim,
-            );
-            self.endProfilePhase(.moe_swiglu, suffix_swiglu_phase);
+            if (!use_fused_gate_up_cols) {
+                const suffix_gate_up_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = scratch_gate.handle, .size = suffix_route_inter_bytes },
+                    .{ .buffer = scratch_up.handle, .size = suffix_route_inter_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&suffix_gate_up_ranges);
+                const suffix_swiglu_phase = self.beginProfilePhase();
+                try self.dispatchFfnActivation(
+                    scratch_gate.handle,
+                    scratch_gate.size,
+                    scratch_up.handle,
+                    scratch_up.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    suffix_route_count * inter_dim,
+                );
+                self.endProfilePhase(.moe_swiglu, suffix_swiglu_phase);
+            }
 
             self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, suffix_route_inter_bytes);
             const suffix_down_phase = self.beginProfilePhase();
