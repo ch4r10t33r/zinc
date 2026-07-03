@@ -386,6 +386,8 @@ pub const DmmvDispatch = struct {
     pipeline_q4k_moe_kpar: ?Pipeline,
     /// Grouped top-1 prefill Q4_K MoE DMMV over route-packed token columns.
     pipeline_q4k_moe_cols: ?Pipeline,
+    /// Q8_1-input sibling for grouped Q4_K MoE down projection probes.
+    pipeline_q4k_moe_cols_q8_1: ?Pipeline,
     /// Fused gate+up Q4_K MoE pipeline (6 bindings: W_gate, W_up, X, Y_gate,
     /// Y_up, routing). Halves the dispatch count for the MoE gate+up phase
     /// and reads the shared input once per block.
@@ -436,6 +438,8 @@ pub const DmmvDispatch = struct {
     /// Qwen short-prefill route-packed top-1 fused gate+up+SwiGLU for
     /// separate Q4_K gate/up expert tensors.
     pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1: ?Pipeline,
+    /// DP4a/Q8_1 sibling of the grouped Qwen top-1 gate+up+SwiGLU path.
+    pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1: ?Pipeline,
     /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
     /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
     /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
@@ -1027,6 +1031,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_q4k_moe_cols != null) {
             log.info("dmmv_q4k_moe_cols pipeline loaded (grouped top-1 MoE prefill)", .{});
         }
+        const q4k_moe_cols_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_cols_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_moe_cols_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_cols_q8_1_path, 7, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K grouped MoE cols Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q4k_moe_cols_q8_1 != null) {
+            log.info("dmmv_q4k_moe_cols_q8_1 pipeline loaded (grouped top-1 MoE prefill Q8_1 down)", .{});
+        }
 
         // Cross-token batched MoE Q4_K DMMV. Same 4-binding shape as kpar
         // (A, X, Y, routing) but with the larger MoeBatchedDmmvPushConstants
@@ -1120,6 +1132,14 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null) {
             log.info("dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1 pipeline loaded (grouped Qwen top-1 MoE prefill gate/up)", .{});
+        }
+        const q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1_path, 8, gemma_top1_gate_up_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Qwen grouped top-1 Q8_1 gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 != null) {
+            log.info("dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 pipeline loaded (grouped Qwen top-1 MoE prefill Q8_1 gate/up)", .{});
         }
 
         // Q8_0 fused gate+up+SwiGLU. 4 bindings, same push struct as the
@@ -2267,6 +2287,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_moe = pipeline_q4k_moe,
             .pipeline_q4k_moe_kpar = pipeline_q4k_moe_kpar,
             .pipeline_q4k_moe_cols = pipeline_q4k_moe_cols,
+            .pipeline_q4k_moe_cols_q8_1 = pipeline_q4k_moe_cols_q8_1,
             .pipeline_q4k_moe_batched = pipeline_q4k_moe_batched,
             .pipeline_q4k_fused_gate_up_moe = pipeline_q4k_fused_gate_up_moe,
             .pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_q4k_fused_gate_up_moe_spec8,
@@ -2280,6 +2301,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 = pipeline_q4k_moe_fused_gate_up_geglu_batch_top1,
             .pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_geglu_cols_top1,
             .pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1,
+            .pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 = pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_fused_gate_up_geglu = pipeline_q8_0_fused_gate_up_geglu,
@@ -2706,6 +2728,69 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    pub fn recordMoeColsQ8_1DispatchIndirect(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        x_packed_buf: vk.c.VkBuffer,
+        x_packed_size: vk.c.VkDeviceSize,
+        x_scale_dsum_buf: vk.c.VkBuffer,
+        x_scale_dsum_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        indirect_buf: vk.c.VkBuffer,
+        indirect_offset: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        ids_stride: u32,
+        x_route_divisor: u32,
+        a_offset: u32,
+        x_offset: u32,
+        y_offset: u32,
+        accumulate: bool,
+    ) !void {
+        const pip = if (self.pipeline_q4k_moe_cols_q8_1) |*p| p else return error.PipelineNotLoaded;
+        if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
+        if ((K & 255) != 0) return error.InvalidArgument;
+        const push = MoeColsDmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .expert_stride = expert_stride,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
+            .ids_stride = ids_stride,
+            .x_route_divisor = @max(x_route_divisor, 1),
+            .accumulate = if (accumulate) 1 else 0,
+        };
+        const infos = [7]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = x_packed_buf, .offset = 0, .range = x_packed_size },
+            .{ .buffer = x_scale_dsum_buf, .offset = 0, .range = x_scale_dsum_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatchIndirect(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            indirect_buf,
+            indirect_offset,
+        );
+    }
+
     pub fn recordGemmaTop1GateUpGegluColsDispatchIndirect(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -2809,6 +2894,69 @@ pub const DmmvDispatch = struct {
             .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
             .{ .buffer = up_buf, .offset = 0, .range = up_size },
             .{ .buffer = x_buf, .offset = 0, .range = x_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatchIndirect(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            indirect_buf,
+            indirect_offset,
+        );
+    }
+
+    pub fn recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        x_packed_buf: vk.c.VkBuffer,
+        x_packed_size: vk.c.VkDeviceSize,
+        x_scale_dsum_buf: vk.c.VkBuffer,
+        x_scale_dsum_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        indirect_buf: vk.c.VkBuffer,
+        indirect_offset: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        ids_stride: u32,
+        x_route_divisor: u32,
+        a_offset: u32,
+        y_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1) |*p| p else return error.PipelineNotLoaded;
+        if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
+        if ((K & 255) != 0) return error.InvalidArgument;
+        const push = GemmaTop1GateUpColsPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .expert_stride = expert_stride,
+            .up_offset = 0,
+            .y_offset = y_offset,
+            .ids_stride = ids_stride,
+            .x_route_divisor = @max(x_route_divisor, 1),
+        };
+        const infos = [8]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = x_packed_buf, .offset = 0, .range = x_packed_size },
+            .{ .buffer = x_scale_dsum_buf, .offset = 0, .range = x_scale_dsum_size },
             .{ .buffer = y_buf, .offset = 0, .range = y_size },
             .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
             .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
@@ -5591,6 +5739,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_moe) |*p| p.deinit();
         if (self.pipeline_q4k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q4k_moe_cols) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_cols_q8_1) |*p| p.deinit();
         if (self.pipeline_q4k_moe_batched) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe_spec8) |*p| p.deinit();
@@ -5604,6 +5753,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_geglu) |*p| p.deinit();

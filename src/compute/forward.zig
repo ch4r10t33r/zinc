@@ -2496,20 +2496,31 @@ pub const InferenceEngine = struct {
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
-        // rms_norm_dmmv_f32 pipeline is loaded. Folds the standalone
-        // ffn-norm dispatch into the MoE router DMMV, saving one
-        // dispatch + one barrier per MoE layer (~30 layers on Qwen 3.6
-        // 35B-A3B). Disabled by setting ZINC_FUSED_RMS_ROUTER=0. Per-call
-        // gates (architecture, weight type, etc.) are evaluated in the
-        // forward path so models that don't fit silently fall back.
+        // rms_norm_dmmv_f32 pipeline is loaded, except on Intel Qwen 3.6
+        // MoE where the fused route currently produces malformed output.
+        // Folds the standalone ffn-norm dispatch into the MoE router DMMV,
+        // saving one dispatch + one barrier per MoE layer (~30 layers on
+        // Qwen 3.6 35B-A3B). Disabled by setting ZINC_FUSED_RMS_ROUTER=0.
+        // Per-call gates (architecture, weight type, etc.) are evaluated
+        // in the forward path so models that don't fit silently fall back.
         const fused_rms_router_env = std.posix.getenv("ZINC_FUSED_RMS_ROUTER");
         const fused_rms_router_explicitly_off = fused_rms_router_env != null and std.mem.eql(u8, fused_rms_router_env.?, "0");
-        const fused_rms_router_enabled = !fused_rms_router_explicitly_off and
+        const fused_rms_router_forced_on = fused_rms_router_env != null and !fused_rms_router_explicitly_off;
+        const fused_rms_router_intel_qwen_disabled = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const fused_rms_router_policy_enabled = fused_rms_router_forced_on or
+            (!fused_rms_router_explicitly_off and !fused_rms_router_intel_qwen_disabled);
+        const fused_rms_router_enabled = fused_rms_router_policy_enabled and
             elementwise.pipeline_rms_norm_dmmv_f32 != null;
         if (fused_rms_router_enabled) {
-            log.info("Fused FFN-norm + router DMMV ENABLED (default, set ZINC_FUSED_RMS_ROUTER=0 to disable)", .{});
+            if (fused_rms_router_forced_on) {
+                log.info("Fused FFN-norm + router DMMV ENABLED via ZINC_FUSED_RMS_ROUTER", .{});
+            } else {
+                log.info("Fused FFN-norm + router DMMV ENABLED (default, set ZINC_FUSED_RMS_ROUTER=0 to disable)", .{});
+            }
         } else if (fused_rms_router_explicitly_off) {
             log.info("Fused FFN-norm + router DMMV DISABLED via ZINC_FUSED_RMS_ROUTER=0", .{});
+        } else if (fused_rms_router_intel_qwen_disabled) {
+            log.info("Fused FFN-norm + router DMMV DISABLED by default on Intel Qwen 3.6 MoE (set ZINC_FUSED_RMS_ROUTER=1 to force)", .{});
         }
 
         // Fused SSM pre-norm (cycle 13): merges (rms_norm_mul → alpha
@@ -19228,6 +19239,63 @@ pub const InferenceEngine = struct {
         const use_fused_gate_up_cols =
             self.use_moe_fused_gate_up_swiglu and
             self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null;
+        const q8_1_gate_up_cols_enabled = if (std.posix.getenv("ZINC_MOE_Q8_1_GATE_UP_COLS")) |raw|
+            std.mem.eql(u8, raw, "1") or
+                std.ascii.eqlIgnoreCase(raw, "on") or
+                std.ascii.eqlIgnoreCase(raw, "true") or
+                std.ascii.eqlIgnoreCase(raw, "yes")
+        else
+            false;
+        const q8_1_gate_up_packed = self.batched_scratch_hidden_i8;
+        const q8_1_gate_up_scale_dsum = self.batched_scratch_hidden_scale_dsum;
+        const prefix_hidden_i8_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+            @sizeOf(u32);
+        const prefix_hidden_scale_dsum_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+            2 *
+            @sizeOf(f32);
+        const use_q8_1_gate_up_cols =
+            use_fused_gate_up_cols and
+            q8_1_gate_up_cols_enabled and
+            self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            q8_1_gate_up_packed != null and
+            q8_1_gate_up_scale_dsum != null and
+            (hidden_dim & 255) == 0 and
+            q8_1_gate_up_packed.?.size >= prefix_hidden_i8_bytes and
+            q8_1_gate_up_scale_dsum.?.size >= prefix_hidden_scale_dsum_bytes;
+        const q8_1_down_cols_env = std.posix.getenv("ZINC_MOE_Q8_1_DOWN_COLS");
+        const q8_1_down_cols_requested = if (q8_1_down_cols_env) |raw|
+            !(std.mem.eql(u8, raw, "0") or
+                std.ascii.eqlIgnoreCase(raw, "off") or
+                std.ascii.eqlIgnoreCase(raw, "false") or
+                std.ascii.eqlIgnoreCase(raw, "no"))
+        else
+            false;
+        const q8_1_down_packed = self.batched_scratch_swiglu_i8;
+        const q8_1_down_scale_dsum = self.batched_scratch_swiglu_scale_dsum;
+        const prefix_inter_i8_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim / 4) *
+            @sizeOf(u32);
+        const prefix_inter_scale_dsum_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim / 32) *
+            2 *
+            @sizeOf(f32);
+        const use_q8_1_down_cols =
+            q8_1_down_cols_requested and
+            down_exps.info.type_ == .q4_k and
+            self.dmmv.pipeline_q4k_moe_cols_q8_1 != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            q8_1_down_packed != null and
+            q8_1_down_scale_dsum != null and
+            (inter_dim & 255) == 0 and
+            q8_1_down_packed.?.size >= prefix_inter_i8_bytes and
+            q8_1_down_scale_dsum.?.size >= prefix_inter_scale_dsum_bytes;
         const suffix_route_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_route_count) *
             @as(vk.c.VkDeviceSize, inter_dim) *
@@ -19398,7 +19466,56 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
         const gate_up_phase = self.beginProfilePhase();
-        if (use_fused_gate_up_cols) {
+        if (use_q8_1_gate_up_cols) {
+            const hidden_i8 = q8_1_gate_up_packed.?;
+            const hidden_sd = q8_1_gate_up_scale_dsum.?;
+            try self.dmmv.recordQuantizeActQ8_1(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                prefix_tokens,
+                hidden_dim,
+            );
+            const q8_1_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = hidden_i8.handle, .size = prefix_hidden_i8_bytes },
+                .{ .buffer = hidden_sd.handle, .size = prefix_hidden_scale_dsum_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&q8_1_ranges);
+            try self.dmmv.recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_exps.gpu_buffer.handle,
+                gate_exps.gpu_buffer.size,
+                up_exps.gpu_buffer.handle,
+                up_exps.gpu_buffer.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                scratch_swiglu.handle,
+                prefix_inter_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                0,
+                inter_dim,
+                hidden_dim,
+                gate_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+            );
+        } else if (use_fused_gate_up_cols) {
             try self.dmmv.recordQwenTop1GateUpSwigluColsDispatchIndirect(
                 &self.decode_cmd,
                 self.instance.push_descriptor_fn,
@@ -19507,34 +19624,85 @@ pub const InferenceEngine = struct {
 
         self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, prefix_inter_bytes);
         const down_phase = self.beginProfilePhase();
-        try self.dmmv.recordMoeColsDispatchIndirect(
-            &self.decode_cmd,
-            self.instance.push_descriptor_fn,
-            down_exps.info.type_,
-            down_exps.gpu_buffer.handle,
-            down_exps.gpu_buffer.size,
-            scratch_swiglu.handle,
-            scratch_swiglu.size,
-            scratch_hidden.handle,
-            prefix_hidden_bytes,
-            counts.handle,
-            counts_bytes,
-            ids.handle,
-            ids_bytes,
-            active_blocks.handle,
-            active_blocks_bytes,
-            dispatch_args.handle,
-            3 * @sizeOf(u32),
-            hidden_dim,
-            inter_dim,
-            down_stride,
-            ids_stride,
-            1,
-            0,
-            0,
-            0,
-            true,
-        );
+        if (use_q8_1_down_cols) {
+            const swiglu_i8 = q8_1_down_packed.?;
+            const swiglu_sd = q8_1_down_scale_dsum.?;
+            try self.dmmv.recordQuantizeActQ8_1(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                swiglu_i8.handle,
+                swiglu_i8.size,
+                swiglu_sd.handle,
+                swiglu_sd.size,
+                prefix_tokens,
+                inter_dim,
+            );
+            const q8_1_swiglu_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = swiglu_i8.handle, .size = prefix_inter_i8_bytes },
+                .{ .buffer = swiglu_sd.handle, .size = prefix_inter_scale_dsum_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&q8_1_swiglu_ranges);
+            try self.dmmv.recordMoeColsQ8_1DispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                down_exps.gpu_buffer.handle,
+                down_exps.gpu_buffer.size,
+                swiglu_i8.handle,
+                swiglu_i8.size,
+                swiglu_sd.handle,
+                swiglu_sd.size,
+                scratch_hidden.handle,
+                prefix_hidden_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                3 * @sizeOf(u32),
+                hidden_dim,
+                inter_dim,
+                down_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+                0,
+                true,
+            );
+        } else {
+            try self.dmmv.recordMoeColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                down_exps.info.type_,
+                down_exps.gpu_buffer.handle,
+                down_exps.gpu_buffer.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                scratch_hidden.handle,
+                prefix_hidden_bytes,
+                counts.handle,
+                counts_bytes,
+                ids.handle,
+                ids_bytes,
+                active_blocks.handle,
+                active_blocks_bytes,
+                dispatch_args.handle,
+                3 * @sizeOf(u32),
+                hidden_dim,
+                inter_dim,
+                down_stride,
+                ids_stride,
+                1,
+                0,
+                0,
+                0,
+                true,
+            );
+        }
         self.endProfilePhase(.moe_down, down_phase);
 
         var grouped_total_tokens = prefix_tokens;

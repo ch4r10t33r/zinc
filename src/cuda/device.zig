@@ -45,6 +45,12 @@ pub const CudaDevice = struct {
     /// @param allocator Forwarded to `init` for the selected device.
     /// @returns Initialised `CudaDevice` for the best device, or `error.CudaNoDevice` if no device is found.
     pub fn initBest(allocator: std.mem.Allocator) !CudaDevice {
+        // Allow explicit device override (e.g. ZINC_CUDA_DEVICE=1 for 4090)
+        if (std.posix.getenv("ZINC_CUDA_DEVICE")) |dev_str| {
+            if (std.fmt.parseInt(u32, dev_str, 10)) |dev_idx| {
+                return init(allocator, dev_idx);
+            } else |_| {}
+        }
         var best_index: i64 = -1;
         var best_cc: u32 = 0;
         var idx: u32 = 0;
