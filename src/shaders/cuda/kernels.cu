@@ -5197,9 +5197,11 @@ extern "C" __global__ void gemm_q4k_mma_lowsmem(const unsigned* a_u32, const flo
     const float* Abase=A+(pc.x_offset>>2);
     const unsigned lane = tid & 31u;
 
-    // Accumulators: 4 floats per m16n8 output, 2 per warp for 16x16 output
-    float cL0=0,cL1=0,cL2=0,cL3=0; // left half (cols ft*16..ft*16+7)
-    float cR0=0,cR1=0,cR2=0,cR3=0; // right half (cols ft*16+8..ft*16+15)
+    // Accumulators: 4 mma outputs per warp (2 M-halves × 2 N-halves)
+    float cL0a=0,cL1a=0,cL2a=0,cL3a=0; // first M-half (rows fm*16), left N
+    float cR0a=0,cR1a=0,cR2a=0,cR3a=0; // first M-half, right N
+    float cL0b=0,cL1b=0,cL2b=0,cL3b=0; // second M-half (rows (fm+2)*16), left N
+    float cR0b=0,cR1b=0,cR2b=0,cR3b=0; // second M-half, right N
 
     for (unsigned c=0u;c<nchunk;c++){
         unsigned sbk=c>>3, sb8=c&7u;
@@ -5236,34 +5238,52 @@ extern "C" __global__ void gemm_q4k_mma_lowsmem(const unsigned* a_u32, const flo
             As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
         }
         __syncthreads();
-        // MMA: 2 K-sub-blocks per BK=32 chunk
+        // MMA: 2 K-sub-blocks per BK=32 chunk. Each sub-block: 2 A loads + 2 B loads + 4 mma
         #pragma unroll
         for(unsigned ks=0;ks<2;ks++){
-            unsigned a0r,a1r,a2r,a3r;
-            load_a_frag(a0r,a1r,a2r,a3r,Ws,(fm*16u)*BK+ks*16u,BK);
+            unsigned a0r,a1r,a2r,a3r, b0r,b1r,b2r,b3r;
+            load_a_frag(a0r,a1r,a2r,a3r, Ws,(fm*16u)*BK+ks*16u,BK);
+            load_a_frag(b0r,b1r,b2r,b3r, Ws,((fm+2u)*16u)*BK+ks*16u,BK);
             unsigned bL0,bL1,bR0,bR1;
             load_b_frag_ldm(bL0,bL1,As,(ks*16u)*BT+ft*16u,BT);
-            load_b_frag_ldm(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);            mma_m16n8k16(cL0,cL1,cL2,cL3,a0r,a1r,a2r,a3r,bL0,bL1,cL0,cL1,cL2,cL3);
-            mma_m16n8k16(cR0,cR1,cR2,cR3,a0r,a1r,a2r,a3r,bR0,bR1,cR0,cR1,cR2,cR3);
+            load_b_frag_ldm(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);
+            mma_m16n8k16(cL0a,cL1a,cL2a,cL3a,a0r,a1r,a2r,a3r,bL0,bL1,cL0a,cL1a,cL2a,cL3a);
+            mma_m16n8k16(cR0a,cR1a,cR2a,cR3a,a0r,a1r,a2r,a3r,bR0,bR1,cR0a,cR1a,cR2a,cR3a);
+            mma_m16n8k16(cL0b,cL1b,cL2b,cL3b,b0r,b1r,b2r,b3r,bL0,bL1,cL0b,cL1b,cL2b,cL3b);
+            mma_m16n8k16(cR0b,cR1b,cR2b,cR3b,b0r,b1r,b2r,b3r,bR0,bR1,cR0b,cR1b,cR2b,cR3b);
         }
         __syncthreads();
     }
-    // Store accumulator: each thread holds D[row][col], D[row][col+1], D[row+8][col], D[row+8][col+1]
-    // where row=lane/4, col=2*(lane%4)
+    // Store: each thread holds D[row][col], D[row][col+1], D[row+8][col], D[row+8][col+1]
+    // for both M-halves and both N-halves.
     {
+        // First M-half (rows fm*16..fm*16+15)
         unsigned row0 = m0 + fm*16u + (lane>>2);
         unsigned row1 = row0 + 8u;
         unsigned col0 = t0 + ft*16u + (lane&3u)*2u;
         unsigned col1 = col0 + 1u;
-        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cL0;
-        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cL1;
-        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cL2;
-        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cL3;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cL0a;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cL1a;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cL2a;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cL3a;
         col0 += 8u; col1 += 8u;
-        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cR0;
-        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cR1;
-        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cR2;
-        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cR3;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cR0a;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cR1a;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cR2a;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cR3a;
+        // Second M-half (rows (fm+2)*16..(fm+2)*16+15)
+        col0 -= 8u; col1 -= 8u;
+        row0 = m0 + (fm+2u)*16u + (lane>>2);
+        row1 = row0 + 8u;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cL0b;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cL1b;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cL2b;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cL3b;
+        col0 += 8u; col1 += 8u;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cR0b;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cR1b;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cR2b;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cR3b;
     }
 }
 
