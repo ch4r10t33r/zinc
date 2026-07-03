@@ -1041,6 +1041,7 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_QWEN36_MOE_PREFILL_TOPK",
   "ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD",
   "ZINC_QWEN36_Q8_WIDE4_SSM_OUT",
+  "ZINC_Q8_1_LM_HEAD",
   "ZINC_GEMMA_MOE_TOPK",
   "ZINC_GEMMA_MOE_PREFILL_TOPK",
   "ZINC_PREFILL_PROFILE",
@@ -1064,7 +1065,7 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_SERVE_WCACHE_MB",
 ];
 
-function collectRemoteZincTuningEnv(dotEnv) {
+export function collectRemoteZincTuningEnv(dotEnv) {
   const env = {};
   for (const key of REMOTE_ZINC_TUNING_ENV_KEYS) {
     const value = process.env[key] ?? dotEnv[key];

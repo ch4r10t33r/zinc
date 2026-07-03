@@ -8,6 +8,7 @@ import {
   buildZincOpenAiPayload,
   benchmarkFailureReason,
   canonicalModelIdFromPath,
+  collectRemoteZincTuningEnv,
   compareModelsByName,
   detectRdnaServerStartupFailure,
   DEFAULT_LOCAL_MODEL_ROOT,
@@ -99,6 +100,10 @@ test("parseArgs reads Intel suite options", () => {
   expect(args.intelWorkdir).toBe("/home/tempuser/zinc-intel-loop");
   expect(args.intelXdgCacheHome).toBe("/home/tempuser/.cache");
   expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
+});
+
+test("remote tuning env forwards Q8_1 LM-head toggle", () => {
+  expect(collectRemoteZincTuningEnv({ ZINC_Q8_1_LM_HEAD: "1" }).ZINC_Q8_1_LM_HEAD).toBe("1");
 });
 
 test("parseArgs reads RDNA backend and device options", () => {

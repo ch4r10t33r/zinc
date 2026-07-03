@@ -1338,8 +1338,9 @@ pub const InferenceEngine = struct {
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
-    // Opt-in via ZINC_Q8_1_LM_HEAD=1. Quantizes the final norm vector to Q8_1
-    // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
+    // Default-on for Intel Qwen 3.6 MoE; force on elsewhere with
+    // ZINC_Q8_1_LM_HEAD=1 or disable with =0. Quantizes the final norm vector
+    // to Q8_1 and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
     // Opt-in via ZINC_Q4K_LM_HEAD_DP4A=1. Quantizes the final norm vector to
     // the DP4a Q8_1 activation layout and runs matching Q4_K LM heads through
@@ -2966,16 +2967,25 @@ pub const InferenceEngine = struct {
         }
 
         const q8_1_lm_env = std.posix.getenv("ZINC_Q8_1_LM_HEAD");
-        const q8_1_lm_flag = q8_1_lm_env != null and std.mem.eql(u8, q8_1_lm_env.?, "1");
-        const q8_1_lm_enabled = q8_1_lm_flag and
+        const q8_1_lm_explicitly_off = q8_1_lm_env != null and std.mem.eql(u8, q8_1_lm_env.?, "0");
+        const q8_1_lm_forced_on = q8_1_lm_env != null and !q8_1_lm_explicitly_off;
+        const q8_1_lm_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const q8_1_lm_requested = !q8_1_lm_explicitly_off and (q8_1_lm_forced_on or q8_1_lm_default_on);
+        const q8_1_lm_enabled = q8_1_lm_requested and
             dmmv.pipeline_q8_0_q8_1 != null and
             dmmv.pipeline_quantize_q8_1 != null and
             instance.push_descriptor_fn != null and
             (config.hidden_dim & 31) == 0;
         if (q8_1_lm_enabled) {
-            log.info("Q8_0 x Q8_1 LM-head path ENABLED via ZINC_Q8_1_LM_HEAD=1", .{});
-        } else if (q8_1_lm_flag) {
-            log.info("ZINC_Q8_1_LM_HEAD=1 requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
+            if (q8_1_lm_forced_on) {
+                log.info("Q8_0 x Q8_1 LM-head path ENABLED via ZINC_Q8_1_LM_HEAD", .{});
+            } else {
+                log.info("Q8_0 x Q8_1 LM-head path ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_Q8_1_LM_HEAD=0 to disable)", .{});
+            }
+        } else if (q8_1_lm_requested) {
+            log.info("Q8_0 x Q8_1 LM-head path requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
+        } else if (q8_1_lm_explicitly_off) {
+            log.info("Q8_0 x Q8_1 LM-head path DISABLED via ZINC_Q8_1_LM_HEAD=0", .{});
         }
 
         const q4k_lm_head_dp4a_env = std.posix.getenv("ZINC_Q4K_LM_HEAD_DP4A");
