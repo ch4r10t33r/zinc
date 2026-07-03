@@ -106,6 +106,7 @@ const gemma_prefill_tiny_prompt_topk: u32 = 2;
 const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
+const qwen_dense_intel_deep_prefill_min_tokens: usize = 64;
 
 fn gemmaPrefillTailTopkLimit(prompt_tokens: u32, base_limit: u32) u32 {
     if (prompt_tokens > 0 and
@@ -18777,7 +18778,11 @@ pub const InferenceEngine = struct {
             self.gpu_config.vendor == .amd_rdna4 or
             self.gpu_config.vendor == .amd_rdna4_apu;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return 0;
-        if (mode == null and !is_amd) return 0;
+        const use_intel_qwen_dense_deep_prefix = mode == null and
+            (self.isQwen35DenseHybrid9B() or self.isQwen36DenseHybrid27B()) and
+            isIntelGpuVendor(self.gpu_config.vendor) and
+            prompt_len >= qwen_dense_intel_deep_prefill_min_tokens;
+        if (mode == null and !is_amd and !use_intel_qwen_dense_deep_prefix) return 0;
 
         // Tiny prompts (<=8 tok) use a deep prefix because the layer-major
         // setup cost is amortized over a tiny work envelope.
@@ -18795,7 +18800,7 @@ pub const InferenceEngine = struct {
         // segment_layer=4. The previously-blocking SSM projection replay
         // is bypassed because use_ssm_preproj is default-off.
         // Override with ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS=1 to revert.
-        var layers: u32 = if (mode != null) 1 else if (prompt_len <= 8) 8 else 3;
+        var layers: u32 = if (mode != null) 1 else if (use_intel_qwen_dense_deep_prefix) cfg.n_layers - 1 else if (prompt_len <= 8) 8 else 3;
         if (mode) |raw| {
             if (!std.mem.eql(u8, raw, "1")) {
                 layers = std.fmt.parseInt(u32, raw, 10) catch layers;
