@@ -102,8 +102,13 @@ test("parseArgs reads Intel suite options", () => {
   expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
 });
 
-test("remote tuning env forwards Q8_1 LM-head toggle", () => {
-  expect(collectRemoteZincTuningEnv({ ZINC_Q8_1_LM_HEAD: "1" }).ZINC_Q8_1_LM_HEAD).toBe("1");
+test("remote tuning env forwards Q8_1 projection toggles", () => {
+  const env = collectRemoteZincTuningEnv({
+    ZINC_Q8_1_LM_HEAD: "1",
+    ZINC_Q8_1_SSM_QKV_Z: "1",
+  });
+  expect(env.ZINC_Q8_1_LM_HEAD).toBe("1");
+  expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe("1");
 });
 
 test("parseArgs reads RDNA backend and device options", () => {

@@ -1357,6 +1357,10 @@ pub const InferenceEngine = struct {
     // Opt-in via ZINC_FUSED_SSM_QKV_Z=1. Fuses the Qwen A3B SSM wqkv and
     // z/gate Q8_0 projections into one dispatch when both share norm_buf.
     use_fused_ssm_qkv_z: bool = false,
+    // Default-on for Intel Qwen 3.6 MoE; force on elsewhere with
+    // ZINC_Q8_1_SSM_QKV_Z=1 or disable with =0. Quantizes the SSM norm vector
+    // once and runs the Q8_0 wqkv/z projections through integer-dot DMMV.
+    use_q8_1_ssm_qkv_z: bool = false,
     // Opt-in via ZINC_BATCH_ATTN=1. Foundation for prefill-path attention
     // batching (effort-6 Step 6 A). When set and flash_attn_batched is
     // loaded, the attention call site routes through the batched shader with
@@ -3061,6 +3065,31 @@ pub const InferenceEngine = struct {
             log.info("SSM fused Q8_0 wqkv+z projection requested but prerequisites missing; using separate SSM projections", .{});
         }
 
+        const q8_1_ssm_qkv_z_env = std.posix.getenv("ZINC_Q8_1_SSM_QKV_Z");
+        const q8_1_ssm_qkv_z_explicitly_off = q8_1_ssm_qkv_z_env != null and
+            std.mem.eql(u8, q8_1_ssm_qkv_z_env.?, "0");
+        const q8_1_ssm_qkv_z_forced_on = q8_1_ssm_qkv_z_env != null and
+            !q8_1_ssm_qkv_z_explicitly_off;
+        const q8_1_ssm_qkv_z_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const q8_1_ssm_qkv_z_requested = !q8_1_ssm_qkv_z_explicitly_off and
+            (q8_1_ssm_qkv_z_forced_on or q8_1_ssm_qkv_z_default_on);
+        const q8_1_ssm_qkv_z_enabled = q8_1_ssm_qkv_z_requested and
+            dmmv.pipeline_q8_0_q8_1 != null and
+            dmmv.pipeline_quantize_q8_1 != null and
+            instance.push_descriptor_fn != null and
+            (config.hidden_dim & 31) == 0;
+        if (q8_1_ssm_qkv_z_enabled) {
+            if (q8_1_ssm_qkv_z_forced_on) {
+                log.info("SSM Q8_0 x Q8_1 wqkv+z projection ENABLED via ZINC_Q8_1_SSM_QKV_Z", .{});
+            } else {
+                log.info("SSM Q8_0 x Q8_1 wqkv+z projection ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_Q8_1_SSM_QKV_Z=0 to disable)", .{});
+            }
+        } else if (q8_1_ssm_qkv_z_requested) {
+            log.info("SSM Q8_0 x Q8_1 wqkv+z projection requested but prerequisites missing; using default SSM projections", .{});
+        } else if (q8_1_ssm_qkv_z_explicitly_off) {
+            log.info("SSM Q8_0 x Q8_1 wqkv+z projection DISABLED via ZINC_Q8_1_SSM_QKV_Z=0", .{});
+        }
+
         // Effort-6 Step 5 prerequisite: count_experts wire-in. When
         // ZINC_COUNT_EXPERTS_PREFILL=1 is set alongside ZINC_CAPTURE_ROUTING=1
         // and the count_experts pipeline is loaded, prefillBatch will scan
@@ -3527,6 +3556,7 @@ pub const InferenceEngine = struct {
             .use_q4k_q8_1_dmmv = q4k_q8_1_enabled,
             .use_q8_spec_dmmv = q8_spec_enabled,
             .use_fused_ssm_qkv_z = fused_ssm_qkv_z_enabled,
+            .use_q8_1_ssm_qkv_z = q8_1_ssm_qkv_z_enabled,
             .use_count_experts_prefill = count_experts_enabled,
             .use_capture_ffn_input = ffn_input_capture_flag and prefill_ffn_input_capture_buf.handle != null,
             .use_a3b_validate = a3b_validate_enabled,
@@ -15316,6 +15346,38 @@ pub const InferenceEngine = struct {
         );
     }
 
+    fn dispatchDmmvQ8_0Q8_1Prequantized(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        output_buf: Buffer,
+        output_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q8_0_q8_1 orelse return error.ShaderNotLoaded);
+        const push = DmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = 0,
+            .x_offset = 0,
+            .y_offset = 0,
+            .acc_mode = 0,
+        };
+        self.pushDispatch3(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            self.q8_1_buf.handle,
+            self.q8_1_buf.size,
+            output_buf.handle,
+            output_size,
+            (M + 1) / 2,
+            1,
+            1,
+        );
+    }
+
     fn dispatchDmmvQ8_0FusedPairBatched(
         self: *InferenceEngine,
         tensor0: *const LoadedTensor,
@@ -16284,6 +16346,16 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_q8_0_fused_pair != null and
             self.instance.push_descriptor_fn != null and
             (hidden_dim & 31) == 0;
+        const q8_1_norm_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, (hidden_dim + 31) / 32) * Q8_1_BLOCK_BYTES;
+        const can_q8_1_qkv_z = self.use_q8_1_ssm_qkv_z and
+            !is_dead_tail and
+            wqkv_tensor.info.type_ == .q8_0 and
+            z_tensor.info.type_ == .q8_0 and
+            self.dmmv.pipeline_q8_0_q8_1 != null and
+            self.dmmv.pipeline_quantize_q8_1 != null and
+            self.instance.push_descriptor_fn != null and
+            (hidden_dim & 31) == 0 and
+            self.q8_1_buf.size >= q8_1_norm_bytes;
         const use_prebatched_ssm_proj = self.partialSsmPreprojActiveFor(layer);
 
         if (use_fused_pre_norm) {
@@ -16367,6 +16439,34 @@ pub const InferenceEngine = struct {
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
                     self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
+            } else if (can_q8_1_qkv_z) {
+                self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
+                try self.dmmv.recordQuantizeQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    self.norm_buf.handle,
+                    hidden_size,
+                    self.q8_1_buf.handle,
+                    self.q8_1_buf.size,
+                    hidden_dim,
+                );
+                self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_norm_bytes);
+                try self.dispatchDmmvQ8_0Q8_1Prequantized(
+                    wqkv_tensor,
+                    self.attn_out_buf,
+                    qkv_bytes,
+                    @intCast(conv_channels),
+                    hidden_dim,
+                );
+                try self.dispatchDmmvQ8_0Q8_1Prequantized(
+                    z_tensor,
+                    self.gate_buf,
+                    z_bytes,
+                    @intCast(d_inner),
+                    hidden_dim,
+                );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else if (can_fuse_qkv_z) {
                 self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
                 const ssm_proj_qkv_z_phase = self.beginProfilePhase();
@@ -16440,6 +16540,33 @@ pub const InferenceEngine = struct {
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
                     self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
+            } else if (can_q8_1_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
+                try self.dmmv.recordQuantizeQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    self.norm_buf.handle,
+                    hidden_size,
+                    self.q8_1_buf.handle,
+                    self.q8_1_buf.size,
+                    hidden_dim,
+                );
+                self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_norm_bytes);
+                try self.dispatchDmmvQ8_0Q8_1Prequantized(
+                    wqkv_tensor,
+                    self.attn_out_buf,
+                    qkv_bytes,
+                    @intCast(conv_channels),
+                    hidden_dim,
+                );
+                try self.dispatchDmmvQ8_0Q8_1Prequantized(
+                    z_tensor,
+                    self.gate_buf,
+                    z_bytes,
+                    @intCast(d_inner),
+                    hidden_dim,
+                );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else if (can_fuse_qkv_z) {
                 const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPair(
