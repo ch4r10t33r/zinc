@@ -2617,8 +2617,8 @@ fn b1MatvecOn() bool {
 
 // Effort 28: the small-B (2..8) token-batch matvec (`*_btok`) is now DEFAULT-ON
 // (opt out with ZINC_BATCH_MROW=0/off/false/no). Same env knob as the qwen
-// `decodeBatch` port. Flipped 2026-06-15 after the CLEAN-window head-to-head gate
-// (throughput_vs_llama.sh, qwen35-9b, 5090, 60/60 rounds uncontended): mrow ON
+// `decodeBatch` port. Flipped 2026-06-15 after the clean-window head-to-head gate:
+// mrow ON
 // clean-beats mrow OFF at every batched B (4.14×/2.83×/2.29× at B=2/4/8), no
 // regression at B=1. The batched mrow-ON path is token-identical to N-serial
 // (proven every cycle), so the flip just makes the validated-better path the

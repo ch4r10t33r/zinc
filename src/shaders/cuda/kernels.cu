@@ -2455,7 +2455,7 @@ extern "C" __global__ void build_expert_order(const unsigned* expert_ids, unsign
 }
 
 // ---- T2 (grouped Tensor-core MoE-expert GEMM) primitives ---------------------
-// The routed-expert FFN gap vs llama is the SCALAR matvec compute (grouped matvec
+// The routed-expert FFN bottleneck is the scalar matvec compute (grouped matvec
 // is dead on both GPUs — Effort-26 c7 / 2026-06-22 4090 A/B). T2 puts the gate/up
 // experts on the Tensor cores by GATHERING each expert's tokens contiguously and
 // running the existing `gemm_q4k_tc` per expert. These three kernels are the glue:
@@ -5043,6 +5043,102 @@ extern "C" __global__ void gemm_q4k_tc_f16a_lowsmem(const unsigned* a_u32, const
 // Cs[BT*BM] output buffer after the K-loop completes. 3 blocks/SM vs 2 for the
 // 24KB gemm_q4k_tc. Output uses stride BM=64 (same as gemm_q4k_tc — no column
 // overflow issues that plagued the 8KB two-phase attempt).
+// ZINC_PREFILL_F16TC=1: forces fp16 wmma.mma.sync via inline PTX instead of
+// NVRTC's default fp32 (.f32.f32) wmma::mma_sync.
+__device__ __forceinline__ void wmma_mma_f16_inline(
+    float* d, const half* a, const half* b, const float* c) {
+    asm volatile(
+        "wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+        "{%8,%9,%10,%11}, "
+        "{%12,%13,%14,%15}, "
+        "{%16,%17,%18,%19,%20,%21,%22,%23};\n"
+        : "=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3]),
+          "=f"(d[4]),"=f"(d[5]),"=f"(d[6]),"=f"(d[7])
+        : "r"(*(const unsigned*)&a[0]), "r"(*(const unsigned*)&a[2]),
+          "r"(*(const unsigned*)&a[4]), "r"(*(const unsigned*)&a[6]),
+          "r"(*(const unsigned*)&b[0]), "r"(*(const unsigned*)&b[2]),
+          "r"(*(const unsigned*)&b[4]), "r"(*(const unsigned*)&b[6]),
+          "f"(c[0]),"f"(c[1]),"f"(c[2]),"f"(c[3]),
+          "f"(c[4]),"f"(c[5]),"f"(c[6]),"f"(c[7]));
+}
+extern "C" __global__ void gemm_q4k_tc_lowsmem_f16(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float smem[BT*BM];
+    half* Ws = (half*)smem;
+    half* As = ((half*)smem) + (BM*BK);
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
+    unsigned bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x;
+    unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
+    unsigned a0=(pc.a_offset>>2);
+    const float* Abase=A+(pc.x_offset>>2);
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0,c1;
+    wmma::fill_fragment(c0,0.0f); wmma::fill_fragment(c1,0.0f);
+
+    for (unsigned c=0u;c<nchunk;c++){
+        unsigned sbk=c>>3, sb8=c&7u;
+        unsigned wid=tid>>5, lane=tid&31u;
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned r=wid+(unsigned)u*8u, l=lane, row=m0+r;
+            float wv=0.0f;
+            if(row<pc.M){
+                unsigned blk=a0+row*bpr*36u+sbk*36u;
+                float d_sc,dm_mn;
+                if(lane==0){
+                    unsigned dd=a_u32[blk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    d_sc=d*(float)s; dm_mn=dmin*(float)mn;
+                }
+                d_sc=__shfl_sync(0xFFFFFFFFu,d_sc,0);
+                dm_mn=__shfl_sync(0xFFFFFFFFu,dm_mn,0);
+                const unsigned char* qs=(const unsigned char*)(a_u32+blk+4u);
+                unsigned char qb=qs[(sb8>>1)*32u+l];
+                unsigned nib=(sb8&1u)==0u?(qb&0xFu):(unsigned)(qb>>4);
+                wv=d_sc*(float)nib-dm_mn;
+            }
+            Ws[r*BK+l]=__float2half(wv);
+        }
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned t=idx>>5,l=idx&31u,tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned ks=0;ks<2;ks++){
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f,a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f,&Ws[(fm*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(a1f,&Ws[((fm+2u)*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(bf,&As[(ks*16u)*BT+ft*16u],BT);
+            // Inline PTX: force fp16 wmma.mma.sync instead of NVRTC's fp32 default
+            wmma_mma_f16_inline(c0.x, a0f.x, bf.x, c0.x);
+            wmma_mma_f16_inline(c1.x, a1f.x, bf.x, c1.x);
+        }
+        __syncthreads();
+    }
+    float* Cs = smem;
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+fm*16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+(fm+2u)*16u], c1, BM, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for(int u=0;u<16;u++){
+        unsigned idx=tid+(unsigned)u*256u;
+        unsigned r=idx%BM, t=idx/BM;
+        unsigned row=m0+r, tok=t0+t;
+        if(row<pc.M&&tok<pc.T){
+            unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row;
+            if(pc.acc_mode!=0u) Y[yi]+=Cs[t*BM+r]; else Y[yi]=Cs[t*BM+r];
+        }
+    }
+}
 extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
     const unsigned BM=64u, BT=64u, BK=32u;
     // 16KB shared: Ws+As occupy first 8KB during K-loop; full 16KB reused as Cs for output
