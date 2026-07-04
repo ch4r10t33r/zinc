@@ -106,7 +106,7 @@ const gemma_prefill_tiny_prompt_topk: u32 = 2;
 const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
-const qwen_dense_intel_deep_prefill_min_tokens: usize = 64;
+const qwen_dense_intel_deep_prefill_min_tokens: usize = 32;
 
 fn gemmaPrefillTailTopkLimit(prompt_tokens: u32, base_limit: u32) u32 {
     if (prompt_tokens > 0 and
@@ -11602,7 +11602,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.qwenDenseFfnDp4aEnabled(n_tokens)) return false;
         if (self.elementwise.pipeline_residual_rms_norm_quant_q8_1 == null) return false;
         if (self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a == null) return false;
@@ -17230,6 +17230,10 @@ pub const InferenceEngine = struct {
             self.gpu_config.vendor == .amd_rdna4_apu;
     }
 
+    fn isQwenDensePrefillAccelGpu(self: *const InferenceEngine) bool {
+        return self.isAmdRdna() or isIntelGpuVendor(self.gpu_config.vendor);
+    }
+
     fn intelA3bProductionEnabled(self: *const InferenceEngine) bool {
         if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
         const raw = std.posix.getenv("ZINC_INTEL_A3B_PRODUCTION") orelse return true;
@@ -17257,7 +17261,7 @@ pub const InferenceEngine = struct {
 
     fn qwen36DensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return n_tokens;
-        if (!self.isAmdRdna()) return n_tokens;
+        if (!self.isQwenDensePrefillAccelGpu()) return n_tokens;
         const min_dp4a_tokens: u32 = 32;
         if (n_tokens < min_dp4a_tokens) return n_tokens;
         return (n_tokens + 31) & ~@as(u32, 31);
@@ -17334,7 +17338,7 @@ pub const InferenceEngine = struct {
     fn qwen36Dp4aDownEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (std.posix.getenv("ZINC_QWEN36_27B_DP4A_DOWN")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
@@ -17345,7 +17349,7 @@ pub const InferenceEngine = struct {
     fn qwenDenseFfnDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
 
         // Mesa 26.0-devel regression workaround (measured on the Radeon RX
@@ -17383,7 +17387,7 @@ pub const InferenceEngine = struct {
     fn qwenDenseSsmOutDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
@@ -17398,7 +17402,7 @@ pub const InferenceEngine = struct {
     fn qwenDenseSsmProjDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
@@ -17413,7 +17417,7 @@ pub const InferenceEngine = struct {
     fn qwenDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
 
         if (self.isQwen35DenseHybrid9B()) {
@@ -18963,7 +18967,7 @@ pub const InferenceEngine = struct {
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         return self.instance.push_descriptor_fn != null and
             self.elementwise.pipeline_ssm_gated_norm != null;
     }
@@ -18973,7 +18977,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwenLayerMajorSsmPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.use_ssm_delta_normed_qk) return false;
         if (self.elementwise.pipeline_ssm_delta_net == null and self.elementwise.pipeline_ssm_delta_net_cols8 == null) return false;
@@ -19053,7 +19057,7 @@ pub const InferenceEngine = struct {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         return n_tokens >= 16;
     }
 
@@ -19082,7 +19086,7 @@ pub const InferenceEngine = struct {
         if (prompt_len < 16 or self.validation_diagnostics_enabled) return 0;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return 0;
-        if (!self.isAmdRdna()) return 0;
+        if (!self.isQwenDensePrefillAccelGpu()) return 0;
 
         const cfg = self.model.config;
         if (prefix_layers + 1 >= cfg.n_layers) return 0;
@@ -22491,7 +22495,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.attention.pipeline_batched == null) return false;
         if (self.elementwise.pipeline_rope_batched == null) return false;
