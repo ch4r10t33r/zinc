@@ -572,6 +572,7 @@ export function outputQualityStatus(preview, generatedTokens = null) {
   if (
     /(?:^|[\s:])(?:\d+\.){12,}/.test(text) ||
     /(?:^|\n)\s*(\d+[.)])\s*(?:\n\s*\1\s*){11,}/.test(text) ||
+    hasRepeatedNumberedItemText(text) ||
     /([#*_=-])\1{31,}/.test(text) ||
     /\b([A-Za-z]{3,})\1{8,}\b/.test(text)
   ) {
@@ -587,6 +588,28 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     label: "Preview OK",
     note: "The captured preview does not show an obvious stop-token, control-token, or repetition failure.",
   };
+}
+
+function hasRepeatedNumberedItemText(text) {
+  const items = [...text.matchAll(/(?:^|\s)(\d{1,3})[.)]\s+([\s\S]*?)(?=(?:\s+\d{1,3}[.)]\s+)|$)/g)]
+    .map((match) => `${match[2] ?? ""}`
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim())
+    .filter((item) => item.length >= 24);
+  let last = "";
+  let run = 0;
+  for (const item of items) {
+    const key = item.slice(0, 160);
+    if (key === last) {
+      run += 1;
+    } else {
+      last = key;
+      run = 1;
+    }
+    if (run >= 4) return true;
+  }
+  return false;
 }
 
 function scenarioNeedsOutputReview(scenario) {
@@ -732,6 +755,10 @@ function recalculateScenarioComparison(scenario) {
   return {
     ...scenario,
     comparison,
+    output_quality: outputQualityStatus(
+      scenario?.zinc?.output_preview,
+      scenario?.zinc?.generated_tokens,
+    ),
   };
 }
 
@@ -2443,6 +2470,7 @@ function scenarioResultPayload(entry, scenarioDef, zinc, baseline) {
     zinc,
     baseline: baseline?.decode_tps ? baseline : baseline,
     comparison: baseline?.decode_tps ? buildComparison(zinc, baseline, { expectedGeneratedTokens: scenarioDef.max_tokens }) : null,
+    output_quality: outputQualityStatus(zinc?.output_preview, zinc?.generated_tokens),
   };
 }
 

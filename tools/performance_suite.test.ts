@@ -987,6 +987,13 @@ test("output quality status flags malformed benchmark previews", () => {
   expect(outputQualityStatus("2\n</think>\n<|im_start|>0.\n<|im_end|>", 96).tone).toBe("caution");
   expect(outputQualityStatus("##\n<think>first</think>\n<think>second", 128).tone).toBe("caution");
   expect(outputQualityStatus("1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.", 128).tone).toBe("caution");
+  expect(outputQualityStatus(
+    "1. What is the most important thing to remember about the relationship between the brain and the body? " +
+    "2. What is the most important thing to remember about the relationship between the brain and the body? " +
+    "3. What is the most important thing to remember about the relationship between the brain and the body? " +
+    "4. What is the most important thing to remember about the relationship between the brain and the body?",
+    96,
+  ).tone).toBe("caution");
   expect(outputQualityStatus("This implementation plan explains the command shape and warmup policy.", 96).tone).toBe("positive");
 });
 
@@ -1045,7 +1052,9 @@ test("artifact target summary excludes preview-flagged rows from headline stats"
   ]);
 
   const intel = artifact.targets[0];
-  expect(intel?.models.find((model) => model.id === "bad-fast")?.zinc?.decode_tps.median).toBe(200);
+  const badFast = intel?.models.find((model) => model.id === "bad-fast");
+  expect(badFast?.zinc?.decode_tps.median).toBe(200);
+  expect(badFast?.scenarios?.[0]?.output_quality?.tone).toBe("caution");
   expect(intel?.summary.fastest_model_id).toBe("good-slower");
   expect(intel?.summary.fastest_decode_tps).toBe(50);
   expect(intel?.summary.successful_models).toBe(1);
