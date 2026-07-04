@@ -19702,6 +19702,14 @@ pub const InferenceEngine = struct {
             (hidden_dim + 31) / 32
         else
             (hidden_dim + 3) / 4;
+        const prefix_gate_up_workgroups_x: u32 = if (use_fused_gate_up_cols and !use_q8_1_gate_up_cols)
+            (inter_dim + 7) / 8
+        else
+            (inter_dim + 3) / 4;
+        const suffix_gate_up_workgroups_x: u32 = if (use_fused_gate_up_cols and !use_q8_1_suffix_gate_up_cols)
+            (inter_dim + 7) / 8
+        else
+            (inter_dim + 3) / 4;
         const suffix_route_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_route_count) *
             @as(vk.c.VkDeviceSize, inter_dim) *
@@ -19873,7 +19881,7 @@ pub const InferenceEngine = struct {
                 1,
                 route_stride_u32,
                 ids_stride,
-                (inter_dim + 3) / 4,
+                prefix_gate_up_workgroups_x,
                 prefix_down_workgroups_x,
                 0,
             );
@@ -20252,7 +20260,7 @@ pub const InferenceEngine = struct {
                 suffix_k,
                 route_stride_u32,
                 suffix_route_count,
-                (inter_dim + 3) / 4,
+                suffix_gate_up_workgroups_x,
                 (hidden_dim + 3) / 4,
                 prefix_tokens,
             );

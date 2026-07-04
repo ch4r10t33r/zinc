@@ -11,6 +11,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : require
 
 layout(local_size_x = 64) in;
 
@@ -34,8 +35,8 @@ layout(set = 0, binding = 5) readonly buffer PackedIds { uint packed_ids[]; };
 layout(set = 0, binding = 6) readonly buffer ActiveBlocks { uint active_blocks[]; };
 
 const uint NUM_COLS = 8u;
-const uint ROWS_PER_WG = 4u;
-const uint LANES_PER_ROW = 16u;
+const uint ROWS_PER_WG = 8u;
+const uint LANES_PER_ROW = 8u;
 const uint Q4K_BLOCK_U32 = 36u;
 
 vec4 unpack_nibbles_lo(uint v) {
@@ -349,15 +350,6 @@ void main() {
     const uint x6 = (route6 / x_div) * (K / 4u);
     const uint x7 = (route7 / x_div) * (K / 4u);
 
-    const uint il = lane / 4u;
-    const uint ir = lane & 3u;
-    const uint v_im = il / 2u;
-    const uint v_in = il & 1u;
-    const uint l0 = 4u * (2u * ir + v_in);
-    const uint q_offset_in_half = 32u * v_im + l0;
-    const uint y_offset_local = 64u * v_im + l0;
-    const uint shift = v_im * 16u;
-
     const uint blocks_per_row = K / 256u;
     const uint expert_base_u32 = (a_offset + expert_id * expert_stride) / 4u;
     const uint gate_row_u32 = expert_base_u32 + row * blocks_per_row * Q4K_BLOCK_U32;
@@ -368,13 +360,25 @@ void main() {
     vec4 up0 = vec4(0.0);
     vec4 up1 = vec4(0.0);
 
-    for (uint b = 0u; b < blocks_per_row; b++) {
-        const uint idx0 = (b * 256u + y_offset_local) / 4u;
-        const uint idx1 = idx0 + 8u;
-        const uint idx2 = (b * 256u + y_offset_local + 128u) / 4u;
-        const uint idx3 = idx2 + 8u;
+    [[unroll]] for (uint lane_pass = 0u; lane_pass < 2u; lane_pass++) {
+        const uint virtual_lane = lane + lane_pass * LANES_PER_ROW;
+        const uint il = virtual_lane / 4u;
+        const uint ir = virtual_lane & 3u;
+        const uint v_im = il / 2u;
+        const uint v_in = il & 1u;
+        const uint l0 = 4u * (2u * ir + v_in);
+        const uint q_offset_in_half = 32u * v_im + l0;
+        const uint y_offset_local = 64u * v_im + l0;
+        const uint shift = v_im * 16u;
 
-        accumulate_gate_up_row(gate_row_u32, b, q_offset_in_half, shift, idx0, idx1, idx2, idx3, x0, x1, x2, x3, x4, x5, x6, x7, active0, active1, active2, active3, active4, active5, active6, active7, gate0, gate1, up0, up1);
+        for (uint b = 0u; b < blocks_per_row; b++) {
+            const uint idx0 = (b * 256u + y_offset_local) / 4u;
+            const uint idx1 = idx0 + 8u;
+            const uint idx2 = (b * 256u + y_offset_local + 128u) / 4u;
+            const uint idx3 = idx2 + 8u;
+
+            accumulate_gate_up_row(gate_row_u32, b, q_offset_in_half, shift, idx0, idx1, idx2, idx3, x0, x1, x2, x3, x4, x5, x6, x7, active0, active1, active2, active3, active4, active5, active6, active7, gate0, gate1, up0, up1);
+        }
     }
 
     const float gate_out0 = subgroupClusteredAdd(gate0.x, LANES_PER_ROW);
