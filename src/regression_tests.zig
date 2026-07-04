@@ -445,6 +445,28 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(forward, "return accumulate_down;");
 }
 
+test "Vulkan Intel Qwen 3.5 dense prefill uses shallow prefix for segment sweep" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const use_intel_qwen35_segment_sweep =";
+    try expectContainsNear(src, marker, "self.isQwen35DenseHybrid9B()", 180);
+    try expectContainsNear(src, marker, "isIntelGpuVendor(self.gpu_config.vendor)", 260);
+    try expectContainsNear(src, marker, "prompt_len >= qwen_dense_intel_deep_prefill_min_tokens", 360);
+    try expectContains(src, "full-attn layers inside");
+    try expectContainsNear(src, "var layers: u32 = if (mode != null) 1", "use_intel_qwen35_segment_sweep) 2", 180);
+    try expectContainsNear(src, "var layers: u32 = if (mode != null) 1", "use_intel_qwen36_dense_deep_prefix) cfg.n_layers - 1", 260);
+}
+
+test "Vulkan Intel Qwen 3.5 dense prefill defaults off fused SSM AB" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const intel_qwen35_dense_hybrid_9b =";
+    try expectContainsNear(src, marker, "isIntelGpuVendor(gpu_config.vendor)", 120);
+    try expectContainsNear(src, marker, "config.architecture == .qwen35", 180);
+    try expectContainsNear(src, marker, "config.hidden_dim == 4096", 520);
+    try expectContainsNear(src, "const fused_ssm_ab_policy_enabled = if", "else if (intel_qwen35_dense_hybrid_9b)", 220);
+    try expectContainsNear(src, "else if (intel_qwen35_dense_hybrid_9b)", "false", 80);
+    try expectContains(src, "set ZINC_FUSED_SSM_AB=1 to enable");
+}
+
 test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_5120_n64_q6_q8_1_ragged = [_]pipeline_mod.SpecConst{");
