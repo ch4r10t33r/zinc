@@ -17330,6 +17330,16 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q8_0 != null;
     }
 
+    fn qwenA3bShortPrefillSeparateSsmQkvZ(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
+        if (n_tokens == 0 or n_tokens > 64) return false;
+        if (std.posix.getenv("ZINC_FUSED_SSM_QKV_Z")) |raw| {
+            if (raw.len > 0 and !std.mem.eql(u8, raw, "0")) return false;
+        }
+        return true;
+    }
+
     /// int8 DP4a dense-down prefill GEMM (Qwen3.6-27B). Default-on when the
     /// device exposes shaderIntegerDotProduct; disable with
     /// ZINC_QWEN36_27B_DP4A_DOWN=0. The Q6_K f32-FMA down GEMM is a tuned local
@@ -20867,7 +20877,8 @@ pub const InferenceEngine = struct {
                 self.decode_cmd.computeBuffersBarrier(&i8_ranges);
             }
 
-            const can_mul_mm_q8_qkv_z = !self.use_fused_ssm_qkv_z and
+            const use_separate_q8_qkv_z = self.qwenA3bShortPrefillSeparateSsmQkvZ(n_tokens);
+            const can_mul_mm_q8_qkv_z = (!self.use_fused_ssm_qkv_z or use_separate_q8_qkv_z) and
                 wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
                 self.dmmv.pipeline_mul_mm_q8_0 != null and
@@ -20881,6 +20892,7 @@ pub const InferenceEngine = struct {
                 self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
                 self.dmmv.pipeline_quantize_act_q8 != null;
             const can_fuse_q8_qkv_z = self.use_fused_ssm_qkv_z and
+                !use_separate_q8_qkv_z and
                 wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
                 self.dmmv.pipeline_q8_0_fused_pair != null and
