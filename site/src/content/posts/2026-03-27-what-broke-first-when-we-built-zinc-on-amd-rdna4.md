@@ -7,6 +7,8 @@ tags:
   - llm-inference
   - rdna4
   - qwen3-5
+  - vulkan
+  - zig
   - flash-attention
   - page-attention
   - vllm
@@ -14,12 +16,17 @@ tags:
 keywords:
   - local LLM inference
   - AMD RDNA4 inference
+  - AMD GPU inference
+  - RDNA4 LLM
+  - Vulkan inference
   - Qwen3.5-35B-A3B GGUF
   - flash attention
+  - KV cache
   - paged KV cache
   - mixture of experts
   - state space model
   - RoPE
+  - GGUF
   - tokenizer correctness
   - GPT-2 byte-level BPE
   - GGUF model loading
