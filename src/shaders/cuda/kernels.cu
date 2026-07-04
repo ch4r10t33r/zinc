@@ -1215,15 +1215,18 @@ extern "C" __global__ void ssm_delta_net(
     const float* conv_out, const unsigned char* dt_bias, const float* alpha,
     const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
     DeltaNetPush pc) {
+    // State stored transposed: state[h][col][row] — col-major for coalesced
+    // warp access in ssm_delta_net_warp. Block kernel adapts by swapping
+    // row/col roles: blockIdx.y = col, threadIdx.x = row.
     unsigned h = blockIdx.x;
-    unsigned row = blockIdx.y;
-    unsigned col = threadIdx.x;                  // 0..head_v_dim-1
-    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
+    unsigned col = blockIdx.y;
+    unsigned row = threadIdx.x;                  // 0..head_v_dim-1
+    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
     unsigned hv = pc.head_v_dim;
     unsigned qk_dim = pc.d_state * pc.n_group;
     unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
-    size_t row_base = ((size_t)h * hv + row) * hv;
-    float rs = state[row_base + col];            // state[h][row][col]
+    size_t col_base = ((size_t)h * hv + col) * hv;
+    float rs = state[col_base + row];            // state[h][col][row]
 
     float dt_bias_val = 0.0f;
     if (pc.has_dt_bias != 0u)
@@ -1243,15 +1246,14 @@ extern "C" __global__ void ssm_delta_net(
         unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
         unsigned v_off = conv_base + 2u * qk_dim + h * hv;
 
-        // L2-normalize Q/K per group (sum-sq reduced across cols), scale Q.
-        float qi = (col < k_len) ? conv_out[q_off + col] : 0.0f;
-        float ki = (col < k_len) ? conv_out[k_off + col] : 0.0f;
+        float qi = (row < k_len) ? conv_out[q_off + row] : 0.0f;
+        float ki = (row < k_len) ? conv_out[k_off + row] : 0.0f;
         float sumq = zinc_block_reduce_sum_all(qi * qi);
         float sumk = zinc_block_reduce_sum_all(ki * ki);
         float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
         float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
 
-        if (col == 0) {
+        if (row == 0) {
             float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
             float sp = logf(1.0f + expf(a));               // softplus
             float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
@@ -1261,16 +1263,16 @@ extern "C" __global__ void ssm_delta_net(
         __syncthreads();
         float g = s_g, b = s_b;
 
-        float v_val = conv_out[v_off + row];
+        float v_val = conv_out[v_off + col];
         rs *= g;                                            // decay
-        float sk = zinc_block_reduce_sum_all((col < k_len) ? rs * skv : 0.0f);
+        float sk = zinc_block_reduce_sum_all((row < k_len) ? rs * skv : 0.0f);
         float d = b * (v_val - sk);
-        if (col < k_len) rs += skv * d;                     // rank-1 update
-        float o = zinc_block_reduce_sum_all((col < k_len) ? rs * sq : 0.0f);  // readout
-        if (col == 0) out_data[t * pc.y_stride_tok + h * hv + row] = o;
+        if (row < k_len) rs += skv * d;                     // rank-1 update
+        float o = zinc_block_reduce_sum_all((row < k_len) ? rs * sq : 0.0f);  // readout
+        if (row == 0) out_data[t * pc.y_stride_tok + h * hv + col] = o;
         __syncthreads();
     }
-    state[row_base + col] = rs;                             // write final state
+    state[col_base + row] = rs;                             // write final state
 }
 
 // ---- ssm_delta_net_warp (warp-level scan — no __syncthreads in hot loop) -----
@@ -1518,17 +1520,19 @@ extern "C" __global__ void ssm_delta_net_seq(
     const float* conv_out, const unsigned char* dt_bias, const float* alpha,
     const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
     const unsigned* slots, DeltaNetSeqPush pc) {
+    // Transposed state: state[slot][h][col][row] — col-major for coalesced
+    // warp access in prefill kernels. blockIdx.y = col, threadIdx.x = row.
     unsigned h = blockIdx.x;
-    unsigned row = blockIdx.y;
+    unsigned col = blockIdx.y;
     unsigned b = blockIdx.z;
-    unsigned col = threadIdx.x;                  // 0..head_v_dim-1
-    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
+    unsigned row = threadIdx.x;                  // 0..head_v_dim-1
+    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
     unsigned hv = pc.head_v_dim;
     unsigned qk_dim = pc.d_state * pc.n_group;
     unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
     size_t state_base = (size_t)slots[b] * pc.ssm_state_len;
-    size_t row_base = state_base + ((size_t)h * hv + row) * hv;
-    float rs = state[row_base + col];            // state[slot][h][row][col]
+    size_t col_base = state_base + ((size_t)h * hv + col) * hv;
+    float rs = state[col_base + row];            // state[slot][h][col][row]
 
     float dt_bias_val = 0.0f;
     if (pc.has_dt_bias != 0u)
@@ -1548,15 +1552,15 @@ extern "C" __global__ void ssm_delta_net_seq(
     unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
     unsigned v_off = conv_base + 2u * qk_dim + h * hv;
 
-    // L2-normalize Q/K per group (sum-sq reduced across cols), scale Q.
-    float qi = (col < k_len) ? conv_out[q_off + col] : 0.0f;
-    float ki = (col < k_len) ? conv_out[k_off + col] : 0.0f;
+    // L2-normalize Q/K per group (sum-sq reduced across rows), scale Q.
+    float qi = (row < k_len) ? conv_out[q_off + row] : 0.0f;
+    float ki = (row < k_len) ? conv_out[k_off + row] : 0.0f;
     float sumq = zinc_block_reduce_sum_all(qi * qi);
     float sumk = zinc_block_reduce_sum_all(ki * ki);
     float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
     float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
 
-    if (col == 0) {
+    if (row == 0) {
         float a = alpha[b * pc.ab_stride_tok + h] + dt_bias_val;
         float sp = logf(1.0f + expf(a));               // softplus
         float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
@@ -1566,14 +1570,14 @@ extern "C" __global__ void ssm_delta_net_seq(
     __syncthreads();
     float g = s_g, bcoef = s_b;
 
-    float v_val = conv_out[v_off + row];
+    float v_val = conv_out[v_off + col];
     rs *= g;                                            // decay
-    float sk = zinc_block_reduce_sum_all((col < k_len) ? rs * skv : 0.0f);
+    float sk = zinc_block_reduce_sum_all((row < k_len) ? rs * skv : 0.0f);
     float delta = bcoef * (v_val - sk);
-    if (col < k_len) rs += skv * delta;                 // rank-1 update
-    float o = zinc_block_reduce_sum_all((col < k_len) ? rs * sq : 0.0f);  // readout
-    if (col == 0) out_data[b * pc.y_stride_tok + h * hv + row] = o;
-    state[row_base + col] = rs;                          // write final state
+    if (row < k_len) rs += skv * delta;                 // rank-1 update
+    float o = zinc_block_reduce_sum_all((row < k_len) ? rs * sq : 0.0f);  // readout
+    if (row == 0) out_data[b * pc.y_stride_tok + h * hv + col] = o;
+    state[col_base + row] = rs;                          // write final state
 }
 
 // ---- ssm_delta_net_chunked (parallel intra-chunk delta-net) ------------------

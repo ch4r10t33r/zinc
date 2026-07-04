@@ -854,7 +854,7 @@ pub const ForwardCuda = struct {
             const cc = shim.cuda_compute_capability(ctx);
             log.info("mma.sync cubin: cc={d}, trying nvcc cubin path", .{cc});
             if (cc >= 89) {
-                const cubin_data = if (cc >= 100) @embedFile("../cuda/cubins/mma_kernel.sm120.cubin") else @embedFile("../cuda/cubins/mma_kernel.sm89.cubin");
+                const cubin_data = if (cc >= 100) @embedFile("../cuda/cubins/mma_kernel.sm120.fatbin") else @embedFile("../cuda/cubins/mma_kernel.sm89.fatbin");
                 log.info("mma.sync cubin: {d} bytes embedded", .{cubin_data.len});
                 if (pipeline.createPipelineFromImage(ctx, cubin_data.ptr, cubin_data.len, "gemm_q4k_mma_lowsmem")) |pipe| {
                     log.info("mma.sync: nvcc cubin loaded OK", .{});
