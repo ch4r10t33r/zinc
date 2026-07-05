@@ -20981,6 +20981,151 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn prepareQwenDenseSsmAlphaBetaQ8(
+        self: *InferenceEngine,
+        scratch_norm: Buffer,
+        hidden_dim: u32,
+        dt_rank: u32,
+        n_tokens: u32,
+    ) !u32 {
+        if (!self.qwenDenseProjectionDp4aEnabled(n_tokens)) return 0;
+        if ((dt_rank & 31) != 0 or (hidden_dim & 31) != 0) return 0;
+        if (self.instance.push_descriptor_fn == null) return 0;
+        if (self.dmmv.pipeline_quantize_act_q8 == null) return 0;
+        if (self.dmmv.pipeline_mul_mm_q8_0_full_dp4a == null) return 0;
+        if (self.dmmv.pipeline_mul_mm_q8_0 == null) return 0;
+
+        const norm_i8 = self.batched_scratch_norm_q8 orelse return 0;
+        const norm_scale = self.batched_scratch_norm_q8_scale orelse return 0;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return 0;
+
+        const need_i8: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+            @sizeOf(u32);
+        const need_scale: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+            @sizeOf(f32);
+        if (norm_i8.size < need_i8 or norm_scale.size < need_scale) return 0;
+
+        try self.dmmv.recordQuantizeActQ8(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            scratch_norm.handle,
+            scratch_norm.size,
+            norm_i8.handle,
+            norm_i8.size,
+            norm_scale.handle,
+            norm_scale.size,
+            full_cols,
+            hidden_dim,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = norm_i8.handle, .size = norm_i8.size },
+            .{ .buffer = norm_scale.handle, .size = norm_scale.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+        return full_cols;
+    }
+
+    fn recordQwenDenseSsmAlphaBetaQ8(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        scratch_norm: Buffer,
+        dst: Buffer,
+        dt_rank: u32,
+        hidden_dim: u32,
+        n_tokens: u32,
+        q8_cols: u32,
+    ) !void {
+        if (q8_cols > 0) {
+            const norm_i8 = self.batched_scratch_norm_q8.?;
+            const norm_scale = self.batched_scratch_norm_q8_scale.?;
+            try self.dmmv.recordMulMmQ8_0FullDp4a(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                norm_i8.handle,
+                norm_i8.size,
+                norm_scale.handle,
+                norm_scale.size,
+                dst.handle,
+                dst.size,
+                dt_rank,
+                q8_cols,
+                hidden_dim,
+                0,
+                0,
+            );
+            if (q8_cols >= n_tokens) return;
+            try self.dmmv.recordMulMmQ8_0(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                dst.handle,
+                dst.size,
+                dt_rank,
+                n_tokens - q8_cols,
+                hidden_dim,
+                hidden_dim,
+                dt_rank,
+                0,
+                q8_cols * hidden_dim,
+                q8_cols * dt_rank,
+            );
+            return;
+        }
+
+        if (self.instance.push_descriptor_fn != null and
+            self.dmmv.pipeline_mul_mm_q8_0 != null and
+            (hidden_dim & 31) == 0)
+        {
+            try self.dmmv.recordMulMmQ8_0(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                dst.handle,
+                dst.size,
+                dt_rank,
+                n_tokens,
+                hidden_dim,
+                hidden_dim,
+                dt_rank,
+                0,
+                0,
+                0,
+            );
+            return;
+        }
+
+        var tok: u32 = 0;
+        while (tok < n_tokens) : (tok += 1) {
+            const x_offset: u32 = @intCast(tok * hidden_dim * @sizeOf(f32));
+            const y_offset: u32 = @intCast(tok * dt_rank * @sizeOf(f32));
+            try self.dispatchDmmvInner(
+                tensor,
+                scratch_norm,
+                scratch_norm.size,
+                dst,
+                dt_rank,
+                hidden_dim,
+                0,
+                x_offset,
+                y_offset,
+                0,
+            );
+        }
+    }
+
     fn prefillQwen36RunSsmLayerToFfnNorm(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -21109,45 +21254,14 @@ pub const InferenceEngine = struct {
             );
             self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_total_bytes);
             if (alpha_beta_q8) {
+                const ab_q8_cols = try self.prepareQwenDenseSsmAlphaBetaQ8(scratch_norm, hidden_dim, dt_rank, n_tokens);
                 self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
                 const ssm_proj_alpha_phase = self.beginProfilePhase();
-                var ab_tok: u32 = 0;
-                while (ab_tok < n_tokens) : (ab_tok += 1) {
-                    const x_offset: u32 = @intCast(ab_tok * hidden_dim * @sizeOf(f32));
-                    const y_offset: u32 = @intCast(ab_tok * dt_rank * @sizeOf(f32));
-                    try self.dispatchDmmvInner(
-                        alpha_t,
-                        scratch_norm,
-                        scratch_norm.size,
-                        scratch_q,
-                        dt_rank,
-                        hidden_dim,
-                        0,
-                        x_offset,
-                        y_offset,
-                        0,
-                    );
-                }
+                try self.recordQwenDenseSsmAlphaBetaQ8(alpha_t, scratch_norm, scratch_q, dt_rank, hidden_dim, n_tokens, ab_q8_cols);
                 self.endProfilePhase(.ssm_proj_alpha, ssm_proj_alpha_phase);
 
                 const ssm_proj_beta_phase = self.beginProfilePhase();
-                ab_tok = 0;
-                while (ab_tok < n_tokens) : (ab_tok += 1) {
-                    const x_offset: u32 = @intCast(ab_tok * hidden_dim * @sizeOf(f32));
-                    const y_offset: u32 = @intCast(ab_tok * dt_rank * @sizeOf(f32));
-                    try self.dispatchDmmvInner(
-                        beta_t,
-                        scratch_norm,
-                        scratch_norm.size,
-                        scratch_k,
-                        dt_rank,
-                        hidden_dim,
-                        0,
-                        x_offset,
-                        y_offset,
-                        0,
-                    );
-                }
+                try self.recordQwenDenseSsmAlphaBetaQ8(beta_t, scratch_norm, scratch_k, dt_rank, hidden_dim, n_tokens, ab_q8_cols);
                 self.endProfilePhase(.ssm_proj_beta, ssm_proj_beta_phase);
             } else {
                 try self.dispatchF32DualBatched(
