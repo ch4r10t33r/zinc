@@ -2513,8 +2513,13 @@ pub fn main() !void {
             };
             defer engine.deinit();
 
+            const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else tokenizer.eosId();
+            if (eos_id == std.math.maxInt(u32)) {
+                log.info("Benchmark mode: ignoring EOS until max_tokens", .{});
+            }
+
             // Generate
-            const output_tokens = forward_metal.generate(&engine, prompt_tokens, config.max_tokens, tokenizer.eosId(), allocator) catch |err| {
+            const output_tokens = forward_metal.generate(&engine, prompt_tokens, config.max_tokens, eos_id, allocator) catch |err| {
                 log.err("Failed to generate: {s}", .{@errorName(err)});
                 std.process.exit(1);
             };
@@ -2575,7 +2580,7 @@ pub fn main() !void {
                         try text_buf.appendSlice(allocator, "<?>");
                     }
                 }
-                const output_text = trimCliOutputText(text_buf.items, use_chat_prompt);
+                const output_text = trimCliOutputText(text_buf.items, use_chat_prompt or eos_id == std.math.maxInt(u32));
                 log.info("Output ({d} tokens): {s}", .{ output_tokens.len, output_text });
             }
         } else {
@@ -2716,8 +2721,13 @@ pub fn main() !void {
             log.debug("Prompt decoded: \"{s}\"", .{pt_buf.items});
         }
 
+        const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else tokenizer.eosId();
+        if (eos_id == std.math.maxInt(u32)) {
+            log.info("Benchmark mode: ignoring EOS until max_tokens", .{});
+        }
+
         // Generate
-        const output_tokens = try forward_mod.generate(&engine, prompt_tokens, config.max_tokens, tokenizer.eosId(), allocator);
+        const output_tokens = try forward_mod.generate(&engine, prompt_tokens, config.max_tokens, eos_id, allocator);
         defer allocator.free(output_tokens);
 
         // Output token IDs
@@ -2798,7 +2808,7 @@ pub fn main() !void {
                     try text_buf.appendSlice(allocator, "<?>");
                 }
             }
-            const output_text = trimCliOutputText(text_buf.items, use_chat_prompt);
+            const output_text = trimCliOutputText(text_buf.items, use_chat_prompt or eos_id == std.math.maxInt(u32));
             log.info("Output text: {s}", .{output_text});
             // Also log raw token IDs for debugging
             log.info("Output tokens ({d}): first20={any}", .{

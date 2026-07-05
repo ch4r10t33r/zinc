@@ -44,6 +44,32 @@ same DP4a scratch was noisy and not worth keeping. Against the kept
 candidate, 111p no-profile moved 674.2 -> 645.5 tok/s across three runs
 and 2971p was flat (1138.6 -> 1139.8 tok/s across two runs).
 
+### 2026-07-05 manual Q6_K MoE columns probe
+
+Added path-coverage logging for A3B prefill so profiles show which layers
+used grouped MoE versus token fallback. The current 154-token diagnostic
+prompt reports the expected safe default mask:
+
+- grouped: `0x3bfffffffd` (layers 0, 2-33, 35-37)
+- fallback: `0x4400000002` (layers 1, 34, 38)
+
+Prototype Q6_K route-packed columns support validated as a standalone shader
+with `tools/validate_q6k_moe_cols.zig`: overwrite and accumulate both matched
+the CPU Q6_K dequant reference at `M=2048, K=768`. But enabling it inside the
+Qwen A3B grouped path changed the answer-bearing diagnostic prompt:
+
+| Variant | Prefill | Mask | Output |
+|---|---:|---|---|
+| Q6_K grouped layers 34+38 | 540.9 tok/s | fallback `0x2` | wrong (`the reference...`) |
+| Q6_K grouped layer 34 only (`ZINC_MOE_Q6K_COLS=1`) | 482.8 tok/s | fallback `0x4000000002` | wrong (`the reference...`) |
+| Q6_K columns default-off | 441.5 tok/s profile sample | fallback `0x4400000002` | correct (`the capital of France.`) |
+
+Keep `dmmv_q6k_moe_cols.comp` and the validator as infrastructure, but leave
+the in-model Q6_K columns path opt-in via `ZINC_MOE_Q6K_COLS=1` until a
+layer replay validator compares grouped layer output against token fallback
+inside the full prefill orchestration. Do not claim the Q6_K speedup as a
+valid win.
+
 Rejected follow-up: forcing `ZINC_QWEN36_Q8_WIDE4_SSM_OUT=1` on RDNA is
 not a default-on keep. It preserved the first output token on the 111p
 and 2971p probes, but the no-profile 111p repeats were noisy and did not

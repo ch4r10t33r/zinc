@@ -1237,8 +1237,21 @@ function managedModelPullCommand(modelId) {
   return `./zig-out/bin/zinc model pull ${shellQuote(modelId)}`;
 }
 
+function zincBenchmarkEnv(caseDef) {
+  return caseDef.prompt_mode === "chat" ? {} : { ZINC_BENCH_IGNORE_EOS: "1" };
+}
+
+function zincBenchmarkEnvPrefix(caseDef) {
+  return Object.entries(zincBenchmarkEnv(caseDef))
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(" ");
+}
+
 export function localZincCommand(caseDef) {
-  const parts = ["./zig-out/bin/zinc"];
+  const envPrefix = zincBenchmarkEnvPrefix(caseDef);
+  const parts = [];
+  if (envPrefix) parts.push(envPrefix);
+  parts.push("./zig-out/bin/zinc");
   if (caseDef.prompt_mode === "chat") parts.push("--chat");
   parts.push("-n", String(caseDef.max_tokens));
   if (caseDef.context_tokens != null) parts.push("--context", String(caseDef.context_tokens));
@@ -1748,7 +1761,10 @@ export function remoteZincCommand(caseDef, creds) {
   const parts = [];
   if (creds.commandPrelude) parts.push(creds.commandPrelude, "&&");
   parts.push(`cd ${shellQuote(creds.workdir)}`, "&&");
-  const envPrefix = remoteEnvPrefix(creds);
+  const envPrefix = remoteEnvPrefix({
+    ...creds,
+    env: { ...zincBenchmarkEnv(caseDef), ...(creds.env ?? {}) },
+  });
   if (envPrefix) parts.push(envPrefix);
   parts.push(
     "./zig-out/bin/zinc",

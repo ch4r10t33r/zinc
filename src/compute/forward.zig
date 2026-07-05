@@ -1445,6 +1445,19 @@ pub const InferenceEngine = struct {
     prefill_route_pack_single_tail_blocks_actual: u64 = 0,
     prefill_route_pack_padding_slots_actual: u64 = 0,
     prefill_route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    prefill_path_ssm_layers: u32 = 0,
+    prefill_path_full_attn_batched_layers: u32 = 0,
+    prefill_path_full_attn_fallback_layers: u32 = 0,
+    prefill_path_final_kv_only_layers: u32 = 0,
+    prefill_path_final_fallback_layers: u32 = 0,
+    prefill_path_moe_layers: u32 = 0,
+    prefill_path_moe_grouped_layers: u32 = 0,
+    prefill_path_moe_grouped_tokens: u64 = 0,
+    prefill_path_moe_top1_prefix_tokens: u64 = 0,
+    prefill_path_moe_exact_suffix_tokens: u64 = 0,
+    prefill_path_moe_token_fallbacks: u64 = 0,
+    prefill_path_moe_grouped_layer_mask: u64 = 0,
+    prefill_path_moe_fallback_layer_mask: u64 = 0,
     // Pipelined prefill: second command buffer + embedding staging so the CPU
     // can prepare and submit the next prompt token while the GPU is still
     // executing the previous one. See prefillBatch() for the ping-pong logic.
@@ -3895,6 +3908,22 @@ pub const InferenceEngine = struct {
         self.prefill_route_pack_tail_size_blocks_actual = [_]u64{0} ** moe_route_pack_profile_tail_bins;
     }
 
+    fn resetPrefillPathProfile(self: *InferenceEngine) void {
+        self.prefill_path_ssm_layers = 0;
+        self.prefill_path_full_attn_batched_layers = 0;
+        self.prefill_path_full_attn_fallback_layers = 0;
+        self.prefill_path_final_kv_only_layers = 0;
+        self.prefill_path_final_fallback_layers = 0;
+        self.prefill_path_moe_layers = 0;
+        self.prefill_path_moe_grouped_layers = 0;
+        self.prefill_path_moe_grouped_tokens = 0;
+        self.prefill_path_moe_top1_prefix_tokens = 0;
+        self.prefill_path_moe_exact_suffix_tokens = 0;
+        self.prefill_path_moe_token_fallbacks = 0;
+        self.prefill_path_moe_grouped_layer_mask = 0;
+        self.prefill_path_moe_fallback_layer_mask = 0;
+    }
+
     fn recordPrefillRoutePackCounts(
         self: *InferenceEngine,
         counts: []const u32,
@@ -3944,6 +3973,28 @@ pub const InferenceEngine = struct {
         for (0..moe_route_pack_profile_tail_bins) |i| {
             self.prefill_route_pack_tail_size_blocks_actual[i] += tail_size_blocks[i];
         }
+    }
+
+    fn recordPrefillMoePathCounts(self: *InferenceEngine, layer: u32, n_tokens: u32, grouped_tokens: u32) void {
+        self.prefill_path_moe_layers += 1;
+        self.prefill_path_moe_grouped_tokens += grouped_tokens;
+        const layer_bit: u64 = if (layer < 64) @as(u64, 1) << @intCast(layer) else 0;
+        if (grouped_tokens > 0) {
+            self.prefill_path_moe_grouped_layers += 1;
+            self.prefill_path_moe_grouped_layer_mask |= layer_bit;
+        }
+        if (grouped_tokens < n_tokens) {
+            self.prefill_path_moe_fallback_layer_mask |= layer_bit;
+        }
+        if (self.moe_prefill_tail_topk_limit == 1 and self.moe_prefill_tail_topk_guard_tokens < n_tokens) {
+            const prefix_tokens = n_tokens - self.moe_prefill_tail_topk_guard_tokens;
+            const exact_suffix = @min(grouped_tokens -| prefix_tokens, self.moe_prefill_tail_topk_guard_tokens);
+            self.prefill_path_moe_top1_prefix_tokens += @min(grouped_tokens, prefix_tokens);
+            self.prefill_path_moe_exact_suffix_tokens += exact_suffix;
+        } else if (grouped_tokens == n_tokens and grouped_tokens > 0) {
+            self.prefill_path_moe_exact_suffix_tokens += grouped_tokens;
+        }
+        self.prefill_path_moe_token_fallbacks += n_tokens -| grouped_tokens;
     }
 
     fn avgProfilePhaseMs(self: *const InferenceEngine, phase: ProfilePhase) f64 {
@@ -19664,9 +19715,24 @@ pub const InferenceEngine = struct {
         const up_exps = lt.ffn_up_exps orelse return inactive;
         const down_exps = lt.ffn_down_exps orelse return inactive;
         if (gate_exps.info.type_ != .q4_k or up_exps.info.type_ != .q4_k) return inactive;
-        if (down_exps.info.type_ != .q5_k and down_exps.info.type_ != .q4_k) return inactive;
-        if (down_exps.info.type_ == .q5_k and self.dmmv.pipeline_q5k_moe_cols == null) return inactive;
-        if (down_exps.info.type_ == .q4_k and self.dmmv.pipeline_q4k_moe_cols == null) return inactive;
+        const q6_cols_requested = if (std.posix.getenv("ZINC_MOE_Q6K_COLS")) |raw|
+            !(std.mem.eql(u8, raw, "0") or
+                std.ascii.eqlIgnoreCase(raw, "off") or
+                std.ascii.eqlIgnoreCase(raw, "false") or
+                std.ascii.eqlIgnoreCase(raw, "no"))
+        else
+            false;
+        // The standalone Q6_K columns shader validates, but the Qwen A3B
+        // in-model grouped path still changes answer-bearing prompts. Keep it
+        // opt-in until a layer replay validator proves orchestration parity.
+        const allow_late_q6_grouped = exact_grouped or layer + 2 < cfg.n_layers;
+        const down_cols_supported = switch (down_exps.info.type_) {
+            .q4_k => self.dmmv.pipeline_q4k_moe_cols != null,
+            .q5_k => self.dmmv.pipeline_q5k_moe_cols != null,
+            .q6_k => q6_cols_requested and allow_late_q6_grouped and self.dmmv.pipeline_q6k_moe_cols != null,
+            else => false,
+        };
+        if (!down_cols_supported) return inactive;
 
         const counts = self.batched_scratch_moe_counts orelse return inactive;
         const ids = self.batched_scratch_moe_ids orelse return inactive;
@@ -19809,10 +19875,12 @@ pub const InferenceEngine = struct {
             self.logits_staging.mapped != null and
             self.logits_staging.size >= q8_1_down_compare_bytes;
         var q8_1_down_compare_ran = false;
+        const standard_down_workgroups_x: u32 = (hidden_dim + 3) / 4;
         const prefix_down_workgroups_x: u32 = if (use_q8_1_down_cols)
             (hidden_dim + 31) / 32
         else
-            (hidden_dim + 3) / 4;
+            standard_down_workgroups_x;
+        const suffix_down_workgroups_x = standard_down_workgroups_x;
         const suffix_route_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_route_count) *
             @as(vk.c.VkDeviceSize, inter_dim) *
@@ -20364,7 +20432,7 @@ pub const InferenceEngine = struct {
                 route_stride_u32,
                 suffix_route_count,
                 (inter_dim + 3) / 4,
-                (hidden_dim + 3) / 4,
+                suffix_down_workgroups_x,
                 prefix_tokens,
             );
             if (collect_route_profile) {
@@ -20921,6 +20989,7 @@ pub const InferenceEngine = struct {
             route_cache_active = grouped_result.route_cache_active;
             grouped_prefix_tokens = grouped_result.grouped_tokens;
         }
+        self.recordPrefillMoePathCounts(layer, n_tokens, grouped_prefix_tokens);
 
         var primary_pending: bool = false;
         var alt_pending: bool = false;
@@ -23619,6 +23688,7 @@ pub const InferenceEngine = struct {
             const is_full_attn = ((layer + 1) % full_attn_interval) == 0;
             if (is_final_layer) {
                 if (is_full_attn and self.a3bProductionFinalFullAttnKvOnlyEligible(n_tokens, hidden_dim, layer)) {
+                    self.prefill_path_final_kv_only_layers += 1;
                     try self.prefillQwen36RunFinalFullAttnKvOnly(
                         state,
                         base_token,
@@ -23641,6 +23711,7 @@ pub const InferenceEngine = struct {
                         true,
                     );
                 } else {
+                    self.prefill_path_final_fallback_layers += 1;
                     try self.prefillQwen36RunPartialTokenLoop(
                         state,
                         prompt_tokens,
@@ -23665,6 +23736,7 @@ pub const InferenceEngine = struct {
 
             if (is_full_attn) {
                 if (self.a3bProductionFullAttnBatchedEligible(n_tokens, hidden_dim, layer, scratch_gate, scratch_swiglu)) {
+                    self.prefill_path_full_attn_batched_layers += 1;
                     try self.prefillQwen36RunFullAttnLayerToFfnNorm(
                         state,
                         base_token,
@@ -23698,6 +23770,7 @@ pub const InferenceEngine = struct {
                         pipeline_tail,
                     );
                 } else {
+                    self.prefill_path_full_attn_fallback_layers += 1;
                     try self.prefillQwen36RunPartialTokenLoop(
                         state,
                         prompt_tokens,
@@ -23719,6 +23792,7 @@ pub const InferenceEngine = struct {
                 continue;
             }
 
+            self.prefill_path_ssm_layers += 1;
             try self.prefillQwen36RunSsmLayerToFfnNorm(
                 state,
                 prompt_tokens,
@@ -28057,6 +28131,7 @@ pub fn generate(
     engine.diag_summary_len = 0;
     engine.resetProfilingSamples();
     engine.resetPrefillRoutePackProfile();
+    engine.resetPrefillPathProfile();
 
     log.debug("Generating: {d} prompt tokens, max {d} output tokens", .{
         prompt_tokens.len, effective_max_tokens,
@@ -28279,6 +28354,38 @@ pub fn generate(
                     to_ms(dense_down_matmul_q4_ns),
                     to_ms(dense_down_matmul_q6_ns),
                     to_ms(dense_residual_ns),
+                },
+            );
+        }
+        const any_path_profile =
+            engine.prefill_path_ssm_layers > 0 or
+            engine.prefill_path_full_attn_batched_layers > 0 or
+            engine.prefill_path_full_attn_fallback_layers > 0 or
+            engine.prefill_path_final_kv_only_layers > 0 or
+            engine.prefill_path_final_fallback_layers > 0 or
+            engine.prefill_path_moe_layers > 0;
+        if (any_path_profile) {
+            log.info(
+                "Prefill path coverage: ssm_layers={d} full_attn_batched={d} full_attn_fallback={d} final_kv_only={d} final_fallback={d} moe_layers={d} moe_grouped_layers={d} grouped_tokens={d} top1_prefix_tokens={d} exact_suffix_tokens={d} token_fallbacks={d}",
+                .{
+                    engine.prefill_path_ssm_layers,
+                    engine.prefill_path_full_attn_batched_layers,
+                    engine.prefill_path_full_attn_fallback_layers,
+                    engine.prefill_path_final_kv_only_layers,
+                    engine.prefill_path_final_fallback_layers,
+                    engine.prefill_path_moe_layers,
+                    engine.prefill_path_moe_grouped_layers,
+                    engine.prefill_path_moe_grouped_tokens,
+                    engine.prefill_path_moe_top1_prefix_tokens,
+                    engine.prefill_path_moe_exact_suffix_tokens,
+                    engine.prefill_path_moe_token_fallbacks,
+                },
+            );
+            log.info(
+                "Prefill MoE layer masks: grouped=0x{x} fallback=0x{x}",
+                .{
+                    engine.prefill_path_moe_grouped_layer_mask,
+                    engine.prefill_path_moe_fallback_layer_mask,
                 },
             );
         }

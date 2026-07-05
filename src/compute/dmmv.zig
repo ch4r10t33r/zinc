@@ -27,6 +27,15 @@ pub const DmmvPushConstants = extern struct {
     acc_mode: u32 = 0, // 0 = overwrite (y = result), 1 = accumulate (y += result)
 };
 
+test "MoE route-packed columns support Q6_K alignment" {
+    try std.testing.expect(moeColsKAligned(.q4_k, 256));
+    try std.testing.expect(moeColsKAligned(.q5_k, 256));
+    try std.testing.expect(moeColsKAligned(.q6_k, 256));
+    try std.testing.expect(moeColsKAligned(.q5_1, 32));
+    try std.testing.expect(!moeColsKAligned(.q6_k, 128));
+    try std.testing.expect(!moeColsKAligned(.q8_0, 256));
+}
+
 /// Push constants for batch DMMV shaders (prefill: multiple columns).
 pub const BatchDmmvPushConstants = extern struct {
     M: u32,
@@ -73,6 +82,15 @@ pub const MoeColsDmmvPushConstants = extern struct {
     x_route_divisor: u32,
     accumulate: u32 = 0,
 };
+
+fn moeColsKAligned(quant_type: GGMLType, K: u32) bool {
+    if (K == 0) return false;
+    return switch (quant_type) {
+        .q5_1 => (K & 31) == 0,
+        .q4_k, .q5_k, .q6_k => (K & 255) == 0,
+        else => false,
+    };
+}
 
 /// Push constants for the fused MoE down + weighted_acc shader
 /// (src/shaders/dmmv_q4k_moe_fused_down_acc.comp). Same layout as
@@ -518,6 +536,9 @@ pub const DmmvDispatch = struct {
     pipeline_q8_0_moe_fused_down_acc_scaled: ?Pipeline,
     /// MoE Q6K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q6k_moe: ?Pipeline,
+    /// Grouped top-1 prefill Q6_K MoE DMMV over route-packed token columns.
+    /// Covers mixed-quant Qwen A3B layers whose down experts are Q6_K.
+    pipeline_q6k_moe_cols: ?Pipeline,
     /// Foundation for future mul_mmq work: quantize an F32 activation into
     /// Q8_1 blocks. 2 bindings (A f32 vec4 in, D u32 stream out), push
     /// constants {ne, num_blocks}. Activation pre-quantizer preserved as
@@ -1297,6 +1318,14 @@ pub const DmmvDispatch = struct {
             log.warn("Q6_K MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q6k_moe_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_moe_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_moe_cols = pipeline_mod.createFromSpirvWithOptions(instance, q6k_moe_cols_path, 6, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q6_K grouped MoE cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q6k_moe_cols != null) {
+            log.info("dmmv_q6k_moe_cols pipeline loaded (grouped top-1 MoE prefill)", .{});
+        }
 
         if (pipeline_q4k_moe != null and pipeline_q5k_moe != null and pipeline_q6k_moe != null) {
             log.info("MoE DMMV pipelines loaded — GPU expert dispatch enabled (no readback)", .{});
@@ -2341,6 +2370,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k_moe_cols = pipeline_q5k_moe_cols,
             .pipeline_q5k_moe_cols_q8_1 = pipeline_q5k_moe_cols_q8_1,
             .pipeline_q6k_moe = pipeline_q6k_moe,
+            .pipeline_q6k_moe_cols = pipeline_q6k_moe_cols,
             .pipeline_quantize_q8_1 = pipeline_quantize_q8_1,
             .pipeline_count_experts = pipeline_count_experts,
             .pipeline_moe_route_pack = pipeline_moe_route_pack,
@@ -2712,12 +2742,11 @@ pub const DmmvDispatch = struct {
             .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_1 => if (self.pipeline_q5_1_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q6_k => if (self.pipeline_q6k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             else => return error.UnsupportedQuantType,
         };
         if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
-        if (quant_type == .q5_1) {
-            if ((K & 31) != 0) return error.InvalidArgument;
-        } else if ((K & 255) != 0) return error.InvalidArgument;
+        if (!moeColsKAligned(quant_type, K)) return error.InvalidArgument;
         const push = MoeColsDmmvPushConstants{
             .M = M,
             .K = K,
@@ -3004,15 +3033,15 @@ pub const DmmvDispatch = struct {
     /// overwrites `y_buf` (no accumulate). Each buffer is paired with its byte size.
     /// @param cmd Command buffer to record into.
     /// @param push_desc_fn Optional push-descriptor function (null uses bound descriptor sets).
-    /// @param quant_type Weight quantization; only `q4_k` and `q5_k` are supported here.
+    /// @param quant_type Weight quantization; supports route-packed K-quant columns plus Gemma Q5_1 down rows.
     /// @param M Output rows (expert weight rows).
-    /// @param K Contraction width; must be a multiple of 256.
+    /// @param K Contraction width; must match the quantization block alignment.
     /// @param expert_stride Per-expert stride (elements) into the weight buffer.
     /// @param active_block_count Number of active expert blocks to dispatch (workgroups-Y).
     /// @param ids_stride Per-token stride into the packed IDs buffer.
     /// @param x_route_divisor Divisor mapping output rows back to source activation rows.
-    /// @returns `error.UnsupportedQuantType` for non-q4_k/q5_k weights, or
-    ///   `error.InvalidArgument` on zero M/K/active_block_count/ids_stride or K not 256-aligned.
+    /// @returns `error.UnsupportedQuantType` for unsupported weights, or
+    ///   `error.InvalidArgument` on zero M/K/active_block_count/ids_stride or incompatible K alignment.
     pub fn recordMoeColsDispatch(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -3044,12 +3073,11 @@ pub const DmmvDispatch = struct {
             .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_1 => if (self.pipeline_q5_1_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q6_k => if (self.pipeline_q6k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             else => return error.UnsupportedQuantType,
         };
         if (M == 0 or K == 0 or active_block_count == 0 or ids_stride == 0) return error.InvalidArgument;
-        if (quant_type == .q5_1) {
-            if ((K & 31) != 0) return error.InvalidArgument;
-        } else if ((K & 255) != 0) return error.InvalidArgument;
+        if (!moeColsKAligned(quant_type, K)) return error.InvalidArgument;
         const push = MoeColsDmmvPushConstants{
             .M = M,
             .K = K,
@@ -5801,6 +5829,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5_1_moe_down_acc_scaled_batch_top1) |*p| p.deinit();
         if (self.pipeline_q8_0_moe_fused_down_acc_scaled) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
+        if (self.pipeline_q6k_moe_cols) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
         if (self.pipeline_count_experts) |*p| p.deinit();
         if (self.pipeline_moe_route_pack) |*p| p.deinit();
