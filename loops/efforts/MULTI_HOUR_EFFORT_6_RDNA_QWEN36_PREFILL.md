@@ -1451,6 +1451,8 @@ Correct baseline for this probe is first output token `{ 17 }`, text `2`.
 | Q8_1 down-column path | 805.81 tok/s | 378.4 ms / 366.9 ms down | `{ 16 }` / `1` | reject |
 | 16-route block, consumers still wrote only routes 0-7 | 819.07 tok/s | 348.6 ms / 337.8 ms down | `{ 248069 }` / `</think>` | reject |
 | complete 16-route block, all 16 routes written | 802.23 tok/s | 385.5 ms / 388.6 ms down | `{ 17 }` / `2` | reject |
+| LDS activation cache inside gate/up shader | 770.56 tok/s | 523.0 ms | `{ 17 }` / `2` | reject |
+| full-block branch inside gate/up shader | 797.72 tok/s | 386.8 ms | `{ 17 }` / `2` | reject |
 
 Do not repeat wider row tiling on `dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp`
 without a per-layer numeric validator. The current four-row / 16-lane reduction
@@ -1463,6 +1465,12 @@ first sampled token. Also do not widen route blocks to 16 in the current DMMV
 shape: the complete version was correct but flat/slower because the extra
 accumulators erased the active-block reduction. The next real target remains a
 tiled expert-major GEMM with per-layer validation.
+
+Also do not add LDS activation caching or a full-block branch inside the current
+gate/up DMMV shader. The cache version preserved the first token but paid too
+much in barriers/LDS pressure; the full-block split was correct but slightly
+slower than the baseline. The current shader is already close to the best local
+shape for this DMMV design.
 
 ## Success Criteria
 
