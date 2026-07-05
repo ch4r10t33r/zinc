@@ -1,6 +1,19 @@
 # Effort 6 - RDNA4 Qwen3.6-35B-A3B prefill recovery
 
-> **Status:** plateaued · 109 cycles · best 759 tok/s (154-tok harness) · board core 77% of llama (311 vs 405)
+> **Status:** active continuation · latest kept RDNA prefill change is the
+> A3B Q8_0 DP4a crossover policy (`f10a910c`, guarded by `e11a033b`);
+> later RDNA wide4, MoE guard, singleton-tail, and flash-attention LDS
+> probes are measured rejects.
+
+Current overnight runs should use the Codex agent explicitly:
+
+```bash
+bun loops/optimize_perf.ts --effort 6 --resume --cycles 100 --agent codex
+```
+
+The historical plateau marker below is kept for continuity: best 759.18
+prefill tok/s on the old 154-token harness after 109 cycles; do not compare
+that number directly to the newer 111p/2971p continuation probes.
 
 ## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
 
