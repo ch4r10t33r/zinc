@@ -17550,7 +17550,7 @@ pub const InferenceEngine = struct {
         if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
-        if (n_tokens < 128) return false;
+        if (n_tokens < 64) return false;
         return self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8 != null and
             self.dmmv.pipeline_mul_mm_q8_0 != null;
@@ -17858,29 +17858,8 @@ pub const InferenceEngine = struct {
         const packed_i8 = self.batched_scratch_norm_q8 orelse return 0;
         const scale = self.batched_scratch_norm_q8_scale orelse return 0;
 
-        var full_cols = n_tokens & ~@as(u32, 31);
+        const full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols == 0) return 0;
-        const padded_cols = self.qwenA3bPrefillPaddedTokenCount(n_tokens);
-        if (padded_cols > full_cols) {
-            const need_input_padded: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, padded_cols) *
-                @as(vk.c.VkDeviceSize, K) *
-                @sizeOf(f32);
-            const need_i8_padded: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, padded_cols) *
-                @as(vk.c.VkDeviceSize, K / 4) *
-                @sizeOf(u32);
-            const need_scale_padded: vk.c.VkDeviceSize =
-                @as(vk.c.VkDeviceSize, padded_cols) *
-                @as(vk.c.VkDeviceSize, K / 32) *
-                @sizeOf(f32);
-            if (src.size >= need_input_padded and
-                packed_i8.size >= need_i8_padded and
-                scale.size >= need_scale_padded)
-            {
-                full_cols = padded_cols;
-            }
-        }
         const need_input: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, full_cols) *
             @as(vk.c.VkDeviceSize, K) *
@@ -21261,7 +21240,20 @@ pub const InferenceEngine = struct {
             }
 
             const use_separate_q8_qkv_z = self.qwenA3bShortPrefillSeparateSsmQkvZ(n_tokens);
-            const can_mul_mm_q8_qkv_z = (!self.use_fused_ssm_qkv_z or use_separate_q8_qkv_z) and
+            const can_dp4a_q8_qkv_z =
+                wqkv_t.info.type_ == .q8_0 and
+                z_t.info.type_ == .q8_0 and
+                self.dmmv.pipeline_mul_mm_q8_0 != null and
+                self.instance.push_descriptor_fn != null and
+                n_tokens >= 16 and
+                (hidden_dim & 31) == 0 and
+                (conv_channels & 31) == 0 and
+                (d_inner & 31) == 0 and
+                self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) and
+                self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
+                self.dmmv.pipeline_quantize_act_q8 != null;
+            const can_mul_mm_q8_qkv_z = !can_dp4a_q8_qkv_z and
+                (!self.use_fused_ssm_qkv_z or use_separate_q8_qkv_z) and
                 wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
                 self.dmmv.pipeline_mul_mm_q8_0 != null and
@@ -21270,10 +21262,6 @@ pub const InferenceEngine = struct {
                 (hidden_dim & 31) == 0 and
                 (conv_channels & 31) == 0 and
                 (d_inner & 31) == 0;
-            const can_dp4a_q8_qkv_z = can_mul_mm_q8_qkv_z and
-                self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) and
-                self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
-                self.dmmv.pipeline_quantize_act_q8 != null;
             const can_fuse_q8_qkv_z = self.use_fused_ssm_qkv_z and
                 !use_separate_q8_qkv_z and
                 wqkv_t.info.type_ == .q8_0 and
