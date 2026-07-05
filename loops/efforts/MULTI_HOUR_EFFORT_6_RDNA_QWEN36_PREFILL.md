@@ -31,6 +31,15 @@ same DP4a scratch was noisy and not worth keeping. Against the kept
 candidate, 111p no-profile moved 674.2 -> 645.5 tok/s across three runs
 and 2971p was flat (1138.6 -> 1139.8 tok/s across two runs).
 
+Rejected follow-up: forcing `ZINC_QWEN36_Q8_WIDE4_SSM_OUT=1` on RDNA is
+not a default-on keep. It preserved the first output token on the 111p
+and 2971p probes, but the no-profile 111p repeats were noisy and did not
+beat the warmed default path. On the 2971p profile run, SSM-out regressed
+from 229.0 ms to 276.0 ms and total prefill fell from 807.2 to
+764.4 tok/s; no-profile long runs were effectively flat around
+1.14k tok/s. Leave this path Intel/default-off unless a new per-shape
+policy is proven with no-profile wins.
+
 The original A3b problem is no longer open. The accepted production
 path is now layer-major A3B prefill:
 
