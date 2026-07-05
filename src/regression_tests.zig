@@ -490,6 +490,19 @@ test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
     try expectContains(q6_q8_1, "if (SPEC_RAGGED_N == 0u || col_g < N)");
 }
 
+test "Vulkan Qwen A3B SSM Q8 DP4a keeps RDNA crossover and no-padding policy" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContainsNear(src, "fn qwenA3bSsmQ8Dp4aEnabled", "if (n_tokens < 64) return false;", 900);
+    try expectContainsNear(src, "const can_dp4a_q8_qkv_z =", "self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)", 900);
+    try expectContainsNear(src, "const can_mul_mm_q8_qkv_z = !can_dp4a_q8_qkv_z", "(!self.use_fused_ssm_qkv_z or use_separate_q8_qkv_z)", 500);
+
+    const prep_start = std.mem.indexOf(u8, src, "fn qwenA3bPrepareProjectionQ8") orelse return error.TestExpectedEqual;
+    const prep_end = std.mem.indexOf(u8, src[prep_start..], "fn dispatchQwenA3bQ8ProjectionDp4a") orelse return error.TestExpectedEqual;
+    const prep_src = src[prep_start .. prep_start + prep_end];
+    try expectContains(prep_src, "const full_cols = n_tokens & ~@as(u32, 31);");
+    try expectNotContains(prep_src, "qwenA3bPrefillPaddedTokenCount");
+}
+
 test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64_bm64");

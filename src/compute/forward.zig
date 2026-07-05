@@ -17550,6 +17550,8 @@ pub const InferenceEngine = struct {
         if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
+        // RDNA4 A/B: the Q8_0 DP4a path wins clearly in the 64-127 token
+        // band for A3B SSM qkv/z, while shorter prompts still lose to setup.
         if (n_tokens < 64) return false;
         return self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8 != null and
@@ -17858,6 +17860,9 @@ pub const InferenceEngine = struct {
         const packed_i8 = self.batched_scratch_norm_q8 orelse return 0;
         const scale = self.batched_scratch_norm_q8_scale orelse return 0;
 
+        // Keep A3B Q8_0 SSM projections on real full columns only. Padding the
+        // 2971-token path up to the scratch capacity made the long prompt flat
+        // to slower; the scalar tail is cheaper than quantizing fake columns.
         const full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols == 0) return 0;
         const need_input: vk.c.VkDeviceSize =
@@ -21240,6 +21245,8 @@ pub const InferenceEngine = struct {
             }
 
             const use_separate_q8_qkv_z = self.qwenA3bShortPrefillSeparateSsmQkvZ(n_tokens);
+            // For A3B, prefer the Q8_0 DP4a path over the older fused Q8 pair
+            // once the measured 64-token crossover is reached.
             const can_dp4a_q8_qkv_z =
                 wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
