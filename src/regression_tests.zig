@@ -179,6 +179,7 @@ test "Vulkan Intel Qwen MoE defaults fused SSM QKV plus Z projection" {
     try expectContains(src, "ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
     try expectContains(src, "use_qwen36_q8_wide4_ssm_out");
     try expectContains(src, "qwen36_q8_wide4_ssm_out_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor)");
+    try expectContains(src, "self.prefill_active or self.use_qwen36_q8_wide4_ssm_out_decode");
     try expectContains(src, "K == self.model.config.ssm_d_inner");
 }
 

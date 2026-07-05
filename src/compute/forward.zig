@@ -1355,9 +1355,12 @@ pub const InferenceEngine = struct {
     // Q8_0 x Q8_1 integer-dot DMMV for medium/large overwrite projections.
     // Disable with ZINC_GEMMA_Q8_1_DMMV=0.
     use_gemma_q8_1_dmmv: bool = false,
-    // Experimental Intel Qwen A3B path: route SSM-out Q8_0 projections
-    // through the existing four-row DMMV shader.
+    // Intel Qwen A3B SSM-out Q8_0 prefill path through the existing four-row
+    // DMMV shader. Normal decode stays on generic Q8 unless the env flag is
+    // explicitly forced on; 7-run Intel A3B core validation showed a small
+    // decode win for the generic path.
     use_qwen36_q8_wide4_ssm_out: bool = false,
+    use_qwen36_q8_wide4_ssm_out_decode: bool = false,
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
@@ -3051,6 +3054,9 @@ pub const InferenceEngine = struct {
             std.mem.eql(u8, qwen36_q8_wide4_ssm_out_env.?, "0");
         const qwen36_q8_wide4_ssm_out_forced_on = qwen36_q8_wide4_ssm_out_env != null and
             !qwen36_q8_wide4_ssm_out_explicitly_off;
+        // Wide4 SSM-out helps the A3B prefill rows, but normal decode is a
+        // little faster through generic Q8. Default-on means prefill only;
+        // forcing the env var on also enables the decode experiment.
         const qwen36_q8_wide4_ssm_out_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
         const qwen36_q8_wide4_ssm_out_requested = !qwen36_q8_wide4_ssm_out_explicitly_off and
             (qwen36_q8_wide4_ssm_out_forced_on or qwen36_q8_wide4_ssm_out_default_on);
@@ -3060,7 +3066,7 @@ pub const InferenceEngine = struct {
             if (qwen36_q8_wide4_ssm_out_forced_on) {
                 log.info("Qwen 3.6 Q8_0 SSM-out wide4 path ENABLED via ZINC_QWEN36_Q8_WIDE4_SSM_OUT", .{});
             } else {
-                log.info("Qwen 3.6 Q8_0 SSM-out wide4 path ENABLED by default on Intel (set ZINC_QWEN36_Q8_WIDE4_SSM_OUT=0 to disable)", .{});
+                log.info("Qwen 3.6 Q8_0 SSM-out wide4 prefill path ENABLED by default on Intel (decode uses generic Q8; set ZINC_QWEN36_Q8_WIDE4_SSM_OUT=0 to disable prefill path)", .{});
             }
         } else if (qwen36_q8_wide4_ssm_out_explicitly_off) {
             log.info("Qwen 3.6 Q8_0 SSM-out wide4 path DISABLED via ZINC_QWEN36_Q8_WIDE4_SSM_OUT=0", .{});
@@ -3661,6 +3667,7 @@ pub const InferenceEngine = struct {
             .use_gemma_q8_wide4_dmmv = gemma_q8_wide4_enabled,
             .use_gemma_q8_1_dmmv = gemma_q8_1_dmmv_enabled,
             .use_qwen36_q8_wide4_ssm_out = qwen36_q8_wide4_ssm_out_enabled,
+            .use_qwen36_q8_wide4_ssm_out_decode = qwen36_q8_wide4_ssm_out_enabled and qwen36_q8_wide4_ssm_out_forced_on,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
             .use_q4k_lm_head_dp4a = q4k_lm_head_dp4a_enabled,
@@ -16035,7 +16042,7 @@ pub const InferenceEngine = struct {
                 return;
             }
 
-            if (self.use_qwen36_q8_wide4_ssm_out and qt == .q8_0 and M == self.model.config.hidden_dim and K == self.model.config.ssm_d_inner and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
+            if (self.use_qwen36_q8_wide4_ssm_out and (self.prefill_active or self.use_qwen36_q8_wide4_ssm_out_decode) and qt == .q8_0 and M == self.model.config.hidden_dim and K == self.model.config.ssm_d_inner and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
                 const wide4_pip = &self.dmmv.pipeline_q8_0_wide4.?;
                 const push_wide4 = DmmvPushConstants{
                     .M = M,
