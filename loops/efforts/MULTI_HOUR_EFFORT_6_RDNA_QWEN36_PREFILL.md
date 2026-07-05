@@ -1453,6 +1453,7 @@ Correct baseline for this probe is first output token `{ 17 }`, text `2`.
 | complete 16-route block, all 16 routes written | 802.23 tok/s | 385.5 ms / 388.6 ms down | `{ 17 }` / `2` | reject |
 | LDS activation cache inside gate/up shader | 770.56 tok/s | 523.0 ms | `{ 17 }` / `2` | reject |
 | full-block branch inside gate/up shader | 797.72 tok/s | 386.8 ms | `{ 17 }` / `2` | reject |
+| Q8_1 gate/up-column path on long top-1 prefix | 800.65 tok/s | 378.3 ms | `{ 198 }` / empty | reject |
 
 Do not repeat wider row tiling on `dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp`
 without a per-layer numeric validator. The current four-row / 16-lane reduction
@@ -1471,6 +1472,10 @@ gate/up DMMV shader. The cache version preserved the first token but paid too
 much in barriers/LDS pressure; the full-block split was correct but slightly
 slower than the baseline. The current shader is already close to the best local
 shape for this DMMV design.
+
+Do not force `ZINC_MOE_Q8_1_GATE_UP_COLS=1` for the long top-1 prefix path.
+It is noise-level on throughput and changes the first output token. The existing
+default, which limits that path to exact grouped suffix-only runs, should stay.
 
 ## Success Criteria
 
