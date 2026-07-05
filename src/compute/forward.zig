@@ -19238,11 +19238,11 @@ pub const InferenceEngine = struct {
             self.isQwen35DenseHybrid9B() and
             isIntelGpuVendor(self.gpu_config.vendor) and
             prompt_len >= qwen_dense_intel_deep_prefill_min_tokens;
-        const use_intel_qwen36_dense_deep_prefix = mode == null and
+        const use_intel_qwen36_segment_sweep = mode == null and
             self.isQwen36DenseHybrid27B() and
             isIntelGpuVendor(self.gpu_config.vendor) and
             prompt_len >= qwen_dense_intel_deep_prefill_min_tokens;
-        if (mode == null and !is_amd and !use_intel_qwen35_segment_sweep and !use_intel_qwen36_dense_deep_prefix) return 0;
+        if (mode == null and !is_amd and !use_intel_qwen35_segment_sweep and !use_intel_qwen36_segment_sweep) return 0;
 
         // Tiny prompts (<=8 tok) use a deep prefix because the layer-major
         // setup cost is amortized over a tiny work envelope.
@@ -19259,13 +19259,15 @@ pub const InferenceEngine = struct {
         // segment-loop partial_token_loop between the old prefix=1 and
         // segment_layer=4. The previously-blocking SSM projection replay
         // is bypassed because use_ssm_preproj is default-off.
-        // Qwen3.5 9B on Intel wants a shallow prefix: full-attn layers inside
-        // the prefix still run token-major, while the segment sweep below can
-        // batch them. A deep prefix measured ~190 tok/s on the 64-token long
-        // draft prefill; prefix=2/3 both beat the deep prefix, with prefix=2
-        // giving the best median in the focused Intel sweep.
+        // Qwen dense-hybrid models on Intel want a shallow prefix: full-attn layers inside
+        // the prefix still run token-major, while the segment
+        // sweep below can batch them. For Qwen3.5 9B, a deep prefix measured
+        // ~190 tok/s on the 64-token long-draft prefill; prefix=2/3 both beat
+        // the deep prefix, with prefix=2 giving the best median. For Qwen3.6
+        // 27B, prefix=3 lifts the decode-extended prefill row from ~78 tok/s
+        // to ~137 tok/s and improves all four Intel suite scenarios.
         // Override with ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS=1 to revert.
-        var layers: u32 = if (mode != null) 1 else if (use_intel_qwen35_segment_sweep) 2 else if (use_intel_qwen36_dense_deep_prefix) cfg.n_layers - 1 else if (prompt_len <= 8) 8 else 3;
+        var layers: u32 = if (mode != null) 1 else if (use_intel_qwen35_segment_sweep) 2 else if (use_intel_qwen36_segment_sweep) 3 else if (prompt_len <= 8) 8 else 3;
         if (mode) |raw| {
             if (!std.mem.eql(u8, raw, "1")) {
                 layers = std.fmt.parseInt(u32, raw, 10) catch layers;
