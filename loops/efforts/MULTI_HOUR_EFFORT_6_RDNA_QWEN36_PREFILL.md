@@ -40,6 +40,20 @@ from 229.0 ms to 276.0 ms and total prefill fell from 807.2 to
 1.14k tok/s. Leave this path Intel/default-off unless a new per-shape
 policy is proven with no-profile wins.
 
+Rejected follow-up: reducing the Qwen A3B prefill MoE exact-tail guard
+below 16 is still correctness-sensitive. Guard 12 and 8 preserved the
+111p first token, but guard 4 and 0 changed it; on the 2971p probe,
+guards 12/8/4 all changed the first token while guard 0 happened to
+match with no speedup. Do not lower `ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD`
+without a validator and a cross-prompt sweep.
+
+Rejected follow-up: a singleton-tail branch inside
+`dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp` preserved output but
+regressed the 2971p profile. Gate/up moved 393.0 -> 396.9 ms and total
+prefill fell 804.6 -> 741.4 tok/s. The current eight-route shader should
+stay branch-unified; if singleton tails are attacked again, split them
+into a separate dispatch rather than branching inside the hot shader.
+
 The original A3b problem is no longer open. The accepted production
 path is now layer-major A3B prefill:
 
