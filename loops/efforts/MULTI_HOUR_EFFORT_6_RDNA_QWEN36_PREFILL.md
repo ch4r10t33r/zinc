@@ -120,6 +120,16 @@ hot gate/up shader regressed. If attacking this again, use either a separate
 tail dispatch with a layer replay validator or skip directly to grouped-MoE
 GEMM / `mul_mat_id` style work. Do not re-submit another route-width flip.
 
+Rejected follow-up: batching the Qwen A3B exact-suffix shared-expert Q8_0
+projections with explicit source/destination token offsets is not a keep. The
+prototype replaced the per-token shared gate/up/down DMMVs for suffix tokens
+with offset `mul_mm_q8_0` dispatches. On the 322-token context-long profile,
+the first sample fell to 586.5 tok/s and shared expert rose to 11.1 ms; the
+repeat recovered to 639.4 tok/s overall but shared stayed worse at 10.8 ms.
+The prior current-tree profile was 642.8 tok/s with shared at 7.6 ms. Reverted;
+do not retry offset-batched shared Q8_0 projections without evidence that the
+small exact suffix is large enough to amortize the GEMM path.
+
 Kept follow-up: full-attention layer-major prefill now keeps the fused
 RMS+Q8_1 handoff opt-in via `ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT=1`.
 The root cause was narrower than the whole batched full-attention segment:
