@@ -144,6 +144,8 @@ export type LoopOptions = {
   host: string;
   port: number;
   user: string;
+  sshPasswordEnvVar: string | null;
+  sshPasswordFile: string | null;
   remoteDir: string;
   remoteHome: string;
   xdgCacheHome: string;
@@ -274,8 +276,77 @@ function isValueToken(value: string | undefined): value is string {
   return value != null && !value.startsWith("--");
 }
 
+function envValue(envMap: Record<string, string>, fileEnv: Record<string, string>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = envMap[key] ?? fileEnv[key];
+    if (value != null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function validatePasswordEnvName(name: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`Invalid SSH password environment variable name: ${name}`);
+  }
+}
+
+function hasSshPasswordAuth(opts: Pick<LoopOptions, "sshPasswordEnvVar" | "sshPasswordFile">): boolean {
+  return Boolean(opts.sshPasswordEnvVar || opts.sshPasswordFile);
+}
+
+export function buildSshOptions(opts: Pick<LoopOptions, "sshPasswordEnvVar" | "sshPasswordFile">): string[] {
+  if (!hasSshPasswordAuth(opts)) {
+    return ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"];
+  }
+  return [
+    "-o", "BatchMode=no",
+    "-o", "NumberOfPasswordPrompts=1",
+    "-o", "PreferredAuthentications=publickey,password,keyboard-interactive",
+    "-o", "StrictHostKeyChecking=no",
+  ];
+}
+
+function sshAskpassScript(opts: Pick<LoopOptions, "sshPasswordEnvVar" | "sshPasswordFile">): string | null {
+  if (opts.sshPasswordFile) return `#!/bin/sh\ncat ${q(opts.sshPasswordFile)}\n`;
+  if (!opts.sshPasswordEnvVar) return null;
+  validatePasswordEnvName(opts.sshPasswordEnvVar);
+  return `#!/bin/sh\nif [ -z "\${${opts.sshPasswordEnvVar}+set}" ]; then exit 1; fi\nprintf '%s\\n' "\${${opts.sshPasswordEnvVar}}"\n`;
+}
+
+function resolveSshPasswordAuth(envMap: Record<string, string>, fileEnv: Record<string, string>): Pick<LoopOptions, "sshPasswordEnvVar" | "sshPasswordFile"> {
+  for (const key of ["ZINC_GPU_SSH_PASSWORD", "ZINC_INTEL_SSH_PASSWORD", "ZINC_SSH_PASSWORD"]) {
+    if (envMap[key]) return { sshPasswordEnvVar: key, sshPasswordFile: null };
+  }
+  for (const key of ["ZINC_GPU_SSH_PASSWORD", "ZINC_INTEL_SSH_PASSWORD", "ZINC_SSH_PASSWORD"]) {
+    if (fileEnv[key]) {
+      process.env[key] = fileEnv[key];
+      return { sshPasswordEnvVar: key, sshPasswordFile: null };
+    }
+  }
+  const sshPasswordEnvVar = envValue(
+    envMap,
+    fileEnv,
+    "ZINC_GPU_SSH_PASSWORD_ENV",
+    "ZINC_INTEL_SSH_PASSWORD_ENV",
+    "ZINC_SSH_PASSWORD_ENV",
+  );
+  if (sshPasswordEnvVar) {
+    validatePasswordEnvName(sshPasswordEnvVar);
+    return { sshPasswordEnvVar, sshPasswordFile: null };
+  }
+  const sshPasswordFile = envValue(
+    envMap,
+    fileEnv,
+    "ZINC_GPU_SSH_PASSWORD_FILE",
+    "ZINC_INTEL_SSH_PASSWORD_FILE",
+    "ZINC_SSH_PASSWORD_FILE",
+  );
+  return { sshPasswordEnvVar: null, sshPasswordFile: sshPasswordFile ?? null };
+}
+
 export function parseArgsFrom(argv: string[], envMap: Record<string, string> = process.env): LoopOptions {
   const fileEnv = envMap === process.env ? ENV : {};
+  const sshPasswordAuth = resolveSshPasswordAuth(envMap, fileEnv);
   const user = envMap.ZINC_GPU_USER ?? fileEnv.ZINC_GPU_USER ?? envMap.ZINC_INTEL_USER ?? fileEnv.ZINC_INTEL_USER ?? envMap.ZINC_USER ?? fileEnv.ZINC_USER ?? "root";
   const envRemoteHome = envMap.ZINC_GPU_REMOTE_HOME ?? fileEnv.ZINC_GPU_REMOTE_HOME ?? envMap.ZINC_INTEL_REMOTE_HOME ?? fileEnv.ZINC_INTEL_REMOTE_HOME ?? envMap.ZINC_REMOTE_HOME ?? fileEnv.ZINC_REMOTE_HOME;
   const envRemoteDir = envMap.ZINC_GPU_REMOTE_DIR ?? fileEnv.ZINC_GPU_REMOTE_DIR ?? envMap.ZINC_INTEL_WORKDIR ?? fileEnv.ZINC_INTEL_WORKDIR ?? envMap.ZINC_INTEL_REMOTE_DIR ?? fileEnv.ZINC_INTEL_REMOTE_DIR ?? envMap.ZINC_REMOTE_DIR ?? fileEnv.ZINC_REMOTE_DIR;
@@ -296,6 +367,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     host: envMap.ZINC_GPU_HOST ?? fileEnv.ZINC_GPU_HOST ?? envMap.ZINC_INTEL_HOST ?? fileEnv.ZINC_INTEL_HOST ?? envMap.ZINC_HOST ?? fileEnv.ZINC_HOST ?? "127.0.0.1",
     port: Number(envMap.ZINC_GPU_PORT ?? fileEnv.ZINC_GPU_PORT ?? envMap.ZINC_INTEL_PORT ?? fileEnv.ZINC_INTEL_PORT ?? envMap.ZINC_PORT ?? fileEnv.ZINC_PORT ?? "22"),
     user,
+    ...sshPasswordAuth,
     remoteDir: envRemoteDir ?? `${remoteHome}/zinc-gpu-loop`,
     remoteHome,
     xdgCacheHome: envXdgCacheHome ?? `${remoteHome}/.cache`,
@@ -592,10 +664,11 @@ function median(values: number[]): number | null {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-async function runCommand(cmd: string, args: string[], opts: { cwd?: string; timeout?: number; stream?: boolean; formatter?: (line: string) => string | null } = {}): Promise<CommandResult> {
+async function runCommand(cmd: string, args: string[], opts: { cwd?: string; timeout?: number; stream?: boolean; formatter?: (line: string) => string | null; env?: NodeJS.ProcessEnv } = {}): Promise<CommandResult> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd ?? REPO_ROOT,
+      env: opts.env ?? process.env,
       stdio: ["ignore", "pipe", "pipe"],
       timeout: opts.timeout ?? 120_000,
     });
@@ -634,10 +707,35 @@ async function runCommand(cmd: string, args: string[], opts: { cwd?: string; tim
   });
 }
 
+async function runWithOptionalAskpass(
+  opts: LoopOptions,
+  cmd: string,
+  args: string[],
+  commandOpts: { cwd?: string; timeout?: number; stream?: boolean; formatter?: (line: string) => string | null } = {},
+): Promise<CommandResult> {
+  const script = sshAskpassScript(opts);
+  if (!script) return runCommand(cmd, args, commandOpts);
+
+  const askpassPath = `/tmp/zinc-askpass-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await writeFile(askpassPath, script, { mode: 0o700 });
+  try {
+    return await runCommand(cmd, args, {
+      ...commandOpts,
+      env: {
+        ...process.env,
+        DISPLAY: process.env.DISPLAY ?? "zinc-askpass",
+        SSH_ASKPASS: askpassPath,
+        SSH_ASKPASS_REQUIRE: "force",
+      },
+    });
+  } finally {
+    await rm(askpassPath, { force: true });
+  }
+}
+
 async function ssh(opts: LoopOptions, command: string, timeout = 120_000): Promise<CommandResult> {
-  return runCommand("ssh", [
-    "-o", "BatchMode=yes",
-    "-o", "StrictHostKeyChecking=no",
+  return runWithOptionalAskpass(opts, "ssh", [
+    ...buildSshOptions(opts),
     "-p", String(opts.port),
     `${opts.user}@${opts.host}`,
     command,
@@ -653,7 +751,7 @@ async function checkedSsh(opts: LoopOptions, command: string, timeout = 120_000)
 }
 
 async function rsyncToRemote(opts: LoopOptions): Promise<void> {
-  const res = await runCommand("rsync", [
+  const res = await runWithOptionalAskpass(opts, "rsync", [
     "-az",
     "--delete",
     "--exclude", ".git",
@@ -671,7 +769,7 @@ async function rsyncToRemote(opts: LoopOptions): Promise<void> {
     "--exclude", ".perf_optimize",
     "--exclude", ".zinc_optimize",
     "--exclude", ".DS_Store",
-    "-e", `ssh -p ${opts.port} -o BatchMode=yes -o StrictHostKeyChecking=no`,
+    "-e", `ssh -p ${opts.port} ${buildSshOptions(opts).join(" ")}`,
     `${REPO_ROOT}/`,
     `${opts.user}@${opts.host}:${opts.remoteDir}/`,
   ], { timeout: 180_000 });

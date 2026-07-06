@@ -4,6 +4,7 @@ import {
   buildRemoteLlamaBenchCommand,
   buildRemoteLlamaCliCommand,
   buildRemoteZincCommand,
+  buildSshOptions,
   changedSince,
   combinedCommandOutput,
   isAgentAuthFailure,
@@ -126,6 +127,32 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.remoteDir).toBe("/home/tempuser/zinc-intel-loop");
     expect(opts.xdgCacheHome).toBe("/home/tempuser/.cache");
     expect(opts.remoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
+  });
+
+  test("supports temporary password auth for Intel bootstrap nodes", () => {
+    const opts = parseArgsFrom([], {
+      ZINC_INTEL_HOST: "intel.local",
+      ZINC_INTEL_PORT: "8888",
+      ZINC_INTEL_USER: "tempuser",
+      ZINC_INTEL_SSH_PASSWORD: "not-for-command-lines",
+    });
+
+    expect(opts.sshPasswordEnvVar).toBe("ZINC_INTEL_SSH_PASSWORD");
+    expect(opts.sshPasswordFile).toBeNull();
+    expect(buildSshOptions(opts)).toContain("BatchMode=no");
+    expect(buildSshOptions(opts)).toContain("NumberOfPasswordPrompts=1");
+  });
+
+  test("keeps keyless default SSH in batch mode when no password auth is configured", () => {
+    const opts = parseArgsFrom([], {
+      ZINC_INTEL_HOST: "intel.local",
+      ZINC_INTEL_PORT: "8888",
+      ZINC_INTEL_USER: "tempuser",
+    });
+
+    expect(opts.sshPasswordEnvVar).toBeNull();
+    expect(opts.sshPasswordFile).toBeNull();
+    expect(buildSshOptions(opts)).toContain("BatchMode=yes");
   });
 
   test("derives remote defaults from an explicit SSH user", () => {

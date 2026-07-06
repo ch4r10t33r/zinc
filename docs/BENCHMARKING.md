@@ -29,6 +29,11 @@ bun tools/performance_suite.mjs --target rdna --rdna-node rdna2 --rdna-sync --rd
 # Intel Arc target (separate remote node from .env)
 bun tools/performance_suite.mjs --target intel --intel-sync --intel-build --intel-start-llama
 
+# Temporary password-only Intel nodes can use a process environment secret.
+# Do not commit the value; prefer a throwaway shell export or password file.
+export ZINC_INTEL_SSH_PASSWORD='<temporary-password>'
+bun tools/performance_suite.mjs --target intel --intel-sync --intel-build --intel-start-llama
+
 # Everything in one run
 bun tools/performance_suite.mjs --target all --rdna-sync --rdna-build --rdna-start-llama
 ```
@@ -38,6 +43,8 @@ Defaults are 1 warmup + 3 measured runs per scenario; pass `--runs N --warmup M`
 RDNA suite runs sync into `/root/zinc-bench` by default. Keep that checkout isolated from optimization loops and ad-hoc experiments; sharing `/root/zinc` can overwrite `zig-out/bin/zinc` mid-suite and invalidate later model rows. The suite verifies `zinc --version` reports the requested backend before RDNA measurements, and before every ZINC scenario, so a stale or overwritten binary fails loudly instead of publishing mixed Vulkan/ZINC_RT data.
 
 `bun tools/performance_suite.mjs --help` lists every flag (target subset, model filtering, baseline binary overrides, remote workdir / libc / model-root overrides, etc.).
+
+For password-auth Intel nodes, the suite reads `ZINC_INTEL_SSH_PASSWORD`, `ZINC_INTEL_SSH_PASSWORD_ENV`, or `ZINC_INTEL_SSH_PASSWORD_FILE` and drives `ssh`/`rsync` through `SSH_ASKPASS`. The generic `loops/optimize_gpu.ts` loop accepts the same variables, plus the `ZINC_GPU_*` equivalents. The generated benchmark commands reference only the env-var name or file path, not the password itself. Remove the temporary secret after the node is converted to key-based SSH.
 
 Current RDNA publish runs cover Gemma 4 26B-A4B Q4_K_M, Gemma 4 31B Q4_K_M, Qwen 3.5 9B Q4_K_M, Qwen 3.6 27B Q4_K_M, and Qwen 3.6 35B-A3B UD Q4_K_XL. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
 

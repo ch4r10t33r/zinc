@@ -82,6 +82,17 @@ suite cleared all supported rows (`/tmp/zinc-intel-full-q8suffix-20260705-125016
 limited to Intel exact-grouped prefill unless a new full-suite run proves a
 broader policy.
 
+Rejected follow-up: routing A3B Q8_0 SSM-out through the same full-column
+DP4a activation quantization used for SSM qkv/z is not safe. The prototype
+quantized `scratch_swiglu` with `qwenA3bPrepareProjectionQ8(..., d_inner, ...)`,
+ran `mul_mm_q8_0_full_dp4a` for full columns, and left the ragged tail on the
+existing Q8_0 path. On the 154-token diagnostic profile, the branch produced
+418.8 tok/s and wrong output (`some of the most common acronyms`) while the
+same binary with `ZINC_A3B_Q8_SSM_OUT_DP4A=0` produced 697.0 tok/s and the
+correct Paris answer. SSM-out itself moved 18.4 -> 35.0 ms. Code was reverted;
+do not retry activation-Q8_0 DP4a for SSM-out without an in-layer numeric replay
+validator and cross-prompt correctness sweep.
+
 Rejected follow-up: forcing `ZINC_QWEN36_Q8_WIDE4_SSM_OUT=1` on RDNA is
 not a default-on keep. It preserved the first output token on the 111p
 and 2971p probes, but the no-profile 111p repeats were noisy and did not

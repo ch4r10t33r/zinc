@@ -380,6 +380,30 @@ test("Intel ZINC command can pin a temporary SSH key", () => {
   expect(cmd).toContain("ssh -i '/tmp/zinc_key' -o IdentitiesOnly=yes -p 8888 tempuser@intel.local");
 });
 
+test("Intel ZINC command supports temporary password auth without embedding the secret", () => {
+  const cmd = intelZincCommand({
+    model_path: "/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
+    prompt_mode: "raw",
+    prompt: "The capital of France is",
+    max_tokens: 8,
+    context_tokens: 512,
+  }, {
+    host: "intel.local",
+    user: "tempuser",
+    port: "8888",
+    sshPasswordEnvVar: "ZINC_INTEL_SSH_PASSWORD",
+    workdir: "/home/tempuser/zinc",
+    env: {},
+  });
+
+  expect(cmd).toContain("SSH_ASKPASS=");
+  expect(cmd).toContain("SSH_ASKPASS_REQUIRE=force");
+  expect(cmd).toContain("NumberOfPasswordPrompts=1");
+  expect(cmd).toContain("StrictHostKeyChecking=accept-new");
+  expect(cmd).toContain("ZINC_INTEL_SSH_PASSWORD");
+  expect(cmd).not.toContain("ChangeMe");
+});
+
 test("RDNA startup failure detection spots unsupported model architecture logs", () => {
   const failure = detectRdnaServerStartupFailure(`
 llama_model_load: error loading model: error loading model architecture: unknown model architecture: 'gemma4'

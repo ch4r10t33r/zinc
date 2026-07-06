@@ -274,6 +274,8 @@ ZINC_INTEL_USER=<ssh-user>
 ZINC_INTEL_WORKDIR=/home/<ssh-user>/zinc-gpu-loop
 ZINC_INTEL_XDG_CACHE_HOME=/home/<ssh-user>/.cache
 ZINC_INTEL_MODEL_ROOT=/home/<ssh-user>/.cache/zinc/models/models
+# Temporary password-only nodes only; prefer key-based SSH after bootstrap.
+ZINC_INTEL_SSH_PASSWORD_FILE=/tmp/zinc-intel-password
 ```
 
 Deploy and test:

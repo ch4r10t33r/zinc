@@ -1714,11 +1714,12 @@ function remoteCommand(commandText, creds) {
   if (creds.sshKey) {
     sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  appendPasswordSshOptions(sshArgs, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
   sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
-  return `ssh ${sshArgs.join(" ")}`;
+  return withSshAskpass(`ssh ${sshArgs.join(" ")}`, creds);
 }
 
 function rdnaRemoteCommand(commandText, creds) {
@@ -1730,11 +1731,12 @@ function remoteDetachedCommand(commandText, creds) {
   if (creds.sshKey) {
     sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  appendPasswordSshOptions(sshArgs, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
   sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
-  return `ssh ${sshArgs.join(" ")}`;
+  return withSshAskpass(`ssh ${sshArgs.join(" ")}`, creds);
 }
 
 function rdnaDetachedCommand(commandText, creds) {
@@ -1746,11 +1748,61 @@ function remoteSshTransport(creds) {
   if (creds.sshKey) {
     parts.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  appendPasswordSshOptions(parts, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     parts.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
   parts.push("-p", creds.port);
   return parts.join(" ");
+}
+
+function appendPasswordSshOptions(args, creds) {
+  if (!hasSshPasswordAuth(creds)) return;
+  args.push(
+    "-o", "BatchMode=no",
+    "-o", "NumberOfPasswordPrompts=1",
+    "-o", "PreferredAuthentications=publickey,password,keyboard-interactive",
+  );
+  if (process.env.ZINC_SSH_STRICT !== "no") {
+    args.push("-o", "StrictHostKeyChecking=accept-new");
+  }
+}
+
+function hasSshPasswordAuth(creds) {
+  return Boolean(creds.sshPasswordEnvVar || creds.sshPasswordFile);
+}
+
+function validatePasswordEnvName(name) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`Invalid SSH password environment variable name '${name}'.`);
+  }
+}
+
+function sshAskpassScript(creds) {
+  if (creds.sshPasswordFile) {
+    return `#!/bin/sh\ncat ${shellQuote(creds.sshPasswordFile)}\n`;
+  }
+  if (!creds.sshPasswordEnvVar) return null;
+  validatePasswordEnvName(creds.sshPasswordEnvVar);
+  return `#!/bin/sh\nif [ -z "\${${creds.sshPasswordEnvVar}+set}" ]; then exit 1; fi\nprintf '%s\\n' "\${${creds.sshPasswordEnvVar}}"\n`;
+}
+
+function sshAskpassSetup(creds) {
+  const script = sshAskpassScript(creds);
+  if (!script) return "";
+  const display = process.env.DISPLAY || "zinc-askpass";
+  return [
+    "zinc_askpass=$(mktemp /tmp/zinc-askpass.XXXXXX)",
+    `printf %s ${shellQuote(script)} > "$zinc_askpass"`,
+    "chmod 700 \"$zinc_askpass\"",
+    "trap 'rm -f \"$zinc_askpass\"' EXIT",
+    `DISPLAY=${shellQuote(display)} SSH_ASKPASS="$zinc_askpass" SSH_ASKPASS_REQUIRE=force`,
+  ].join(" && ");
+}
+
+function withSshAskpass(command, creds) {
+  const setup = sshAskpassSetup(creds);
+  return setup ? `${setup} ${command}` : command;
 }
 
 function rdnaSshTransport(creds) {
@@ -2391,7 +2443,7 @@ async function prepareRdna(args, creds) {
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
     ].join(" ");
-    await runShell(rsyncCmd, { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+    await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.rdnaBuild) {
@@ -2458,7 +2510,7 @@ async function prepareIntel(args, creds, remoteLibcConf) {
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
     ].join(" ");
-    await runShell(rsyncCmd, { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+    await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (remoteLibcConf) {
@@ -2749,6 +2801,26 @@ function remoteHomeForUser(user) {
   return user === "root" ? "/root" : `/home/${user}`;
 }
 
+function resolveSshPasswordAuth(dotEnv, directKeys, envVarKeys, fileKeys) {
+  for (const key of directKeys) {
+    if (process.env[key]) return { sshPasswordEnvVar: key };
+  }
+  for (const key of directKeys) {
+    if (dotEnv[key]) {
+      process.env[key] = dotEnv[key];
+      return { sshPasswordEnvVar: key };
+    }
+  }
+  const sshPasswordEnvVar = envValue(dotEnv, ...envVarKeys);
+  if (sshPasswordEnvVar) {
+    validatePasswordEnvName(sshPasswordEnvVar);
+    return { sshPasswordEnvVar };
+  }
+  const sshPasswordFile = envValue(dotEnv, ...fileKeys);
+  if (sshPasswordFile) return { sshPasswordFile };
+  return {};
+}
+
 async function buildRdnaCreds(args) {
   const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
   const host = rdnaEnvValue(dotEnv, args, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST");
@@ -2775,6 +2847,12 @@ async function buildIntelConfig(args) {
   const user = envValue(dotEnv, "ZINC_INTEL_USER") ?? "tempuser";
   const port = envValue(dotEnv, "ZINC_INTEL_PORT") ?? "22";
   const sshKey = envValue(dotEnv, "ZINC_INTEL_SSH_KEY", "ZINC_SSH_KEY");
+  const sshPasswordAuth = resolveSshPasswordAuth(
+    dotEnv,
+    ["ZINC_INTEL_SSH_PASSWORD", "ZINC_SSH_PASSWORD"],
+    ["ZINC_INTEL_SSH_PASSWORD_ENV", "ZINC_SSH_PASSWORD_ENV"],
+    ["ZINC_INTEL_SSH_PASSWORD_FILE", "ZINC_SSH_PASSWORD_FILE"],
+  );
   if (!host || !user) {
     throw new Error("Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env");
   }
@@ -2810,6 +2888,7 @@ async function buildIntelConfig(args) {
       user,
       port,
       sshKey,
+      ...sshPasswordAuth,
       workdir,
       env: remoteEnv,
       vkDevice,
@@ -3172,7 +3251,7 @@ async function prepareCuda(args, creds) {
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
     ].join(" ");
-    await runShell(rsyncCmd, { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+    await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.cudaBuild) {
