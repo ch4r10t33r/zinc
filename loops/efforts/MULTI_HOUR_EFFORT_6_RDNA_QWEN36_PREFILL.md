@@ -1726,6 +1726,13 @@ route. It still allocated/captured successfully, but did not compare this path.
 Do not claim a hard numerical-correctness proof for this change until a
 production-path replay check exists.
 
+Rejected same-cycle MoE follow-up: reran the existing
+`ZINC_MOE_Q8_1_DOWN_COLS=1 ZINC_MOE_Q8_1_DOWN_COMPARE=1` diagnostic on the
+same 322-token `context-long` prompt. The sampled layer diff still grows across
+depth (`max_abs` reached `4.91e-3` by layer 37) and the MoE-down bucket regressed
+to `54.2 ms` versus the normal `~51 ms`. Keep Q8_1 routed-down off for this
+model; it is neither faster nor numerically tight enough on the current path.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
