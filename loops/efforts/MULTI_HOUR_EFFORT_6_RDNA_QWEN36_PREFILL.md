@@ -236,6 +236,36 @@ Same RDNA node, same 154-token prompt, profiled sample after the instrumentation
 the next optimization should target one of the named 25-31 ms sub-buckets, not
 the now-default-off shared f32 gate experiment.
 
+Rejected follow-up: the current 154-token Q8_1 routed-down path remains
+diagnostic-only. With `ZINC_MOE_Q8_1_DOWN_COLS=1
+ZINC_MOE_Q8_1_DOWN_COMPARE=1`, sampled per-layer diffs were small enough to
+look tempting (`max_abs` mostly below `4e-3`), but the measured path was slower:
+profile sample `422.39 tok/s`, MoE down `32.5 ms` versus the normal `~27.7 ms`.
+No-profile paired samples were worse and changed the continuation:
+
+| Mode | Samples | Median | Output |
+|---|---|---:|---|
+| default | `464.14, 715.07, 724.78, 601.60, 509.15` tok/s | `601.60` tok/s | `some of the most common acronyms` |
+| Q8_1 down | `426.49, 440.71, 420.80, 434.01, 437.98` tok/s | `434.01` tok/s | `, the reference packet.` |
+
+Rejected follow-up: padding the A3B Q8_0 projection DP4a tail from 154 to 160
+tokens is not correctness-safe. The combined probe removed the f32 ragged tail
+for both SSM qkv/z and SSM-out, which can make profile sub-buckets look much
+better, but it changed answer-bearing continuations. Splitting the probe showed
+both halves are unsafe on the same prompt:
+
+| `ZINC_A3B_Q8_PROJ_PAD_TAIL` | Samples | Output |
+|---|---|---|
+| `qkv_z` | `747.83, 610.82` tok/s | `us the reference, the reference the reference` |
+| `ssm_out` | `528.35, 515.18` tok/s | `be the the the the the the the` |
+| `all` | `554.73, 648.26` tok/s | `particular attention to the fact that the user` |
+
+The default output in the same sweep stayed `some of the most common acronyms`
+at `474.85, 709.02` tok/s. Code was reverted. Keep the real-column policy in
+`qwenA3bPrepareProjectionQ8`; do not pad the answer-bearing tail unless there
+is a layer replay validator and a prompt sweep proving the final hidden state
+is acceptable.
+
 Rejected follow-up: reducing the Qwen A3B prefill MoE exact-tail guard
 below 16 is still correctness-sensitive. Guard 12 and 8 preserved the
 111p first token, but guard 4 and 0 changed it; on the 2971p probe,
