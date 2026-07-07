@@ -383,6 +383,7 @@ const Pipelines = struct {
     rope_batched: CudaPipeline,
     kv_cache_write_batched: CudaPipeline,
     attention_causal_batched: CudaPipeline,
+    attention_causal_v2: CudaPipeline, // coalesced warp-per-key qwen prefill attention (ZINC_ATTN_V2)
 };
 
 /// Token-major scratch for the batched prefill path (Effort 26 T0). Allocated
@@ -648,6 +649,7 @@ pub const ForwardCuda = struct {
     // Effort 26 T0: batched prefill (qwen). Lazily-allocated token-major scratch
     // + the cuBLAS dense-GEMM toggles (mirrors the gemma prefillBatched path).
     batch: ?BatchScratch = null,
+    use_attn_v2: bool = false, // ZINC_ATTN_V2: coalesced warp-per-key qwen prefill attention (token-tolerance)
     use_cublas: bool = false, // dense Q4_K/Q6_K prefill GEMMs via cuBLAS fp16 TC
     use_cublas_q5: bool = false, // also route Q5_K dense GEMMs through cuBLAS (qwen attn_qkv/ssm_out)
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
@@ -839,6 +841,7 @@ pub const ForwardCuda = struct {
         pipes.rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rope_batched");
         pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write_batched");
         pipes.attention_causal_batched = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched");
+        pipes.attention_causal_v2 = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched_v2");
         // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
@@ -1431,6 +1434,7 @@ pub const ForwardCuda = struct {
         var prof_ssm: i64 = 0;
         var prof_ffn: i64 = 0;
         // cuBLAS dense-GEMM defaults (mirror the gemma path): on unless opted out.
+        self.use_attn_v2 = std.posix.getenv("ZINC_ATTN_V2") != null;
         self.use_cublas = cublasDefaultOn();
         self.use_cublas_q5 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ5") == null;
         self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
@@ -1676,7 +1680,11 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.kv_cache_write_batched, .{ ceilDiv(d.kv_dim, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.k, &self.kv_k[L], &b.v, &self.kv_v[L] }, &kvw, @sizeOf(KvWriteBatchPush), 0);
         // Causal attention for all T queries (block (head, t), seq_len = t+1).
         const attn = AttnBatchPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .T = T, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        cmd.dispatch(&self.pipes.attention_causal_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), T * 4);
+        if (self.use_attn_v2) {
+            cmd.dispatch(&self.pipes.attention_causal_v2, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), (T + d.head_dim) * 4);
+        } else {
+            cmd.dispatch(&self.pipes.attention_causal_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), T * 4);
+        }
         // Sigmoid attention gate, element-wise over all [T, q_dim].
         const sm = SigmoidMulPush{ .N = T * d.q_dim };
         cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(T * d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.attn_out, &b.attn_gate, &b.attn_out }, &sm, @sizeOf(SigmoidMulPush), 0);
