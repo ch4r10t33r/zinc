@@ -72,6 +72,16 @@ layer replay validator compares grouped layer output against token fallback
 inside the full prefill orchestration. Do not claim the Q6_K speedup as a
 valid win.
 
+2026-07-06 follow-up: a narrower layer-38-only Q6_K grouped probe is also a
+correctness reject. The temporary `ZINC_MOE_Q6K_COLS=38` mode grouped layer 38
+while leaving layer 34 on fallback. It improved the profiled path shape
+(`moe_grouped_layers=37`, token fallbacks `462 -> 308`, MoE down `27.4 -> 16.9
+ms`, prefill `707.93 tok/s` after a cold default `437.29 tok/s`) but changed
+the continuation to `several countries in the world. # #`. The regular
+`ZINC_MOE_Q6K_COLS=1` sample was likewise wrong (`the the capital of the United
+States.`). The temporary layer selector was removed; Q6_K grouped MoE still
+needs a production-path layer replay validator before any performance claim.
+
 Historical rejected follow-up: an earlier exact-suffix
 `ZINC_MOE_Q8_1_DOWN_COLS=1` prototype was not safe on the 154-token diagnostic
 prompt (`the capital of France.` changed to `also a a reference...`) and was
