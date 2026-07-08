@@ -34,10 +34,15 @@ Why keep this dormant instead of wiring it immediately:
 - Source guards now keep the shader installed, the DMMV pipeline/recorder
   wired, and the GLSL comments free of external-runtime naming.
 
-Next credible step: add a layer replay validator for routed MoE GEMM that
-compares one layer's post-FFN output against the current route-packed path on
-the same routing table. If it passes, prefer a route-pack-native tiled GEMM
-consumer over token-major id scanning.
+Follow-up in the same continuation added `ZINC_MOE_ID_Q4K_COMPARE=1`, a
+diagnostic-only replay that runs the current route-packed Q4_K gate projection
+and the routed `mul_mm_id_q4k` gate projection on the same prefix routing table,
+then logs sampled row diffs as `ZINC_MOE_ID_Q4K_COMPARE`. It does not alter
+default generation.
+
+Next credible step: run that validator on RDNA. If it passes with tight diffs,
+extend it from gate-only to gate+up/down or build a route-pack-native tiled GEMM
+consumer over the already packed expert-major ID table.
 
 ## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
 

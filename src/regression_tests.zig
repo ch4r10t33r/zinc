@@ -1097,6 +1097,12 @@ test "Vulkan routed Q4_K MoE GEMM foundation stays compile registered" {
     try expectContains(shader, "data_expert_count[expert_idx]");
     try expectContains(shader, "row_ids[count - ic * BN] = uvec2(ii0, ii1);");
     try expectContains(shader, "d_data[d_idx] = sums[m][n];");
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "ZINC_MOE_ID_Q4K_COMPARE");
+    try expectContainsNear(forward, "const use_id_q4k_compare =", "pipeline_mul_mm_id_q4k", 700);
+    try expectContainsNear(forward, "if (use_id_q4k_compare)", "recordMulMmIdQ4K", 3600);
+    try expectContains(forward, "ZINC_MOE_ID_Q4K_COMPARE: layer={d}");
 }
 
 test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
@@ -1145,6 +1151,7 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q6K_SUFFIX_COMPARE", 23000);
     try expectContains(forward, "ZINC_MOE_Q6K_SUFFIX_COMPARE: layer=");
     try expectContains(forward, "q6_suffix_compare_routes[sample_i]");
+    try expectContains(forward, "else\n            exact_grouped;");
     try expectContains(forward, "prefix_tokens * hidden_dim");
     try expectContainsNear(forward, "suffix_route_count", "suffix_k", 80);
     try expectContainsNear(forward, "suffix_route_count", "prefix_tokens", 120);
@@ -1153,14 +1160,32 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(forward, "Diagnostic/exactness path for Qwen A3B top-1 grouped prefix");
     try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, prefix_tokens);");
     try expectContains(forward, "try self.dispatchSigmoidScaleAccBatch(");
+    try expectContains(forward, "fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine, default_on: bool) bool");
+    try expectContains(forward, "const raw = std.posix.getenv(\"ZINC_A3B_SHARED_F32_GATE_BATCH\") orelse return default_on;");
+    try expectContains(forward, "self.qwenA3bSharedF32GateBatchEnabled(exact_grouped)");
+    try expectContains(forward, "fn qwenA3bAttentionProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool");
+    try expectContains(forward, "std.posix.getenv(\"ZINC_A3B_ATTN_DP4A\")");
+    try expectContains(forward, "!self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)) return false;");
+    try expectContains(forward, "self.gemmaDenseProjectionDp4aEnabled(n_tokens) or\n                self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)");
+    try expectContains(forward, "const attn_proj_q8_dp4a_wanted =");
+    try expectContains(forward, "try self.qwenA3bPrepareProjectionQ8(scratch_norm, hidden_dim, n_tokens)");
+    try expectContains(forward, "try self.dispatchQwenA3bQ8ProjectionDp4a(q_t, scratch_norm, scratch_q");
+    try expectContains(forward, "try self.dispatchQwenA3bQ8ProjectionDp4a(o_t, scratch_attn_out, scratch_down");
+    try expectContains(forward, "const kv_q8_dp4a_wanted =");
     try expectContains(forward, "recordQuantizeActQ8_1");
     try expectContains(forward, "recordQwenTop1GateUpSwigluColsDispatchIndirect");
     try expectContains(forward, "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect");
     try expectContains(forward, "recordMoeColsQ8_1DispatchIndirect");
+    try expectContains(forward, "self.dmmv.moePipelineForType(gate_exps.info.type_) == null");
+    try expectContains(forward, "const q4_gate_up_experts = gate_exps.info.type_ == .q4_k and up_exps.info.type_ == .q4_k;");
+    try expectContains(forward, "q4_gate_up_experts and\n            self.use_moe_fused_gate_up_swiglu");
+    try expectContains(forward, "gate_exps.info.type_,\n                    gate_exps.gpu_buffer.handle");
+    try expectContains(forward, "up_exps.info.type_,\n                    up_exps.gpu_buffer.handle");
     try expectContains(forward, "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=");
     try expectContains(forward, "ZINC_MOE_Q6K_COLS_COMPARE: layer=");
     try expectContains(forward, "dequantRow(mmap[q6_down_data_off..]");
-    try expectContains(forward, "if (n_tokens < 16 or n_tokens > 192) return false;");
+    try expectContains(forward, "const qwen_a3b_exact_grouped_moe_prefill_max_tokens: u32 = 384;");
+    try expectContains(forward, "if (n_tokens < 16 or n_tokens > qwen_a3b_exact_grouped_moe_prefill_max_tokens) return false;");
     try expectContains(forward, "const qwen_a3b_shared_q8_shape = self.isQwen36A3bMoePrefillModel()");
     try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);");
 
@@ -1201,7 +1226,7 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(q8_q5_down_shader, "x_route_divisor");
 }
 
-test "Vulkan Qwen grouped prefill keeps shared expert f32 gate batching opt-in" {
+test "Vulkan Qwen grouped prefill defaults exact shared expert f32 gate batching" {
     const forward = @embedFile("compute/forward.zig");
     const marker = "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);";
     const start = std.mem.indexOf(u8, forward, marker) orelse return error.TestExpectedEqual;
@@ -1209,8 +1234,8 @@ test "Vulkan Qwen grouped prefill keeps shared expert f32 gate batching opt-in" 
 
     try expectContains(forward, "fn qwenA3bSharedF32GateBatchEnabled");
     try expectContains(forward, "ZINC_A3B_SHARED_F32_GATE_BATCH");
-    try expectContainsNear(forward, "fn qwenA3bSharedF32GateBatchEnabled", "orelse return false;", 400);
-    try expectContains(block, "self.qwenA3bSharedF32GateBatchEnabled()");
+    try expectContainsNear(forward, "fn qwenA3bSharedF32GateBatchEnabled", "orelse return default_on;", 400);
+    try expectContains(block, "self.qwenA3bSharedF32GateBatchEnabled(exact_grouped)");
     try expectContains(block, "sg.info.type_ == .f32");
     try expectContains(block, "self.elementwise.pipeline_router_f32_batch != null");
     try expectContains(block, "try self.dispatchRouterF32Batch(");

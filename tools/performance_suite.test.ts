@@ -113,6 +113,7 @@ test("remote tuning env forwards tuning toggles", () => {
     ZINC_MOE_SINGLETON_TAIL_SPLIT: "1",
     ZINC_INTEL_A3B_PRODUCTION: "0",
     ZINC_A3B_SHARED_F32_GATE_BATCH: "0",
+    ZINC_A3B_ATTN_DP4A: "0",
     ZINC_QWEN35_9B_BM64_DOWN: "0",
     ZINC_QWEN35_9B_K12288_BK2: "0",
     ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS: "4",
@@ -130,6 +131,7 @@ test("remote tuning env forwards tuning toggles", () => {
   expect(env.ZINC_MOE_SINGLETON_TAIL_SPLIT).toBe("1");
   expect(env.ZINC_INTEL_A3B_PRODUCTION).toBe("0");
   expect(env.ZINC_A3B_SHARED_F32_GATE_BATCH).toBe("0");
+  expect(env.ZINC_A3B_ATTN_DP4A).toBe("0");
   expect(env.ZINC_QWEN35_9B_BM64_DOWN).toBe("0");
   expect(env.ZINC_QWEN35_9B_K12288_BK2).toBe("0");
   expect(env.ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS).toBe("4");

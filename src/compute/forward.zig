@@ -107,6 +107,7 @@ const gemma_prefill_tiny_prompt_topk: u32 = 2;
 const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
+const qwen_a3b_exact_grouped_moe_prefill_max_tokens: u32 = 384;
 const qwen_dense_intel_deep_prefill_min_tokens: usize = 32;
 const moe_route_block_cols: u32 = 8;
 const moe_route_pack_profile_tail_bins: usize = moe_route_block_cols - 1;
@@ -4186,10 +4187,11 @@ pub const InferenceEngine = struct {
             try growSlot(self.instance, &self.batched_scratch_swiglu_scale_dsum, inter_scale_dsum_bytes, storage_xfer);
             // Same path also drives the int8 DP4a dense gate/up prefill
             // (K=hidden_dim), Q5_K SSM out prefill (K=d_inner), and Gemma
-            // attention projections. Gemma's O projection consumes the full
+            // / A3B attention projections. O projection consumes the full
             // attention output width, which can exceed hidden_dim, so include
-            // q_dim when the Gemma projection DP4a path is active.
-            const max_attention_proj_k: u32 = if (self.gemmaDenseProjectionDp4aEnabled(n_tokens)) q_dim else 0;
+            // q_dim when an attention projection DP4a path is active.
+            const max_attention_proj_k: u32 = if (self.gemmaDenseProjectionDp4aEnabled(n_tokens) or
+                self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)) q_dim else 0;
             const max_dp4a_k = @max(@max(hidden_dim, cfg.ssm_d_inner), max_attention_proj_k);
             const hidden_i8_bytes = n * (max_dp4a_k / 4) * @sizeOf(u32);
             const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * f32_sz;
@@ -17686,7 +17688,7 @@ pub const InferenceEngine = struct {
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
         if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
-        if (n_tokens < 16 or n_tokens > 192) return false;
+        if (n_tokens < 16 or n_tokens > qwen_a3b_exact_grouped_moe_prefill_max_tokens) return false;
         if (std.posix.getenv("ZINC_QWEN36_MOE_GROUPED_EXACT")) |env| {
             if (std.mem.eql(u8, env, "0") or
                 std.ascii.eqlIgnoreCase(env, "off") or
@@ -17700,9 +17702,9 @@ pub const InferenceEngine = struct {
             self.elementwise.pipeline_moe_weighted_acc_batch != null;
     }
 
-    fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine) bool {
+    fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine, default_on: bool) bool {
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        const raw = std.posix.getenv("ZINC_A3B_SHARED_F32_GATE_BATCH") orelse return false;
+        const raw = std.posix.getenv("ZINC_A3B_SHARED_F32_GATE_BATCH") orelse return default_on;
         return raw.len > 0 and
             !std.mem.eql(u8, raw, "0") and
             !std.ascii.eqlIgnoreCase(raw, "off") and
@@ -17832,8 +17834,22 @@ pub const InferenceEngine = struct {
         return self.qwen36Dp4aDownEnabled() and n_tokens >= 32;
     }
 
+    fn qwenA3bAttentionProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (std.posix.getenv("ZINC_A3B_ATTN_DP4A")) |v| {
+            if (std.mem.eql(u8, v, "0")) return false;
+        }
+        return n_tokens >= 64;
+    }
+
     fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
-        if (!self.qwenDenseProjectionDp4aEnabled(n_tokens)) return false;
+        if (!self.qwenDenseProjectionDp4aEnabled(n_tokens) and
+            !self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)) return false;
         if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
         if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
         if (self.batched_scratch_hidden_i8 == null) return false;
@@ -19864,19 +19880,18 @@ pub const InferenceEngine = struct {
         const gate_exps = lt.ffn_gate_exps orelse return inactive;
         const up_exps = lt.ffn_up_exps orelse return inactive;
         const down_exps = lt.ffn_down_exps orelse return inactive;
-        if (gate_exps.info.type_ != .q4_k or up_exps.info.type_ != .q4_k) return inactive;
+        if (self.dmmv.moePipelineForType(gate_exps.info.type_) == null) return inactive;
+        if (self.dmmv.moePipelineForType(up_exps.info.type_) == null) return inactive;
         const q6_cols_requested = if (std.posix.getenv("ZINC_MOE_Q6K_COLS")) |raw|
             !(std.mem.eql(u8, raw, "0") or
                 std.ascii.eqlIgnoreCase(raw, "off") or
                 std.ascii.eqlIgnoreCase(raw, "false") or
                 std.ascii.eqlIgnoreCase(raw, "no"))
         else
-            false;
-        // Q6_K routed columns match CPU dequant replay, but enabling them here
-        // groups an extra prefix layer that the fallback path otherwise runs
-        // token-by-token with the model's shared expert. The grouped prefix path
-        // intentionally skips that shared expert for speed, so keep Q6_K opt-in
-        // until a full grouped-vs-fallback replay proves the policy equivalent.
+            exact_grouped;
+        // Q6_K routed columns match CPU dequant replay. Keep them opt-in for
+        // the older approximate top-1 prefix path, but allow them by default
+        // for exact grouped A3B prefill where the shared expert is batched too.
         const allow_late_q6_grouped = exact_grouped or layer + 2 < cfg.n_layers;
         const down_cols_supported = switch (down_exps.info.type_) {
             .q4_k => self.dmmv.pipeline_q4k_moe_cols != null,
@@ -19916,7 +19931,9 @@ pub const InferenceEngine = struct {
         const up_stride = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
         const down_stride = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
         if (gate_stride != up_stride) return inactive;
+        const q4_gate_up_experts = gate_exps.info.type_ == .q4_k and up_exps.info.type_ == .q4_k;
         const use_fused_gate_up_cols =
+            q4_gate_up_experts and
             self.use_moe_fused_gate_up_swiglu and
             self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null;
         const q8_1_gate_up_cols_default_on = exact_grouped and prefix_tokens == 0;
@@ -20127,6 +20144,31 @@ pub const InferenceEngine = struct {
             self.logits_staging.mapped != null and
             self.logits_staging.size >= q6_suffix_compare_bytes;
         var q6_suffix_compare_ran = false;
+        const id_q4k_compare_requested = envFlagEnabled("ZINC_MOE_ID_Q4K_COMPARE", false);
+        const id_q4k_compare_sample_elems: u32 = @min(inter_dim, 64);
+        const id_q4k_compare_sample_count: u32 = if (prefix_tokens >= 3) 3 else 0;
+        var id_q4k_compare_tokens = [_]u32{ 0, 0, 0 };
+        if (id_q4k_compare_sample_count == 3) {
+            id_q4k_compare_tokens[1] = prefix_tokens / 2;
+            id_q4k_compare_tokens[2] = prefix_tokens - 1;
+        }
+        const id_q4k_compare_sample_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, id_q4k_compare_sample_elems) * @sizeOf(f32);
+        const id_q4k_compare_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, id_q4k_compare_sample_count) *
+            id_q4k_compare_sample_bytes *
+            2;
+        const use_id_q4k_compare =
+            id_q4k_compare_requested and
+            prefix_tokens > 0 and
+            id_q4k_compare_sample_count > 0 and
+            gate_exps.info.type_ == .q4_k and
+            self.dmmv.pipeline_mul_mm_id_q4k != null and
+            scratch_gate.size >= prefix_inter_bytes and
+            scratch_up.size >= prefix_inter_bytes and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= id_q4k_compare_bytes;
+        var id_q4k_compare_ran = false;
         const gate_shexp = lt.ffn_gate_shexp;
         const up_shexp = lt.ffn_up_shexp;
         const down_shexp = lt.ffn_down_shexp;
@@ -20191,6 +20233,7 @@ pub const InferenceEngine = struct {
             !use_q8_1_down_compare and
             !use_q6_down_compare and
             !use_q6_suffix_compare and
+            !use_id_q4k_compare and
             self.logits_staging.mapped != null and
             self.logits_staging.size >= route_profile_counts_bytes;
         var route_profile_prefix_copied = false;
@@ -20330,6 +20373,87 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
             self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
+            if (use_id_q4k_compare) {
+                try self.dmmv.recordMoeColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_exps.info.type_,
+                    gate_exps.gpu_buffer.handle,
+                    gate_exps.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_gate.handle,
+                    prefix_inter_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    gate_stride,
+                    ids_stride,
+                    1,
+                    0,
+                    0,
+                    0,
+                    false,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_gate.handle, prefix_inter_bytes);
+                try self.dmmv.recordMulMmIdQ4K(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_exps.gpu_buffer.handle,
+                    gate_exps.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_up.handle,
+                    prefix_inter_bytes,
+                    scratch_router_output.handle,
+                    scratch_router_output.size,
+                    counts.handle,
+                    counts_bytes,
+                    inter_dim,
+                    hidden_dim,
+                    hidden_dim,
+                    inter_dim,
+                    gate_stride,
+                    inter_dim,
+                    1,
+                    prefix_tokens,
+                    route_stride_u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    cfg.n_experts,
+                    (prefix_tokens + 15) / 16,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_up.handle, prefix_inter_bytes);
+                self.decode_cmd.computeToTransferBarrier();
+                for (0..id_q4k_compare_sample_count) |sample_i| {
+                    const token_idx = id_q4k_compare_tokens[sample_i];
+                    const sample_src = @as(vk.c.VkDeviceSize, token_idx) *
+                        @as(vk.c.VkDeviceSize, inter_dim) *
+                        @sizeOf(f32);
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_gate.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = sample_src,
+                        .dstOffset = @as(vk.c.VkDeviceSize, sample_i) * id_q4k_compare_sample_bytes,
+                        .size = id_q4k_compare_sample_bytes,
+                    });
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_up.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = sample_src,
+                        .dstOffset = (@as(vk.c.VkDeviceSize, id_q4k_compare_sample_count) + @as(vk.c.VkDeviceSize, sample_i)) * id_q4k_compare_sample_bytes,
+                        .size = id_q4k_compare_sample_bytes,
+                    });
+                }
+                self.decode_cmd.transferToComputeBarrier();
+                id_q4k_compare_ran = true;
+            }
+
             const gate_up_phase = self.beginProfilePhase();
             if (use_q8_1_gate_up_cols) {
                 const hidden_i8 = q8_1_gate_up_packed.?;
@@ -20414,7 +20538,7 @@ pub const InferenceEngine = struct {
                 try self.dmmv.recordMoeColsDispatchIndirect(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
-                    .q4_k,
+                    gate_exps.info.type_,
                     gate_exps.gpu_buffer.handle,
                     gate_exps.gpu_buffer.size,
                     scratch_norm.handle,
@@ -20442,7 +20566,7 @@ pub const InferenceEngine = struct {
                 try self.dmmv.recordMoeColsDispatchIndirect(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
-                    .q4_k,
+                    up_exps.info.type_,
                     up_exps.gpu_buffer.handle,
                     up_exps.gpu_buffer.size,
                     scratch_norm.handle,
@@ -20747,7 +20871,7 @@ pub const InferenceEngine = struct {
                 try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, prefix_tokens);
                 try self.dispatchProjectionBatched(up_shexp.?, scratch_norm, scratch_up, shexp_inter_dim, hidden_dim, prefix_tokens);
                 if (shexp_gate) |sg| {
-                    if (self.qwenA3bSharedF32GateBatchEnabled() and
+                    if (self.qwenA3bSharedF32GateBatchEnabled(exact_grouped) and
                         sg.info.type_ == .f32 and
                         self.elementwise.pipeline_router_f32_batch != null and
                         self.instance.push_descriptor_fn != null)
@@ -20960,7 +21084,7 @@ pub const InferenceEngine = struct {
                 try self.dmmv.recordMoeColsDispatchIndirect(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
-                    .q4_k,
+                    gate_exps.info.type_,
                     gate_exps.gpu_buffer.handle,
                     gate_exps.gpu_buffer.size,
                     scratch_norm.handle,
@@ -20988,7 +21112,7 @@ pub const InferenceEngine = struct {
                 try self.dmmv.recordMoeColsDispatchIndirect(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
-                    .q4_k,
+                    up_exps.info.type_,
                     up_exps.gpu_buffer.handle,
                     up_exps.gpu_buffer.size,
                     scratch_norm.handle,
@@ -21120,7 +21244,7 @@ pub const InferenceEngine = struct {
                     try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);
                     try self.dispatchProjectionBatched(up_shexp.?, scratch_norm, scratch_up, shexp_inter_dim, hidden_dim, suffix_tokens);
                     if (shexp_gate) |sg| {
-                        if (self.qwenA3bSharedF32GateBatchEnabled() and
+                        if (self.qwenA3bSharedF32GateBatchEnabled(exact_grouped) and
                             sg.info.type_ == .f32 and
                             self.elementwise.pipeline_router_f32_batch != null and
                             self.instance.push_descriptor_fn != null)
@@ -21302,6 +21426,50 @@ pub const InferenceEngine = struct {
                     cfg.n_experts,
                 );
             }
+        }
+        if (id_q4k_compare_ran) {
+            const ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+            const sample_elems_usize: usize = @intCast(id_q4k_compare_sample_elems);
+            const sample_count_usize: usize = @intCast(id_q4k_compare_sample_count);
+            const candidate_base = sample_count_usize * sample_elems_usize;
+            var max_abs: f32 = 0;
+            var max_sample: usize = 0;
+            var max_elem: usize = 0;
+            var max_ref: f32 = 0;
+            var max_candidate: f32 = 0;
+            var sum_abs: f64 = 0;
+            var compared: usize = 0;
+            for (0..sample_count_usize) |sample_i| {
+                const ref_base = sample_i * sample_elems_usize;
+                const got_base = candidate_base + ref_base;
+                for (0..sample_elems_usize) |elem_i| {
+                    const ref_v = ptr[ref_base + elem_i];
+                    const got_v = ptr[got_base + elem_i];
+                    const diff = @abs(ref_v - got_v);
+                    sum_abs += diff;
+                    compared += 1;
+                    if (diff > max_abs) {
+                        max_abs = diff;
+                        max_sample = sample_i;
+                        max_elem = elem_i;
+                        max_ref = ref_v;
+                        max_candidate = got_v;
+                    }
+                }
+            }
+            const mean_abs = if (compared > 0) sum_abs / @as(f64, @floatFromInt(compared)) else 0.0;
+            log.info("ZINC_MOE_ID_Q4K_COMPARE: layer={d} prefix_tokens={d} samples={d} elems={d} max_abs={e:.6}@tok{d}/elem{d} mean_abs={e:.6} ref={d:.6} candidate={d:.6}", .{
+                layer,
+                prefix_tokens,
+                id_q4k_compare_sample_count,
+                id_q4k_compare_sample_elems,
+                max_abs,
+                id_q4k_compare_tokens[max_sample],
+                max_elem,
+                mean_abs,
+                max_ref,
+                max_candidate,
+            });
         }
         if (q8_1_down_compare_ran) {
             const ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
@@ -23202,18 +23370,30 @@ pub const InferenceEngine = struct {
         // Qwen3.6-27B RDNA path, reuse the dense/SSM DP4a projection kernels
         // here: one Q8_1 quantize of attn_norm feeds all eligible Q4_K/Q6_K
         // attention projections for this layer.
-        const attn_proj_dp4a_wanted =
-            self.qwen36ProjectionDp4aSupported(q_t, q_rows, hidden_dim, n_tokens) or
-            self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
-            self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens) or
-            (use_separate_gate and self.qwen36ProjectionDp4aSupported(attn_gate_t_opt.?, layer_q_dim, hidden_dim, n_tokens));
+        const attn_proj_q8_dp4a_wanted =
+            self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens) and
+            (q_t.info.type_ == .q8_0 or
+                k_t.info.type_ == .q8_0 or
+                v_t.info.type_ == .q8_0 or
+                (use_separate_gate and attn_gate_t_opt.?.info.type_ == .q8_0));
+        const attn_proj_q8_dp4a_cols: u32 = if (attn_proj_q8_dp4a_wanted)
+            try self.qwenA3bPrepareProjectionQ8(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
+        const attn_proj_dp4a_wanted = attn_proj_q8_dp4a_cols == 0 and
+            (self.qwen36ProjectionDp4aSupported(q_t, q_rows, hidden_dim, n_tokens) or
+                self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
+                self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens) or
+                (use_separate_gate and self.qwen36ProjectionDp4aSupported(attn_gate_t_opt.?, layer_q_dim, hidden_dim, n_tokens)));
         const attn_proj_dp4a_cols: u32 = if (attn_proj_dp4a_wanted)
             try self.qwen36PrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
         else
             0;
         if (use_packed_gate) {
             var q_done = false;
-            if (attn_proj_dp4a_cols > 0) {
+            if (attn_proj_q8_dp4a_cols > 0) {
+                q_done = try self.dispatchQwenA3bQ8ProjectionDp4a(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens, attn_proj_q8_dp4a_cols);
+            } else if (attn_proj_dp4a_cols > 0) {
                 q_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens, attn_proj_dp4a_cols);
             }
             if (!q_done) {
@@ -23221,7 +23401,9 @@ pub const InferenceEngine = struct {
             }
         } else {
             var q_done = false;
-            if (attn_proj_dp4a_cols > 0) {
+            if (attn_proj_q8_dp4a_cols > 0) {
+                q_done = try self.dispatchQwenA3bQ8ProjectionDp4a(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, attn_proj_q8_dp4a_cols);
+            } else if (attn_proj_dp4a_cols > 0) {
                 q_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
             }
             if (!q_done) {
@@ -23229,14 +23411,18 @@ pub const InferenceEngine = struct {
             }
         }
         var k_done = false;
-        if (attn_proj_dp4a_cols > 0) {
+        if (attn_proj_q8_dp4a_cols > 0) {
+            k_done = try self.dispatchQwenA3bQ8ProjectionDp4a(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, attn_proj_q8_dp4a_cols);
+        } else if (attn_proj_dp4a_cols > 0) {
             k_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
         }
         if (!k_done) {
             try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
         }
         var v_done = false;
-        if (attn_proj_dp4a_cols > 0) {
+        if (attn_proj_q8_dp4a_cols > 0) {
+            v_done = try self.dispatchQwenA3bQ8ProjectionDp4a(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, attn_proj_q8_dp4a_cols);
+        } else if (attn_proj_dp4a_cols > 0) {
             v_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
         }
         if (!v_done) {
@@ -23244,7 +23430,9 @@ pub const InferenceEngine = struct {
         }
         if (use_separate_gate) {
             var gate_done = false;
-            if (attn_proj_dp4a_cols > 0) {
+            if (attn_proj_q8_dp4a_cols > 0) {
+                gate_done = try self.dispatchQwenA3bQ8ProjectionDp4a(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens, attn_proj_q8_dp4a_cols);
+            } else if (attn_proj_dp4a_cols > 0) {
                 gate_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
             }
             if (!gate_done) {
@@ -23419,7 +23607,12 @@ pub const InferenceEngine = struct {
         // Quantize the post-attention activation separately; it has K=o_cols,
         // not hidden_dim like the Q/K/V/gate inputs above.
         var o_done = false;
-        if (self.qwen36ProjectionDp4aSupported(o_t, hidden_dim, o_cols, n_tokens)) {
+        if (self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens) and o_t.info.type_ == .q8_0) {
+            const o_q8_cols = try self.qwenA3bPrepareProjectionQ8(scratch_attn_out, o_cols, n_tokens);
+            if (o_q8_cols > 0) {
+                o_done = try self.dispatchQwenA3bQ8ProjectionDp4a(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens, o_q8_cols);
+            }
+        } else if (self.qwen36ProjectionDp4aSupported(o_t, hidden_dim, o_cols, n_tokens)) {
             const o_dp4a_cols = try self.qwen36PrepareProjectionQ8_1(scratch_attn_out, o_cols, n_tokens);
             if (o_dp4a_cols > 0) {
                 o_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens, o_dp4a_cols);
@@ -23570,22 +23763,33 @@ pub const InferenceEngine = struct {
         );
         self.decode_cmd.computeBarrier();
 
-        const kv_dp4a_wanted =
-            self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
-            self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens);
+        const kv_q8_dp4a_wanted =
+            self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens) and
+            (k_t.info.type_ == .q8_0 or v_t.info.type_ == .q8_0);
+        const kv_q8_dp4a_cols: u32 = if (kv_q8_dp4a_wanted)
+            try self.qwenA3bPrepareProjectionQ8(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
+        const kv_dp4a_wanted = kv_q8_dp4a_cols == 0 and
+            (self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
+                self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens));
         const kv_dp4a_cols: u32 = if (kv_dp4a_wanted)
             try self.qwen36PrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
         else
             0;
         var k_done = false;
-        if (kv_dp4a_cols > 0) {
+        if (kv_q8_dp4a_cols > 0) {
+            k_done = try self.dispatchQwenA3bQ8ProjectionDp4a(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, kv_q8_dp4a_cols);
+        } else if (kv_dp4a_cols > 0) {
             k_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, kv_dp4a_cols);
         }
         if (!k_done) {
             try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
         }
         var v_done = false;
-        if (kv_dp4a_cols > 0) {
+        if (kv_q8_dp4a_cols > 0) {
+            v_done = try self.dispatchQwenA3bQ8ProjectionDp4a(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, kv_q8_dp4a_cols);
+        } else if (kv_dp4a_cols > 0) {
             v_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, kv_dp4a_cols);
         }
         if (!v_done) {
