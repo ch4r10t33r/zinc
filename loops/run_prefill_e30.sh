@@ -30,6 +30,10 @@ THIS CYCLE:
 5. MEASURE: interleaved ABBA A/B (≥4 rounds, drop the cold first round) of your change vs default, zinc prefill tok/s on the 5090; the box has ~±10% boost noise so require a consistent multi-round win. For 'beat llama', the bar is ~/workspace/llama.cpp/build/bin/llama-bench pp on the same gguf.
 6. If a VALIDATED WIN: commit ONLY your scoped change to perf/e30-<short-target> via a git worktree, push it (NEVER main); append a dated one-liner to ${EFFORT}'s cycle log AND to project_effort26_beat_llama memory. If NEGATIVE: revert the code, log the finding in the effort file (negatives are valuable). Clean box scratch.
 
+TIMEOUT DISCIPLINE (this cycle is killed at 50min): wrap EVERY box zinc run in 'timeout 200' so a buggy GPU-hanging kernel (e.g. a bad __syncthreads/OOB) cannot stall you — if a run returns EMPTY output, that kernel crashed/hung: REVERT it immediately, do not retry. Prefer isolated microbenches ('dbg_cuda gemm M K T') over full model reloads where possible.
+
+MEMORY CONTINUITY (critical — the prior run re-litigated because cycles skipped this): BEFORE you finish — win, negative, OR running low on time — you MUST append a dated one-liner (target + verdict + branch) to BOTH project_effort26_beat_llama memory AND ${EFFORT}'s cycle log, so the next cycle does not repeat your work. Read those FIRST and never re-attempt a documented dead end (flash-attention is DEAD — do not rebuild it).
+
 NEVER: break token-correctness, commit unvalidated code or a swept working tree, push to main, disturb other loops' worktrees/GPUs, or trust a single boost-noisy measurement. STOP after one increment."
 
 echo "=== e30 prefill loop START $(date -u +%FT%TZ) — 5090, root=$ROOT, max $MAX ===" | tee -a "$LOG"
@@ -37,8 +41,10 @@ i=0
 while [ "$i" -lt "$MAX" ]; do
   i=$((i + 1))
   echo "===== e30 cycle $i / $MAX — $(date -u +%FT%TZ) =====" | tee -a "$LOG"
-  claude -p --permission-mode bypassPermissions --effort high "$PROMPT" 2>&1 | tee -a "$LOG" \
-    || echo "(cycle $i exited nonzero — self-recovering)" | tee -a "$LOG"
+  timeout 3000 claude -p --permission-mode bypassPermissions --effort high "$PROMPT" 2>&1 | tee -a "$LOG" \
+    || echo "(cycle $i exited nonzero/timed-out — self-recovering)" | tee -a "$LOG"
+  # kill any box zinc/build a hung cycle may have orphaned before the next cycle
+  ssh -o BatchMode=yes -o ConnectTimeout=8 zincbox 'pkill -f "zig-out/bin/zinc" 2>/dev/null; pkill -f "zig build" 2>/dev/null' >/dev/null 2>&1 || true
   echo "===== e30 cycle $i done — $(date -u +%FT%TZ); sleeping ${SLEEP}s =====" | tee -a "$LOG"
   sleep "$SLEEP"
 done

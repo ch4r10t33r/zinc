@@ -29,13 +29,20 @@ The BT=32 negative below was the ONE guess made without profiling — it was neu
 
 ## Candidate levers (priority = EV × tractability). Pick ONE per cycle, profile-gate it.
 
-1. **Flash-attention for dense (highest EV — v2's +53% proves attention work pays
-   off on dense).** v2 still uses a 3-pass materialized-scores softmax
-   (`gemma_attention_batched_v2`). A query-tiled online-softmax kernel (load K/V
-   tiles to shared, reuse across a query tile, running max/sum) cuts K/V re-reads
-   and avoids full-score materialization. HARD: online-softmax numerics — gate
-   HARD on token-identity to the default kernel. gemma-31b (dense, all-attention)
-   is the best target + measurement.
+1. **int8 MMQ TC GEMM (THE priority — it's the only lever left; hard, multi-cycle).**
+   Attacks attention-QKVO + experts + SSM-projections at once. The correct-SASS
+   CUBIN fp16 mma path exists + is token-correct but LOSES to cuBLAS (fp16-TC =
+   cuBLAS parity ceiling is real). int8 is the only thing that can beat cuBLAS
+   (2× TC rate + int8 nibbles direct). DESIGN: keep the Q4_K nibble as int8,
+   quantize the activation int8 per-row (Q8_1-style), `mma.sync …s8.s8.s32`;
+   Q4_K-asymmetric epilogue = accumulate per-32-subblock s32 (`P=Σ nib·qA`) →
+   store to shared → fp32 fold `acc += sA·d·sc·P − sA·dmin·mn·SA[sb]`. THE RISK:
+   that per-subblock store-s32-to-shared+rescale is a tax the fp16 path avoids →
+   a prior microbench (Effort-26 cycle-8) killed int8 to <1.3×. So: build an
+   ISOLATED `dbg_cuda gemm M K T` microbench of the int8 kernel vs `gemm_q4k_tc`
+   / cuBLAS at gemma shapes FIRST; if not ≥1.3× ISOLATED, abandon (do NOT wire).
+   Only wire into gemmDispatch if the microbench passes. Compile via the standalone
+   CUBIN path (nvcc, correct s8 SASS) — NVRTC miscompiles TC on sm_120.
 2. **QKV projection fusion** (attention GEMMs, ~200ms): Q/K/V read the SAME b.norm
    input with 3 separate cuBLAS GEMMs → one grouped/concatenated GEMM (dequant 3
    weights into one fp16 buffer, one cublasGemmEx, slice outputs). Watch the
@@ -52,6 +59,11 @@ The BT=32 negative below was the ONE guess made without profiling — it was neu
    wiring. Multi-cycle.
 
 ## Dead ends — DO NOT re-litigate (all tested this effort, negative)
+- **FLASH-ATTENTION (`gemma_attention_flash`, query-tiled online-softmax)**: DEAD.
+  Cycle-5's WIP builds but produces EMPTY output (crashes/deadlocks the GPU — a
+  __syncthreads/OOB bug; it hung cycle-5 4.75h). Premise is marginal anyway: K/V
+  is small + L2-cached, so v2's coalescing already captured the reuse. Cycle-3
+  measured a working flash variant NEGATIVE at T=376. Do NOT rebuild flash.
 - **BT=32 MoE expert tiles**: neutral (padding not the bottleneck; weight-dequant-ALU-bound).
 - **qwen attention v2**: marginal (attention small in SSM-heavy qwen) — opt-in, don't default-on.
 - **fp16 weight cache / ZINC_PREFILL_F16**: warm/serving-only; −24% on cold single prefill.
