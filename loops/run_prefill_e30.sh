@@ -41,7 +41,8 @@ i=0
 while [ "$i" -lt "$MAX" ]; do
   i=$((i + 1))
   echo "===== e30 cycle $i / $MAX — $(date -u +%FT%TZ) =====" | tee -a "$LOG"
-  timeout 3000 claude -p --permission-mode bypassPermissions --effort high "$PROMPT" 2>&1 | tee -a "$LOG" \
+  # macOS has no `timeout`; perl alarm survives exec → hard-kills a cycle at 50min.
+  perl -e 'alarm shift; exec @ARGV' 3000 claude -p --permission-mode bypassPermissions --effort high "$PROMPT" 2>&1 | tee -a "$LOG" \
     || echo "(cycle $i exited nonzero/timed-out — self-recovering)" | tee -a "$LOG"
   # kill any box zinc/build a hung cycle may have orphaned before the next cycle
   ssh -o BatchMode=yes -o ConnectTimeout=8 zincbox 'pkill -f "zig-out/bin/zinc" 2>/dev/null; pkill -f "zig build" 2>/dev/null' >/dev/null 2>&1 || true
