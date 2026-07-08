@@ -2138,6 +2138,13 @@ fixed-K profile `826.80 tok/s`, SSM `130.7 ms`, `qkv_z=37.4 ms`,
 `qkv_z=36.0 ms`, `out_proj=17.4 ms`. Rejected and removed. The generic shader
 variant appears to compile better on this RDNA stack than the `SPEC_K` variants.
 
+Rejected Q8 DP4a LDS unpadding probe (2026-07-08): temporarily changed
+`mul_mm_q8_0_full_dp4a.comp` `SPACK` from `9` to `8`, removing the extra LDS
+padding word per row. Output stayed stable on the 300-token prompt, but prefill
+was flat to slower: `766.26`, `989.22`, `882.91` tok/s, median `882.91 tok/s`
+versus the surrounding clean-build checks in the `~890-901 tok/s` band. Rejected
+and restored `SPACK=9`; the padding is still justified on this RDNA path.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
