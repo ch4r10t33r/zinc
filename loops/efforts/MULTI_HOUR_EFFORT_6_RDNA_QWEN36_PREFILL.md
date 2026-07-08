@@ -58,6 +58,16 @@ gate_up `351.6 ms`. Do not retry this simple shared-memory tiled
 route-pack-native gate/up shape without a different inner-loop design and a
 small standalone shaderstats/microbench proving it fixes the register/LDS cost.
 
+Q6_K grouped columns re-check on the same 300-token prompt: the opt-in
+`ZINC_MOE_Q6K_COLS=1` profile looked strong (`784.46 tok/s`, MoE `80.2 ms`,
+gate_up/down `20.8/32.0 ms`, token fallbacks `300` vs default `900`), but it
+is still not a safe default. No-profile paired runs changed the first generated
+tokens: default stopped immediately with `{248046}` in all three samples, while
+Q6 produced the stable 16-token continuation starting `{198, 7525, 1965, 25,
+...}`. That may be a better-looking continuation, but it is a deterministic
+logit change from the accepted path. Keep Q6_K grouped columns opt-in until a
+reference-logit or cross-prompt coherence sweep proves the policy is acceptable.
+
 Next credible step: keep the gate-only `mul_mm_id_q4k` replay oracle for
 numeric validation, but target a different structural lever. The fresh
 300-token profile says the biggest named buckets are SSM (`155.8 ms`) and MoE
