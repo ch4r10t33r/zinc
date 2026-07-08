@@ -82,6 +82,57 @@ the continuation to `several countries in the world. # #`. The regular
 States.`). The temporary layer selector was removed; Q6_K grouped MoE still
 needs a production-path layer replay validator before any performance claim.
 
+2026-07-07 follow-up: added that production-path Q6_K routed-down replay
+validator behind `ZINC_MOE_Q6K_COLS_COMPARE=1`. It runs the exact route-packed
+Q6_K columns path into scratch, samples the SwiGLU input, routed output, and
+route IDs, then CPU-dequantizes the same GGUF expert rows and compares the
+full hidden output before accumulating the scratch result back into the normal
+state. RDNA run on the canonical 154-token prompt with
+`ZINC_MOE_Q6K_COLS=1 ZINC_MOE_Q6K_COLS_COMPARE=1`:
+
+- narrow sample: layer 34, `samples=3`, `elems=64`, `max_abs=2.98e-8`
+- full sample: layer 34, `samples=7`, `elems=2048`, `max_abs=5.96e-8`,
+  `mean_abs=6.20e-9`, `invalid_routes=0`
+- path coverage unchanged from the Q6 grouped probe:
+  `moe_grouped_layers=37`, fallback mask `0x4000000002`
+- generation still follows the wrong Q6-enabled continuation
+  (`all those words separated by a space,`)
+
+Conclusion: the Q6_K columns shader and route IDs are numerically clean for the
+grouped layer-34 path. The remaining correctness issue is not a simple Q6
+dequant/packing bug; next investigation should compare grouped-policy state
+against the token-fallback path, especially the top-1-prefix/fallback boundary
+and any layer-state side effects. Do not spend more cycles retuning
+`dmmv_q6k_moe_cols.comp` before proving that policy equivalence gap.
+
+Follow-up header scan confirmed this GGUF has shared-expert tensors
+(`ffn_gate_inp_shexp`, `ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp`).
+That makes the likely Q6 correctness mechanism: enabling Q6_K columns groups
+one more non-terminal prefix layer, and grouped prefix MoE skips the shared
+expert approximation that token fallback still executes. The next useful
+validator is grouped-prefix post-hidden vs token-fallback post-hidden for layer
+34, not another Q6 shader replay.
+
+2026-07-07 manual correction: the Q6 replay exposed a real orchestration bug,
+but not in Q6_K dequant. The route-packed suffix gate/up+SwiGLU shaders used
+route-local token IDs to read `scratch_norm`, while route packing correctly
+read suffix routing from `prefix_tokens + suffix_tok`. Added an `x_token_base`
+push constant to the Qwen/Gemma route-packed gate/up shaders and pass
+`prefix_tokens` for suffix dispatches.
+
+RDNA canonical 154-token prompt after the fix:
+
+| Variant | Prefill | Grouped MoE | Output |
+|---|---:|---:|---|
+| default Q4/Q5 grouped | `525.8 tok/s` | 36 layers | coherent `Paris.` continuation |
+| `ZINC_MOE_Q6K_COLS=1` | `503.3 tok/s` | 37 layers | same coherent `Paris.` continuation |
+
+The previous suffix Q6 diagnostic remains useful: sampled Q6_K routed-down
+matched CPU dequant at `max_abs=2.38e-7`, so the shader was clean. With the
+token-base fix, Q6_K is no longer obviously broken on this prompt, but it is
+not faster than the corrected default path, so keep it opt-in. The accepted
+win is the suffix token-base fix for all route-packed gate/up users.
+
 Historical rejected follow-up: an earlier exact-suffix
 `ZINC_MOE_Q8_1_DOWN_COLS=1` prototype was not safe on the 154-token diagnostic
 prompt (`the capital of France.` changed to `also a a reference...`) and was
@@ -335,6 +386,37 @@ Named sub-buckets:
 The buckets are close now. Do not read "SSM is largest" as permission
 to try another broad SSM micro-variant. Pick a named sub-bucket with
 fresh evidence.
+
+2026-07-07 `context-long` refresh after the suffix token-base fix and rejected
+fused-submit rollback: direct `ZINC_PREFILL_PROFILE=1` on the 322-token site
+scenario reported `590.27 tok/s` under profiling overhead, with path coverage
+`ssm_layers=30`, `full_attn_batched=9`, `final_kv_only=1`,
+`moe_grouped_layers=36`, `grouped_tokens=11592`, `top1_prefix_tokens=11016`,
+`exact_suffix_tokens=576`, and `token_fallbacks=966`.
+
+Fresh named buckets for this longer scenario:
+
+| Bucket | ms |
+|---|---:|
+| MoE | 168.6 |
+| SSM | 138.2 |
+| attention | 110.5 |
+| shared expert | 8.1 |
+| tail | 1.0 |
+
+MoE sub-buckets: router `11.8 ms`, topk `1.2 ms`, gate_up `72.7 ms`,
+swiglu `2.9 ms`, down `57.1 ms`, weighted_acc `5.5 ms`.
+SSM sub-buckets: norm_ab `5.5 ms`, qkv_z `42.7 ms`, conv `13.9 ms`,
+delta `25.3 ms`, gated norm `8.5 ms`, out `41.8 ms`,
+out_proj `35.4 ms`, out_resid `6.2 ms`.
+
+A repeat profile on the same build showed MoE gate_up at `48.0 ms` and down at
+`51.2 ms`, so gate_up is noisy but still the largest MoE lever when it spikes.
+Route-pack occupancy remains poor (`util=43.4%`, `tail_blocks=77.7%`,
+`singleton_tail=1404`), but route-width and singleton-tail variants are already
+measured rejects. The next MoE attempt should be grouped GEMM / `mul_mat_id`
+style or a correctness-validated top-k weighted grouping, not another
+route-width reshuffle.
 
 ### What not to repeat
 
@@ -1879,6 +1961,25 @@ median looked like a possible +1% (`720.08` vs `712.16` tok/s), but the named
 SSM sub-buckets were flat and later samples fell with all phases slowing
 together. Do not keep extra Q8_0 DP4a pipeline variants without a shader-shape
 change (e.g. larger BM/BN or different BK), not just `SPEC_K`.
+
+Rejected fused SSM+MoE submit probe (2026-07-07): tried recording grouped MoE
+into the same command buffer immediately after the A3B SSM layer produced
+`scratch_norm`, guarded by `ZINC_A3B_FUSE_SSM_MOE_SUBMIT=1`. The goal was to
+remove one submit/wait per SSM layer without changing routed MoE math.
+
+Targeted same-build RDNA `context-long` server runs:
+
+| mode | artifact | prefill | decode | note |
+|---|---|---:|---:|---|
+| fused flag on | `/tmp/zinc-rdna-qwen36-context-fuse-ssm-moe-20260707-095110.json` | `931.9 tok/s` | `116.0 tok/s` | samples `906.6`, `957.3` |
+| default | `/tmp/zinc-rdna-qwen36-context-default-samebuild-20260707-095208.json` | `912.9 tok/s` | `120.1 tok/s` | samples `922.7`, `903.2` |
+
+The prefill difference was within node noise and the decode path was worse with
+the fused flag. Both previews repeated the benchmark prompt's checklist marker,
+so the probe did not isolate a new correctness failure, but it also did not
+produce a clean win. Removed the flag and the in-command MoE recording hook.
+Next submit-reduction attempts need a larger unit of fusion than just SSM+MoE
+within one layer, or they need to keep multiple layer command buffers in flight.
 
 ## Success Criteria
 

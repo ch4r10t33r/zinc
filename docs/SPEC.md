@@ -2,10 +2,11 @@
 
 Last updated: 2026-04-17
 
-ZINC is a local-first LLM inference engine written primarily in Zig. It reads GGUF directly, runs single-model inference through a CLI and OpenAI-compatible HTTP API, and targets two GPU backends:
+ZINC is a local-first LLM inference engine written primarily in Zig. It reads GGUF directly, runs single-model inference through a CLI and OpenAI-compatible HTTP API, and targets native consumer-GPU backends:
 
-- **Vulkan** on Linux, primarily for AMD RDNA3/RDNA4
+- **Vulkan** on Linux for AMD RDNA3/RDNA4 and Intel Arc
 - **Metal** on macOS for Apple Silicon
+- **CUDA** on NVIDIA as an experimental opt-in backend
 
 This page is a living architecture document for the **current implementation**. Where the repository contains prototype code or forward-looking work, that is called out explicitly instead of being presented as already shipped behavior.
 
@@ -95,6 +96,7 @@ Key properties of the Vulkan path:
 - decode work is recorded against explicit command buffers
 - per-dispatch variability is carried through push constants and descriptor bindings
 - AMD-specific tuning is built around wave64 and bandwidth-sensitive decode kernels
+- Intel Arc uses the same Vulkan runtime surface with Arc-specific device detection, catalog profile support, and benchmark coverage
 
 The Vulkan engine is where the most explicit static-graph and paged-KV machinery exists today.
 

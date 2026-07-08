@@ -89,8 +89,8 @@ const jsonLd = {
     <section class="status-banner">
       <div>
         <p class="kicker">Current Status</p>
-        <h2>Experimental and under active development</h2>
-        <p>The CLI path is the best-supported way to use ZINC today. Linux on AMD RDNA3 or RDNA4 is the intended environment. Server mode and broader model coverage are still evolving.</p>
+      <h2>Supported on AMD, Intel Arc, and Apple Silicon</h2>
+      <p>The CLI path is the best-supported way to use ZINC today. Linux Vulkan covers AMD RDNA3/RDNA4 and Intel Arc Xe2/Battlemage; macOS uses the native Metal path on Apple Silicon. Server mode and broader model coverage are still evolving.</p>
       </div>
       <a href="/zinc/benchmarks/" class="status-link">Benchmarks</a>
     </section>
@@ -104,6 +104,8 @@ const jsonLd = {
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
 zig build -Doptimize=ReleaseFast
+
+# RDNA4 Linux only; skip on Intel Arc and macOS.
 export RADV_PERFTEST=coop_matrix
 
 # Verify Vulkan, shaders, and the runtime path first

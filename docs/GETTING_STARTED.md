@@ -2,7 +2,7 @@
 
 > **Experimental software**: ZINC is under active development. The CLI path is the best-supported way to start. Server mode, model coverage, and performance tuning are still moving quickly.
 
-ZINC runs local LLMs on AMD GPUs without ROCm by using Vulkan, and it runs the same managed GGUF model flow on Apple Silicon through Metal. The fastest way to check if it works on your machine is:
+ZINC runs local LLMs on Linux Vulkan GPUs without ROCm by using native Vulkan paths for AMD Radeon and Intel Arc, and it runs the same managed GGUF model flow on Apple Silicon through Metal. The fastest way to check if it works on your machine is:
 
 1. Install Zig.
 2. Build the binary.
@@ -31,7 +31,7 @@ export RADV_PERFTEST=coop_matrix
 ZINC currently targets:
 
 - **Linux** with AMD RDNA3/RDNA4 GPUs through Vulkan 1.3
-- **Linux** with Intel Arc Xe2 / Battlemage GPUs through Vulkan 1.3 (experimental)
+- **Linux** with Intel Arc Xe2 / Battlemage GPUs through Vulkan 1.3
 - **macOS** with Apple Silicon (M1 through M5) through Metal
 - **GGUF models** (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, MXFP4, F16, F32 quantizations)
 
@@ -43,11 +43,11 @@ This list is intentionally narrow. It shows the exact GGUFs that have been valid
 
 | Model | Model ID (`zinc model pull <id>`) | Exact GGUF | Fits on | Status |
 |------|------|------------|---------|--------|
-| **Qwen 3.5 9B** | `qwen35-9b-q4k-m` | [Qwen3.5-9B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 8+ GB VRAM or unified | supported |
-| **Gemma 4 26B-A4B MoE** | `gemma4-26b-a4b-q4k-m` | [gemma-4-26B-A4B-it-UD-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | 16+ GB VRAM or unified | supported |
-| **Gemma 4 31B** | `gemma4-31b-q4k-m` | [gemma-4-31B-it-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) | 24+ GB VRAM or unified | supported |
-| **Qwen3.6 27B Dense** | `qwen36-27b-q4k-m` | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified | experimental |
-| **Qwen3.6 35B-A3B UD** | `qwen36-35b-a3b-q4k-xl` | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified | supported |
+| **Qwen 3.5 9B** | `qwen35-9b-q4k-m` | [Qwen3.5-9B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 8+ GB VRAM or unified | supported on AMD, Intel Arc, Metal |
+| **Gemma 4 26B-A4B MoE** | `gemma4-26b-a4b-q4k-m` | [gemma-4-26B-A4B-it-UD-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | 16+ GB VRAM or unified | supported on AMD, Intel Arc, Metal |
+| **Gemma 4 31B** | `gemma4-31b-q4k-m` | [gemma-4-31B-it-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) | 24+ GB VRAM or unified | supported on AMD, Intel Arc, Metal |
+| **Qwen3.6 27B Dense** | `qwen36-27b-q4k-m` | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified | experimental model on AMD, Intel Arc, Metal |
+| **Qwen3.6 35B-A3B UD** | `qwen36-35b-a3b-q4k-xl` | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified | supported on AMD, Intel Arc, Metal |
 
 ## Install dependencies
 
@@ -60,7 +60,7 @@ xcode-select --install
 
 That is all you need. No Vulkan, no glslc, no Python, no MLX.
 
-### Linux (AMD GPU)
+### Linux (AMD or Intel Arc GPU)
 
 ```bash
 sudo apt update
@@ -89,7 +89,7 @@ Before running a prompt, verify the machine and GPU:
 ./zig-out/bin/zinc --check
 ```
 
-On RDNA4 Linux, enable cooperative matrix first:
+On RDNA4 Linux, enable cooperative matrix first. Intel Arc and macOS users skip this variable:
 
 ```bash
 export RADV_PERFTEST=coop_matrix
@@ -120,10 +120,10 @@ This downloads the model into a local cache and verifies the SHA-256 hash.
 
 The `--chat` flag wraps your prompt in the model's chat template (system prompt, role tags, etc.), which is required for instruct-tuned models to produce proper answers. Without `--chat`, the model treats the input as raw text completion, which still works but produces less focused output.
 
-**On RDNA4 Linux, the env var below is required** — cooperative matrix is the fast path, and without it you may see slow or incorrect output. macOS users skip the `export` line.
+**On RDNA4 Linux, the env var below is required** — cooperative matrix is the fast path, and without it you may see slow or incorrect output. Intel Arc and macOS users skip the `export` line.
 
 ```bash
-# RDNA4 Linux only — required, not optional. Skip this line on macOS.
+# RDNA4 Linux only — required, not optional. Skip this line on Intel Arc and macOS.
 export RADV_PERFTEST=coop_matrix
 
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat

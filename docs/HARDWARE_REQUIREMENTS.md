@@ -9,7 +9,7 @@ ZINC runs on consumer GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). Thi
 | **Linux** | AMD RDNA4 discrete (Navi 48 / Navi 44) | Vulkan 1.3 | Primary tuning target |
 | **Linux** | AMD RDNA4 APU (Strix Halo / gfx1151) | Vulkan 1.3 | Supported with APU-specific bandwidth tuning |
 | **Linux** | AMD RDNA3 | Vulkan 1.3 | Supported, less tuned |
-| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3+ | Experimental bring-up |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3+ | Supported, validated benchmark target |
 | **macOS** | Apple Silicon M1 through M5 | Metal | Supported, native MSL shaders |
 
 ## AMD GPUs (Linux)
@@ -52,7 +52,7 @@ Exact fit depends on architecture, quantization, and context length. `--check -m
 
 ## Intel Arc GPUs (Linux)
 
-Intel Arc support is an experimental Vulkan bring-up path. The current target is the Arc B-series / Battlemage line:
+Intel Arc support is an official Linux Vulkan path. The current validated target is the Arc B-series / Battlemage line:
 
 | Family | Examples | Notes |
 | --- | --- | --- |
@@ -84,6 +84,8 @@ If that command does not show your Intel Arc GPU, ZINC will not use it.
 | 32 GB | B65, B70 | 27B dense and 35B MoE targets |
 
 See [Intel GPU Reference](/zinc/docs/intel-gpu-reference/) for the full B-series card table, device IDs, memory bandwidth, Xe2 opcode notes, and ZINC tuning guidance.
+
+The public benchmark matrix currently validates all five managed catalog models on an Intel Arc BMG G31-class node. Decode and prefill both beat the same-machine llama.cpp baseline on the headline rows, while end-to-end server latency and deeper Arc-specific tuning are still active work.
 
 ## Other Vulkan GPUs
 
@@ -157,7 +159,7 @@ See which models ZINC supports on your machine:
 ./zig-out/bin/zinc model list --all
 ```
 
-The catalog automatically selects the right GPU profile (`amd-rdna4-32gb`, `apple-silicon`, etc.) and shows which models are installed, active, and fit the available memory.
+The catalog automatically selects the right GPU profile (`amd-rdna4-32gb`, `intel-arc`, `apple-silicon`, etc.) and shows which models are installed, active, and fit the available memory.
 
 ## System requirements (both platforms)
 

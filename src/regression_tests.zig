@@ -380,16 +380,23 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     const src = @embedFile("compute/forward.zig");
     const marker = "fn prefillGemmaGroupedMoeExact";
     try expectContains(src, "ZINC_GEMMA_MOE_GROUPED_PREFILL");
+    try expectContains(src, "fn prefillGemmaRecordBatchedAttentionToFfnNorm");
     try expectContains(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm");
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "orelse return true", 200);
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "std.ascii.eqlIgnoreCase(env, \"off\")", 500);
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 900);
     try expectContainsNear(src, "fn gemmaShortMoePrefixPrefillEnabled", "!self.isAmdRdna()", 900);
-    try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
+    try expectContainsNear(src, marker, "try self.prefillGemmaRecordBatchedAttentionToFfnNorm", 18000);
     try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
+    try expectContainsNear(src, marker, "self.moe_topk_limit > 0", 1200);
+    try expectContainsNear(src, marker, "@min(cfg.n_experts_used, self.moe_topk_limit)", 1200);
+    try expectContainsNear(src, marker, "const shared_scratch_capacity_tokens", 2600);
+    try expectContainsNear(src, "const shared_scratch_capacity_tokens", "const dp4a_padded_tokens = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);", 900);
+    try expectContainsNear(src, "const shared_scratch_capacity_tokens", "ceilTokens(dp4a_padded_tokens, shared_scratch_inter_dim, inter_dim)", 1400);
+    try expectContains(src, "const batched_scratch_tokens = @max(route_count, shared_scratch_capacity_tokens);");
     try expectContainsNear(src, "fn ensureGemmaMoePrefillDp4aScratchCapacity", "batched_scratch_norm_q8_scale", 2400);
-    try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchGemmaQkvProjectionsBatched", 9000);
-    try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchFlashAttnBatched", 22000);
+    try expectContainsNear(src, "fn prefillGemmaRecordBatchedAttentionToFfnNorm", "try self.dispatchGemmaQkvProjectionsBatched", 9000);
+    try expectContainsNear(src, "fn prefillGemmaRecordBatchedAttentionToFfnNorm", "try self.dispatchFlashAttnBatched", 22000);
     try expectContains(src, "fn gemmaProjectionPrefillPaddedTokenCount");
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 400);
@@ -401,14 +408,24 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aSupported", "self.batched_scratch_norm_q8", 1500);
     try expectContainsNear(src, "fn dispatchGemmaProjectionBatchedDp4a", "recordMulMmQ8_0FullDp4a", 7000);
     try expectContainsNear(src, "fn gemmaDenseGegluDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
-    try expectContainsNear(src, marker, "const scratch_route_ids = scratch_shared_up;", 2600);
-    try expectContainsNear(src, marker, "if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;", 11200);
-    try expectContainsNear(src, marker, "scratch_route_ids.handle", 15500);
-    try expectContainsNear(src, marker, "try self.dispatchMoeWeightedAccScaledBatch", 20000);
-    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 26000);
-    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 30000);
-    try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 9200);
-    try expectContainsNear(src, marker, "self.resetTimestamps();", 13600);
+    try expectContainsNear(src, marker, "const scratch_route_ids = scratch_shared_up;", 4600);
+    try expectContainsNear(src, marker, "if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;", 16000);
+    try expectContainsNear(src, marker, "const collect_route_profile =", 13000);
+    try expectContainsNear(src, marker, "self.recordPrefillRoutePackCounts(", 36000);
+    try expectContainsNear(src, marker, "scratch_route_ids.handle", 22000);
+    try expectContainsNear(src, marker, "try self.dispatchMoeWeightedAccScaledBatch", 24000);
+    try expectContainsNear(src, marker, "const shared_proj_phase = self.beginProfilePhase();", 28500);
+    try expectContainsNear(src, marker, "self.endProfilePhase(.shared_proj, shared_proj_phase);", 30000);
+    try expectContainsNear(src, marker, "const shared_down_phase = self.beginProfilePhase();", 30500);
+    try expectContainsNear(src, marker, "self.endProfilePhase(.shared_down, shared_down_phase);", 32000);
+    try expectContainsNear(src, marker, "const shared_acc_phase = self.beginProfilePhase();", 32500);
+    try expectContainsNear(src, marker, "self.endProfilePhase(.shared_gate_acc, shared_acc_phase);", 34000);
+    try expectContainsNear(src, marker, "const layer_record_start = std.time.nanoTimestamp();", 18000);
+    try expectContainsNear(src, marker, "self.prefill_cpu_record_ns += @intCast(std.time.nanoTimestamp() - layer_record_start);", 36000);
+    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 34000);
+    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 38000);
+    try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 11800);
+    try expectContainsNear(src, marker, "self.resetTimestamps();", 15200);
     try expectContainsNear(src, "fn prefillBatchedImpl", "return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);", 1800);
 }
 
@@ -823,9 +840,16 @@ test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
 test "Vulkan Intel batched prefill keeps chunk override for fallback debugging" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "ZINC_INTEL_BATCHED_PREFILL_CHUNK");
-    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "orelse return 96;", 500);
+    try expectContains(src, "const gemma_prefill_dp4a_max_tokens: u32 = 384;");
+    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "orelse return default_limit;", 500);
     try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "if (std.mem.eql(u8, raw, \"0\")) return 0;", 700);
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "intelBatchedPrefillChunkLimit", 1200);
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "intelBatchedPrefillChunkLimit", 1800);
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "const intel_gemma_moe_default", 1200);
+    try expectContainsNear(src, "const intel_gemma_moe_default", "cfg.n_experts > 0", 300);
+    try expectContainsNear(src, "const intel_gemma_moe_default", "gemmaGroupedMoePrefillEnvEnabled()", 500);
+    try expectContainsNear(src, "const intel_batched_requested", "intel_gemma_chunk_default", 500);
+    try expectContainsNear(src, "const intel_default_chunk_limit", "if (intel_gemma_moe_default) gemma_prefill_dp4a_max_tokens else 96", 250);
+    try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "padded_tokens <= gemma_prefill_dp4a_max_tokens", 1000);
     try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
 }
 
@@ -1080,8 +1104,13 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(dmmv, "if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1) |*p| p.deinit();");
     try expectContains(dmmv, "if (self.pipeline_q4k_moe_cols_q8_1) |*p| p.deinit();");
     try expectContains(dmmv, "if (self.pipeline_q5k_moe_cols_q8_1) |*p| p.deinit();");
+    try expectContains(dmmv, "x_token_base: u32 = 0");
+    try expectContains(dmmv, ".x_token_base = x_token_base");
 
     const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "fn moePrefixSharedExactRequested() bool");
+    try expectContainsNear(forward, "fn ensureBatchedScratchCapacity(", "moePrefixSharedExactRequested()", 2200);
+    try expectContainsNear(forward, "fn ensureBatchedScratchCapacity(", "cfg.shared_expert_intermediate_dim", 2400);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1", 9200);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "self.use_moe_fused_gate_up_swiglu", 9200);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "q8_1_gate_up_cols_default_on = exact_grouped", 12000);
@@ -1089,11 +1118,25 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_GATE_UP_COLS", 12000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COLS", 14000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE", 17000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQuantizeActQ8_1", 26000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 30000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect", 30000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordMoeColsQ8_1DispatchIndirect", 42000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 60000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q6K_COLS_COMPARE", 19000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q6K_SUFFIX_COMPARE", 23000);
+    try expectContains(forward, "ZINC_MOE_Q6K_SUFFIX_COMPARE: layer=");
+    try expectContains(forward, "q6_suffix_compare_routes[sample_i]");
+    try expectContains(forward, "prefix_tokens * hidden_dim");
+    try expectContainsNear(forward, "suffix_route_count", "suffix_k", 80);
+    try expectContainsNear(forward, "suffix_route_count", "prefix_tokens", 120);
+    try expectContains(forward, "can_group_prefix_shared");
+    try expectContainsNear(forward, "const can_group_prefix_shared =", "down_exps.info.type_ == .q6_k", 500);
+    try expectContains(forward, "Diagnostic/exactness path for Qwen A3B top-1 grouped prefix");
+    try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, prefix_tokens);");
+    try expectContains(forward, "try self.dispatchSigmoidScaleAccBatch(");
+    try expectContains(forward, "recordQuantizeActQ8_1");
+    try expectContains(forward, "recordQwenTop1GateUpSwigluColsDispatchIndirect");
+    try expectContains(forward, "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect");
+    try expectContains(forward, "recordMoeColsQ8_1DispatchIndirect");
+    try expectContains(forward, "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=");
+    try expectContains(forward, "ZINC_MOE_Q6K_COLS_COMPARE: layer=");
+    try expectContains(forward, "dequantRow(mmap[q6_down_data_off..]");
     try expectContains(forward, "if (n_tokens < 16 or n_tokens > 192) return false;");
     try expectContains(forward, "const qwen_a3b_shared_q8_shape = self.isQwen36A3bMoePrefillModel()");
     try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);");
@@ -1104,6 +1147,7 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(shader, "MatrixAUp");
     try expectContains(shader, "ActiveBlocks");
     try expectContains(shader, "x_route_divisor");
+    try expectContains(shader, "x_token_base + route0 / x_div");
     try expectContains(shader, "const uint ROWS_PER_WG = 4u;");
     try expectContains(shader, "const uint LANES_PER_ROW = 16u;");
     try expectNotContains(shader, "lane_pass");
@@ -1116,6 +1160,7 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(q8_shader, "ActScaleDsum");
     try expectContains(q8_shader, "dotPacked4x8AccSatEXT");
     try expectContains(q8_shader, "x_route_divisor");
+    try expectContains(q8_shader, "const uint tok0 = x_token_base + route0 / x_div;");
     try expectContains(q8_shader, "float swiglu(float gate, float up)");
 
     const q8_down_shader = @embedFile("shaders/dmmv_q4k_moe_cols_q8_1.comp");

@@ -22,6 +22,7 @@ layout(push_constant) uniform PushConstants {
     uint y_offset;
     uint ids_stride;
     uint x_route_divisor;
+    uint x_token_base;
 };
 
 layout(set = 0, binding = 0) readonly buffer MatrixA { uint a_u32[]; };
@@ -32,8 +33,8 @@ layout(set = 0, binding = 4) readonly buffer PackedIds { uint packed_ids[]; };
 layout(set = 0, binding = 5) readonly buffer ActiveBlocks { uint active_blocks[]; };
 
 const uint NUM_COLS = 8u;
-const uint ROWS_PER_WG = 4u;
-const uint LANES_PER_ROW = 16u;
+const uint ROWS_PER_WG = 8u;
+const uint LANES_PER_ROW = 8u;
 const uint Q4K_BLOCK_U32 = 36u;
 
 vec4 unpack_nibbles_lo(uint v) {
@@ -174,14 +175,14 @@ void main() {
     const uint route7 = active7 ? packed_ids[ids_base + 7u] : 0u;
 
     const uint x_div = max(x_route_divisor, 1u);
-    const uint x0 = (route0 / x_div) * (K / 4u);
-    const uint x1 = (route1 / x_div) * (K / 4u);
-    const uint x2 = (route2 / x_div) * (K / 4u);
-    const uint x3 = (route3 / x_div) * (K / 4u);
-    const uint x4 = (route4 / x_div) * (K / 4u);
-    const uint x5 = (route5 / x_div) * (K / 4u);
-    const uint x6 = (route6 / x_div) * (K / 4u);
-    const uint x7 = (route7 / x_div) * (K / 4u);
+    const uint x0 = (x_token_base + route0 / x_div) * (K / 4u);
+    const uint x1 = (x_token_base + route1 / x_div) * (K / 4u);
+    const uint x2 = (x_token_base + route2 / x_div) * (K / 4u);
+    const uint x3 = (x_token_base + route3 / x_div) * (K / 4u);
+    const uint x4 = (x_token_base + route4 / x_div) * (K / 4u);
+    const uint x5 = (x_token_base + route5 / x_div) * (K / 4u);
+    const uint x6 = (x_token_base + route6 / x_div) * (K / 4u);
+    const uint x7 = (x_token_base + route7 / x_div) * (K / 4u);
 
     const uint il = lane / 4u;
     const uint ir = lane & 3u;

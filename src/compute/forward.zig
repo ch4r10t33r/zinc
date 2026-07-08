@@ -100,6 +100,7 @@ fn qwenDenseDownDp4aAccEligible(
 }
 const gemma_prefill_micro_prompt_guard_tokens: u32 = 8;
 const gemma_prefill_long_draft_prompt_min_tokens: u32 = 49;
+const gemma_prefill_dp4a_max_tokens: u32 = 384;
 const gemma_prefill_long_draft_prompt_guard_tokens: u32 = 2;
 const gemma_prefill_shared_skip_max_tokens: u32 = 72;
 const gemma_prefill_tiny_prompt_topk: u32 = 2;
@@ -1021,20 +1022,28 @@ fn isIntelGpuVendor(vendor: GpuVendor) bool {
     return vendor == .intel_arc_xe2 or vendor == .intel_arc;
 }
 
-fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
+fn intelBatchedPrefillChunkLimit(vendor: GpuVendor, default_limit: u32) u32 {
     if (!isIntelGpuVendor(vendor)) return 0;
-    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 96;
+    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return default_limit;
     if (std.mem.eql(u8, raw, "0")) return 0;
     return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
 
-fn prefillProfileRequested() bool {
-    const raw = std.posix.getenv("ZINC_PREFILL_PROFILE") orelse return false;
+fn envFlagEnabled(comptime name: []const u8, default_value: bool) bool {
+    const raw = std.posix.getenv(name) orelse return default_value;
     return raw.len > 0 and
         !std.mem.eql(u8, raw, "0") and
         !std.ascii.eqlIgnoreCase(raw, "off") and
         !std.ascii.eqlIgnoreCase(raw, "false") and
         !std.ascii.eqlIgnoreCase(raw, "no");
+}
+
+fn prefillProfileRequested() bool {
+    return envFlagEnabled("ZINC_PREFILL_PROFILE", false);
+}
+
+fn moePrefixSharedExactRequested() bool {
+    return envFlagEnabled("ZINC_MOE_PREFIX_SHARED_EXACT", false);
 }
 
 // ---------------------------------------------------------------------------
@@ -3054,6 +3063,7 @@ pub const InferenceEngine = struct {
         } else if (gemma_q8_wide4_explicitly_off) {
             log.info("Gemma Q8_0 four-row DMMV path DISABLED via ZINC_GEMMA_Q8_WIDE4_DMMV=0", .{});
         }
+
         const gemma_q8_1_dmmv_env = std.posix.getenv("ZINC_GEMMA_Q8_1_DMMV");
         const gemma_q8_1_dmmv_explicitly_off = gemma_q8_1_dmmv_env != null and
             std.mem.eql(u8, gemma_q8_1_dmmv_env.?, "0");
@@ -4102,9 +4112,13 @@ pub const InferenceEngine = struct {
         const q_scratch_dim = @max(q_dim, @max(cfg.ssm_d_inner, cfg.ssm_dt_rank));
         const kv_scratch_dim = @max(kv_dim, cfg.ssm_dt_rank);
         const attn_out_scratch_dim = @max(q_dim, cfg.ssm_d_inner);
-        const gate_scratch_dim = @max(inter_dim, ssm_conv_dim);
-        const up_scratch_dim = @max(inter_dim, cfg.ssm_d_inner);
-        const swiglu_scratch_dim = @max(inter_dim, cfg.ssm_d_inner);
+        const shared_inter_dim: u32 = if (moePrefixSharedExactRequested() and cfg.architecture == .qwen2_moe and cfg.n_experts > 0)
+            @max(inter_dim, cfg.shared_expert_intermediate_dim)
+        else
+            inter_dim;
+        const gate_scratch_dim = @max(@max(inter_dim, shared_inter_dim), ssm_conv_dim);
+        const up_scratch_dim = @max(@max(inter_dim, shared_inter_dim), cfg.ssm_d_inner);
+        const swiglu_scratch_dim = @max(@max(inter_dim, shared_inter_dim), cfg.ssm_d_inner);
 
         const n: u64 = n_tokens;
         const f32_sz: u64 = @sizeOf(f32);
@@ -12721,7 +12735,7 @@ pub const InferenceEngine = struct {
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
         const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
-        if (padded_tokens < 64 or padded_tokens > 96) return false;
+        if (padded_tokens < 64 or padded_tokens > gemma_prefill_dp4a_max_tokens) return false;
         return self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8_1 != null;
     }
@@ -12735,7 +12749,7 @@ pub const InferenceEngine = struct {
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
         const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
-        if (padded_tokens < 64 or padded_tokens > 96) return false;
+        if (padded_tokens < 64 or padded_tokens > gemma_prefill_dp4a_max_tokens) return false;
         const q6_path =
             self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8 != null and
@@ -12779,7 +12793,7 @@ pub const InferenceEngine = struct {
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
         const padded_tokens = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
-        return padded_tokens >= 64 and padded_tokens <= 96;
+        return padded_tokens >= 64 and padded_tokens <= gemma_prefill_dp4a_max_tokens;
     }
 
     fn gemmaDenseProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
@@ -17642,7 +17656,7 @@ pub const InferenceEngine = struct {
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
         if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return n_tokens;
-        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
+        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > gemma_prefill_dp4a_max_tokens) return n_tokens;
         if (n_tokens < 64) return 64;
         return (n_tokens + 31) & ~@as(u32, 31);
     }
@@ -17652,7 +17666,7 @@ pub const InferenceEngine = struct {
         if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
         if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
         if (!self.isAmdRdna() and !isIntelGpuVendor(self.gpu_config.vendor)) return n_tokens;
-        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
+        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > gemma_prefill_dp4a_max_tokens) return n_tokens;
         if (n_tokens < 64) return 64;
         return (n_tokens + 31) & ~@as(u32, 31);
     }
@@ -19858,9 +19872,11 @@ pub const InferenceEngine = struct {
                 std.ascii.eqlIgnoreCase(raw, "no"))
         else
             false;
-        // The standalone Q6_K columns shader validates, but the Qwen A3B
-        // in-model grouped path still changes answer-bearing prompts. Keep it
-        // opt-in until a layer replay validator proves orchestration parity.
+        // Q6_K routed columns match CPU dequant replay, but enabling them here
+        // groups an extra prefix layer that the fallback path otherwise runs
+        // token-by-token with the model's shared expert. The grouped prefix path
+        // intentionally skips that shared expert for speed, so keep Q6_K opt-in
+        // until a full grouped-vs-fallback replay proves the policy equivalent.
         const allow_late_q6_grouped = exact_grouped or layer + 2 < cfg.n_layers;
         const down_cols_supported = switch (down_exps.info.type_) {
             .q4_k => self.dmmv.pipeline_q4k_moe_cols != null,
@@ -20011,6 +20027,51 @@ pub const InferenceEngine = struct {
             self.logits_staging.mapped != null and
             self.logits_staging.size >= q8_1_down_compare_bytes;
         var q8_1_down_compare_ran = false;
+        const q6_down_compare_requested = if (std.posix.getenv("ZINC_MOE_Q6K_COLS_COMPARE")) |raw|
+            !(std.mem.eql(u8, raw, "0") or
+                std.ascii.eqlIgnoreCase(raw, "off") or
+                std.ascii.eqlIgnoreCase(raw, "false") or
+                std.ascii.eqlIgnoreCase(raw, "no"))
+        else
+            false;
+        const q6_down_compare_sample_elems: u32 = hidden_dim;
+        const q6_down_compare_sample_count: u32 = if (prefix_tokens >= 7) 7 else if (prefix_tokens >= 3) 3 else 0;
+        var q6_down_compare_tokens = [_]u32{ 0, 0, 0, 0, 0, 0, 0 };
+        if (q6_down_compare_sample_count == 7) {
+            q6_down_compare_tokens[1] = prefix_tokens / 6;
+            q6_down_compare_tokens[2] = prefix_tokens / 3;
+            q6_down_compare_tokens[3] = prefix_tokens / 2;
+            q6_down_compare_tokens[4] = (prefix_tokens * 2) / 3;
+            q6_down_compare_tokens[5] = (prefix_tokens * 5) / 6;
+            q6_down_compare_tokens[6] = prefix_tokens - 1;
+        } else if (q6_down_compare_sample_count == 3) {
+            q6_down_compare_tokens[1] = prefix_tokens / 2;
+            q6_down_compare_tokens[2] = prefix_tokens - 1;
+        }
+        const q6_down_compare_swiglu_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q6_down_compare_sample_count) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        const q6_down_compare_sample_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q6_down_compare_sample_elems) * @sizeOf(f32);
+        const q6_down_compare_output_offset = q6_down_compare_swiglu_bytes;
+        const q6_down_compare_route_offset =
+            q6_down_compare_output_offset +
+            @as(vk.c.VkDeviceSize, q6_down_compare_sample_count) *
+                q6_down_compare_sample_bytes;
+        const q6_down_compare_bytes =
+            q6_down_compare_route_offset +
+            @as(vk.c.VkDeviceSize, q6_down_compare_sample_count) *
+                @sizeOf(u32);
+        const use_q6_down_compare =
+            down_exps.info.type_ == .q6_k and
+            q6_down_compare_requested and
+            q6_down_compare_sample_count > 0 and
+            self.model.mmap_data != null and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= q6_down_compare_bytes;
+        var q6_down_compare_ran = false;
+        const q6_suffix_compare_requested = envFlagEnabled("ZINC_MOE_Q6K_SUFFIX_COMPARE", false);
         const standard_down_workgroups_x: u32 = (hidden_dim + 3) / 4;
         const prefix_down_workgroups_x: u32 = if (use_q8_1_down_cols)
             (hidden_dim + 31) / 32
@@ -20029,22 +20090,81 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, suffix_tokens) *
             @as(vk.c.VkDeviceSize, hidden_dim) *
             @sizeOf(f32);
+        const q6_suffix_compare_sample_elems: u32 = hidden_dim;
+        const q6_suffix_compare_sample_count: u32 = if (suffix_route_count >= 7) 7 else if (suffix_route_count >= 3) 3 else 0;
+        var q6_suffix_compare_routes = [_]u32{ 0, 0, 0, 0, 0, 0, 0 };
+        if (q6_suffix_compare_sample_count == 7) {
+            q6_suffix_compare_routes[1] = suffix_route_count / 6;
+            q6_suffix_compare_routes[2] = suffix_route_count / 3;
+            q6_suffix_compare_routes[3] = suffix_route_count / 2;
+            q6_suffix_compare_routes[4] = (suffix_route_count * 2) / 3;
+            q6_suffix_compare_routes[5] = (suffix_route_count * 5) / 6;
+            q6_suffix_compare_routes[6] = suffix_route_count - 1;
+        } else if (q6_suffix_compare_sample_count == 3) {
+            q6_suffix_compare_routes[1] = suffix_route_count / 2;
+            q6_suffix_compare_routes[2] = suffix_route_count - 1;
+        }
+        const q6_suffix_compare_swiglu_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q6_suffix_compare_sample_count) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        const q6_suffix_compare_sample_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q6_suffix_compare_sample_elems) * @sizeOf(f32);
+        const q6_suffix_compare_output_offset = q6_suffix_compare_swiglu_bytes;
+        const q6_suffix_compare_expert_offset =
+            q6_suffix_compare_output_offset +
+            @as(vk.c.VkDeviceSize, q6_suffix_compare_sample_count) *
+                q6_suffix_compare_sample_bytes;
+        const q6_suffix_compare_bytes =
+            q6_suffix_compare_expert_offset +
+            @as(vk.c.VkDeviceSize, q6_suffix_compare_sample_count) *
+                @sizeOf(u32);
+        const use_q6_suffix_compare =
+            down_exps.info.type_ == .q6_k and
+            q6_suffix_compare_requested and
+            q6_suffix_compare_sample_count > 0 and
+            self.model.mmap_data != null and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= q6_suffix_compare_bytes;
+        var q6_suffix_compare_ran = false;
         const gate_shexp = lt.ffn_gate_shexp;
         const up_shexp = lt.ffn_up_shexp;
         const down_shexp = lt.ffn_down_shexp;
         const shexp_gate = lt.ffn_gate_inp_shexp;
-        const has_suffix_shared_expert = gate_shexp != null and up_shexp != null and down_shexp != null;
+        const has_shared_expert = gate_shexp != null and up_shexp != null and down_shexp != null;
         const shexp_inter_dim = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+        const prefix_shared_inter_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, shexp_inter_dim) *
+            @sizeOf(f32);
+        const prefix_shared_gate_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) * @sizeOf(f32);
         const suffix_shared_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_tokens) *
             @as(vk.c.VkDeviceSize, shexp_inter_dim) *
             @sizeOf(f32);
+        const can_group_prefix_shared =
+            moePrefixSharedExactRequested() and
+            prefix_tokens > 0 and
+            down_exps.info.type_ == .q6_k and
+            has_shared_expert and
+            self.dmmv.pipelineForType(gate_shexp.?.info.type_) != null and
+            self.dmmv.pipelineForType(up_shexp.?.info.type_) != null and
+            self.dmmv.pipelineForType(down_shexp.?.info.type_) != null and
+            (shexp_gate == null or
+                (self.dmmv.pipelineForType(shexp_gate.?.info.type_) != null and
+                    self.elementwise.pipeline_sigmoid_scale_acc_batch != null)) and
+            prefix_shared_inter_bytes <= scratch_gate.size and
+            prefix_shared_inter_bytes <= scratch_up.size and
+            prefix_shared_inter_bytes <= scratch_swiglu.size and
+            prefix_hidden_bytes <= scratch_down.size and
+            (shexp_gate == null or prefix_shared_gate_bytes <= scratch_router_output.size);
         const can_group_suffix =
             suffix_tokens > 0 and
             suffix_k > 0 and
             (hidden_dim & 3) == 0 and
             self.elementwise.pipeline_moe_weighted_acc_batch != null and
-            (!has_suffix_shared_expert or
+            (!has_shared_expert or
                 (self.dmmv.pipelineForType(gate_shexp.?.info.type_) != null and
                     self.dmmv.pipelineForType(up_shexp.?.info.type_) != null and
                     self.dmmv.pipelineForType(down_shexp.?.info.type_) != null and
@@ -20055,7 +20175,7 @@ pub const InferenceEngine = struct {
             suffix_route_inter_bytes <= scratch_up.size and
             suffix_route_inter_bytes <= scratch_swiglu.size and
             suffix_route_hidden_bytes <= scratch_down.size and
-            (!has_suffix_shared_expert or
+            (!has_shared_expert or
                 (suffix_shared_inter_bytes <= scratch_gate.size and
                     suffix_shared_inter_bytes <= scratch_up.size and
                     suffix_shared_inter_bytes <= scratch_swiglu.size and
@@ -20069,6 +20189,8 @@ pub const InferenceEngine = struct {
         const collect_route_profile =
             (self.profile_enabled or prefillProfileRequested()) and
             !use_q8_1_down_compare and
+            !use_q6_down_compare and
+            !use_q6_suffix_compare and
             self.logits_staging.mapped != null and
             self.logits_staging.size >= route_profile_counts_bytes;
         var route_profile_prefix_copied = false;
@@ -20257,6 +20379,7 @@ pub const InferenceEngine = struct {
                     1,
                     0,
                     0,
+                    0,
                 );
             } else if (use_fused_gate_up_cols) {
                 try self.dmmv.recordQwenTop1GateUpSwigluColsDispatchIndirect(
@@ -20283,6 +20406,7 @@ pub const InferenceEngine = struct {
                     gate_stride,
                     ids_stride,
                     1,
+                    0,
                     0,
                     0,
                 );
@@ -20516,36 +20640,201 @@ pub const InferenceEngine = struct {
                     );
                 }
             } else {
-                try self.dmmv.recordMoeColsDispatchIndirect(
-                    &self.decode_cmd,
-                    self.instance.push_descriptor_fn,
-                    down_exps.info.type_,
-                    down_exps.gpu_buffer.handle,
-                    down_exps.gpu_buffer.size,
-                    scratch_swiglu.handle,
-                    scratch_swiglu.size,
-                    scratch_hidden.handle,
-                    prefix_hidden_bytes,
-                    counts.handle,
-                    counts_bytes,
-                    ids.handle,
-                    ids_bytes,
-                    active_blocks.handle,
-                    active_blocks_bytes,
-                    dispatch_args.handle,
-                    3 * @sizeOf(u32),
-                    hidden_dim,
-                    inter_dim,
-                    down_stride,
-                    ids_stride,
-                    1,
-                    0,
-                    0,
-                    0,
-                    true,
-                );
+                if (use_q6_down_compare) {
+                    // Diagnostic-only replay: run the Q6_K routed down pass into
+                    // scratch, sample its input/output/route IDs, then accumulate
+                    // the same scratch result into the normal hidden state.
+                    try self.dmmv.recordMoeColsDispatchIndirect(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        down_exps.info.type_,
+                        down_exps.gpu_buffer.handle,
+                        down_exps.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        scratch_down.handle,
+                        prefix_hidden_bytes,
+                        counts.handle,
+                        counts_bytes,
+                        ids.handle,
+                        ids_bytes,
+                        active_blocks.handle,
+                        active_blocks_bytes,
+                        dispatch_args.handle,
+                        3 * @sizeOf(u32),
+                        hidden_dim,
+                        inter_dim,
+                        down_stride,
+                        ids_stride,
+                        1,
+                        0,
+                        0,
+                        0,
+                        false,
+                    );
+                    self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
+                    self.decode_cmd.computeToTransferBarrier();
+                    for (0..q6_down_compare_sample_count) |sample_i| {
+                        const token_idx = q6_down_compare_tokens[sample_i];
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_swiglu.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = @as(vk.c.VkDeviceSize, token_idx) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                            .dstOffset = @as(vk.c.VkDeviceSize, sample_i) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                            .size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = @as(vk.c.VkDeviceSize, token_idx) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32),
+                            .dstOffset = q6_down_compare_output_offset + @as(vk.c.VkDeviceSize, sample_i) * q6_down_compare_sample_bytes,
+                            .size = q6_down_compare_sample_bytes,
+                        });
+                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_router_output.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                            .srcOffset = @as(vk.c.VkDeviceSize, token_idx) * route_slot_bytes,
+                            .dstOffset = q6_down_compare_route_offset + @as(vk.c.VkDeviceSize, sample_i) * @sizeOf(u32),
+                            .size = @sizeOf(u32),
+                        });
+                    }
+                    self.decode_cmd.transferToComputeBarrier();
+                    try self.dispatchScaleAccWithOffsets(
+                        scratch_hidden.handle,
+                        0,
+                        prefix_hidden_bytes,
+                        scratch_down.handle,
+                        0,
+                        prefix_hidden_bytes,
+                        prefix_tokens * hidden_dim,
+                        1.0,
+                    );
+                    q6_down_compare_ran = true;
+                } else {
+                    try self.dmmv.recordMoeColsDispatchIndirect(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        down_exps.info.type_,
+                        down_exps.gpu_buffer.handle,
+                        down_exps.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        scratch_hidden.handle,
+                        prefix_hidden_bytes,
+                        counts.handle,
+                        counts_bytes,
+                        ids.handle,
+                        ids_bytes,
+                        active_blocks.handle,
+                        active_blocks_bytes,
+                        dispatch_args.handle,
+                        3 * @sizeOf(u32),
+                        hidden_dim,
+                        inter_dim,
+                        down_stride,
+                        ids_stride,
+                        1,
+                        0,
+                        0,
+                        0,
+                        true,
+                    );
+                }
             }
             self.endProfilePhase(.moe_down, down_phase);
+
+            if (can_group_prefix_shared) {
+                // Diagnostic/exactness path for Qwen A3B top-1 grouped prefix:
+                // replay the shared expert for prefix tokens after routed MoE
+                // accumulation. Default path intentionally skips this work.
+                self.decode_cmd.computeBarrier();
+                const prefix_shared_phase = self.beginProfilePhase();
+                const prefix_shared_proj_phase = self.beginProfilePhase();
+                try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, prefix_tokens);
+                try self.dispatchProjectionBatched(up_shexp.?, scratch_norm, scratch_up, shexp_inter_dim, hidden_dim, prefix_tokens);
+                if (shexp_gate) |sg| {
+                    if (self.qwenA3bSharedF32GateBatchEnabled() and
+                        sg.info.type_ == .f32 and
+                        self.elementwise.pipeline_router_f32_batch != null and
+                        self.instance.push_descriptor_fn != null)
+                    {
+                        try self.dispatchRouterF32Batch(
+                            scratch_norm.handle,
+                            scratch_norm.size,
+                            sg.gpu_buffer.handle,
+                            sg.gpu_buffer.size,
+                            scratch_router_output.handle,
+                            prefix_shared_gate_bytes,
+                            1,
+                            hidden_dim,
+                            prefix_tokens,
+                        );
+                    } else {
+                        var prefix_tok: u32 = 0;
+                        while (prefix_tok < prefix_tokens) : (prefix_tok += 1) {
+                            try self.dispatchDmmvInner(
+                                sg,
+                                scratch_norm,
+                                scratch_norm.size,
+                                scratch_router_output,
+                                1,
+                                hidden_dim,
+                                0,
+                                prefix_tok * hidden_dim * @sizeOf(f32),
+                                prefix_tok * @sizeOf(f32),
+                                0,
+                            );
+                        }
+                    }
+                }
+                self.endProfilePhase(.shared_proj, prefix_shared_proj_phase);
+                const prefix_shared_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = scratch_gate.handle, .size = prefix_shared_inter_bytes },
+                    .{ .buffer = scratch_up.handle, .size = prefix_shared_inter_bytes },
+                    .{ .buffer = scratch_router_output.handle, .size = prefix_shared_gate_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&prefix_shared_ranges);
+
+                const prefix_shared_swiglu_phase = self.beginProfilePhase();
+                try self.dispatchFfnActivation(
+                    scratch_gate.handle,
+                    scratch_gate.size,
+                    scratch_up.handle,
+                    scratch_up.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    prefix_tokens * shexp_inter_dim,
+                );
+                self.endProfilePhase(.shared_swiglu, prefix_shared_swiglu_phase);
+
+                self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, prefix_shared_inter_bytes);
+                const prefix_shared_down_phase = self.beginProfilePhase();
+                try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_down, hidden_dim, shexp_inter_dim, prefix_tokens);
+                self.endProfilePhase(.shared_down, prefix_shared_down_phase);
+
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
+                const prefix_shared_acc_phase = self.beginProfilePhase();
+                if (shexp_gate != null) {
+                    try self.dispatchSigmoidScaleAccBatch(
+                        scratch_hidden.handle,
+                        scratch_hidden.size,
+                        scratch_down.handle,
+                        prefix_hidden_bytes,
+                        scratch_router_output.handle,
+                        prefix_shared_gate_bytes,
+                        hidden_dim,
+                        prefix_tokens,
+                        0,
+                    );
+                } else {
+                    try self.dispatchScaleAccWithOffsets(
+                        scratch_hidden.handle,
+                        0,
+                        prefix_hidden_bytes,
+                        scratch_down.handle,
+                        0,
+                        prefix_hidden_bytes,
+                        prefix_tokens * hidden_dim,
+                        1.0,
+                    );
+                }
+                self.endProfilePhase(.shared_gate_acc, prefix_shared_acc_phase);
+                self.endProfilePhase(.shared_expert, prefix_shared_phase);
+            }
         }
 
         var grouped_total_tokens = prefix_tokens;
@@ -20634,6 +20923,7 @@ pub const InferenceEngine = struct {
                     gate_stride,
                     suffix_route_count,
                     suffix_k,
+                    prefix_tokens,
                     0,
                     0,
                 );
@@ -20662,6 +20952,7 @@ pub const InferenceEngine = struct {
                     gate_stride,
                     suffix_route_count,
                     suffix_k,
+                    prefix_tokens,
                     0,
                     0,
                 );
@@ -20774,6 +21065,32 @@ pub const InferenceEngine = struct {
                 0,
                 false,
             );
+            if (use_q6_suffix_compare) {
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, suffix_route_hidden_bytes);
+                self.decode_cmd.computeToTransferBarrier();
+                for (0..q6_suffix_compare_sample_count) |sample_i| {
+                    const route_idx = q6_suffix_compare_routes[sample_i];
+                    const suffix_tok = route_idx / suffix_k;
+                    const slot = route_idx - suffix_tok * suffix_k;
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_swiglu.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = @as(vk.c.VkDeviceSize, route_idx) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                        .dstOffset = @as(vk.c.VkDeviceSize, sample_i) * @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                        .size = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32),
+                    });
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = @as(vk.c.VkDeviceSize, route_idx) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32),
+                        .dstOffset = q6_suffix_compare_output_offset + @as(vk.c.VkDeviceSize, sample_i) * q6_suffix_compare_sample_bytes,
+                        .size = q6_suffix_compare_sample_bytes,
+                    });
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_router_output.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = (@as(vk.c.VkDeviceSize, prefix_tokens + suffix_tok) * route_slot_bytes) + @as(vk.c.VkDeviceSize, slot) * @sizeOf(u32),
+                        .dstOffset = q6_suffix_compare_expert_offset + @as(vk.c.VkDeviceSize, sample_i) * @sizeOf(u32),
+                        .size = @sizeOf(u32),
+                    });
+                }
+                self.decode_cmd.transferToComputeBarrier();
+                q6_suffix_compare_ran = true;
+            }
             self.endProfilePhase(.moe_down, suffix_down_phase);
 
             self.decode_cmd.computeBufferBarrier(scratch_down.handle, suffix_route_hidden_bytes);
@@ -20794,7 +21111,7 @@ pub const InferenceEngine = struct {
             );
             self.endProfilePhase(.moe_weighted_acc, suffix_acc_phase);
 
-            if (has_suffix_shared_expert) {
+            if (has_shared_expert) {
                 self.decode_cmd.computeBarrier();
                 const shared_phase = self.beginProfilePhase();
                 const batch_shared_suffix = prefix_tokens == 0;
@@ -21028,6 +21345,153 @@ pub const InferenceEngine = struct {
                 mean_abs,
                 max_ref,
                 max_q8,
+            });
+        }
+        if (q6_down_compare_ran) {
+            const mmap = self.model.mmap_data.?;
+            const ptr_u8: [*]const u8 = @ptrCast(self.logits_staging.mapped.?);
+            const ptr_f32: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+            const sample_elems_usize: usize = @intCast(q6_down_compare_sample_elems);
+            const sample_count_usize: usize = @intCast(q6_down_compare_sample_count);
+            const inter_dim_usize: usize = @intCast(inter_dim);
+            const output_f32_base: usize = @intCast(q6_down_compare_output_offset / @sizeOf(f32));
+            const route_u8_base: usize = @intCast(q6_down_compare_route_offset);
+            const down_base_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset);
+            const row_buf = try self.allocator.alloc(f32, inter_dim_usize);
+            defer self.allocator.free(row_buf);
+
+            var max_abs: f32 = 0;
+            var max_sample: usize = 0;
+            var max_elem: usize = 0;
+            var max_expert: u32 = 0;
+            var max_ref: f32 = 0;
+            var max_q6: f32 = 0;
+            var sum_abs: f64 = 0;
+            var compared: usize = 0;
+            var invalid_routes: usize = 0;
+
+            for (0..sample_count_usize) |sample_i| {
+                const route_off = route_u8_base + sample_i * @sizeOf(u32);
+                const expert_id = std.mem.readInt(u32, ptr_u8[route_off..][0..@sizeOf(u32)], .little);
+                if (expert_id >= cfg.n_experts) {
+                    invalid_routes += 1;
+                    continue;
+                }
+                const swiglu_base = sample_i * inter_dim_usize;
+                const got_base = output_f32_base + sample_i * sample_elems_usize;
+                const q6_down_data_off = down_base_off + @as(usize, expert_id) * @as(usize, down_stride);
+                for (0..sample_elems_usize) |elem_i| {
+                    dequantRow(mmap[q6_down_data_off..], @intCast(elem_i), inter_dim, down_exps.info.type_, row_buf);
+                    var dot: f64 = 0;
+                    for (0..inter_dim_usize) |j| {
+                        dot += @as(f64, row_buf[j]) * @as(f64, ptr_f32[swiglu_base + j]);
+                    }
+                    const ref_v: f32 = @floatCast(dot);
+                    const got_v = ptr_f32[got_base + elem_i];
+                    const diff = @abs(ref_v - got_v);
+                    sum_abs += diff;
+                    compared += 1;
+                    if (diff > max_abs) {
+                        max_abs = diff;
+                        max_sample = sample_i;
+                        max_elem = elem_i;
+                        max_expert = expert_id;
+                        max_ref = ref_v;
+                        max_q6 = got_v;
+                    }
+                }
+            }
+            const mean_abs = if (compared > 0) sum_abs / @as(f64, @floatFromInt(compared)) else 0.0;
+            log.info("ZINC_MOE_Q6K_COLS_COMPARE: layer={d} prefix_tokens={d} samples={d} elems={d} invalid_routes={d} max_abs={e:.6}@tok{d}/expert{d}/elem{d} mean_abs={e:.6} ref={d:.6} q6={d:.6}", .{
+                layer,
+                prefix_tokens,
+                q6_down_compare_sample_count,
+                q6_down_compare_sample_elems,
+                invalid_routes,
+                max_abs,
+                q6_down_compare_tokens[max_sample],
+                max_expert,
+                max_elem,
+                mean_abs,
+                max_ref,
+                max_q6,
+            });
+        }
+        if (q6_suffix_compare_ran) {
+            const mmap = self.model.mmap_data.?;
+            const ptr_u8: [*]const u8 = @ptrCast(self.logits_staging.mapped.?);
+            const ptr_f32: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+            const sample_elems_usize: usize = @intCast(q6_suffix_compare_sample_elems);
+            const sample_count_usize: usize = @intCast(q6_suffix_compare_sample_count);
+            const inter_dim_usize: usize = @intCast(inter_dim);
+            const output_f32_base: usize = @intCast(q6_suffix_compare_output_offset / @sizeOf(f32));
+            const expert_u8_base: usize = @intCast(q6_suffix_compare_expert_offset);
+            const down_base_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset);
+            const row_buf = try self.allocator.alloc(f32, inter_dim_usize);
+            defer self.allocator.free(row_buf);
+
+            var max_abs: f32 = 0;
+            var max_sample: usize = 0;
+            var max_elem: usize = 0;
+            var max_route: u32 = 0;
+            var max_expert: u32 = 0;
+            var max_ref: f32 = 0;
+            var max_q6: f32 = 0;
+            var sum_abs: f64 = 0;
+            var compared: usize = 0;
+            var invalid_routes: usize = 0;
+
+            for (0..sample_count_usize) |sample_i| {
+                const expert_off = expert_u8_base + sample_i * @sizeOf(u32);
+                const expert_id = std.mem.readInt(u32, ptr_u8[expert_off..][0..@sizeOf(u32)], .little);
+                if (expert_id >= cfg.n_experts) {
+                    invalid_routes += 1;
+                    continue;
+                }
+                const swiglu_base = sample_i * inter_dim_usize;
+                const got_base = output_f32_base + sample_i * sample_elems_usize;
+                const q6_down_data_off = down_base_off + @as(usize, expert_id) * @as(usize, down_stride);
+                for (0..sample_elems_usize) |elem_i| {
+                    dequantRow(mmap[q6_down_data_off..], @intCast(elem_i), inter_dim, down_exps.info.type_, row_buf);
+                    var dot: f64 = 0;
+                    for (0..inter_dim_usize) |j| {
+                        dot += @as(f64, row_buf[j]) * @as(f64, ptr_f32[swiglu_base + j]);
+                    }
+                    const ref_v: f32 = @floatCast(dot);
+                    const got_v = ptr_f32[got_base + elem_i];
+                    const diff = @abs(ref_v - got_v);
+                    sum_abs += diff;
+                    compared += 1;
+                    if (diff > max_abs) {
+                        max_abs = diff;
+                        max_sample = sample_i;
+                        max_elem = elem_i;
+                        max_route = q6_suffix_compare_routes[sample_i];
+                        max_expert = expert_id;
+                        max_ref = ref_v;
+                        max_q6 = got_v;
+                    }
+                }
+            }
+            const max_tok = if (suffix_k > 0) max_route / suffix_k else 0;
+            const max_slot = if (suffix_k > 0) max_route - max_tok * suffix_k else 0;
+            const mean_abs = if (compared > 0) sum_abs / @as(f64, @floatFromInt(compared)) else 0.0;
+            log.info("ZINC_MOE_Q6K_SUFFIX_COMPARE: layer={d} suffix_tokens={d} routes={d} samples={d} elems={d} invalid_routes={d} max_abs={e:.6}@route{d}/tok{d}/slot{d}/expert{d}/elem{d} mean_abs={e:.6} ref={d:.6} q6={d:.6}", .{
+                layer,
+                suffix_tokens,
+                suffix_route_count,
+                q6_suffix_compare_sample_count,
+                q6_suffix_compare_sample_elems,
+                invalid_routes,
+                max_abs,
+                max_route,
+                max_tok,
+                max_slot,
+                max_expert,
+                max_elem,
+                mean_abs,
+                max_ref,
+                max_q6,
             });
         }
 
@@ -24642,7 +25106,7 @@ pub const InferenceEngine = struct {
         return true;
     }
 
-    /// Batched Gemma attention front-half for exact grouped MoE prefill.
+    /// Record Gemma's batched attention front-half for exact grouped MoE prefill.
     ///
     /// Postconditions:
     ///   - scratch_hidden[token] includes the attention residual for `layer`
@@ -24652,9 +25116,8 @@ pub const InferenceEngine = struct {
     /// This mirrors the Gemma attention segment in the dense batched prefill
     /// path, but stops before any FFN work so the caller can run Gemma's
     /// exact top-k grouped MoE.
-    fn prefillGemmaRunBatchedAttentionToFfnNorm(
+    fn prefillGemmaRecordBatchedAttentionToFfnNorm(
         self: *InferenceEngine,
-        state: *DecodeState,
         base_token: u32,
         n_tokens: u32,
         hidden_dim: u32,
@@ -24715,13 +25178,6 @@ pub const InferenceEngine = struct {
         if (scratch_q.size < q_total_bytes or scratch_attn_out.size < q_total_bytes) return error.BufferTooSmall;
         if (scratch_k.size < kv_total_bytes or scratch_v.size < kv_total_bytes) return error.BufferTooSmall;
         if (scratch_down.size < hidden_batch_bytes) return error.BufferTooSmall;
-
-        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-        try self.decode_cmd.reset();
-        try self.decode_cmd.beginOneTime();
-        self.resetTimestamps();
-        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-        self.decode_cmd.transferToComputeBarrier();
 
         const attention_phase = self.beginProfilePhase();
 
@@ -25032,7 +25488,44 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeBarrier();
         self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
         self.endProfilePhase(.attention, attention_phase);
+    }
 
+    fn prefillGemmaRunBatchedAttentionToFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        scratch_v: Buffer,
+        scratch_attn_out: Buffer,
+        scratch_down: Buffer,
+    ) !void {
+        if (n_tokens == 0) return;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.transferToComputeBarrier();
+        try self.prefillGemmaRecordBatchedAttentionToFfnNorm(
+            base_token,
+            n_tokens,
+            hidden_dim,
+            layer,
+            scratch_hidden,
+            scratch_norm,
+            scratch_q,
+            scratch_k,
+            scratch_v,
+            scratch_attn_out,
+            scratch_down,
+        );
         self.decode_cmd.computeToTransferBarrier();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         try self.decode_cmd.end();
@@ -25046,7 +25539,11 @@ pub const InferenceEngine = struct {
         if (prompt_tokens.len == 0) return;
         const cfg = self.model.config;
         const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
-        const n_used = cfg.n_experts_used;
+        const n_used = if (self.moe_topk_limit > 0)
+            @min(cfg.n_experts_used, self.moe_topk_limit)
+        else
+            cfg.n_experts_used;
+        if (n_used == 0) return error.UnsupportedConfiguration;
         const route_count = n_tokens * n_used;
         const hidden_dim = cfg.hidden_dim;
         const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
@@ -25078,7 +25575,24 @@ pub const InferenceEngine = struct {
             try self.ensureKvPagesForContext(target_context_tokens);
         }
 
-        try self.ensureBatchedScratchCapacity(route_count);
+        const shared_scratch_capacity_tokens = blk: {
+            const ceilTokens = struct {
+                fn f(tokens: u32, need_dim: u32, slot_dim: u32) u32 {
+                    if (tokens == 0 or need_dim == 0 or slot_dim == 0) return tokens;
+                    const numerator = @as(u64, tokens) * @as(u64, need_dim);
+                    return @intCast((numerator + @as(u64, slot_dim) - 1) / @as(u64, slot_dim));
+                }
+            }.f;
+            const q_scratch_dim: u32 = cfg.n_heads * cfg.head_dim;
+            const dp4a_padded_tokens = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
+            var needed = n_tokens;
+            needed = @max(needed, ceilTokens(dp4a_padded_tokens, shared_scratch_inter_dim, inter_dim));
+            needed = @max(needed, ceilTokens(dp4a_padded_tokens, shared_scratch_inter_dim, q_scratch_dim));
+            needed = @max(needed, ceilTokens(dp4a_padded_tokens, hidden_dim, inter_dim));
+            break :blk needed;
+        };
+        const batched_scratch_tokens = @max(route_count, shared_scratch_capacity_tokens);
+        try self.ensureBatchedScratchCapacity(batched_scratch_tokens);
         try self.ensureGemmaMoePrefillDp4aScratchCapacity(n_tokens, shared_scratch_inter_dim);
         const scratch_hidden = self.batched_scratch_hidden.?;
         const scratch_norm = self.batched_scratch_norm.?;
@@ -25104,6 +25618,7 @@ pub const InferenceEngine = struct {
             self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
             self.prefill_embed_big_capacity_bytes = total_embed_bytes;
         }
+        const cpu_embed_start = std.time.nanoTimestamp();
         {
             const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
             const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
@@ -25118,6 +25633,7 @@ pub const InferenceEngine = struct {
                 for (dst) |*v| v.* *= gemma_scale;
             }
         }
+        const cpu_embed_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - cpu_embed_start);
         self.prefill_embed_big_hidden = hidden_dim;
         self.prefill_embed_big_token_count = n_tokens;
         self.prefill_current_token_idx = 0;
@@ -25167,6 +25683,7 @@ pub const InferenceEngine = struct {
             self.prefill_pipeline_mode = false;
         }
 
+        const initial_record_start = std.time.nanoTimestamp();
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
         vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &vk.c.VkBufferCopy{
@@ -25175,12 +25692,15 @@ pub const InferenceEngine = struct {
             .size = total_embed_bytes,
         });
         try self.decode_cmd.end();
+        const initial_record_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - initial_record_start);
+        const initial_submit_wait_start = std.time.nanoTimestamp();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        const initial_submit_wait_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - initial_submit_wait_start);
 
         self.prefill_token_samples = 0;
-        self.prefill_cpu_embed_ns = 0;
-        self.prefill_cpu_record_ns = 0;
-        self.prefill_submit_wait_ns = 0;
+        self.prefill_cpu_embed_ns = cpu_embed_elapsed_ns;
+        self.prefill_cpu_record_ns = initial_record_elapsed_ns;
+        self.prefill_submit_wait_ns = initial_submit_wait_elapsed_ns;
         self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
         self.prefill_gpu_total_ns = 0;
         const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
@@ -25226,6 +25746,10 @@ pub const InferenceEngine = struct {
         const route_pack_active_blocks_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, route_count) * @sizeOf(u32);
         const route_pack_dispatch_args_bytes: vk.c.VkDeviceSize = 6 * @sizeOf(u32);
+        const collect_route_profile =
+            prefillProfileRequested() and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= route_pack_counts_bytes;
         if (route_buf.size < @max(route_bytes, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32))) return error.BufferTooSmall;
         if (scratch_router_logits.size < router_logits_bytes) return error.BufferTooSmall;
         if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;
@@ -25244,8 +25768,14 @@ pub const InferenceEngine = struct {
 
         var layer: u32 = 0;
         while (layer + 1 < cfg.n_layers) : (layer += 1) {
-            try self.prefillGemmaRunBatchedAttentionToFfnNorm(
-                state,
+            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+            const layer_record_start = std.time.nanoTimestamp();
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            self.decode_cmd.transferToComputeBarrier();
+            try self.prefillGemmaRecordBatchedAttentionToFfnNorm(
                 base_token,
                 n_tokens,
                 hidden_dim,
@@ -25271,11 +25801,6 @@ pub const InferenceEngine = struct {
             const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
             const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
 
-            try self.decode_cmd.reset();
-            try self.decode_cmd.beginOneTime();
-            self.resetTimestamps();
-            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-            self.decode_cmd.transferToComputeBarrier();
             const moe_phase = self.beginProfilePhase();
 
             const router_phase = self.beginProfilePhase();
@@ -25344,6 +25869,15 @@ pub const InferenceEngine = struct {
             };
             self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
             self.decode_cmd.computeToIndirectBufferBarrier(route_pack_dispatch_args.handle, route_pack_dispatch_args_bytes);
+            if (collect_route_profile) {
+                self.decode_cmd.computeToTransferBarrier();
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, route_pack_counts.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = 0,
+                    .size = route_pack_counts_bytes,
+                });
+                self.decode_cmd.transferToComputeBarrier();
+            }
 
             try self.dispatchRmsNorm(
                 scratch_hidden.handle,
@@ -25473,6 +26007,7 @@ pub const InferenceEngine = struct {
                     return error.BufferTooSmall;
                 }
                 const shexp_gate = lt.ffn_gate_inp_shexp;
+                const shared_proj_phase = self.beginProfilePhase();
                 if (shexp_gate) |sg| {
                     try self.dispatchProjectionBatched(sg, scratch_shared_norm, route_buf, 1, hidden_dim, n_tokens);
                     self.decode_cmd.computeBufferBarrier(route_buf.handle, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32));
@@ -25544,9 +26079,11 @@ pub const InferenceEngine = struct {
                 } else {
                     self.barrierAfterGemmaGateUpGeglu(shared_gateup_result, scratch_swiglu, shared_inter_bytes, n_tokens, shared_gateup_dp4a_cols);
                 }
+                self.endProfilePhase(.shared_proj, shared_proj_phase);
 
                 const shared_already_q8 = shared_gateup_result == .q8_geglu;
                 const shared_already_q8_1 = shared_gateup_result == .q8_1_geglu;
+                const shared_down_phase = self.beginProfilePhase();
                 if (!try self.dispatchGemmaDenseDownDp4aBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens, shared_already_q8, shared_already_q8_1, shared_gateup_dp4a_cols)) {
                     if (shared_already_q8 or shared_already_q8_1) return error.UnsupportedConfiguration;
                     var shared_down_done = false;
@@ -25572,6 +26109,7 @@ pub const InferenceEngine = struct {
                     }
                 }
                 self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
+                self.endProfilePhase(.shared_down, shared_down_phase);
 
                 if (lt.post_ffw_norm_1) |pfn1_t| {
                     try self.dispatchRmsNorm(
@@ -25587,6 +26125,7 @@ pub const InferenceEngine = struct {
                     );
                     self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
                 }
+                const shared_acc_phase = self.beginProfilePhase();
                 if (shexp_gate != null) {
                     try self.dispatchSigmoidScaleAccBatch(
                         scratch_norm.handle,
@@ -25610,6 +26149,7 @@ pub const InferenceEngine = struct {
                     );
                 }
                 self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+                self.endProfilePhase(.shared_gate_acc, shared_acc_phase);
                 self.endProfilePhase(.shared_expert, shared_phase);
             }
 
@@ -25638,8 +26178,21 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeToTransferBarrier();
             _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             try self.decode_cmd.end();
+            self.prefill_cpu_record_ns += @intCast(std.time.nanoTimestamp() - layer_record_start);
+            const layer_submit_wait_start = std.time.nanoTimestamp();
             try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            self.prefill_submit_wait_ns += @intCast(std.time.nanoTimestamp() - layer_submit_wait_start);
             if (enable_gpu_phase_timing) self.recordProfilingSample();
+            if (collect_route_profile) {
+                const counts_ptr: [*]const u32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                const n_experts_usize: usize = @intCast(cfg.n_experts);
+                self.recordPrefillRoutePackCounts(
+                    counts_ptr[0..n_experts_usize],
+                    n_tokens,
+                    route_count,
+                    cfg.n_experts,
+                );
+            }
         }
 
         try self.prefillQwen36RunPartialTokenLoop(
@@ -26205,7 +26758,7 @@ pub const InferenceEngine = struct {
     /// model and prompt length match those specialized paths; otherwise falls back to
     /// the `canUseBatchedPrefillRdna`-gated batched body or `prefillBatch` (per-token
     /// serial path). Set `ZINC_BATCHED_PREFILL=0` to force the serial fallback or
-    /// `=validate` to run both paths and diff the last-token logits. Intel Arc dense
+    /// `=validate` to run both paths and diff the last-token logits. Intel Arc
     /// Gemma uses the chunked batched path by default; Qwen 3.6 A3B uses the
     /// specialized layer-major path by default; other Intel models still
     /// require `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
@@ -26219,11 +26772,19 @@ pub const InferenceEngine = struct {
             cfg.architecture == .gemma and
             cfg.n_experts == 0 and
             cfg.ssm_d_inner == 0;
+        const intel_gemma_moe_default =
+            cfg.architecture == .gemma and
+            cfg.n_experts > 0 and
+            cfg.n_experts_used > 0 and
+            cfg.ssm_d_inner == 0 and
+            gemmaGroupedMoePrefillEnvEnabled();
+        const intel_gemma_chunk_default = intel_dense_gemma_default or intel_gemma_moe_default;
         const intel_batched_explicitly_on = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
         const intel_batched_explicitly_off = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "0");
         const intel_batched_requested = isIntelGpuVendor(self.gpu_config.vendor) and
-            (intel_batched_explicitly_on or (!intel_batched_explicitly_off and intel_dense_gemma_default));
-        const chunk_limit = intelBatchedPrefillChunkLimit(self.gpu_config.vendor);
+            (intel_batched_explicitly_on or (!intel_batched_explicitly_off and intel_gemma_chunk_default));
+        const intel_default_chunk_limit: u32 = if (intel_gemma_moe_default) gemma_prefill_dp4a_max_tokens else 96;
+        const chunk_limit = intelBatchedPrefillChunkLimit(self.gpu_config.vendor, intel_default_chunk_limit);
         if (intel_batched_requested and
             chunk_limit > 0 and
             prompt_tokens.len > chunk_limit and

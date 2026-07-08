@@ -166,7 +166,7 @@ export const topicHubs: TopicHub[] = [
       {
         title: 'ZINC performance status',
         href: '/zinc/benchmarks/',
-        description: 'Current AMD and Metal results for the models you may use as local coding backends.',
+        description: 'Current AMD, Intel Arc, Metal, and CUDA results for the models you may use as local coding backends.',
       },
     ],
     docs: [
@@ -343,7 +343,7 @@ export const topicHubs: TopicHub[] = [
       {
         title: 'Getting Started with ZINC',
         href: '/zinc/docs/getting-started/',
-        description: 'Build ZINC, pull a managed model, and run local inference on AMD or Apple Silicon.',
+        description: 'Build ZINC, pull a managed model, and run local inference on AMD, Intel Arc, or Apple Silicon.',
       },
       {
         title: 'ZINC Benchmarks',
@@ -420,7 +420,7 @@ export const topicHubs: TopicHub[] = [
       },
       {
         label: 'Pick the right hardware bucket',
-        detail: 'Separate 16 GB, 32 GB, and Apple Silicon runs. A model that technically loads may still reserve too little context to be useful.',
+        detail: 'Separate 16 GB, 32 GB, Intel Arc, and Apple Silicon runs. A model that technically loads may still reserve too little context to be useful.',
       },
       {
         label: 'Run the baseline',
@@ -490,9 +490,9 @@ export const topicHubs: TopicHub[] = [
         description: 'The main architecture explainer for Qwen3.6, MoE, SSM, context, and local engine implications.',
       },
       {
-        title: 'Qwen3.6-35B-A3B GGUF on AMD and Metal',
+        title: 'Qwen3.6-35B-A3B GGUF on AMD, Intel Arc, and Metal',
         href: '/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc/',
-        description: 'Managed model support, AMD RDNA4 and Apple Silicon notes, and practical run guidance.',
+        description: 'Managed model support, AMD RDNA4, Intel Arc, Apple Silicon notes, and practical run guidance.',
       },
       {
         title: 'Why speculative decoding does not net out on Qwen 35B-A3B',
@@ -690,7 +690,7 @@ export const topicHubs: TopicHub[] = [
       {
         title: 'Run LLMs on AMD GPUs Without ROCm',
         href: '/zinc/docs/getting-started/',
-        description: 'The fastest path from clone to local AMD inference.',
+        description: 'The fastest path from clone to local AMD, Intel Arc, or Apple Silicon inference.',
       },
       {
         title: 'AMD RDNA3/RDNA4 GPU Reference',
@@ -804,7 +804,7 @@ export const topicHubs: TopicHub[] = [
     articleIdeas: [
       {
         label: 'Long-context budgets by GPU memory',
-        detail: 'A table for 16 GB, 24 GB, 32 GB, and Apple Silicon using common Qwen and Gemma shapes.',
+        detail: 'A table for 16 GB, 24 GB, 32 GB, Intel Arc, and Apple Silicon using common Qwen and Gemma shapes.',
       },
       {
         label: 'FP8 versus Q4 KV cache',

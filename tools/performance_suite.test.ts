@@ -108,6 +108,8 @@ test("remote tuning env forwards tuning toggles", () => {
     ZINC_Q8_1_LM_HEAD: "1",
     ZINC_Q8_1_SSM_QKV_Z: "1",
     ZINC_MOE_Q5K_Q8_1_DOWN_ACC: "1",
+    ZINC_MOE_Q6K_COLS: "1",
+    ZINC_MOE_PREFIX_SHARED_EXACT: "1",
     ZINC_MOE_SINGLETON_TAIL_SPLIT: "1",
     ZINC_INTEL_A3B_PRODUCTION: "0",
     ZINC_A3B_SHARED_F32_GATE_BATCH: "0",
@@ -123,6 +125,8 @@ test("remote tuning env forwards tuning toggles", () => {
   expect(env.ZINC_Q8_1_LM_HEAD).toBe("1");
   expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe("1");
   expect(env.ZINC_MOE_Q5K_Q8_1_DOWN_ACC).toBe("1");
+  expect(env.ZINC_MOE_Q6K_COLS).toBe("1");
+  expect(env.ZINC_MOE_PREFIX_SHARED_EXACT).toBe("1");
   expect(env.ZINC_MOE_SINGLETON_TAIL_SPLIT).toBe("1");
   expect(env.ZINC_INTEL_A3B_PRODUCTION).toBe("0");
   expect(env.ZINC_A3B_SHARED_F32_GATE_BATCH).toBe("0");
@@ -146,6 +150,12 @@ test("parseArgs reads RDNA backend and device options", () => {
     "vulkan",
     "--rdna-vk-device",
     "1",
+    "--rdna-llama-server",
+    "/opt/baseline/bin/llama-server",
+    "--rdna-llama-cli",
+    "/opt/baseline/bin/llama-cli",
+    "--rdna-llama-device",
+    "ROCm0",
     "--require-rdna-device-substring",
     "GFX1201",
   ]);
@@ -154,6 +164,9 @@ test("parseArgs reads RDNA backend and device options", () => {
   expect(args.rdnaNode).toBe("rdna1");
   expect(args.rdnaBackend).toBe("vulkan");
   expect(args.rdnaVkDevice).toBe(1);
+  expect(args.rdnaLlamaServer).toBe("/opt/baseline/bin/llama-server");
+  expect(args.rdnaLlamaCli).toBe("/opt/baseline/bin/llama-cli");
+  expect(args.rdnaLlamaDevice).toBe("ROCm0");
   expect(args.requireRdnaDeviceSubstring).toBe("GFX1201");
   expect(args.rdnaWorkdir).toBe("/root/zinc-bench");
 });

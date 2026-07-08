@@ -20,7 +20,7 @@ The executable will be here:
 
 ## Run a preflight check first
 
-This is the fastest way to answer "does this machine, Vulkan stack, and model look runnable at all?"
+This is the fastest way to answer "does this machine, Vulkan or Metal stack, and model look runnable at all?"
 
 ```bash
 # General machine + Vulkan + shader preflight
@@ -54,8 +54,8 @@ cd /root/zinc
 
 `--check` prints its progress as numbered sections and ends with a summary and verdict. The five sections are:
 
-- `Host Environment`: OS and the current shell's `RADV_PERFTEST`
-- `Linux AMD Prerequisites`: Mesa and GECC / RAS checks on Linux
+- `Host Environment`: OS and the current shell's backend-relevant environment
+- `Linux AMD Prerequisites`: Mesa and GECC / RAS checks on AMD Linux systems
 - `Runtime Assets`: compiled shader directory and required `.spv` files
 - `Vulkan Device`: loader init, GPU enumeration, selected device, and tuning summary
 - `Model File`: GGUF metadata plus an estimated VRAM fit for the current engine
@@ -79,7 +79,7 @@ Exit behavior:
 - `READY [OK]` and `READY WITH WARNINGS [WARN]` exit with code `0`
 - `NOT READY [FAIL]` exits non-zero
 
-One common point of confusion: `RADV_PERFTEST` is checked in the shell where you run `--check`. A plain SSH shell can warn even if your long-running service sets `RADV_PERFTEST=coop_matrix` correctly.
+One common point of confusion on RDNA4: `RADV_PERFTEST` is checked in the shell where you run `--check`. A plain SSH shell can warn even if your long-running service sets `RADV_PERFTEST=coop_matrix` correctly. Intel Arc users do not set `RADV_PERFTEST`.
 
 ### Sample outputs from the shared RDNA4 node
 
@@ -242,10 +242,18 @@ If you want ZINC to manage downloads and the default startup model for you:
 
 ## Run a single prompt from the terminal
 
-This is the best first command to try:
+This is the best first command to try on RDNA4:
 
 ```bash
 export RADV_PERFTEST=coop_matrix
+./zig-out/bin/zinc \
+  -m /path/to/model.gguf \
+  --prompt "The capital of France is"
+```
+
+On Intel Arc, use the same command without the RDNA-only environment variable:
+
+```bash
 ./zig-out/bin/zinc \
   -m /path/to/model.gguf \
   --prompt "The capital of France is"

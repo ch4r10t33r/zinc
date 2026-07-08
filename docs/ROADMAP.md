@@ -10,9 +10,10 @@ Current priorities:
 - improve Windows and cross-platform build reliability
 - harden the OpenAI-compatible server path
 - recover Qwen 3.6 27B dense-FFN and SSM-projection prefill on RDNA4 (the active effort behind the 27B prefill gap vs llama.cpp)
+- harden Intel Arc as an official Linux Vulkan target now that the full catalog matrix is published
 - improve test coverage for scheduler, API, tokenizer, graph, and model loading code
 - make bug reports and regressions easier to reproduce
-- keep RDNA4 and Metal performance work measurable and benchmark-driven
+- keep RDNA4, Intel Arc, and Metal performance work measurable and benchmark-driven
 
 Good contributions here:
 
@@ -46,7 +47,7 @@ Longer-horizon directions:
 
 - more mature continuous batching and serving behavior
 - deeper TurboQuant validation and tuning
-- broader hardware coverage beyond the primary RDNA3/RDNA4 target
+- broader hardware coverage beyond the primary RDNA3/RDNA4 and Intel Arc targets
 - richer visual tooling around execution graphs and performance traces
 - packaging and distribution improvements for non-core developer users
 

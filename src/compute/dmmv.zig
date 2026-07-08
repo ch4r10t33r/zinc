@@ -138,6 +138,7 @@ pub const GemmaTop1GateUpColsPushConstants = extern struct {
     y_offset: u32,
     ids_stride: u32,
     x_route_divisor: u32,
+    x_token_base: u32 = 0,
 };
 
 /// Push constants for the fused split-K merge + o_proj DMMV-acc shader
@@ -2883,6 +2884,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = 0,
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },
@@ -2927,6 +2929,7 @@ pub const DmmvDispatch = struct {
         expert_stride: u32,
         ids_stride: u32,
         x_route_divisor: u32,
+        x_token_base: u32,
         a_offset: u32,
         y_offset: u32,
     ) !void {
@@ -2942,6 +2945,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = x_token_base,
         };
         const infos = [7]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
@@ -2989,6 +2993,7 @@ pub const DmmvDispatch = struct {
         expert_stride: u32,
         ids_stride: u32,
         x_route_divisor: u32,
+        x_token_base: u32,
         a_offset: u32,
         y_offset: u32,
     ) !void {
@@ -3004,6 +3009,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = x_token_base,
         };
         const infos = [8]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = gate_buf, .offset = 0, .range = gate_size },

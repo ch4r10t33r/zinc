@@ -28,7 +28,7 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
   <section class="project-highlight">
     <a href="/zinc/" class="project-card">
       <h2>ZINC</h2>
-      <p>Local LLM inference for consumer GPUs — AMD Radeon via Vulkan, Apple Silicon via Metal, NVIDIA RTX via CUDA experiments, and Intel Arc bring-up. The current strongest measured path is AMD RDNA4, where ZINC beats llama.cpp across the five-model headline sweep.</p>
+      <p>Local LLM inference for consumer GPUs — AMD Radeon via Vulkan, Intel Arc via Vulkan, Apple Silicon via Metal, and NVIDIA RTX via CUDA experiments. The current strongest measured path is AMD RDNA4, and Intel Arc is now an official Linux Vulkan support target.</p>
       <span class="project-link">Learn more &rarr;</span>
     </a>
   </section>

@@ -908,7 +908,7 @@ const jsonLd = {
             <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</p>
             {(target.summary?.successful_models ?? 0) < (target.summary?.benchmarked_models ?? 0) && (
               <p class="panel-banner" role="note">
-                <strong>Experimental bring-up.</strong>{' '}
+                <strong>Partial benchmark run.</strong>{' '}
                 Only {(target.summary?.successful_models ?? 0)} of {(target.summary?.benchmarked_models ?? 0)} ZINC runs completed on this node in the current artifact ({formatShortDate(target.generated_at)}); the rest currently fail (see each row's status for the underlying reason). Numbers and averages shown reflect only the rows that completed — treat them as a partial signal, not a head-to-head verdict.
               </p>
             )}
