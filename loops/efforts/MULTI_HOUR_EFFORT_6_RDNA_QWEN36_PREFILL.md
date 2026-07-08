@@ -2078,6 +2078,17 @@ remain fallback. Route-pack occupancy remains poor (`41.6%` utilization,
 layer 1; the broader performance targets are now SSM qkv/z and SSM out
 projection, plus reducing route-pack tail waste.
 
+Rejected exact-suffix layer-1 probe (2026-07-08): temporarily added an env-gated
+path that allocated full top-k suffix scratch and forced `prefix_tokens=0` for
+selected layers, reusing the existing exact suffix route-pack path. On the same
+300-token prompt, `ZINC_QWEN36_MOE_GROUPED_SUFFIX_LAYERS=layers=1` was fast
+(`1277.24 tok/s` versus default `893.37 tok/s`) but changed output from
+`{248046}` to `{198, 248046}`. This confirms layer 1 is behavior-sensitive:
+the Q6_K math is tight, but changing the early-layer routing exactness changes
+observable generation. Do not default-enable layer 1 through an exact-suffix
+rewrite without updating the coherence contract and comparing against a stronger
+reference.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
