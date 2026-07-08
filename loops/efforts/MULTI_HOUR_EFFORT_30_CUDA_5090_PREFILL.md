@@ -92,5 +92,26 @@ The BT=32 negative below was the ONE guess made without profiling — it was neu
   (NEVER main). If a win, append a dated entry here + to `project_effort26_beat_llama` memory.
 - Revert + log negatives (they're valuable). Clean box scratch. STOP after one increment.
 
+## CONVERGED (2026-07-08) — effort closed, every prefill lever resolved
+
+**THE WIN (shipped to main `ac8192c4`):** coalesced warp-per-key attention (`ZINC_ATTN_V2`
+default-on) → **gemma-31b dense prefill +53% (552→847 t/s, gap 6.0×→3.9× vs llama)**;
+gemma-26b MoE +7%. This was the sole cheap win — a genuinely naive uncoalesced softmax.
+
+**THE LAST LEVER, decisively KILLED (int8-MMQ):** built the full Q4_K int8
+`mma.sync.m16n8k32.s8.s8.s32` GEMM microbench (`dbg_cuda gemm8`/`mma8`, harness on this
+branch's `src/dbg_cuda.zig`). Findings on the 5090 (M=K=4608):
+- NVRTC **compiles inline-PTX int8 mma correctly on sm_120** (no CUBIN gamble) and Blackwell
+  delivers the **1.9× int8 TC rate** — both feared unknowns settled favorably.
+- **But int8/fp16 = 0.92–0.98× (SLOWER), correct to 0.38%** → dense Q4_K prefill is
+  **weight-traffic-bound**, so int8's 1.9× *compute* rate buys **0 wall-clock** (both read the
+  same 0.5-byte Q4_K weight). int8-MMQ is DEAD. Reproduce: `dbg_cuda gemm8 4608 4608 512`.
+
+**Every other lever = dead** (see Dead-ends): flash (broken+L2-caches-KV), BT=32, qwen-attn
+(marginal), QKV-fuse (hangs), conv1d, Q8_0-dense (weight-traffic ×2), fp16-cache (warm-only),
+CUBIN-fp16-mma (−11%), m128/normf16/FP8/graphs. **Prefill is weight-traffic-bound → the only
+lever left is LESS weight traffic (lower-bit quant / different format), not a faster kernel.**
+Residual awake-only idea: cuBLAS-per-MoE-expert (predicted-neg — experts already grouped-TC fp16).
+
 ## Cycle log
 (append dated one-liners per cycle: target, verdict, branch)
