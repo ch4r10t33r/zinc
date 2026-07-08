@@ -53,7 +53,7 @@ The closest row is Gemma 4 31B decode at `1.01x`. We are still cooking: the next
 |----------|-----|---------|--------|
 | **Linux** | AMD RDNA4 (RX 9070, AI PRO R9700) | Vulkan | Primary — hand-tuned shaders |
 | **Linux** | AMD RDNA3 (RX 7900 XTX, etc.) | Vulkan | Supported |
-| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan | Experimental bring-up |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan | Supported — validated benchmark target |
 | **macOS** | Apple Silicon (M1, M2, M3, M4, M5) | Metal | Supported — native MSL shaders |
 
 ZINC focuses on current local-inference models people are actively running:
@@ -68,23 +68,24 @@ Latest checked-in benchmark artifact, same machine, same weights, same prompt:
 | Platform | Compared models | Decode vs llama.cpp | Prefill vs llama.cpp | Read this as |
 |----------|----------------:|--------------------:|---------------------:|--------------|
 | AMD RDNA4 / Vulkan | 5 | 117% avg, 5/5 model wins | 135% avg, 5/5 model wins | Clean current sweep: every published RDNA model is ahead on decode, prefill, end-to-end, and model-level overall |
+| Intel Arc / Vulkan | 5 | 103% avg, 5/5 model wins | 181% avg, 5/5 model wins | Official Linux Vulkan target; all five catalog rows validate on the public Intel node, with performance tuning still younger than RDNA4 |
 | Apple Silicon / Metal | 5 | 87% avg, 1 model win | 54% avg, 1 model win | Mixed by model; Gemma 31B and Qwen 35B are closest |
-| Intel Arc / Vulkan | 5 | 102% avg, 3 model wins | 59% avg, 1 model win | Decode is viable; prefill still trails on most rows |
 
 Full per-model numbers are in [Benchmarks](#benchmarks) and on the public
 dashboard: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks).
 
 ## Start Here
 
-Works the same on Linux (AMD GPU) and macOS (Apple Silicon):
+Works the same on Linux (AMD or Intel GPU) and macOS (Apple Silicon):
 
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
 zig build -Doptimize=ReleaseFast
 
-# On RDNA4 Linux, enable cooperative matrix
-export RADV_PERFTEST=coop_matrix  # skip on macOS
+# On RDNA4 Linux, enable cooperative matrix.
+# Skip this on Intel Arc and macOS.
+export RADV_PERFTEST=coop_matrix
 
 # Verify GPU, shaders, and runtime
 ./zig-out/bin/zinc --check
@@ -116,6 +117,7 @@ validated models listed below.
 | API | Serve OpenAI-compatible `/v1` endpoints with streaming responses |
 | Models | Manage catalog models with `list`, `pull`, `use`, `active`, and `rm` |
 | AMD GPUs | Run the Vulkan backend with RDNA-tuned wave64, cooperative-matrix, and fused-op shaders |
+| Intel Arc | Run the Linux Vulkan backend on Arc Xe2/Battlemage GPUs with the same managed catalog and benchmark harness |
 | Apple Silicon | Run the native Metal backend with MSL shaders, zero-copy mmap, and simdgroup ops |
 | Setup | Let ZINC select the available backend at build time: Vulkan on Linux, Metal on macOS |
 
@@ -123,22 +125,23 @@ validated models listed below.
 
 - Continuous batching and multi-tenant serving are still roadmap work
 - The supported-model list is intentionally narrow
-- Apple Silicon performance tuning is ongoing (RDNA4 path is more mature)
+- Apple Silicon and Intel Arc performance tuning are ongoing (RDNA4 path is more mature)
 
 ## The Problem
 
 Consumer GPUs have the hardware for fast LLM inference — bandwidth, compute, VRAM — but the software doesn't use it:
 
 - **AMD RDNA3/RDNA4**: ROCm doesn't support them. vLLM requires ROCm. llama.cpp's Vulkan path has no RDNA-specific tuning. These $500–1500 cards sit idle.
+- **Intel Arc**: Arc B-series has the VRAM and Vulkan support to run useful local models, but most local inference stacks treat it as a compatibility path rather than a first-class target.
 - **Apple Silicon**: MLX and llama.cpp Metal work, but leave performance on the table. No engine is built from scratch around Metal's strengths (unified memory, simdgroup ops, zero-copy mmap).
 
 ## The Solution
 
 ZINC builds an inference engine tuned for the hardware you actually have.
 
-**Hand-tuned shaders for each platform.** On AMD: wave64, cooperative matrix, architecture-aware tiling via Vulkan compute. On Apple Silicon: native MSL kernels with simdgroup reductions, zero-copy model loading, and Metal pipeline tuning. Not a generic backend that happens to run — built to extract real performance from each GPU.
+**Hand-tuned shaders for each platform.** On AMD: wave64, cooperative matrix, architecture-aware tiling via Vulkan compute. On Intel Arc: the same Linux Vulkan runtime with Arc-aware device detection, model-fit checks, and benchmark coverage. On Apple Silicon: native MSL kernels with simdgroup reductions, zero-copy model loading, and Metal pipeline tuning. Not a generic backend that happens to run — built to extract real performance from each GPU.
 
-**One binary, no driver stack.** No ROCm, no CUDA, no Python. Build with Zig, point at a GGUF, run inference. The right backend (Vulkan or Metal) is selected automatically at build time.
+**One binary, no driver stack.** No ROCm, no Python. Build with Zig, point at a GGUF, run inference. The right backend (Vulkan or Metal) is selected automatically at build time.
 
 **Drop-in compatible.** OpenAI-compatible API, built-in chat UI, managed model catalog. Point your existing client at it and it works.
 
@@ -146,11 +149,11 @@ ZINC builds an inference engine tuned for the hardware you actually have.
 
 The list below matches the current managed model catalog, not a broader wishlist.
 
-- [Qwen 3.5 9B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — supported on AMD RDNA4 16/32 GB, Apple Silicon, and Intel Arc
-- [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
-- [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
-- [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
-- [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
+- [Qwen 3.5 9B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — supported on AMD RDNA4 16/32 GB, Intel Arc, and Apple Silicon
+- [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB, Intel Arc 32 GB, and Apple Silicon
+- [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB, Intel Arc 32 GB, and Apple Silicon
+- [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB, Intel Arc 32 GB, and Apple Silicon
+- [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB, Intel Arc 32 GB, and Apple Silicon
 
 - Use `zinc model list --json` for machine-readable model metadata
 - Current throughput and latency numbers live on the public benchmarks page: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks)
@@ -273,7 +276,7 @@ See also: [CONTRIBUTING.md](./CONTRIBUTING.md) · [Code of Conduct](./CODE_OF_CO
 
 ## Benchmarks
 
-The tables below are pulled directly from the published benchmark data at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest RDNA refresh: 2026-07-01 UTC. Numbers are median tok/s across the suite's runs, with ZINC and llama.cpp on the same hardware, weights, and prompt.
+The tables below are pulled directly from the published benchmark data at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refreshes: RDNA 2026-07-01 UTC, Intel Arc 2026-07-07 UTC, Metal 2026-06-13 UTC. Numbers are median tok/s across the suite's runs, with ZINC and llama.cpp on the same hardware, weights, and prompt.
 
 ### AMD RDNA4 — Radeon AI PRO R9700 (Vulkan)
 
@@ -295,9 +298,20 @@ The tables below are pulled directly from the published benchmark data at [zolot
 | Qwen 3.6 27B Dense Q4_K_M | 15.87 | 104.34 | 15% | 15.44 | 21.93 | 70% |
 | Qwen 3.6 35B A3B UD Q4_K_XL | 97.17 | 300.71 | 33% | **81.64** | 63.09 | **131%** |
 
+### Intel Arc — Intel(R) Graphics BMG G31 (Vulkan)
+
+| Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3.6 35B A3B UD Q4_K_XL | **191.18** | 135.39 | **141%** | **75.26** | 75.07 | **100%** |
+| Qwen 3.5 9B Q4_K_M | **191.06** | 141.98 | **135%** | **55.98** | 54.00 | **104%** |
+| Qwen 3.6 27B Dense Q4_K_M | **92.21** | 37.07 | **249%** | **20.01** | 19.23 | **104%** |
+| Gemma 4 26B-A4B MoE Q4_K_M | **492.97** | 247.57 | **199%** | **64.98** | 62.43 | **104%** |
+| Gemma 4 31B Q4_K_M | **120.83** | 67.23 | **180%** | **18.01** | 17.37 | **104%** |
+
 ### Where we stand vs llama.cpp
 
 - **Ahead of llama.cpp on RDNA4**: aggregate prefill and decode are ahead for all five published RDNA models in the latest suite. Qwen 3.6 35B-A3B decode is `1.54x`, Gemma 4 26B MoE decode is `1.11x`, and Gemma 4 31B dense decode is narrowly ahead at `1.01x`.
+- **Intel Arc is official now**: the current Intel Arc Vulkan matrix completes all five catalog rows, with ZINC ahead on both prefill and decode for every headline model. The margins are smaller than RDNA4 on decode and the path is still younger operationally, but it is now a supported target.
 - **Still close**: Gemma 4 31B long-context decode remains a tight row even though the model-level RDNA result is ahead overall.
 - **Metal is mixed by model**: Gemma 4 31B prefill and Qwen 3.6 35B decode are ahead of llama.cpp, Gemma 4 31B decode is essentially tied, and the smaller Qwen dense rows still need backend-specific tuning.
 
@@ -312,18 +326,18 @@ For local benchmark commands, harnesses, and methodology, see:
 |-----------|--------|
 | Vulkan infrastructure | Done |
 | GGUF parser + model loader | Done |
-| GPU detection (RDNA3/4) | Done |
+| GPU detection (AMD/Intel Vulkan) | Done |
 | Native BPE tokenizer (from GGUF) | Done |
 | GLSL compute shaders (16) | Done |
 | Compute graph + architecture builders | Done |
-| Forward pass (decode loop) | Working — 166.80 tok/s on RDNA4 and 33.86 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
-| Forward pass (prefill loop) | Working — 540.33 tok/s on RDNA4 for Qwen 3.6 35B-A3B; Metal prefill is fast on Qwen 3 8B and Gemma 4 31B but uneven across the catalog |
+| Forward pass (decode loop) | Working — 166.80 tok/s on RDNA4, 75.26 tok/s on Intel Arc, and 81.64 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
+| Forward pass (prefill loop) | Working — 540.33 tok/s on RDNA4 and 191.18 tok/s on Intel Arc for Qwen 3.6 35B-A3B; Metal prefill is fast on Qwen 3 8B and Gemma 4 31B but uneven across the catalog |
 | GPU SSM shaders + cmd batching | Done — RDNA decode is 166.80 tok/s on Qwen 3.6 35B |
 | HTTP server + OpenAI API | Done — Qwen 35B-A3B raw API ~100 tok/s on RDNA4 and Metal server path in progress |
 | Continuous batching | Phase 4 |
 | TurboQuant KV compression | Phase 5 |
 
-Validated on AMD Radeon AI PRO R9700 (RDNA4): Vulkan 1.3 init, GGUF parsing, 21 GB model loaded to VRAM, 723-node MoE graph built, coherent inference output verified against CPU reference.
+Validated on AMD Radeon AI PRO R9700 (RDNA4) and Intel Arc BMG G31-class hardware: Vulkan 1.3 init, GGUF parsing, large catalog models loaded to VRAM, MoE graphs built, coherent inference output verified, and public benchmark rows published against llama.cpp on the same machines.
 
 ## Next Steps
 
@@ -332,7 +346,7 @@ The next push is turning the clean RDNA headline sweep into a wider, harder-to-m
 1. **Widen the Gemma 4 31B margin** — it is ahead in the current RDNA suite, but decode is only `1.01x` llama.cpp. This is the row most likely to regress if we stop paying attention.
 2. **Extend the sweep across more scenarios** — the headline five-model board is green; long-context and long-draft cells need the same level of repeatable coverage.
 3. **Keep improving MoE and SSM prefill** — RDNA prefill now wins the published rows, but the best kernel work is still in batching SSM projections, reducing recurrent-state traffic, and opening more hybrid fast paths.
-4. **Port the RDNA discipline to Metal and Intel** — Apple Silicon and Intel Arc stay public in the same benchmark format, even where they are not winning yet.
+4. **Harden Intel Arc and Metal** — Intel Arc is now in the official support matrix, and Apple Silicon remains public in the same benchmark format; both need the same repeatable tuning discipline RDNA already has.
 5. **Keep the dashboard honest** — all public claims should come from the fair server-vs-server harness, not one-off CLI runs or mixed warmup conditions.
 
 The detailed cycle-50 field report is in the [RDNA optimization blog post](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).

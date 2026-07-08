@@ -101,6 +101,9 @@ export function parseArgs(argv) {
     rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
       ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
       : 0,
+    rdnaLlamaCli: process.env.ZINC_RDNA_LLAMA_CLI_REMOTE ?? process.env.ZINC_LLAMA_CLI_REMOTE ?? null,
+    rdnaLlamaServer: process.env.ZINC_RDNA_LLAMA_SERVER_REMOTE ?? process.env.ZINC_LLAMA_SERVER_REMOTE ?? null,
+    rdnaLlamaDevice: process.env.ZINC_RDNA_LLAMA_DEVICE ?? null,
     requireRdnaDeviceSubstring: process.env.ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING ?? null,
     cudaSync: false,
     cudaBuild: false,
@@ -223,6 +226,15 @@ export function parseArgs(argv) {
       case "--rdna-vk-device":
         args.rdnaVkDevice = parseInteger(argv[++i], "--rdna-vk-device");
         break;
+      case "--rdna-llama-cli":
+        args.rdnaLlamaCli = argv[++i] ?? args.rdnaLlamaCli;
+        break;
+      case "--rdna-llama-server":
+        args.rdnaLlamaServer = argv[++i] ?? args.rdnaLlamaServer;
+        break;
+      case "--rdna-llama-device":
+        args.rdnaLlamaDevice = argv[++i] ?? args.rdnaLlamaDevice;
+        break;
       case "--require-rdna-device-substring":
         args.requireRdnaDeviceSubstring = argv[++i] ?? args.requireRdnaDeviceSubstring;
         break;
@@ -310,6 +322,10 @@ function usage() {
   --rdna-workdir <path>       Override remote ZINC checkout path
   --rdna-vk-device <n>        Vulkan device index on the RDNA node (default 0; env: ZINC_RDNA_VK_DEVICE).
                               Use 'vulkaninfo --summary' on the node to pick the discrete GPU.
+  --rdna-llama-cli <path>     Override remote RDNA llama-cli baseline binary
+  --rdna-llama-server <path>  Override remote RDNA llama-server baseline binary
+  --rdna-llama-device <dev>   Override RDNA llama.cpp --device value, e.g. Vulkan1 or ROCm0.
+                              Use 'none' for builds that should not receive --device.
   --require-rdna-device-substring <s>
                               Refuse to run if the selected Vulkan device name does not contain <s>
                               (env: ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING). E.g. 'GFX1201' for R9700.
@@ -1129,6 +1145,8 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_MOE_Q8_1_GATE_UP_COLS",
   "ZINC_MOE_Q8_1_DOWN_COLS",
   "ZINC_MOE_Q5K_Q8_1_DOWN_ACC",
+  "ZINC_MOE_Q6K_COLS",
+  "ZINC_MOE_PREFIX_SHARED_EXACT",
   "ZINC_MOE_FUSED_GATE_UP",
   "ZINC_MOE_FUSED_GATE_UP_SWIGLU",
   "ZINC_MOE_SINGLETON_TAIL_SPLIT",
@@ -1968,12 +1986,12 @@ async function detectRemoteLlamaServerPath(creds, searchRoots, override = null) 
   return candidate || null;
 }
 
-async function detectRdnaLlamaCliPath(creds) {
-  return detectRemoteLlamaCliPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], process.env.ZINC_LLAMA_CLI_REMOTE ?? null);
+async function detectRdnaLlamaCliPath(creds, args) {
+  return detectRemoteLlamaCliPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], args.rdnaLlamaCli ?? null);
 }
 
-async function detectRdnaLlamaServerPath(creds) {
-  return detectRemoteLlamaServerPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], process.env.ZINC_LLAMA_SERVER_REMOTE ?? null);
+async function detectRdnaLlamaServerPath(creds, args) {
+  return detectRemoteLlamaServerPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], args.rdnaLlamaServer ?? null);
 }
 
 async function runSeries({ label, warmupRuns, runs, command, parser, cwd, timeoutMs }) {
@@ -2906,6 +2924,7 @@ async function buildRdnaCreds(args) {
     workdir: args.rdnaWorkdir,
     env: { RADV_PERFTEST: "coop_matrix" },
     vkDevice: args.rdnaVkDevice ?? 1,
+    serverDeviceArgs: args.rdnaLlamaDevice != null ? llamaDeviceArgs(args.rdnaLlamaDevice) : undefined,
   };
 }
 
@@ -3028,8 +3047,8 @@ async function runRdnaTarget(args) {
   await prepareRdna(args, creds);
   await verifyRdnaZincBackend(args, creds);
   await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
-  const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds);
-  const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds);
+  const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds, args);
+  const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds, args);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
   const zincProvenance = args.rdnaSync
     ? await captureGitProvenance(ROOT)

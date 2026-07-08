@@ -1,15 +1,15 @@
 #version 460
 // ZINC — Count tokens routed to each expert.
 //
-// Effort 6 Step 3-of-5: foundation helper for the MUL_MAT_ID tiled GEMM port.
-// The MUL_MAT_ID GEMM (still to be ported, Step 1+2) uses a per-expert
+// Effort 6 Step 3-of-5: foundation helper for the routed tiled GEMM port.
+// The routed MoE GEMM uses a per-expert
 // early-exit `if (ic*BN >= data_expert_count[expert_idx]) return;` to skip
 // workgroups whose expert has zero routed tokens. This shader produces that
 // `data_expert_count` buffer.
 //
 // Direct port of the reference implementation's count_experts.comp — same shader interface, same
 // reduction pattern (256-thread atomic-free shared-memory sum). Structurally
-// identical so a future Q4_K mul_mm_id port can drop in unchanged.
+// aligned with mul_mm_id_q4k.comp so the validation path can share counts.
 //
 // Bindings:
 //   binding 0: A — readonly u32 array of expert IDs (the routing buffer).

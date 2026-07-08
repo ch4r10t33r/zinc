@@ -10,8 +10,8 @@ If you just want to run inference, see [Getting Started](/zinc/docs/getting-star
 |------|---------|-------------|
 | **Zig** | 0.15.2+ | Host compiler for all Zig source |
 | **Bun** | Latest | TypeScript test runner, site builder, API benchmarks |
-| **glslc** | shaderc 2023.8 | Compiles GLSL compute shaders to SPIR-V (Linux/AMD only) |
-| **Vulkan SDK** | 1.3+ | Runtime for AMD GPU dispatch (Linux only) |
+| **glslc** | shaderc 2023.8 | Compiles GLSL compute shaders to SPIR-V (Linux Vulkan only) |
+| **Vulkan SDK** | 1.3+ | Runtime for AMD and Intel Arc GPU dispatch (Linux only) |
 | **Xcode CLI Tools** | Latest | Metal compiler and frameworks (macOS only) |
 
 On macOS (Apple Silicon):
@@ -21,7 +21,7 @@ brew install zig bun
 xcode-select --install
 ```
 
-On Linux (AMD GPU):
+On Linux (AMD or Intel Arc GPU):
 
 ```bash
 # Zig: https://ziglang.org/download/
@@ -212,7 +212,7 @@ batching should raise aggregate throughput materially without linear p95 growth.
 
 ```bash
 # Generate the benchmark artifact that powers /zinc/benchmarks.
-# Legacy "both" runs RDNA + Metal; use "all" to include the Intel Arc node.
+# Legacy "both" runs RDNA + Metal; use "all" to include Intel Arc and CUDA nodes.
 bun tools/performance_suite.mjs --target both --rdna-sync --rdna-build --rdna-start-llama --output /tmp/zinc-performance.json
 bun tools/performance_suite.mjs --target intel --output /tmp/zinc-intel-performance.json
 ```
@@ -231,9 +231,13 @@ zig build hot-bench -Doptimize=ReleaseFast
 
 For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning/), the [AMD GPU Reference](/zinc/docs/amd-gpu-reference/), and the [Intel GPU Reference](/zinc/docs/intel-gpu-reference/).
 
-## RDNA4 Test Node
+## Remote Benchmark Nodes
 
-For AMD GPU testing, the project uses remote RDNA4 nodes. Environment setup:
+For AMD GPU testing, the project uses remote RDNA4 nodes. Intel Arc benchmark nodes use a separate environment namespace so published support runs do not collide with RDNA credentials or workdirs.
+
+### RDNA4 nodes
+
+Environment setup:
 
 ```bash
 # .env file in repo root

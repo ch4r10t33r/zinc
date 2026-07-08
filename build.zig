@@ -281,12 +281,12 @@ pub fn build(b: *std.Build) void {
         "qk_norm_rope_kv_write",
         "qk_norm_rope_kv_write_batched",
         "k_norm_rope_kv_write_batched",
-        // Effort-6 GEMM port: tiled Q4_K dense GEMM (Step 1) for LM head
-        // and per-expert count helper (Step 3). The MUL_MAT_ID gather
-        // (mul_mm_id_q4k) and Q8_1-activation variant (mul_mmq_q4k) were
-        // landed as foundations but never wired; reverted in cycle 40
-        // pivot. See loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md.
+        // Effort-6 GEMM port: tiled Q4_K dense GEMM plus its routed MoE
+        // gather sibling. Both are compile-registered foundations; production
+        // prefill still uses route-packed columns until the routed GEMM has a
+        // layer replay validator.
         "mul_mm_q4k",
+        "mul_mm_id_q4k",
         "mul_mm_q4k_gate_up_swiglu",
         "mul_mm_q4k_gate_up_geglu",
         "mul_mm_q4k_gate_up_geglu_full",

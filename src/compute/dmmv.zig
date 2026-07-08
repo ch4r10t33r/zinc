@@ -138,6 +138,7 @@ pub const GemmaTop1GateUpColsPushConstants = extern struct {
     y_offset: u32,
     ids_stride: u32,
     x_route_divisor: u32,
+    x_token_base: u32 = 0,
 };
 
 /// Push constants for the fused split-K merge + o_proj DMMV-acc shader
@@ -266,6 +267,27 @@ pub const MulMmQ4KPush = extern struct {
     a_offset: u32,
     b_offset: u32,
     d_offset: u32,
+};
+
+/// Push constants for `mul_mm_id_q4k.comp`, the routed MoE gather sibling
+/// of `MulMmQ4KPush`. Offsets follow existing GEMM conventions: `a_offset`
+/// and `batch_stride_a` are bytes, `b_offset`, `d_offset`, `stride_b`,
+/// `stride_d`, and `batch_stride_d` are f32 elements, and `ids_offset` is
+/// in u32 elements.
+pub const MulMmIdQ4KPush = extern struct {
+    M: u32,
+    K: u32,
+    stride_b: u32,
+    stride_d: u32,
+    batch_stride_a: u32,
+    batch_stride_d: u32,
+    nei0: u32,
+    nei1: u32,
+    nbi1: u32,
+    a_offset: u32,
+    b_offset: u32,
+    d_offset: u32,
+    ids_offset: u32,
 };
 
 /// Push constants for the int8 DP4a full-tile Q6_K dense-down GEMM.
@@ -546,12 +568,12 @@ pub const DmmvDispatch = struct {
     /// consumers (dmmv_q8_0_q8_1, dmmv_q4k_q8_1) share this exact
     /// 36-byte-per-block layout.
     pipeline_quantize_q8_1: ?Pipeline,
-    /// Effort-6 Step 3 foundation for the MUL_MAT_ID tiled GEMM port.
+    /// Effort-6 Step 3 foundation for the routed tiled GEMM path.
     /// Counts how many tokens were routed to each expert. Output is a
-    /// `[n_experts]` u32 buffer that the future MUL_MAT_ID GEMM uses for the
-    /// per-expert early-exit. Pipeline loads at startup; no production
-    /// callers until the tiled GEMM (Steps 1+2) lands. 2 bindings (A routing
-    /// in, D counts out), push = CountExpertsPush.
+    /// `[n_experts]` u32 buffer consumed by the dormant mul_mm_id_q4k path
+    /// for per-expert early exits. Pipeline loads at startup; no production
+    /// callers until replay validation lands. 2 bindings (A routing in,
+    /// D counts out), push = CountExpertsPush.
     pipeline_count_experts: ?Pipeline,
     /// Packs a token-major route cache into expert-major active blocks.
     pipeline_moe_route_pack: ?Pipeline,
@@ -561,10 +583,16 @@ pub const DmmvDispatch = struct {
     /// threads; BK=32 (one Q4_K sub-block) per outer step. Pipeline loads
     /// at startup; this cycle wires it under ZINC_MUL_MM_LM_HEAD=1 to the
     /// final-tail LM head dispatch as a correctness-exercise (LM head
-    /// fires once per prefill so the perf-hotpath impact is small). Step 2
-    /// will add the MUL_MAT_ID variant. 3 bindings (A weights, B f32
-    /// activations, D f32 outputs), push = MulMmQ4KPush.
+    /// fires once per prefill so the perf-hotpath impact is small). The
+    /// routed mul_mm_id_q4k sibling is registered separately. 3 bindings
+    /// (A weights, B f32 activations, D f32 outputs), push = MulMmQ4KPush.
     pipeline_mul_mm_q4k: ?Pipeline,
+    /// Routed MoE gather sibling of pipeline_mul_mm_q4k. The shader consumes
+    /// token-major route ids plus per-expert counts and scatters outputs by
+    /// token/slot. It is compile-registered as a validation target; production
+    /// prefill still uses route-packed columns until this path has numeric
+    /// replay coverage.
+    pipeline_mul_mm_id_q4k: ?Pipeline,
     /// Same GEMM as pipeline_mul_mm_q4k but the output ACCUMULATES into
     /// d_data (d[idx] += result). Used by the fused dense-FFN residual path
     /// to eliminate the standalone barrier + scale_accumulate dispatch.
@@ -1343,7 +1371,7 @@ pub const DmmvDispatch = struct {
             log.info("quantize_q8_1 pipeline loaded (mul_mmq foundation)", .{});
         }
 
-        // Effort 6 Step 3: foundation helper for MUL_MAT_ID GEMM port.
+        // Effort 6 Step 3: foundation helper for the routed GEMM path.
         // Counts tokens-per-expert from a per-(token, layer) routing buffer.
         // 2 bindings (A routing in, D counts out), push = CountExpertsPush.
         const count_experts_push_size = @sizeOf(CountExpertsPush);
@@ -1353,7 +1381,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_count_experts != null) {
-            log.info("count_experts pipeline loaded (MUL_MAT_ID GEMM foundation; not yet wired)", .{});
+            log.info("count_experts pipeline loaded (routed GEMM foundation; not yet wired)", .{});
         }
 
         const moe_route_pack_push_size = @sizeOf(MoeRoutePackPush);
@@ -1378,6 +1406,15 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q4k != null) {
             log.info("mul_mm_q4k pipeline loaded (tiled Q4_K dense GEMM; LM head opt-in via ZINC_MUL_MM_LM_HEAD=1)", .{});
+        }
+        const mul_mm_id_q4k_push_size = @sizeOf(MulMmIdQ4KPush);
+        const mul_mm_id_q4k_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_id_q4k.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_id_q4k = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_id_q4k_path, 5, mul_mm_id_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_id_q4k shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_id_q4k != null) {
+            log.info("mul_mm_id_q4k pipeline loaded (routed Q4_K MoE GEMM foundation; not yet selected)", .{});
         }
         const mul_mm_q4k_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_down_acc.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_down_acc = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_down_acc_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -2375,6 +2412,7 @@ pub const DmmvDispatch = struct {
             .pipeline_count_experts = pipeline_count_experts,
             .pipeline_moe_route_pack = pipeline_moe_route_pack,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
+            .pipeline_mul_mm_id_q4k = pipeline_mul_mm_id_q4k,
             .pipeline_mul_mm_q4k_down_acc = pipeline_mul_mm_q4k_down_acc,
             .pipeline_mul_mm_q4k_down_acc_wide = pipeline_mul_mm_q4k_down_acc_wide,
             .pipeline_mul_mm_q4k_tail8 = pipeline_mul_mm_q4k_tail8,
@@ -2883,6 +2921,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = 0,
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },
@@ -2927,6 +2966,7 @@ pub const DmmvDispatch = struct {
         expert_stride: u32,
         ids_stride: u32,
         x_route_divisor: u32,
+        x_token_base: u32,
         a_offset: u32,
         y_offset: u32,
     ) !void {
@@ -2942,6 +2982,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = x_token_base,
         };
         const infos = [7]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
@@ -2989,6 +3030,7 @@ pub const DmmvDispatch = struct {
         expert_stride: u32,
         ids_stride: u32,
         x_route_divisor: u32,
+        x_token_base: u32,
         a_offset: u32,
         y_offset: u32,
     ) !void {
@@ -3004,6 +3046,7 @@ pub const DmmvDispatch = struct {
             .y_offset = y_offset,
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
+            .x_token_base = x_token_base,
         };
         const infos = [8]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
@@ -3413,6 +3456,81 @@ pub const DmmvDispatch = struct {
             wg_x,
             wg_y,
             1,
+        );
+    }
+
+    /// Dispatch the routed tiled Q4_K MoE GEMM (`mul_mm_id_q4k.comp`).
+    /// One dispatch covers all experts: grid.x tiles output rows, grid.y
+    /// tiles routed token/slot columns per expert, and grid.z is expert id.
+    /// `counts_buf[e]` must contain the number of token/slot pairs routed to
+    /// expert `e`; `ids_buf` is the token-major top-k route table scanned by
+    /// the shader. This path is a validation foundation and is not selected
+    /// by production prefill yet.
+    pub fn recordMulMmIdQ4K(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        batch_stride_a: u32,
+        batch_stride_d: u32,
+        nei0: u32,
+        nei1: u32,
+        nbi1: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+        ids_offset: u32,
+        n_experts: u32,
+        n_tile_y: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_id_q4k) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or n_experts == 0 or n_tile_y == 0) return error.InvalidArgument;
+        if (stride_b == 0 or stride_d == 0 or batch_stride_a == 0 or batch_stride_d == 0) return error.InvalidArgument;
+        if (nei0 == 0 or nei1 == 0 or nbi1 == 0) return error.InvalidArgument;
+        const push = MulMmIdQ4KPush{
+            .M = M,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .batch_stride_a = batch_stride_a,
+            .batch_stride_d = batch_stride_d,
+            .nei0 = nei0,
+            .nei1 = nei1,
+            .nbi1 = nbi1,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+            .ids_offset = ids_offset,
+        };
+        const infos = [5]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            (M + 31) / 32,
+            n_tile_y,
+            n_experts,
         );
     }
 
@@ -5834,6 +5952,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_count_experts) |*p| p.deinit();
         if (self.pipeline_moe_route_pack) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_id_q4k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_down_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_down_acc_wide) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_tail8) |*p| p.deinit();

@@ -2,7 +2,7 @@
 
 Hardware specifications, memory-bandwidth analysis, compiler-visible opcode surface, and ZINC tuning notes for Intel Arc B-series GPUs. This page is the Intel counterpart to the AMD RDNA reference and focuses on Battlemage / Xe2 discrete cards.
 
-Scope note: this reference was checked on 2026-05-17. It covers the currently public B-series desktop and workstation line: Arc B580, Arc B570, Arc Pro B70, Arc Pro B65, Arc Pro B60, and Arc Pro B50. ZINC's Intel Vulkan path is experimental; use this page as an engineering reference, not a claim of feature parity with the RDNA path.
+Scope note: this reference was checked on 2026-05-17 and updated after Intel Arc entered ZINC's official support matrix. It covers the currently public B-series desktop and workstation line: Arc B580, Arc B570, Arc Pro B70, Arc Pro B65, Arc Pro B60, and Arc Pro B50. ZINC's Intel Vulkan path is supported for the managed catalog models validated in the public benchmark suite, but the tuning depth is still younger than the RDNA4 path. Use this page as an engineering reference for Arc-specific performance work, not a claim that every RDNA optimization has an Intel equivalent yet.
 
 ## Reading The Tables
 
@@ -44,6 +44,18 @@ The important inference split is not "gaming card versus pro card"; it is memory
 - B50 is a low-power 16 GB card. Its 224 GB/s bandwidth is the limiting factor for single-stream decode, not the 16 GB capacity.
 - B580 is the strongest consumer B-series small-model card: 12 GB, 456 GB/s, high clock, and 233 INT8 TOPS.
 - B570 is capacity-limited first. The 10 GB VRAM pool is tight for 8B-class models once KV cache and temporary buffers are included.
+
+## ZINC Support Status
+
+Intel Arc is a supported Linux Vulkan target in ZINC. The current public Intel benchmark artifact validates the same five managed catalog rows used on RDNA, Metal, and CUDA:
+
+- Qwen 3.5 9B Q4_K_M
+- Qwen3.6 35B-A3B UD Q4_K_XL
+- Qwen3.6 27B Dense Q4_K_M (catalog status remains experimental as a model target)
+- Gemma 4 31B Q4_K_M
+- Gemma 4 26B-A4B MoE Q4_K_M
+
+The benchmark target is an Intel Arc BMG G31-class Vulkan node. The headline rows are ahead of the same-machine llama.cpp baseline on prefill and decode, but this should still be read as "officially supported and measurable" rather than "fully optimized." The next Arc work is deeper prefill/attention tuning, cleaner server latency, and more coverage across consumer B-series SKUs.
 
 ## LLM Inference Analysis
 
