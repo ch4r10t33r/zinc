@@ -34,11 +34,16 @@ TIMEOUT DISCIPLINE (this cycle is killed at 50min): wrap EVERY box zinc run in '
 
 MEMORY CONTINUITY (critical — the prior run re-litigated because cycles skipped this): BEFORE you finish — win, negative, OR running low on time — you MUST append a dated one-liner (target + verdict + branch) to BOTH project_effort26_beat_llama memory AND ${EFFORT}'s cycle log, so the next cycle does not repeat your work. Read those FIRST and never re-attempt a documented dead end (flash-attention is DEAD — do not rebuild it).
 
-NEVER: break token-correctness, commit unvalidated code or a swept working tree, push to main, disturb other loops' worktrees/GPUs, or trust a single boost-noisy measurement. STOP after one increment."
+NEVER: break token-correctness, commit unvalidated code or a swept working tree, push to main, disturb other loops' worktrees/GPUs, or trust a single boost-noisy measurement. STOP after one increment. CONVERGENCE SELF-STOP: if your HONEST assessment is that the effort has CONVERGED — every lever is shipped or documented-dead and no valid autonomous 50-min increment remains — AND the cycle log already shows a prior cycle reaching the same STOP/converged conclusion, then instead of appending YET ANOTHER redundant confirmation, write the file /tmp/e30_converged containing a one-line reason; the driver halts the loop when that file exists. Only write it when genuinely converged — a real new lever means keep working, do NOT write it."
 
 echo "=== e30 prefill loop START $(date -u +%FT%TZ) — 5090, root=$ROOT, max $MAX ===" | tee -a "$LOG"
 i=0
+rm -f /tmp/e30_converged   # fresh start clears any stale convergence sentinel
 while [ "$i" -lt "$MAX" ]; do
+  if [ -f /tmp/e30_converged ]; then
+    echo "=== e30 HALT: convergence sentinel present — $(head -1 /tmp/e30_converged 2>/dev/null) ($(date -u +%FT%TZ)) ===" | tee -a "$LOG"
+    break
+  fi
   i=$((i + 1))
   echo "===== e30 cycle $i / $MAX — $(date -u +%FT%TZ) =====" | tee -a "$LOG"
   # macOS has no `timeout`; perl alarm survives exec → hard-kills a cycle at 50min.
