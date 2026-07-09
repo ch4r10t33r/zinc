@@ -20,6 +20,7 @@ const GGMLType = @import("model/gguf.zig").GGMLType;
 const loader = @import("model/loader.zig");
 
 const log = std.log.scoped(.hot_bench);
+const qwen_a3b_prefill_full_cols: u32 = 288;
 
 const BenchModelConfig = struct {
     hidden_dim: u32 = 2048,
@@ -33,6 +34,7 @@ const BenchModelConfig = struct {
 
 const BenchKind = enum {
     dmmv_q8_0,
+    mul_mm_q8_0_dp4a,
     ssm_delta_net,
 };
 
@@ -40,6 +42,7 @@ const BenchCase = struct {
     name: []const u8,
     kind: BenchKind,
     M: u32 = 0,
+    N: u32 = 0,
     K: u32 = 0,
     d_inner: u32 = 0,
     dt_rank: u32 = 0,
@@ -49,6 +52,7 @@ const BenchCase = struct {
     fn describe(self: BenchCase, buf: []u8) []const u8 {
         return switch (self.kind) {
             .dmmv_q8_0 => std.fmt.bufPrint(buf, "q8_0 M={d} K={d}", .{ self.M, self.K }) catch self.name,
+            .mul_mm_q8_0_dp4a => std.fmt.bufPrint(buf, "q8_0_dp4a M={d} N={d} K={d}", .{ self.M, self.N, self.K }) catch self.name,
             .ssm_delta_net => std.fmt.bufPrint(buf, "delta d_inner={d} dt_rank={d} d_state={d} n_group={d}", .{
                 self.d_inner,
                 self.dt_rank,
@@ -70,6 +74,7 @@ const BenchResult = struct {
     bytes_per_iter: u64,
     iterations: u32,
     M: u32 = 0,
+    N: u32 = 0,
     K: u32 = 0,
     d_inner: u32 = 0,
     dt_rank: u32 = 0,
@@ -210,7 +215,7 @@ fn printUsage() void {
         \\  --iterations <n>         Timed iterations per case (default: 200)
         \\  --warmup <n>             Warmup iterations per case (default: 25)
         \\  --working-set <n>        Rotate across N buffer sets to reduce cache-hot bias (default: 16)
-        \\  --case <name>            Run one case: q8_router | q8_shared_gate_up | q8_shared_down | q8_ssm_out | ssm_delta
+        \\  --case <name>            Run one case: q8_router | q8_shared_gate_up | q8_shared_down | q8_ssm_out | q8_ssm_qkv_dp4a | q8_ssm_z_dp4a | q8_ssm_out_dp4a | ssm_delta
         \\  --json                   Emit JSON instead of log lines
         \\  -h, --help               Show this help
         \\
@@ -253,12 +258,16 @@ fn loadBenchModelConfig(path: ?[]const u8, allocator: std.mem.Allocator) !BenchM
     return cfg;
 }
 
-fn buildCases(cfg: BenchModelConfig) [5]BenchCase {
+fn buildCases(cfg: BenchModelConfig) [8]BenchCase {
+    const conv_channels = cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
     return .{
         .{ .name = "q8_router", .kind = .dmmv_q8_0, .M = cfg.n_experts, .K = cfg.hidden_dim },
         .{ .name = "q8_shared_gate_up", .kind = .dmmv_q8_0, .M = cfg.shared_expert_intermediate_dim, .K = cfg.hidden_dim },
         .{ .name = "q8_shared_down", .kind = .dmmv_q8_0, .M = cfg.hidden_dim, .K = cfg.shared_expert_intermediate_dim },
         .{ .name = "q8_ssm_out", .kind = .dmmv_q8_0, .M = cfg.hidden_dim, .K = cfg.ssm_d_inner },
+        .{ .name = "q8_ssm_qkv_dp4a", .kind = .mul_mm_q8_0_dp4a, .M = conv_channels, .N = qwen_a3b_prefill_full_cols, .K = cfg.hidden_dim },
+        .{ .name = "q8_ssm_z_dp4a", .kind = .mul_mm_q8_0_dp4a, .M = cfg.ssm_d_inner, .N = qwen_a3b_prefill_full_cols, .K = cfg.hidden_dim },
+        .{ .name = "q8_ssm_out_dp4a", .kind = .mul_mm_q8_0_dp4a, .M = cfg.hidden_dim, .N = qwen_a3b_prefill_full_cols, .K = cfg.ssm_d_inner },
         .{
             .name = "ssm_delta",
             .kind = .ssm_delta_net,
@@ -331,6 +340,19 @@ fn dmmvBytesPerIter(M: u32, K: u32) u64 {
     return q8MatrixBytes(M, K) + @as(u64, K) * @sizeOf(f32) + @as(u64, M) * @sizeOf(f32);
 }
 
+fn q8ActivationBytes(N: u32, K: u32) u64 {
+    return @as(u64, N) * (@as(u64, K) + @as(u64, K / 32) * @sizeOf(f32));
+}
+
+fn q8Dp4aBytesPerIter(M: u32, N: u32, K: u32) u64 {
+    const weight_bytes = q8MatrixBytes(M, K) * @as(u64, N / 32);
+    const quantize_input_bytes = @as(u64, N) * @as(u64, K) * @sizeOf(f32);
+    const quantize_output_bytes = q8ActivationBytes(N, K);
+    const activation_bytes = quantize_output_bytes * @as(u64, M / 32);
+    const output_bytes = @as(u64, N) * @as(u64, M) * @sizeOf(f32);
+    return weight_bytes + quantize_input_bytes + quantize_output_bytes + activation_bytes + output_bytes;
+}
+
 fn ssmDeltaApproxBytesPerIter(d_inner: u32, dt_rank: u32, d_state: u32, n_group: u32) u64 {
     const head_v_dim = d_inner / dt_rank;
     const conv_channels = d_inner + 2 * n_group * d_state;
@@ -386,6 +408,23 @@ const DmmvSlot = struct {
     fn deinit(self: *DmmvSlot) void {
         self.weights.deinit();
         self.x.deinit();
+        self.y.deinit();
+        self.* = undefined;
+    }
+};
+
+const Dp4aSlot = struct {
+    weights: Buffer,
+    x_f32: Buffer,
+    x_packed: Buffer,
+    x_scale: Buffer,
+    y: Buffer,
+
+    fn deinit(self: *Dp4aSlot) void {
+        self.weights.deinit();
+        self.x_f32.deinit();
+        self.x_packed.deinit();
+        self.x_scale.deinit();
         self.y.deinit();
         self.* = undefined;
     }
@@ -455,6 +494,104 @@ fn recordRepeatedDmmv(
             const ds = slot.descriptor_set orelse return error.DescriptorSetMissing;
             try dispatch.recordDispatch(cmd, .q8_0, ds, M, K, 0, 0, 0);
         }
+    }
+    timer.writeEnd(cmd);
+}
+
+fn computeReadToWriteBuffersBarrier(cmd: *const CommandBuffer, ranges: []const CommandBuffer.BufferRange) void {
+    if (ranges.len == 0) return;
+    if (ranges.len > 8) {
+        cmd.computeBarrier();
+        return;
+    }
+    var barriers: [8]vk.c.VkBufferMemoryBarrier = undefined;
+    for (ranges, 0..) |range, i| {
+        barriers[i] = .{
+            .sType = vk.c.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.c.VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT,
+            .srcQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = range.buffer,
+            .offset = 0,
+            .size = range.size,
+        };
+    }
+    vk.c.vkCmdPipelineBarrier(
+        cmd.handle,
+        vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0,
+        null,
+        @intCast(ranges.len),
+        &barriers[0],
+        0,
+        null,
+    );
+}
+
+fn recordRepeatedQ8Dp4a(
+    cmd: *CommandBuffer,
+    timer: *const TimestampTimer,
+    dispatch: *const DmmvDispatch,
+    push_desc_fn: ?@import("vulkan/instance.zig").PushDescriptorFn,
+    slots: []const Dp4aSlot,
+    M: u32,
+    N: u32,
+    K: u32,
+    iterations: u32,
+) !void {
+    if (push_desc_fn == null) return error.PushDescriptorsUnavailable;
+    if (dispatch.pipeline_quantize_act_q8 == null) return error.ShaderNotLoaded;
+    if (dispatch.pipeline_mul_mm_q8_0_full_dp4a == null) return error.ShaderNotLoaded;
+
+    timer.writeStart(cmd);
+    var i: u32 = 0;
+    while (i < iterations) : (i += 1) {
+        const slot = slots[i % slots.len];
+        if (i >= slots.len) {
+            const reusable_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = slot.x_packed.handle, .size = slot.x_packed.size },
+                .{ .buffer = slot.x_scale.handle, .size = slot.x_scale.size },
+            };
+            computeReadToWriteBuffersBarrier(cmd, &reusable_ranges);
+        }
+        try dispatch.recordQuantizeActQ8(
+            cmd,
+            push_desc_fn,
+            slot.x_f32.handle,
+            slot.x_f32.size,
+            slot.x_packed.handle,
+            slot.x_packed.size,
+            slot.x_scale.handle,
+            slot.x_scale.size,
+            N,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = slot.x_packed.handle, .size = slot.x_packed.size },
+            .{ .buffer = slot.x_scale.handle, .size = slot.x_scale.size },
+        };
+        cmd.computeBuffersBarrier(&q8_ranges);
+        try dispatch.recordMulMmQ8_0FullDp4a(
+            cmd,
+            push_desc_fn,
+            slot.weights.handle,
+            slot.weights.size,
+            slot.x_packed.handle,
+            slot.x_packed.size,
+            slot.x_scale.handle,
+            slot.x_scale.size,
+            slot.y.handle,
+            slot.y.size,
+            M,
+            N,
+            K,
+            0,
+            0,
+        );
     }
     timer.writeEnd(cmd);
 }
@@ -606,6 +743,88 @@ fn runDmmvCase(
     };
 }
 
+fn runQ8Dp4aCase(
+    allocator: std.mem.Allocator,
+    instance: *const Instance,
+    queue: vk.c.VkQueue,
+    cmd_pool: *const CommandPool,
+    cmd: *CommandBuffer,
+    timer: *const TimestampTimer,
+    dispatch: *const DmmvDispatch,
+    gpu_config: *const gpu_detect.GpuConfig,
+    case: BenchCase,
+    iterations: u32,
+    warmup: u32,
+    working_set: u32,
+) !BenchResult {
+    if (instance.push_descriptor_fn == null) return error.PushDescriptorsUnavailable;
+    if (case.M == 0 or case.N == 0 or case.K == 0) return error.InvalidArgument;
+    if ((case.M & 31) != 0 or (case.N & 31) != 0 or (case.K & 31) != 0) return error.InvalidArgument;
+
+    const weight_bytes = q8MatrixBytes(case.M, case.K);
+    const x_elems = @as(u64, case.N) * @as(u64, case.K);
+    const x_packed_bytes = @as(u64, case.N) * @as(u64, case.K / 4) * @sizeOf(u32);
+    const x_scale_bytes = @as(u64, case.N) * @as(u64, case.K / 32) * @sizeOf(f32);
+    const y_bytes = @as(u64, case.N) * @as(u64, case.M) * @sizeOf(f32);
+    const slot_count: usize = @intCast(working_set);
+
+    const weight_blob = try allocator.alloc(u8, @intCast(weight_bytes));
+    defer allocator.free(weight_blob);
+
+    const x_host = try allocator.alloc(f32, @intCast(x_elems));
+    defer allocator.free(x_host);
+
+    const slots = try allocator.alloc(Dp4aSlot, slot_count);
+    defer allocator.free(slots);
+    var init_count: usize = 0;
+    errdefer {
+        for (slots[0..init_count]) |*slot| slot.deinit();
+    }
+
+    while (init_count < slot_count) : (init_count += 1) {
+        fillQ80Weights(weight_blob, case.M, case.K, @intCast(init_count * 19));
+        fillF32Pattern(x_host, 0.015625, @intCast(init_count * 23));
+
+        slots[init_count].weights = try initDeviceLocalWithBytes(instance, cmd_pool, weight_blob);
+        slots[init_count].x_f32 = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(x_host));
+        slots[init_count].x_packed = try createStorageBuffer(instance, @intCast(x_packed_bytes));
+        slots[init_count].x_scale = try createStorageBuffer(instance, @intCast(x_scale_bytes));
+        slots[init_count].y = try createStorageBuffer(instance, @intCast(y_bytes));
+    }
+    defer {
+        for (slots[0..slot_count]) |*slot| slot.deinit();
+    }
+
+    try cmd.reset();
+    try cmd.beginOneTime();
+    try recordRepeatedQ8Dp4a(cmd, timer, dispatch, instance.push_descriptor_fn, slots, case.M, case.N, case.K, warmup);
+    try warmupRecorded(cmd, queue);
+
+    try cmd.reset();
+    try cmd.beginOneTime();
+    try recordRepeatedQ8Dp4a(cmd, timer, dispatch, instance.push_descriptor_fn, slots, case.M, case.N, case.K, iterations);
+    const measured = try runRecorded(cmd, queue, timer);
+
+    const bytes_per_iter = q8Dp4aBytesPerIter(case.M, case.N, case.K);
+    const eff_gbps = (@as(f64, @floatFromInt(bytes_per_iter)) * @as(f64, @floatFromInt(iterations))) / (measured.gpu_ms / 1000.0) / 1_000_000_000.0;
+    const utilization = if (gpu_config.bandwidth_gbps > 0) eff_gbps / @as(f64, @floatFromInt(gpu_config.bandwidth_gbps)) * 100.0 else 0.0;
+
+    return .{
+        .name = case.name,
+        .kind = case.kind,
+        .gpu_ms_per_iter = measured.gpu_ms / @as(f64, @floatFromInt(iterations)),
+        .wall_ms_per_iter = measured.wall_ms / @as(f64, @floatFromInt(iterations)),
+        .overhead_ms_per_iter = @max(0.0, measured.wall_ms - measured.gpu_ms) / @as(f64, @floatFromInt(iterations)),
+        .effective_gbps = eff_gbps,
+        .utilization_pct = utilization,
+        .bytes_per_iter = bytes_per_iter,
+        .iterations = iterations,
+        .M = case.M,
+        .N = case.N,
+        .K = case.K,
+    };
+}
+
 fn runSsmDeltaCase(
     allocator: std.mem.Allocator,
     instance: *const Instance,
@@ -748,6 +967,18 @@ fn printResults(results: []const BenchResult) void {
                 result.M,
                 result.K,
             }),
+            .mul_mm_q8_0_dp4a => log.info("{s}: gpu={d:.3} ms/iter wall={d:.3} ms/iter overhead={d:.3} ms/iter | approx {d:.1} GB/s | {d:.1}% of peak | {d} B/iter | M={d} N={d} K={d}", .{
+                result.name,
+                result.gpu_ms_per_iter,
+                result.wall_ms_per_iter,
+                result.overhead_ms_per_iter,
+                result.effective_gbps,
+                result.utilization_pct,
+                result.bytes_per_iter,
+                result.M,
+                result.N,
+                result.K,
+            }),
             .ssm_delta_net => log.info("{s}: gpu={d:.3} ms/iter wall={d:.3} ms/iter overhead={d:.3} ms/iter | approx {d:.1} GB/s | {d:.1}% of peak | {d} B/iter | d_inner={d} dt_rank={d} d_state={d} n_group={d}", .{
                 result.name,
                 result.gpu_ms_per_iter,
@@ -820,6 +1051,7 @@ pub fn main() !void {
         });
         const result = switch (case.kind) {
             .dmmv_q8_0 => try runDmmvCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
+            .mul_mm_q8_0_dp4a => try runQ8Dp4aCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
             .ssm_delta_net => try runSsmDeltaCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &elt, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
         };
         try results.append(allocator, result);
@@ -842,11 +1074,19 @@ test "q8 dmmv bytes model matches 256x2048 router shape" {
     try std.testing.expectEqual(@as(u64, 566_272), dmmvBytesPerIter(256, 2048));
 }
 
+test "q8 dp4a bytes model matches qwen a3b ssm prefill tiles" {
+    try std.testing.expectEqual(@as(u64, 342_761_472), q8Dp4aBytesPerIter(8192, qwen_a3b_prefill_full_cols, 2048));
+    try std.testing.expectEqual(@as(u64, 173_555_712), q8Dp4aBytesPerIter(2048, qwen_a3b_prefill_full_cols, 4096));
+}
+
 test "bench defaults match current qwen35 hot shapes" {
     const cases = buildCases(.{});
     try std.testing.expectEqual(@as(u32, 256), cases[0].M);
     try std.testing.expectEqual(@as(u32, 512), cases[1].M);
     try std.testing.expectEqual(@as(u32, 2048), cases[2].M);
     try std.testing.expectEqual(@as(u32, 4096), cases[3].K);
-    try std.testing.expectEqual(@as(u32, 32), cases[4].dt_rank);
+    try std.testing.expectEqual(@as(u32, 8192), cases[4].M);
+    try std.testing.expectEqual(qwen_a3b_prefill_full_cols, cases[4].N);
+    try std.testing.expectEqual(@as(u32, 4096), cases[6].K);
+    try std.testing.expectEqual(@as(u32, 32), cases[7].dt_rank);
 }

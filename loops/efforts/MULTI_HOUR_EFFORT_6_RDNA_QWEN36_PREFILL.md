@@ -2145,6 +2145,28 @@ was flat to slower: `766.26`, `989.22`, `882.91` tok/s, median `882.91 tok/s`
 versus the surrounding clean-build checks in the `~890-901 tok/s` band. Rejected
 and restored `SPACK=9`; the padding is still justified on this RDNA path.
 
+Added A3B Q8 DP4a prefill hot-bench coverage (2026-07-08): `hot-bench` now has
+three production-shaped Q8_0 DP4a cases that record the same quantize-activation
+plus full-tile GEMM pair used by Qwen3.6 A3B SSM prefill full columns. The cases
+use the 300-token prompt's real 288 full columns and rotate buffer sets to avoid
+measuring a decode-only cache-hot DMMV path by mistake.
+
+RDNA R9700 measurements with `RADV_PERFTEST=coop_matrix`, `--iterations 200`,
+`--warmup 25`, and the canonical `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`:
+
+| case | shape | gpu ms/iter | modeled GB/s |
+|---|---:|---:|---:|
+| `q8_ssm_qkv_dp4a` | `M=8192 N=288 K=2048` | `0.502` | `683.4` |
+| `q8_ssm_z_dp4a` | `M=4096 N=288 K=2048` | `0.265` | `651.8` |
+| `q8_ssm_out_dp4a` | `M=2048 N=288 K=4096` | `0.319` | `543.3` |
+
+Next optimization target from this evidence: `q8_ssm_out_dp4a`. The qkv/z
+shapes are already over the modeled board-bandwidth line because the byte model
+counts expected weight/activation rereads, while SSM-out is lower and lines up
+with the recurring `out_proj` profile bucket. Useful probes should change the
+SSM-out shader shape or scheduling, not reroute qkv/z away from the current
+DP4a branch.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
