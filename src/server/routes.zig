@@ -2039,6 +2039,11 @@ fn ensureRequestedModelActive(
         if (current.managed_id) |active_id| {
             if (std.mem.eql(u8, active_id, requested_model)) return true;
         }
+        // Models loaded from a raw path (-m) or Hugging Face spec (-hf) have
+        // no managed id or catalog entry; /v1/models advertises them under
+        // their display name, so accept that id as a no-op instead of
+        // attempting (and failing) a managed swap.
+        if (std.mem.eql(u8, current.display_name, requested_model)) return true;
         if (comptime runtime.supports_model_management) {
             // The model may have been loaded by --model <path> with no managed_id;
             // resolve the catalog entry that corresponds to the on-disk file so
