@@ -403,7 +403,7 @@ pub fn build(b: *std.Build) void {
     } else if (is_macos) {
         exe_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         exe_mod.addIncludePath(b.path("src/metal"));
         exe_mod.linkFramework("Metal", .{});
@@ -569,7 +569,7 @@ pub fn build(b: *std.Build) void {
         bench_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_mod.addIncludePath(b.path("src/metal"));
         bench_mod.linkFramework("Metal", .{});
@@ -599,7 +599,7 @@ pub fn build(b: *std.Build) void {
         bench_shapes_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_shapes_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_shapes_mod.addIncludePath(b.path("src/metal"));
         bench_shapes_mod.linkFramework("Metal", .{});
@@ -628,7 +628,7 @@ pub fn build(b: *std.Build) void {
         bench_gemm_q4k_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_gemm_q4k_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_gemm_q4k_mod.addIncludePath(b.path("src/metal"));
         bench_gemm_q4k_mod.linkFramework("Metal", .{});
@@ -657,7 +657,7 @@ pub fn build(b: *std.Build) void {
         bench_dmmv_q4k_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_dmmv_q4k_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_dmmv_q4k_mod.addIncludePath(b.path("src/metal"));
         bench_dmmv_q4k_mod.linkFramework("Metal", .{});
@@ -694,7 +694,7 @@ pub fn build(b: *std.Build) void {
     } else if (is_macos) {
         test_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         test_mod.addIncludePath(b.path("src/metal"));
         test_mod.linkFramework("Metal", .{});
