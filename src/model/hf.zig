@@ -8,8 +8,28 @@ const std = @import("std");
 const catalog = @import("catalog.zig");
 const managed = @import("managed.zig");
 
-const manifest_body_limit = 1024 * 1024;
+// The ollama-style manifest is a small bounded document (config + layers +
+// ggufFile), typically ~1 KiB; the cap only guards against a misbehaving
+// server.
+const manifest_body_limit = 4 * 1024 * 1024;
 const redirect_buffer_len = 4096;
+
+/// GGUF file metadata resolved from the Hugging Face manifest endpoint.
+const ResolvedFile = struct {
+    /// Repo-relative GGUF file name (`ggufFile.rfilename`).
+    file_name: []u8,
+    /// Lowercase sha256 hex of the file (`ggufFile.lfs.sha256`), or null
+    /// when the manifest does not carry a usable digest.
+    sha256: ?[]u8,
+    /// File size in bytes, or 0 when unknown.
+    size_bytes: u64,
+
+    fn deinit(self: *ResolvedFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_name);
+        if (self.sha256) |s| allocator.free(s);
+        self.* = undefined;
+    }
+};
 
 /// Parsed `-hf` argument: a Hugging Face repo plus a quantization tag.
 pub const Spec = struct {
@@ -66,9 +86,11 @@ pub fn cacheId(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
 /// Ensures the model described by an `-hf` spec is installed and returns its path.
 ///
 /// If the spec is already cached the installed path is returned without any
-/// network access. Otherwise the GGUF file name is resolved via the Hugging
-/// Face manifest endpoint and the file is downloaded through the managed
-/// pull pipeline (staged `.partial` file, progress bar, manifest write).
+/// network access. Otherwise the GGUF file name and sha256 digest are
+/// resolved via the Hugging Face manifest endpoint and the file is
+/// downloaded through the managed pull pipeline (staged `.partial` file,
+/// progress bar, manifest write), which verifies the download against the
+/// pinned digest when the manifest provides one.
 /// @param spec_text Raw `-hf` argument (`owner/repo[:quant]`).
 /// @param allocator Used for HTTP, path construction, and the returned path.
 /// @param writer Receives human-readable status lines and download progress.
@@ -86,13 +108,13 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
         return path;
     }
 
-    const file_name = try resolveGgufFileName(allocator, spec, writer);
-    defer allocator.free(file_name);
+    var resolved = try resolveGgufFile(allocator, spec, writer);
+    defer resolved.deinit(allocator);
 
     const download_url = try std.fmt.allocPrint(
         allocator,
         "https://huggingface.co/{s}/resolve/main/{s}?download=true",
-        .{ spec.repo, file_name },
+        .{ spec.repo, resolved.file_name },
     );
     defer allocator.free(download_url);
     const homepage_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}", .{spec.repo});
@@ -105,11 +127,13 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
         .family = "huggingface",
         .format = "gguf",
         .quantization = spec.tag,
-        .file_name = file_name,
+        .file_name = resolved.file_name,
         .homepage_url = homepage_url,
         .download_url = download_url,
-        .sha256 = "",
-        .size_bytes = 0,
+        // Pinning the manifest digest makes the pull pipeline verify the
+        // pre-download x-linked-etag and the post-download file hash.
+        .sha256 = resolved.sha256 orelse "",
+        .size_bytes = resolved.size_bytes,
         .required_vram_bytes = 0,
         .default_context_length = 4096,
         .recommended_for_chat = false,
@@ -122,7 +146,7 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
     return managed.resolveInstalledModelPath(id, allocator);
 }
 
-fn resolveGgufFileName(allocator: std.mem.Allocator, spec: Spec, writer: anytype) ![]u8 {
+fn resolveGgufFile(allocator: std.mem.Allocator, spec: Spec, writer: anytype) !ResolvedFile {
     const manifest_url = try std.fmt.allocPrint(
         allocator,
         "https://huggingface.co/v2/{s}/manifests/{s}",
@@ -186,23 +210,67 @@ fn resolveGgufFileName(allocator: std.mem.Allocator, spec: Spec, writer: anytype
         try body.appendSlice(allocator, chunk[0..n]);
     }
 
-    const file_name = extractGgufFileName(body.items) orelse return error.HfManifestMissingGguf;
-    return allocator.dupe(u8, file_name);
+    return parseManifestBody(allocator, body.items);
 }
 
-fn extractGgufFileName(body: []const u8) ?[]const u8 {
-    const gguf_pos = std.mem.indexOf(u8, body, "\"ggufFile\"") orelse return null;
-    const tail = body[gguf_pos..];
-    const key = "\"rfilename\"";
-    const key_pos = std.mem.indexOf(u8, tail, key) orelse return null;
-    var rest = tail[key_pos + key.len ..];
-    var i: usize = 0;
-    while (i < rest.len and (rest[i] == ':' or rest[i] == ' ' or rest[i] == '\t')) i += 1;
-    if (i >= rest.len or rest[i] != '"') return null;
-    rest = rest[i + 1 ..];
-    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    if (end == 0) return null;
-    return rest[0..end];
+fn parseManifestBody(allocator: std.mem.Allocator, body: []const u8) !ResolvedFile {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return error.HfManifestFailed;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.HfManifestFailed,
+    };
+    const gguf = switch (root.get("ggufFile") orelse return error.HfManifestMissingGguf) {
+        .object => |o| o,
+        else => return error.HfManifestMissingGguf,
+    };
+    const file_name = switch (gguf.get("rfilename") orelse return error.HfManifestMissingGguf) {
+        .string => |s| s,
+        else => return error.HfManifestMissingGguf,
+    };
+    if (file_name.len == 0) return error.HfManifestMissingGguf;
+
+    var size_bytes: u64 = 0;
+    if (gguf.get("size")) |v| switch (v) {
+        .integer => |n| {
+            if (n > 0) size_bytes = @intCast(n);
+        },
+        else => {},
+    };
+
+    var sha256: ?[]u8 = null;
+    errdefer if (sha256) |s| allocator.free(s);
+    if (gguf.get("lfs")) |lfs_value| switch (lfs_value) {
+        .object => |lfs| {
+            if (lfs.get("sha256")) |v| switch (v) {
+                .string => |s| {
+                    if (isSha256Hex(s)) {
+                        const owned = try allocator.dupe(u8, s);
+                        for (owned) |*c| c.* = std.ascii.toLower(c.*);
+                        sha256 = owned;
+                    }
+                },
+                else => {},
+            };
+        },
+        else => {},
+    };
+
+    return .{
+        .file_name = try allocator.dupe(u8, file_name),
+        .sha256 = sha256,
+        .size_bytes = size_bytes,
+    };
+}
+
+fn isSha256Hex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
 }
 
 test "parseSpec accepts repo without tag" {
@@ -233,13 +301,41 @@ test "cacheId is a lowercase single path component" {
     try std.testing.expect(std.mem.indexOfScalar(u8, id, '/') == null);
 }
 
-test "extractGgufFileName reads rfilename from the ggufFile object" {
+test "parseManifestBody reads file name, digest, and size from ggufFile" {
     const manifest_body =
-        \\{"siblings":[{"rfilename":"README.md"}],"ggufFile":{"rfilename":"Qwen3.5-9B-Q4_K_M.gguf","size":5650000000},"other":{"rfilename":"mmproj.gguf"}}
+        \\{"siblings":[{"rfilename":"README.md"}],"ggufFile":{"rfilename":"Qwen3.5-9B-Q4_K_M.gguf","size":5650000000,"lfs":{"sha256":"9465E63A22ADD5354D9BB4B99E90117043C7124007664907259BD16D043BB031","size":5650000000}},"other":{"rfilename":"mmproj.gguf"}}
     ;
-    try std.testing.expectEqualStrings("Qwen3.5-9B-Q4_K_M.gguf", extractGgufFileName(manifest_body).?);
+    var resolved = try parseManifestBody(std.testing.allocator, manifest_body);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Qwen3.5-9B-Q4_K_M.gguf", resolved.file_name);
+    try std.testing.expectEqualStrings(
+        "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+        resolved.sha256.?,
+    );
+    try std.testing.expectEqual(@as(u64, 5_650_000_000), resolved.size_bytes);
 }
 
-test "extractGgufFileName returns null when ggufFile is absent" {
-    try std.testing.expect(extractGgufFileName("{\"siblings\":[{\"rfilename\":\"README.md\"}]}") == null);
+test "parseManifestBody tolerates a missing or malformed digest" {
+    const manifest_body =
+        \\{"ggufFile":{"rfilename":"model.gguf","size":-5,"lfs":{"sha256":"not-a-digest"}}}
+    ;
+    var resolved = try parseManifestBody(std.testing.allocator, manifest_body);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("model.gguf", resolved.file_name);
+    try std.testing.expectEqual(@as(?[]u8, null), resolved.sha256);
+    try std.testing.expectEqual(@as(u64, 0), resolved.size_bytes);
+}
+
+test "parseManifestBody rejects manifests without a ggufFile" {
+    try std.testing.expectError(
+        error.HfManifestMissingGguf,
+        parseManifestBody(std.testing.allocator, "{\"siblings\":[{\"rfilename\":\"README.md\"}]}"),
+    );
+}
+
+test "parseManifestBody rejects non-JSON bodies" {
+    try std.testing.expectError(
+        error.HfManifestFailed,
+        parseManifestBody(std.testing.allocator, "<html>rate limited</html>"),
+    );
 }
