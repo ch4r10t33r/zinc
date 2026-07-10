@@ -169,7 +169,9 @@ fn preflightCatalogDrift(
     writer: anytype,
 ) !void {
     if (metadata.size_bytes) |size_bytes| {
-        if (size_bytes != entry.size_bytes) {
+        // size_bytes == 0 means the entry carries no pinned size (e.g. `-hf`
+        // downloads), so there is no catalog expectation to drift from.
+        if (entry.size_bytes != 0 and size_bytes != entry.size_bytes) {
             try writer.print(
                 "Catalog note: upstream size is {d:.2} GiB but pinned catalog size is {d:.2} GiB; continuing because sha256 pin is authoritative.\n",
                 .{ bytesToGiB(size_bytes), bytesToGiB(entry.size_bytes) },
@@ -505,6 +507,11 @@ pub fn pullModelWithObserver(
     defer allocator.free(manifest_path);
 
     if (isInstalled(entry.id, allocator)) {
+        // No pinned sha256 (e.g. `-hf` downloads): trust the cached file.
+        if (entry.sha256.len == 0) {
+            try writer.print("Already installed: {s}\n", .{final_path});
+            return;
+        }
         const actual_sha = try computeFileSha256Hex(final_path, allocator);
         defer allocator.free(actual_sha);
         if (std.ascii.eqlIgnoreCase(actual_sha, entry.sha256)) {

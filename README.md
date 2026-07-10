@@ -99,6 +99,9 @@ export RADV_PERFTEST=coop_matrix
 # Run a prompt (--chat applies the model's chat template for instruct models)
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "Hello" --chat
 
+# Or download any GGUF repo straight from Hugging Face (llama.cpp-style -hf)
+./zig-out/bin/zinc -hf Qwen/Qwen3-0.6B-GGUF:Q8_0 --prompt "Hello" --chat
+
 # Or open the chat UI in your browser
 ./zig-out/bin/zinc chat
 ```
@@ -231,6 +234,14 @@ Use these for model selection, cache management, and API details:
 
 ```bash
 ./zig-out/bin/zinc -m /path/to/model.gguf --prompt "The capital of France is"
+```
+
+Or skip the manual download and pass a Hugging Face repo (with an optional
+`:quant` tag) — ZINC downloads the GGUF into its model cache on first use and
+reuses it afterwards:
+
+```bash
+./zig-out/bin/zinc -hf Qwen/Qwen3-0.6B-GGUF:Q8_0 --prompt "The capital of France is"
 ```
 
 ### Run the Server
