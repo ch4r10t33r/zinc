@@ -945,6 +945,74 @@ const RequestTool = struct {
 /// even when `tools` is non-empty.
 pub const ToolChoice = enum { auto, required, none };
 
+/// Max stop sequences accepted, matching the OpenAI API's own cap.
+const max_stop_sequences = 4;
+
+/// Normalizes an OpenAI `stop` field (absent, a single string, or an array
+/// of strings) into an owned slice of owned strings. Empty strings and a
+/// count beyond `max_stop_sequences` are silently dropped rather than
+/// rejected — matching how other soft-limit fields in this API are handled.
+/// @param allocator Owns the returned slice and each string in it.
+/// @param value Raw `stop` field from the parsed request body, if present.
+/// @returns Heap-allocated slice of heap-allocated stop strings; caller frees both.
+fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const []const u8 {
+    const v = value orelse return &.{};
+    switch (v) {
+        .string => |s| {
+            if (s.len == 0) return &.{};
+            const out = try allocator.alloc([]const u8, 1);
+            out[0] = try allocator.dupe(u8, s);
+            return out;
+        },
+        .array => |arr| {
+            var list: std.ArrayList([]const u8) = .{};
+            errdefer {
+                for (list.items) |s| allocator.free(s);
+                list.deinit(allocator);
+            }
+            for (arr.items) |item| {
+                if (list.items.len >= max_stop_sequences) break;
+                switch (item) {
+                    .string => |s| {
+                        if (s.len == 0) continue;
+                        try list.append(allocator, try allocator.dupe(u8, s));
+                    },
+                    else => {},
+                }
+            }
+            return try list.toOwnedSlice(allocator);
+        },
+        else => return &.{},
+    }
+}
+
+fn freeStopSequences(allocator: std.mem.Allocator, stop: []const []const u8) void {
+    for (stop) |s| allocator.free(s);
+    if (stop.len > 0) allocator.free(stop);
+}
+
+/// Returns a message describing the first requested-but-unsupported chat
+/// parameter, or null if the request only uses supported behavior. Checked
+/// separately from JSON parsing so unsupported requests get a clear 400
+/// instead of a response that silently doesn't match what was asked for
+/// (e.g. `n:2` returning only one choice, or `logprobs` requested but never
+/// present in the response).
+fn firstUnsupportedChatParam(body: ChatRequestBody) ?[]const u8 {
+    if (body.n > 1) return "Field 'n' > 1 is not supported: only a single completion choice is generated";
+    if (logprobsRequested(body.logprobs)) return "Field 'logprobs' is not supported: token log-probabilities are not computed";
+    return null;
+}
+
+fn logprobsRequested(value: ?std.json.Value) bool {
+    const v = value orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |n| n > 0,
+        .null => false,
+        else => true,
+    };
+}
+
 fn parseToolChoice(value: ?std.json.Value) ToolChoice {
     const v = value orelse return .auto;
     switch (v) {
@@ -1053,6 +1121,9 @@ const ChatRequestBody = struct {
     enable_thinking: ?bool = null,
     tools: []const RequestTool = &.{},
     tool_choice: ?std.json.Value = null,
+    stop: ?std.json.Value = null,
+    n: u32 = 1,
+    logprobs: ?std.json.Value = null,
 };
 
 const ParsedChatRequest = struct {
@@ -1067,11 +1138,15 @@ const ParsedChatRequest = struct {
     enable_thinking: ?bool,
     tools: []const tool_format.ToolDefinition,
     tool_choice: ToolChoice,
+    /// Owned by `stop_allocator`; see `parseStopSequences`.
+    stop: []const []const u8,
+    stop_allocator: std.mem.Allocator,
     injected_default_system: bool = false,
     /// Owns parameters_json strings and tool_calls rendering.
     arena: std.heap.ArenaAllocator,
 
     fn deinit(self: *ParsedChatRequest) void {
+        freeStopSequences(self.stop_allocator, self.stop);
         self.parsed.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -1422,6 +1497,9 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         };
     }
 
+    const stop = try parseStopSequences(allocator, parsed.value.stop);
+    errdefer freeStopSequences(allocator, stop);
+
     return .{
         .parsed = parsed,
         .roles = roles[0..count],
@@ -1434,6 +1512,8 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .enable_thinking = parsed.value.enable_thinking,
         .tools = tools_out,
         .tool_choice = if (tools_enabled) parseToolChoice(parsed.value.tool_choice) else .auto,
+        .stop = stop,
+        .stop_allocator = allocator,
         .injected_default_system = injected_default_system,
         .arena = arena,
     };
@@ -1451,6 +1531,18 @@ fn dropInjectedDefaultSystemForGemma(parsed: *ParsedChatRequest, is_gemma: bool)
     parsed.contents = parsed.contents[1..];
     parsed.injected_default_system = false;
 }
+
+/// Combines the built-in template/leak stop strings with a request's
+/// client-supplied `stop` sequences into one list for `findStreamingStopStart`.
+/// @param allocator Owns the returned slice when `client_stops` is non-empty.
+fn combinedStopStrings(allocator: std.mem.Allocator, client_stops: []const []const u8) ![]const []const u8 {
+    if (client_stops.len == 0) return chat_stop_strs[0..];
+    const combined = try allocator.alloc([]const u8, chat_stop_strs.len + client_stops.len);
+    @memcpy(combined[0..chat_stop_strs.len], chat_stop_strs[0..]);
+    @memcpy(combined[chat_stop_strs.len..], client_stops);
+    return combined;
+}
+
 fn findFirstStop(text: []const u8, stop_strs: []const []const u8) ?usize {
     var first: ?usize = null;
     for (stop_strs) |stop| {
@@ -1615,8 +1707,8 @@ fn findRepeatedPhraseLoop(text: []const u8) ?usize {
     return null;
 }
 
-fn findStreamingStopStart(text: []const u8) ?usize {
-    var first: ?usize = findFirstStop(text, chat_stop_strs[0..]);
+fn findStreamingStopStart(text: []const u8, stop_strs: []const []const u8) ?usize {
+    var first: ?usize = findFirstStop(text, stop_strs);
     if (findUnexpectedThinkingTailStart(text)) |idx| {
         if (first == null or idx < first.?) first = idx;
     }
@@ -2098,6 +2190,11 @@ fn handleChatCompletions(
         return;
     }
 
+    if (firstUnsupportedChatParam(parsed.parsed.value)) |msg| {
+        try conn.sendError(400, "invalid_request_error", msg);
+        return;
+    }
+
     var generation_guard = GenerationGuard.acquire(server_state);
     defer generation_guard.release();
     if (!try ensureRequestedModelActive(conn, manager, server_state, parsed.parsed.value.model)) return;
@@ -2315,7 +2412,7 @@ fn handleChatCompletions(
                 return tok.isEndOfGeneration(token);
             }
         }.check;
-        const stop_strs = chat_stop_strs[0..];
+        const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
         var gen_text_buf: [32768]u8 = undefined; // accumulated decoded text for stop check
         var gen_text_len: usize = 0;
         var sent_text_len: usize = 0; // how much of gen_text has been confirmed safe to send
@@ -2414,7 +2511,7 @@ fn handleChatCompletions(
                 }
 
                 // Check for explicit chat stops, reopened think blocks, and leaked prompt-analysis tails.
-                if (findStreamingStopStart(gen_text_buf[0..gen_text_len])) |stop_idx| {
+                if (findStreamingStopStart(gen_text_buf[0..gen_text_len], stop_strs)) |stop_idx| {
                     gen_text_len = stop_idx;
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
@@ -2549,6 +2646,7 @@ fn handleChatCompletions(
         }
     } else {
         // Non-streaming: use same prefill+decode loop with stop detection
+        const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
         var text_buf: std.ArrayList(u8) = .{};
         defer text_buf.deinit(allocator);
         var ns_gen: u32 = 0;
@@ -2575,7 +2673,7 @@ fn handleChatCompletions(
                 }
                 text_buf.appendSlice(allocator, tok_utf8) catch break;
                 ns_gen += 1;
-                const hit = if (findStreamingStopStart(text_buf.items)) |pos| blk: {
+                const hit = if (findStreamingStopStart(text_buf.items, stop_strs)) |pos| blk: {
                     text_buf.shrinkRetainingCapacity(pos);
                     break :blk true;
                 } else false;
@@ -2587,7 +2685,7 @@ fn handleChatCompletions(
                 prev = runtime.sample(engine, &state, sampling, random);
                 state.generated_tokens.append(allocator, prev) catch {};
             }
-            if (!nsIsEog(tokenizer, prev) and ns_gen >= max_tokens and findStreamingStopStart(text_buf.items) == null) {
+            if (!nsIsEog(tokenizer, prev) and ns_gen >= max_tokens and findStreamingStopStart(text_buf.items, stop_strs) == null) {
                 finish_reason = .length;
             }
         }
@@ -2654,20 +2752,18 @@ fn handleChatCompletions(
             , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
             try conn.sendJson(200, wb.items);
         } else {
-            var escaped_buf: [16384]u8 = undefined;
-            const escaped_text = jsonEscape(response_text, &escaped_buf);
-            var resp_fixed_buf: [32768]u8 = undefined;
-            const resp = std.fmt.bufPrint(&resp_fixed_buf,
+            const escaped_text = try jsonEscapeAlloc(allocator, response_text);
+            defer allocator.free(escaped_text);
+            var wb: std.ArrayList(u8) = .{};
+            defer wb.deinit(allocator);
+            try wb.writer(allocator).print(
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 req_id,       ts,                         model_name,
                 escaped_text, @tagName(finish_reason),    prompt_tokens.len,
                 ns_gen,       prompt_tokens.len + ns_gen,
-            }) catch {
-                try conn.sendError(500, "internal_error", "Response too large");
-                return;
-            };
-            try conn.sendJson(200, resp);
+            });
+            try conn.sendJson(200, wb.items);
         }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
@@ -2767,21 +2863,19 @@ fn handleCompletions(
 
     const finish_reason = completionFinishReason(parsed.max_tokens, max_tokens, output_tokens.len);
 
-    var escaped_buf: [16384]u8 = undefined;
-    const escaped_text = jsonEscape(text_buf.items, &escaped_buf);
+    const escaped_text = try jsonEscapeAlloc(allocator, text_buf.items);
+    defer allocator.free(escaped_text);
 
-    var resp_buf: [32768]u8 = undefined;
-    const resp = std.fmt.bufPrint(&resp_buf,
+    var wb: std.ArrayList(u8) = .{};
+    defer wb.deinit(allocator);
+    try wb.writer(allocator).print(
         \\{{"id":"{s}","object":"text_completion","created":{d},"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         req_id,            ts,                                    model_name,
         escaped_text,      @tagName(finish_reason),               prompt_tokens.len,
         output_tokens.len, prompt_tokens.len + output_tokens.len,
-    }) catch {
-        try conn.sendError(500, "internal_error", "Response too large");
-        return;
-    };
-    try conn.sendJson(200, resp);
+    });
+    try conn.sendJson(200, wb.items);
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -3108,6 +3202,32 @@ test "ParsedRequest defaults" {
     try std.testing.expectEqual(@as(f32, 1.0), result.temperature);
 }
 
+/// Same escaping as `jsonEscape`, but grows to fit `input` instead of
+/// silently truncating. `jsonEscape`'s fixed destination buffer makes it a
+/// fit for small, bounded increments (a streamed delta chunk, a tool-call
+/// argument blob); a full/final response body has no such bound, and
+/// truncating it would silently drop content from the client's response
+/// with no error and no signal anything was cut.
+/// @param allocator Used for the returned buffer; caller owns and frees it.
+/// @param input Raw text to escape.
+/// @returns Heap-allocated JSON-escaped text.
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn jsonEscape(input: []const u8, buf: []u8) []const u8 {
     var out: usize = 0;
     for (input) |c| {
@@ -3404,6 +3524,116 @@ test "jsonEscape empty string" {
     var buf: [64]u8 = undefined;
     const result = jsonEscape("", &buf);
     try std.testing.expectEqualStrings("", result);
+}
+
+test "jsonEscape silently truncates input past the destination buffer" {
+    // Documents the existing behavior jsonEscapeAlloc exists to avoid for
+    // full/final response bodies: jsonEscape is a fit only for callers with
+    // a small, bounded increment (a streamed delta, a tool-call arg blob).
+    const input = "this text is much longer than the buffer";
+    var buf: [8]u8 = undefined;
+    const result = jsonEscape(input, &buf);
+    try std.testing.expect(result.len < input.len);
+    try std.testing.expect(std.mem.startsWith(u8, input, result));
+}
+
+test "jsonEscapeAlloc matches jsonEscape for input that fits a fixed buffer" {
+    var buf: [64]u8 = undefined;
+    const fixed = jsonEscape("hello \"world\"\n\t\\ end", &buf);
+    const alloced = try jsonEscapeAlloc(std.testing.allocator, "hello \"world\"\n\t\\ end");
+    defer std.testing.allocator.free(alloced);
+    try std.testing.expectEqualStrings(fixed, alloced);
+}
+
+test "jsonEscapeAlloc does not truncate input larger than jsonEscape's typical buffer" {
+    const long_input = try std.testing.allocator.alloc(u8, 20_000);
+    defer std.testing.allocator.free(long_input);
+    @memset(long_input, 'a');
+    // Sprinkle a few characters that need escaping throughout.
+    long_input[100] = '"';
+    long_input[10_000] = '\n';
+    long_input[19_999] = '\\';
+
+    const escaped = try jsonEscapeAlloc(std.testing.allocator, long_input);
+    defer std.testing.allocator.free(escaped);
+    // 20,000 bytes + 3 extra escape bytes (one each for ", \n, \\).
+    try std.testing.expectEqual(@as(usize, 20_003), escaped.len);
+    try std.testing.expect(std.mem.endsWith(u8, escaped, "\\\\"));
+}
+
+test "parseStopSequences: absent field yields empty slice" {
+    const stop = try parseStopSequences(std.testing.allocator, null);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 0), stop.len);
+}
+
+test "parseStopSequences: a single string becomes a one-element slice" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "\"\\n\\n\"", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 1), stop.len);
+    try std.testing.expectEqualStrings("\n\n", stop[0]);
+}
+
+test "parseStopSequences: an array of strings is preserved in order" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"a\",\"b\",\"c\"]", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 3), stop.len);
+    try std.testing.expectEqualStrings("a", stop[0]);
+    try std.testing.expectEqualStrings("b", stop[1]);
+    try std.testing.expectEqualStrings("c", stop[2]);
+}
+
+test "parseStopSequences: array is capped at max_stop_sequences, non-strings and empties are dropped" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"\",\"a\",42,\"b\",\"c\",\"d\",\"e\"]", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, max_stop_sequences), stop.len);
+    try std.testing.expectEqualStrings("a", stop[0]);
+    try std.testing.expectEqualStrings("d", stop[3]);
+}
+
+test "combinedStopStrings: no client stops returns the built-in list unallocated" {
+    const combined = try combinedStopStrings(std.testing.allocator, &.{});
+    try std.testing.expectEqual(chat_stop_strs.len, combined.len);
+}
+
+test "combinedStopStrings: appends client stops after the built-in list" {
+    const client_stops = [_][]const u8{ "STOP1", "STOP2" };
+    const combined = try combinedStopStrings(std.testing.allocator, &client_stops);
+    defer std.testing.allocator.free(combined);
+    try std.testing.expectEqual(chat_stop_strs.len + 2, combined.len);
+    try std.testing.expectEqualStrings("STOP1", combined[chat_stop_strs.len]);
+    try std.testing.expectEqualStrings("STOP2", combined[chat_stop_strs.len + 1]);
+}
+
+test "firstUnsupportedChatParam: defaults are accepted" {
+    const body = ChatRequestBody{};
+    try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
+}
+
+test "firstUnsupportedChatParam: n=1 is accepted, n>1 is rejected" {
+    var body = ChatRequestBody{ .n = 1 };
+    try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
+    body.n = 2;
+    try std.testing.expect(firstUnsupportedChatParam(body) != null);
+}
+
+test "logprobsRequested: null and false are not requested; true and a positive count are" {
+    try std.testing.expect(!logprobsRequested(null));
+    try std.testing.expect(!logprobsRequested(.{ .bool = false }));
+    try std.testing.expect(!logprobsRequested(.{ .integer = 0 }));
+    try std.testing.expect(logprobsRequested(.{ .bool = true }));
+    try std.testing.expect(logprobsRequested(.{ .integer = 5 }));
+}
+
+test "firstUnsupportedChatParam: logprobs requested is rejected" {
+    const body = ChatRequestBody{ .logprobs = .{ .bool = true } };
+    try std.testing.expect(firstUnsupportedChatParam(body) != null);
 }
 
 test "parseJsonFields defaults when fields missing" {
@@ -3705,7 +3935,7 @@ test "findStreamingStopStart detects leaked prompt-analysis tail" {
         "Overall, while Zig has potential, it is not yet the best choice for production kernel programming." ++
         "<think>\nThinking Process:\n1. Analyze the Request:\n" ++
         "    *   Current State: The assistant has already provided a response in the few-shot example.";
-    try std.testing.expect(findStreamingStopStart(raw) != null);
+    try std.testing.expect(findStreamingStopStart(raw, chat_stop_strs[0..]) != null);
 }
 
 test "trimRestartedAnswer strips duplicated restart from opening paragraph" {
