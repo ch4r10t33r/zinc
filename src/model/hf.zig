@@ -173,6 +173,8 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
     };
 
     try managed.pullModelWithObserver(entry, allocator, writer, null);
+    try writer.print("Remove later with: zinc model rm {s}\n", .{id});
+    try writer.flush();
     return managed.resolveInstalledModelPath(id, allocator);
 }
 

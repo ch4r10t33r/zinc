@@ -478,7 +478,7 @@ const banner =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -524,7 +524,7 @@ const banner_full =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -1575,7 +1575,12 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
         },
         .model_rm => {
             const model_id = config.command_model_id orelse return error.MissingArgValue;
-            _ = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
+            // `-hf` downloads share the managed cache but have no catalog
+            // entry, so accept any id that is installed on disk and only
+            // reject ids that are neither in the catalog nor installed.
+            if (catalog_mod.find(model_id) == null and !managed_mod.isInstalled(model_id, allocator)) {
+                return error.UnknownManagedModel;
+            }
 
             if (try tryRemoveManagedModelViaLocalServer(config.port, model_id, config.command_force, allocator)) |server_response| {
                 defer {
