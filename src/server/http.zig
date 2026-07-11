@@ -253,6 +253,10 @@ pub const Connection = struct {
         _ = std.posix.recv(self.stream.handle, &probe, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT) catch |err| {
             return switch (err) {
                 error.ConnectionResetByPeer, error.ConnectionRefused, error.SocketNotConnected => true,
+                // No data pending (the common case on a healthy connection)
+                // or any other unexpected error: default to "not closed",
+                // matching this function's conservative contract.
+                error.WouldBlock => false,
                 else => false,
             };
         };
@@ -372,13 +376,21 @@ test "isPeerClosed returns false on a graceful half-close (ambiguous case)" {
     // be treated as "peer gone": it is indistinguishable from a compliant
     // client that is still reading the response. See the isPeerClosed doc
     // comment.
+    //
+    // Not timing-dependent: a graceful FIN makes the MSG_PEEK recv succeed
+    // with 0 bytes rather than error, and isPeerClosed() returns false on
+    // every success path regardless of byte count. So this holds whether
+    // the FIN has arrived yet (WouldBlock, caught below and also false) or
+    // not — both branches agree. The sleep only makes the "FIN definitely
+    // arrived" case explicit; it isn't required for the assertion to hold.
     const pair = try loopbackPair();
     defer pair.server.close();
     pair.client.close();
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
+    try std.testing.expect(!conn.isPeerClosed()); // before the FIN necessarily arrives
     std.Thread.sleep(20 * std.time.ns_per_ms);
-    try std.testing.expect(!conn.isPeerClosed());
+    try std.testing.expect(!conn.isPeerClosed()); // after the FIN has definitely arrived
 }
 
 test "Server struct size" {
