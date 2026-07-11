@@ -6,6 +6,7 @@
 //! pipeline for transfer, staging, and manifest bookkeeping.
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const config = @import("config.zig");
 const managed = @import("managed.zig");
 
 // The ollama-style manifest is a small bounded document (config + layers +
@@ -95,6 +96,11 @@ pub fn cacheId(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
 /// @param allocator Used for HTTP, path construction, and the returned path.
 /// @param writer Receives human-readable status lines and download progress.
 /// @returns Heap-allocated absolute path to the installed GGUF; caller owns it.
+/// @note Models zinc cannot run are rejected before the download starts:
+/// quantizations with no kernels (`error.UnsupportedQuantization`, detected
+/// from the tag and the resolved file name) and architectures the loader
+/// does not recognise (`error.UnsupportedArchitecture`, detected from repo
+/// metadata when available).
 /// @note Gated or private repos are not supported: they fail with `error.HfAuthRequired`.
 pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: anytype) ![]u8 {
     const spec = try parseSpec(spec_text);
@@ -108,8 +114,32 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
         return path;
     }
 
+    // Pre-download validation: reject unsupported quantizations (from the
+    // tag, and later from the resolved file name) and unsupported model
+    // architectures (from repo metadata) before any bytes are transferred.
+    if (findRejectedQuantMarker(spec.tag)) |marker| {
+        try printUnsupportedQuant(writer, spec.tag, marker);
+        return error.UnsupportedQuantization;
+    }
+    if (try fetchRepoArchitecture(allocator, spec)) |arch_str| {
+        defer allocator.free(arch_str);
+        if (config.parseArchitecture(arch_str) == .unknown) {
+            try writer.print(
+                "Model architecture '{s}' is not supported by zinc. Supported architectures: llama/mistral, qwen2/qwen3 (dense and MoE), qwen3.5/3.6 (dense and MoE), gemma, gpt-oss, mamba, jamba.\n",
+                .{arch_str},
+            );
+            try writer.flush();
+            return error.UnsupportedArchitecture;
+        }
+    }
+
     var resolved = try resolveGgufFile(allocator, spec, writer);
     defer resolved.deinit(allocator);
+
+    if (findRejectedQuantMarker(resolved.file_name)) |marker| {
+        try printUnsupportedQuant(writer, resolved.file_name, marker);
+        return error.UnsupportedQuantization;
+    }
 
     const download_url = try std.fmt.allocPrint(
         allocator,
@@ -146,21 +176,21 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
     return managed.resolveInstalledModelPath(id, allocator);
 }
 
-fn resolveGgufFile(allocator: std.mem.Allocator, spec: Spec, writer: anytype) !ResolvedFile {
-    const manifest_url = try std.fmt.allocPrint(
-        allocator,
-        "https://huggingface.co/v2/{s}/manifests/{s}",
-        .{ spec.repo, spec.tag },
-    );
-    defer allocator.free(manifest_url);
+const HttpBody = struct {
+    status: std.http.Status,
+    body: []u8,
 
-    try writer.print("Resolving Hugging Face model: {s} (tag: {s})\n", .{ spec.repo, spec.tag });
-    try writer.flush();
+    fn deinit(self: *HttpBody, allocator: std.mem.Allocator) void {
+        allocator.free(self.body);
+        self.* = undefined;
+    }
+};
 
+fn httpGetJson(allocator: std.mem.Allocator, url: []const u8) !HttpBody {
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    const uri = try std.Uri.parse(manifest_url);
+    const uri = try std.Uri.parse(url);
     // Hugging Face only includes the resolved `ggufFile` object in the
     // manifest response when the User-Agent contains "llama-cpp". The typed
     // header slot must be overridden; an extra_headers entry would be sent
@@ -181,14 +211,6 @@ fn resolveGgufFile(allocator: std.mem.Allocator, spec: Spec, writer: anytype) !R
 
     var redirect_buffer: [redirect_buffer_len]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
-    switch (response.head.status.class()) {
-        .success => {},
-        else => switch (response.head.status) {
-            .unauthorized, .forbidden => return error.HfAuthRequired,
-            .not_found => return error.HfModelNotFound,
-            else => return error.HfManifestFailed,
-        },
-    }
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
@@ -210,7 +232,97 @@ fn resolveGgufFile(allocator: std.mem.Allocator, spec: Spec, writer: anytype) !R
         try body.appendSlice(allocator, chunk[0..n]);
     }
 
-    return parseManifestBody(allocator, body.items);
+    return .{
+        .status = response.head.status,
+        .body = try body.toOwnedSlice(allocator),
+    };
+}
+
+fn resolveGgufFile(allocator: std.mem.Allocator, spec: Spec, writer: anytype) !ResolvedFile {
+    const manifest_url = try std.fmt.allocPrint(
+        allocator,
+        "https://huggingface.co/v2/{s}/manifests/{s}",
+        .{ spec.repo, spec.tag },
+    );
+    defer allocator.free(manifest_url);
+
+    try writer.print("Resolving Hugging Face model: {s} (tag: {s})\n", .{ spec.repo, spec.tag });
+    try writer.flush();
+
+    var fetched = try httpGetJson(allocator, manifest_url);
+    defer fetched.deinit(allocator);
+    switch (fetched.status.class()) {
+        .success => {},
+        else => switch (fetched.status) {
+            .unauthorized, .forbidden => return error.HfAuthRequired,
+            .not_found => return error.HfModelNotFound,
+            else => return error.HfManifestFailed,
+        },
+    }
+
+    return parseManifestBody(allocator, fetched.body);
+}
+
+/// Fetches `gguf.architecture` from the Hugging Face model-info API, or
+/// returns null when the metadata is unavailable (network error, gated
+/// repo, non-GGUF repo). Best-effort: absence never blocks a download.
+fn fetchRepoArchitecture(allocator: std.mem.Allocator, spec: Spec) !?[]u8 {
+    const info_url = try std.fmt.allocPrint(
+        allocator,
+        "https://huggingface.co/api/models/{s}",
+        .{spec.repo},
+    );
+    defer allocator.free(info_url);
+
+    var fetched = httpGetJson(allocator, info_url) catch return null;
+    defer fetched.deinit(allocator);
+    if (fetched.status.class() != .success) return null;
+    return extractArchitecture(allocator, fetched.body);
+}
+
+fn extractArchitecture(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const gguf = switch (root.get("gguf") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    const arch = switch (gguf.get("architecture") orelse return null) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (arch.len == 0) return null;
+    return try allocator.dupe(u8, arch);
+}
+
+// Quantization families no zinc backend has kernels for; tensors in these
+// formats would be zero-filled at inference time (see dequantRow), so the
+// download is rejected up front. Formats supported by at least one backend
+// (Q4_K, Q5_0/Q5_1, Q5_K, Q6_K, Q8_0/Q8_1, MXFP4, F16, F32) pass through.
+const rejected_quant_markers = [_][]const u8{
+    "q2_k", "q3_k", "q4_0", "q4_1", "iq1", "iq2", "iq3", "iq4", "bf16", "tq1", "tq2",
+};
+
+fn printUnsupportedQuant(writer: anytype, name: []const u8, marker: []const u8) !void {
+    try writer.print(
+        "Quantization '{s}' is not supported by zinc: no backend has {s} kernels, so its tensors would be zero-filled at inference. Supported quantizations: Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, MXFP4, F16, F32 (e.g. retry with :Q4_K_M or :Q8_0).\n",
+        .{ name, marker },
+    );
+    try writer.flush();
+}
+
+fn findRejectedQuantMarker(text: []const u8) ?[]const u8 {
+    var lower_buf: [256]u8 = undefined;
+    if (text.len > lower_buf.len) return null;
+    const lower = std.ascii.lowerString(&lower_buf, text);
+    for (rejected_quant_markers) |marker| {
+        if (std.mem.indexOf(u8, lower, marker) != null) return marker;
+    }
+    return null;
 }
 
 fn parseManifestBody(allocator: std.mem.Allocator, body: []const u8) !ResolvedFile {
@@ -331,6 +443,39 @@ test "parseManifestBody rejects manifests without a ggufFile" {
         error.HfManifestMissingGguf,
         parseManifestBody(std.testing.allocator, "{\"siblings\":[{\"rfilename\":\"README.md\"}]}"),
     );
+}
+
+test "findRejectedQuantMarker flags unsupported quantizations" {
+    try std.testing.expectEqualStrings("q3_k", findRejectedQuantMarker("Q3_K_M").?);
+    try std.testing.expectEqualStrings("q3_k", findRejectedQuantMarker("mistral-7b-instruct-v0.2.Q3_K_L.gguf").?);
+    try std.testing.expectEqualStrings("q2_k", findRejectedQuantMarker("Q2_K").?);
+    try std.testing.expectEqualStrings("iq4", findRejectedQuantMarker("model-IQ4_XS.gguf").?);
+    try std.testing.expectEqualStrings("q4_0", findRejectedQuantMarker("phi-3-mini-Q4_0.gguf").?);
+    try std.testing.expectEqualStrings("bf16", findRejectedQuantMarker("model-BF16.gguf").?);
+}
+
+test "findRejectedQuantMarker passes supported quantizations" {
+    try std.testing.expect(findRejectedQuantMarker("latest") == null);
+    try std.testing.expect(findRejectedQuantMarker("Q4_K_M") == null);
+    try std.testing.expect(findRejectedQuantMarker("Qwen3-0.6B-Q8_0.gguf") == null);
+    try std.testing.expect(findRejectedQuantMarker("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf") == null);
+    try std.testing.expect(findRejectedQuantMarker("model-F16.gguf") == null);
+    try std.testing.expect(findRejectedQuantMarker("gpt-oss-20b-MXFP4.gguf") == null);
+}
+
+test "extractArchitecture reads gguf.architecture from model info" {
+    const body =
+        \\{"id":"microsoft/Phi-3-mini-4k-instruct-gguf","gguf":{"architecture":"phi3","context_length":4096}}
+    ;
+    const arch = (try extractArchitecture(std.testing.allocator, body)).?;
+    defer std.testing.allocator.free(arch);
+    try std.testing.expectEqualStrings("phi3", arch);
+}
+
+test "extractArchitecture returns null when metadata is absent or malformed" {
+    try std.testing.expectEqual(@as(?[]u8, null), try extractArchitecture(std.testing.allocator, "{\"id\":\"x/y\"}"));
+    try std.testing.expectEqual(@as(?[]u8, null), try extractArchitecture(std.testing.allocator, "{\"gguf\":{}}"));
+    try std.testing.expectEqual(@as(?[]u8, null), try extractArchitecture(std.testing.allocator, "not json"));
 }
 
 test "parseManifestBody rejects non-JSON bodies" {
