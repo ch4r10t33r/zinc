@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 820" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#18251f"/></linearGradient>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#ffd86b" fill-opacity="0.14"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#ffd86b" stroke-width="2.5" stroke-opacity="0.55"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8595a8"/></marker>
+    <style>
+      .title{fill:#f6fbff;font-size:31px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:15px}
+      .panel{fill:#c7d4e2;font-size:17px;font-weight:700}
+      .unit{fill:#f6fbff;font-size:16px;font-weight:700}
+      .unitsub{fill:#9fb0c0;font-size:13px}
+      .rowlab{fill:#c7d4e2;font-size:15px;font-weight:640}
+      .rowsub{fill:#8595a8;font-size:13px}
+      .val{fill:#f6fbff;font-size:15px;font-weight:740}
+      .leg{fill:#aebdcc;font-size:14px}
+      .note{fill:#f2b8ac;font-size:14px;font-weight:640}
+      .ok{fill:#7ee0a8;font-size:14px;font-weight:640}
+      .axis{fill:#8595a8;font-size:13px}
+    </style>
+  </defs>
+  <rect width="1200" height="820" fill="url(#bg)"/>
+
+  <text x="56" y="54" class="title">Where a RDNA4 flash attention kernel spends its issue slots</text>
+  <text x="56" y="82" class="subtitle">Cycles per score-matrix element on one CU. Qwen3.5-9B, head dim 128, key block 64, RX 9070 XT. First-order model.</text>
+  <text x="56" y="104" class="subtitle">Rates: 1024 FP16 matrix FLOP/clk/CU, 64 FP32 vector FMA/clk/CU, 16 transcendental/clk/CU.</text>
+
+  <!-- Panel A: the SIMD pipes -->
+  <text x="56" y="152" class="panel">The two pipes softmax can land on</text>
+
+  <rect x="56" y="172" width="440" height="212" rx="10" fill="#16202f" stroke="#263548"/>
+  <text x="76" y="198" class="unitsub">one RDNA4 SIMD, wave32</text>
+
+  <rect x="76" y="212" width="130" height="52" rx="7" fill="#38d7ff" fill-opacity="0.18" stroke="#38d7ff"/>
+  <text x="141" y="234" text-anchor="middle" class="unit">issue port</text>
+  <text x="141" y="252" text-anchor="middle" class="unitsub">1 instr / wave / clk</text>
+
+  <line x1="206" y1="228" x2="266" y2="228" stroke="#8595a8" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="206" y1="252" x2="266" y2="300" stroke="#8595a8" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="272" y="204" width="204" height="48" rx="7" fill="#38d7ff" fill-opacity="0.14" stroke="#38d7ff"/>
+  <text x="286" y="224" class="unit">vector pipe</text>
+  <text x="286" y="242" class="unitsub">WMMA and FP32 FMA share it</text>
+
+  <rect x="272" y="278" width="204" height="48" rx="7" fill="#ffd86b" fill-opacity="0.14" stroke="#ffd86b"/>
+  <text x="286" y="298" class="unit">transcendental unit</text>
+  <text x="286" y="316" class="unitsub">V_EXP_F32, quarter width</text>
+
+  <text x="76" y="352" class="note">softmax max / sub / sum / rescale &#8594; vector pipe: steals WMMA slots</text>
+  <text x="76" y="372" class="ok">softmax exp &#8594; separate unit: hides behind another wave's WMMA</text>
+
+  <!-- Panel B: cycle budget bars -->
+  <text x="560" y="152" class="panel">Cycles per score element</text>
+
+  <!-- row 1: WMMA only -->
+  <text x="560" y="196" class="rowlab">QK&#8868; and PV on WMMA alone</text>
+  <text x="560" y="214" class="rowsub">512 FLOP at 1024 FLOP/clk</text>
+  <rect x="560" y="222" width="490" height="30" rx="4" fill="#38d7ff" fill-opacity="0.85"/>
+  <text x="1062" y="243" class="val">0.500</text>
+
+  <!-- row 2: first cut -->
+  <text x="560" y="278" class="rowlab">FA kernel, first cut</text>
+  <text x="560" y="296" class="rowsub">+ 6 vector ops, + 1 exp</text>
+  <rect x="560" y="304" width="490" height="30" rx="4" fill="#38d7ff" fill-opacity="0.85"/>
+  <rect x="1050" y="304" width="92" height="30" rx="4" fill="#ff7b6b" fill-opacity="0.9"/>
+  <text x="1152" y="325" class="val">0.594</text>
+
+  <!-- exp overlay track -->
+  <rect x="560" y="340" width="62" height="14" rx="3" fill="url(#hatch)" stroke="#ffd86b" stroke-opacity="0.5"/>
+  <text x="632" y="352" class="rowsub">exp: 0.063 clk on the transcendental unit, off the critical path when waves are available</text>
+
+  <!-- row 3 -->
+  <text x="560" y="400" class="rowlab">FA kernel, trimmed softmax</text>
+  <text x="560" y="418" class="rowsub">log2(e) folded into the QK scale, packed FP16 rescale, deferred divide</text>
+  <rect x="560" y="426" width="490" height="30" rx="4" fill="#38d7ff" fill-opacity="0.85"/>
+  <rect x="1050" y="426" width="46" height="30" rx="4" fill="#ff7b6b" fill-opacity="0.9"/>
+  <text x="1106" y="447" class="val">0.547</text>
+
+  <text x="560" y="500" class="note">first cut: the vector pipe spends 19% more time than the matmul needs</text>
+  <text x="560" y="522" class="ok">trimmed: 9% more. The exp was never the expensive part.</text>
+
+  <!-- legend -->
+  <rect x="560" y="560" width="16" height="16" rx="3" fill="#38d7ff" fill-opacity="0.85"/><text x="584" y="573" class="leg">WMMA matmul (QK&#8868;, PV)</text>
+  <rect x="800" y="560" width="16" height="16" rx="3" fill="#ff7b6b" fill-opacity="0.9"/><text x="824" y="573" class="leg">softmax on the vector pipe</text>
+  <rect x="1046" y="560" width="16" height="16" rx="3" fill="url(#hatch)" stroke="#ffd86b" stroke-opacity="0.5"/><text x="1070" y="573" class="leg">exp</text>
+
+  <!-- bottom takeaway strip -->
+  <rect x="56" y="652" width="1088" height="112" rx="10" fill="#16202f" stroke="#263548"/>
+  <text x="80" y="686" class="unit">RDNA4 has no asynchronous matrix pipe</text>
+  <text x="80" y="712" class="unitsub">Hopper overlaps softmax with the GEMM inside one warpgroup because WGMMA is asynchronous. RDNA4's WMMA issues on the same vector pipe as</text>
+  <text x="80" y="732" class="unitsub">the FP32 FMAs, so every softmax multiply and add is a cycle the matrix units are not running. The only overlap available is across waves, which</text>
+  <text x="80" y="752" class="unitsub">makes occupancy, not the transcendental rate, the thing that decides how much of the softmax is free.</text>
+</svg>

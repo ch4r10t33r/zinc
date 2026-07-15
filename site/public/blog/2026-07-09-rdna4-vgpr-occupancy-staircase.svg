@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 820" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#18251f"/></linearGradient>
+    <linearGradient id="limzone" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff7b6b" stop-opacity="0.10"/><stop offset="1" stop-color="#ff7b6b" stop-opacity="0.02"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#ffd86b"/></marker>
+    <style>
+      .title{fill:#f6fbff;font-size:31px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:15px}
+      .axis{fill:#8595a8;font-size:14px}
+      .axistitle{fill:#c7d4e2;font-size:15px;font-weight:640}
+      .step{fill:none;stroke:#38d7ff;stroke-width:3.5}
+      .ridge{fill:#f2b8ac;font-size:14px;font-weight:640}
+      .ptitle{fill:#f6fbff;font-size:18px;font-weight:780}
+      .psub{fill:#9fb0c0;font-size:13px}
+      .gain{fill:#ffd86b;font-size:16px;font-weight:820}
+      .leg{fill:#aebdcc;font-size:14px}
+    </style>
+  </defs>
+  <rect width="1200" height="820" fill="url(#bg)"/>
+
+  <text x="56" y="56" class="title">RDNA4 occupancy staircase: waves per SIMD vs VGPRs per wave</text>
+  <text x="56" y="84" class="subtitle">RX 9070 XT / R9700, 192 KB register file = 1536 wave32 VGPRs per SIMD, 16 wave slots, 24-register allocation blocks.</text>
+  <text x="56" y="106" class="subtitle">Points are RGA-estimated VGPR footprints for ZINC's Qwen3.5-9B prefill GEMM. First-order model.</text>
+
+  <!-- occupancy-limited zone shading (V > 96) -->
+  <rect x="520" y="140" width="600" height="560" fill="url(#limzone)"/>
+
+  <!-- plot frame -->
+  <rect x="160" y="140" width="960" height="560" fill="none" stroke="#263548"/>
+
+  <!-- Y gridlines + ticks: 0,4,8,12,16 -->
+  <line x1="160" y1="160" x2="1120" y2="160" stroke="#263548" stroke-dasharray="4 6"/>
+  <text x="150" y="165" text-anchor="end" class="axis">16</text>
+  <line x1="160" y1="295" x2="1120" y2="295" stroke="#263548" stroke-dasharray="4 6"/>
+  <text x="150" y="300" text-anchor="end" class="axis">12</text>
+  <line x1="160" y1="430" x2="1120" y2="430" stroke="#263548" stroke-dasharray="4 6"/>
+  <text x="150" y="435" text-anchor="end" class="axis">8</text>
+  <line x1="160" y1="565" x2="1120" y2="565" stroke="#263548" stroke-dasharray="4 6"/>
+  <text x="150" y="570" text-anchor="end" class="axis">4</text>
+  <text x="150" y="705" text-anchor="end" class="axis">0</text>
+  <text x="70" y="420" text-anchor="middle" class="axistitle" transform="rotate(-90 70 420)">active waves per SIMD (occupancy)</text>
+
+  <!-- X ticks: 0,64,96,128,192,256 -->
+  <text x="160" y="724" text-anchor="middle" class="axis">0</text>
+  <text x="400" y="724" text-anchor="middle" class="axis">64</text>
+  <line x1="520" y1="140" x2="520" y2="700" stroke="#f2b8ac" stroke-width="2" stroke-dasharray="5 6"/>
+  <text x="520" y="724" text-anchor="middle" class="axis">96</text>
+  <text x="640" y="724" text-anchor="middle" class="axis">128</text>
+  <text x="880" y="724" text-anchor="middle" class="axis">192</text>
+  <text x="1120" y="724" text-anchor="middle" class="axis">256</text>
+  <text x="640" y="756" text-anchor="middle" class="axistitle">VGPRs allocated per wave (wave32)</text>
+
+  <!-- occupancy step function -->
+  <path class="step" d="M160,160 H520 V295 H610 V362.5 H700 V396.25 H790 V430 H880 V463.75 H970 V497.5 H1120"/>
+
+  <!-- ridge label -->
+  <text x="512" y="622" text-anchor="end" class="ridge">96 VGPRs: last point at</text>
+  <text x="512" y="640" text-anchor="end" class="ridge">full 16-wave occupancy</text>
+  <text x="620" y="176" class="ridge">occupancy-limited zone &#8594;</text>
+
+  <!-- kernel points -->
+  <!-- staged fp16 GEMM: 72 VGPR, 16 waves -->
+  <circle cx="430" cy="160" r="7" fill="#38d7ff" stroke="#0f1724" stroke-width="2"/>
+  <text x="300" y="210" class="ptitle">staged fp16 GEMM</text>
+  <text x="300" y="230" class="psub">~72 VGPR, 16 waves</text>
+  <text x="300" y="248" class="psub">(full occupancy, but memory-bound)</text>
+  <line x1="360" y1="214" x2="424" y2="164" stroke="#4a5a6c" stroke-width="1.2"/>
+
+  <!-- fused first cut: 168 VGPR, 9 waves -->
+  <circle cx="790" cy="396.25" r="8" fill="#ff7b6b" stroke="#0f1724" stroke-width="2"/>
+  <text x="812" y="392" class="ptitle">fused dequant + WMMA, first cut</text>
+  <text x="812" y="412" class="psub">~168 VGPR &#8594; 9 waves (56%)</text>
+  <text x="812" y="430" class="psub">too few waves to hide HBM + WMMA latency</text>
+
+  <!-- fused tuned: 120 VGPR, 12 waves -->
+  <circle cx="610" cy="295" r="8" fill="#ffd86b" stroke="#0f1724" stroke-width="2"/>
+  <text x="628" y="278" class="ptitle">fused, tuned</text>
+  <text x="628" y="298" class="psub">~120 VGPR &#8594; 12 waves (75%)</text>
+
+  <!-- recovery arrow -->
+  <path d="M778,392 C700,360 660,330 622,300" fill="none" stroke="#ffd86b" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <text x="700" y="336" text-anchor="middle" class="gain">scales &#8594; LDS, tighter live ranges: +3 waves</text>
+
+  <!-- legend -->
+  <circle cx="176" cy="792" r="6" fill="#38d7ff"/><text x="190" y="797" class="leg">staged</text>
+  <circle cx="286" cy="792" r="6" fill="#ff7b6b"/><text x="300" y="797" class="leg">fused, first cut</text>
+  <circle cx="470" cy="792" r="6" fill="#ffd86b"/><text x="484" y="797" class="leg">fused, tuned</text>
+</svg>

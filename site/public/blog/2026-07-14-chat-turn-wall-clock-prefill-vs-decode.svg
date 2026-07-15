@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#171426"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:27px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:14px}
+      .panel{fill:#c7d4e2;font-size:16px;font-weight:700}
+      .lab{fill:#c7d4e2;font-size:14px;font-weight:640}
+      .sub{fill:#8595a8;font-size:12.5px}
+      .axis{fill:#8595a8;font-size:12px}
+      .val{fill:#0f1724;font-size:13px;font-weight:760}
+      .valo{fill:#f6fbff;font-size:13px;font-weight:740}
+      .note{fill:#f2a8b8;font-size:13px;font-weight:640}
+      .leg{fill:#aebdcc;font-size:13px}
+    </style>
+  </defs>
+  <rect width="1200" height="900" fill="url(#bg)"/>
+  <text x="56" y="50" class="title">A chat turn is almost all decode, and prefill only rules long prompts</text>
+  <text x="56" y="76" class="subtitle">Qwen3.5-9B on one RX 9070 XT: prefill 962 tok/s, decode 39.6 tok/s. Wall clock split by workload shape (input / output tokens).</text>
+
+  <!-- Panel A -->
+  <text x="56" y="128" class="panel">Where one request spends its wall clock</text>
+  <rect x="56" y="144" width="1088" height="352" rx="10" fill="#16202f" stroke="#263548"/>
+  <!-- legend -->
+  <rect x="800" y="120" width="14" height="12" rx="3" fill="#ffd86b" fill-opacity="0.92"/><text x="820" y="131" class="leg">prefill (prompt)</text>
+  <rect x="940" y="120" width="14" height="12" rx="3" fill="#6ea8ff" fill-opacity="0.92"/><text x="960" y="131" class="leg">decode (generation)</text>
+  <!-- axis ticks 0/25/50/75/100 across track x0=250 width=800 -->
+  <g class="axis" text-anchor="middle">
+    <line x1="250" y1="170" x2="250" y2="470" stroke="#263548" stroke-width="1"/>
+    <line x1="450" y1="170" x2="450" y2="470" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="650" y1="170" x2="650" y2="470" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="850" y1="170" x2="850" y2="470" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="1050" y1="170" x2="1050" y2="470" stroke="#263548" stroke-width="1"/>
+    <text x="250" y="188">0%</text><text x="450" y="188">25%</text><text x="650" y="188">50%</text><text x="850" y="188">75%</text><text x="1050" y="188">100%</text>
+    <text x="1105" y="188" fill="#8595a8">total</text>
+  </g>
+
+  <!-- Row 1: short chat 256/512 -> prefill 2.0% -->
+  <text x="72" y="222" class="lab">Short chat</text><text x="72" y="240" class="sub">256 in / 512 out</text>
+  <rect x="250" y="206" width="16.0" height="40" rx="3" fill="#ffd86b" fill-opacity="0.92"/>
+  <rect x="266.0" y="206" width="784.0" height="40" rx="3" fill="#6ea8ff" fill-opacity="0.92"/>
+  <text x="640" y="231" text-anchor="middle" class="val">decode 98%</text>
+  <text x="1096" y="231" class="valo">13.2 s</text>
+
+  <!-- Row 2: chat 2k/2k -> prefill 4.0% -->
+  <text x="72" y="278" class="lab">Chat turn</text><text x="72" y="296" class="sub">2k in / 2k out</text>
+  <rect x="250" y="262" width="32.0" height="40" rx="3" fill="#ffd86b" fill-opacity="0.92"/>
+  <rect x="282.0" y="262" width="768.0" height="40" rx="3" fill="#6ea8ff" fill-opacity="0.92"/>
+  <text x="648" y="287" text-anchor="middle" class="val">decode 96%</text>
+  <text x="1096" y="287" class="valo">52.6 s</text>
+
+  <!-- Row 3: code review 16k/1k -> prefill 39.7% -->
+  <text x="72" y="334" class="lab">Code review</text><text x="72" y="352" class="sub">16k in / 1k out</text>
+  <rect x="250" y="318" width="317.6" height="40" rx="3" fill="#ffd86b" fill-opacity="0.92"/>
+  <rect x="567.6" y="318" width="482.4" height="40" rx="3" fill="#6ea8ff" fill-opacity="0.92"/>
+  <text x="408" y="343" text-anchor="middle" class="val">prefill 40%</text>
+  <text x="808" y="343" text-anchor="middle" class="val">decode 60%</text>
+  <text x="1096" y="343" class="valo">41.9 s</text>
+
+  <!-- Row 4: RAG 32k/512 -> prefill 72.0% -->
+  <text x="72" y="390" class="lab">RAG answer</text><text x="72" y="408" class="sub">32k in / 512 out</text>
+  <rect x="250" y="374" width="576.0" height="40" rx="3" fill="#ffd86b" fill-opacity="0.92"/>
+  <rect x="826.0" y="374" width="224.0" height="40" rx="3" fill="#6ea8ff" fill-opacity="0.92"/>
+  <text x="538" y="399" text-anchor="middle" class="val">prefill 72%</text>
+  <text x="938" y="399" text-anchor="middle" class="val">28%</text>
+  <text x="1096" y="399" class="valo">46.2 s</text>
+
+  <!-- Row 5: doc summary 32k/256 -> prefill 83.7% -->
+  <text x="72" y="446" class="lab">Doc summary</text><text x="72" y="464" class="sub">32k in / 256 out</text>
+  <rect x="250" y="430" width="669.6" height="40" rx="3" fill="#ffd86b" fill-opacity="0.92"/>
+  <rect x="919.6" y="430" width="130.4" height="40" rx="3" fill="#6ea8ff" fill-opacity="0.92"/>
+  <text x="585" y="455" text-anchor="middle" class="val">prefill 84%</text>
+  <text x="985" y="455" text-anchor="middle" class="val">16%</text>
+  <text x="1096" y="455" class="valo">39.8 s</text>
+
+  <!-- Panel B -->
+  <text x="56" y="548" class="panel">What each post's prefill work saved on one 2k-in / 2k-out chat turn</text>
+  <rect x="56" y="564" width="1088" height="300" rx="10" fill="#16202f" stroke="#263548"/>
+  <text x="80" y="592" class="sub">Prefill time for a 2k prompt shrinks with each speedup, but the seconds it removes from the turn fall off a cliff.</text>
+  <!-- baseline -->
+  <line x1="120" y1="800" x2="1110" y2="800" stroke="#263548" stroke-width="1.5"/>
+  <text x="120" y="826" class="axis">the tail of the series barely moves the wall clock, because decode never changed</text>
+
+  <!-- Bars: saved seconds, scale 44.6 px/s, baseline y=800 -->
+  <!-- 219->430 : 4.48s -> 200px -->
+  <rect x="235" y="600" width="120" height="200" rx="4" fill="#ffd86b" fill-opacity="0.9"/>
+  <text x="295" y="590" text-anchor="middle" class="valo">saved 4.48 s</text>
+  <text x="295" y="822" text-anchor="middle" class="axis">219 &#8594; 430 tok/s</text>
+  <text x="295" y="700" text-anchor="middle" class="val">07-08</text>
+
+  <!-- 430->615 : 1.40s -> 62.5px -->
+  <rect x="465" y="737.5" width="120" height="62.5" rx="4" fill="#ffd86b" fill-opacity="0.78"/>
+  <text x="525" y="727.5" text-anchor="middle" class="valo">1.40 s</text>
+  <text x="525" y="822" text-anchor="middle" class="axis">430 &#8594; 615 tok/s</text>
+  <text x="525" y="775" text-anchor="middle" class="val">07-09/10</text>
+
+  <!-- 615->815 : 0.80s -> 35.7px -->
+  <rect x="695" y="764.3" width="120" height="35.7" rx="4" fill="#ffd86b" fill-opacity="0.62"/>
+  <text x="755" y="754.3" text-anchor="middle" class="valo">0.80 s</text>
+  <text x="755" y="822" text-anchor="middle" class="axis">615 &#8594; 815 tok/s</text>
+  <text x="755" y="790" text-anchor="middle" class="axis">07-11/12</text>
+
+  <!-- 815->962 : 0.37s -> 16.5px -->
+  <rect x="925" y="783.5" width="120" height="16.5" rx="4" fill="#ffd86b" fill-opacity="0.48"/>
+  <text x="985" y="773.5" text-anchor="middle" class="valo">0.37 s</text>
+  <text x="985" y="822" text-anchor="middle" class="axis">815 &#8594; 962 tok/s</text>
+  <text x="985" y="797" text-anchor="middle" class="note">07-13</text>
+
+  <text x="1096" y="852" text-anchor="end" class="sub">decode of 2k tokens at 39.6 tok/s = 50.5 s, fixed across every bar</text>
+</svg>
