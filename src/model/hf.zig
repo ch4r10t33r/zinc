@@ -45,7 +45,9 @@ pub const Spec = struct {
 ///
 /// The quantization suffix is optional; when absent the tag defaults to
 /// `latest`, which the Hugging Face manifest endpoint resolves to the repo's
-/// recommended quantization.
+/// recommended quantization. Each component (owner, repo, tag) must match
+/// the Hugging Face naming grammar; anything else fails with
+/// `error.InvalidHfSpec`.
 /// @param text Raw CLI argument value.
 /// @returns A `Spec` whose slices point into `text`.
 pub fn parseSpec(text: []const u8) !Spec {
@@ -59,7 +61,30 @@ pub fn parseSpec(text: []const u8) !Spec {
     const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return error.InvalidHfSpec;
     if (slash == 0 or slash == repo.len - 1) return error.InvalidHfSpec;
     if (std.mem.indexOfScalarPos(u8, repo, slash + 1, '/') != null) return error.InvalidHfSpec;
+    if (!isValidSpecComponent(repo[0..slash]) or
+        !isValidSpecComponent(repo[slash + 1 ..]) or
+        !isValidSpecComponent(tag))
+    {
+        return error.InvalidHfSpec;
+    }
     return .{ .repo = repo, .tag = tag };
+}
+
+// Hugging Face owner/repo names and quantization tags are alphanumerics
+// plus `.`, `_`, `-`, never starting with `.` or `-`. The components are
+// embedded verbatim in request URLs and the spec becomes the /v1/models
+// display name, so anything outside that grammar — path separators, query
+// or fragment markers, quotes, whitespace — is rejected rather than escaped.
+fn isValidSpecComponent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (s[0] == '.' or s[0] == '-') return false;
+    for (s) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 /// Derives the managed-cache model id for a Hugging Face spec.
@@ -107,19 +132,22 @@ pub fn ensureModel(spec_text: []const u8, allocator: std.mem.Allocator, writer: 
     const id = try cacheId(allocator, spec);
     defer allocator.free(id);
 
+    // Pre-download validation: reject unsupported quantizations (from the
+    // tag, and later from the resolved file name) and unsupported model
+    // architectures (from repo metadata) before any bytes are transferred.
+    // The tag check runs before the cache lookup on purpose: it needs no
+    // network, and a cached copy of a rejected quantization (downloaded by
+    // an older zinc or placed manually) would only generate garbage.
+    if (findRejectedQuantMarker(spec.tag)) |marker| {
+        try printUnsupportedQuant(writer, spec.tag, marker);
+        return error.UnsupportedQuantization;
+    }
+
     if (managed.isInstalled(id, allocator)) {
         const path = try managed.resolveInstalledModelPath(id, allocator);
         try writer.print("Using cached Hugging Face model: {s}\n", .{path});
         try writer.flush();
         return path;
-    }
-
-    // Pre-download validation: reject unsupported quantizations (from the
-    // tag, and later from the resolved file name) and unsupported model
-    // architectures (from repo metadata) before any bytes are transferred.
-    if (findRejectedQuantMarker(spec.tag)) |marker| {
-        try printUnsupportedQuant(writer, spec.tag, marker);
-        return error.UnsupportedQuantization;
     }
     if (try fetchRepoArchitecture(allocator, spec)) |arch_str| {
         defer allocator.free(arch_str);
@@ -317,12 +345,20 @@ fn printUnsupportedQuant(writer: anytype, name: []const u8, marker: []const u8) 
     try writer.flush();
 }
 
+// A marker only counts when it is not embedded in a longer alphanumeric
+// run: `uniq2` must not match `iq2`, and `Q4_01B` must not match `q4_0`,
+// while delimited occurrences (`model-IQ2_XS.gguf`, `Q4_0_4_4`) still do.
+// Case-insensitive and unbounded in length, so an unusually long file name
+// cannot slip past the gate.
 fn findRejectedQuantMarker(text: []const u8) ?[]const u8 {
-    var lower_buf: [256]u8 = undefined;
-    if (text.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(&lower_buf, text);
     for (rejected_quant_markers) |marker| {
-        if (std.mem.indexOf(u8, lower, marker) != null) return marker;
+        var start: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(text, start, marker)) |idx| : (start = idx + 1) {
+            const end = idx + marker.len;
+            const bounded_left = idx == 0 or !std.ascii.isAlphanumeric(text[idx - 1]);
+            const bounded_right = end == text.len or !std.ascii.isAlphanumeric(text[end]);
+            if (bounded_left and bounded_right) return marker;
+        }
     }
     return null;
 }
@@ -407,6 +443,16 @@ test "parseSpec rejects malformed specs" {
     try std.testing.expectError(error.InvalidHfSpec, parseSpec("a/b:"));
 }
 
+test "parseSpec rejects components outside the Hugging Face grammar" {
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo name"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo?download=1"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo#frag:Q8_0"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/..:Q8_0"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo:Q8 0"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo:-Q8_0"));
+    try std.testing.expectError(error.InvalidHfSpec, parseSpec("owner/repo\":Q8_0"));
+}
+
 test "cacheId is a lowercase single path component" {
     const spec = try parseSpec("unsloth/Qwen3.5-9B-GGUF:Q4_K_M");
     const id = try cacheId(std.testing.allocator, spec);
@@ -463,6 +509,20 @@ test "findRejectedQuantMarker passes supported quantizations" {
     try std.testing.expect(findRejectedQuantMarker("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf") == null);
     try std.testing.expect(findRejectedQuantMarker("model-F16.gguf") == null);
     try std.testing.expect(findRejectedQuantMarker("gpt-oss-20b-MXFP4.gguf") == null);
+}
+
+test "findRejectedQuantMarker requires token boundaries" {
+    // Markers embedded in longer alphanumeric runs are not quantization tags.
+    try std.testing.expect(findRejectedQuantMarker("uniq2-model-Q8_0.gguf") == null);
+    try std.testing.expect(findRejectedQuantMarker("model-Q4_01B.gguf") == null);
+    // Delimited occurrences still reject, including marker-prefixed variants.
+    try std.testing.expectEqualStrings("q4_0", findRejectedQuantMarker("model-Q4_0_4_4.gguf").?);
+    try std.testing.expectEqualStrings("iq2", findRejectedQuantMarker("model-IQ2_XXS.gguf").?);
+}
+
+test "findRejectedQuantMarker scans names longer than 256 bytes" {
+    const long_name = "m" ** 300 ++ "-Q2_K.gguf";
+    try std.testing.expectEqualStrings("q2_k", findRejectedQuantMarker(long_name).?);
 }
 
 test "extractArchitecture reads gguf.architecture from model info" {

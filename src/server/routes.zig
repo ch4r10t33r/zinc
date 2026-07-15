@@ -399,7 +399,7 @@ pub fn handleConnection(
         }
     } else if (request.method == .POST and std.mem.eql(u8, request.path, "/v1/models/remove")) {
         if (comptime runtime.supports_model_management) {
-            try handleRemoveModel(conn, manager, server_state, request.body);
+            try handleRemoveModel(conn, manager, server_state, request.body, allocator);
         } else {
             try sendUnsupportedModelManagement(conn);
         }
@@ -586,6 +586,7 @@ fn handleRemoveModel(
     _manager: *model_manager_mod.ModelManager,
     server_state: *ServerState,
     _body: []const u8,
+    _allocator: std.mem.Allocator,
 ) !void {
     if (comptime !runtime.supports_model_management) {
         try sendUnsupportedModelManagement(conn);
@@ -599,7 +600,11 @@ fn handleRemoveModel(
         try conn.sendError(400, "invalid_request_error", "Field 'model' is required");
         return;
     }
-    if (catalog_mod.find(parsed.model_id) == null) {
+    // `-hf` downloads share the managed cache but have no catalog entry, so
+    // mirror the CLI gate: also accept ids that are installed on disk. Safe
+    // for request-supplied ids because the managed path resolvers reject
+    // anything that is not a single filesystem-safe path component.
+    if (catalog_mod.find(parsed.model_id) == null and !managed_mod.isInstalled(parsed.model_id, _allocator)) {
         try conn.sendError(400, "invalid_request_error", "Unknown managed model id");
         return;
     }
