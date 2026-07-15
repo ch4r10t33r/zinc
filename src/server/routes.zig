@@ -961,6 +961,7 @@ fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]c
         .string => |s| {
             if (s.len == 0) return &.{};
             const out = try allocator.alloc([]const u8, 1);
+            errdefer allocator.free(out);
             out[0] = try allocator.dupe(u8, s);
             return out;
         },
@@ -975,7 +976,9 @@ fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]c
                 switch (item) {
                     .string => |s| {
                         if (s.len == 0) continue;
-                        try list.append(allocator, try allocator.dupe(u8, s));
+                        const owned = try allocator.dupe(u8, s);
+                        errdefer allocator.free(owned);
+                        try list.append(allocator, owned);
                     },
                     else => {},
                 }
@@ -998,7 +1001,7 @@ fn freeStopSequences(allocator: std.mem.Allocator, stop: []const []const u8) voi
 /// (e.g. `n:2` returning only one choice, or `logprobs` requested but never
 /// present in the response).
 fn firstUnsupportedChatParam(body: ChatRequestBody) ?[]const u8 {
-    if (body.n > 1) return "Field 'n' > 1 is not supported: only a single completion choice is generated";
+    if (body.n != 1) return "Field 'n' must be 1: only a single completion choice is generated";
     if (logprobsRequested(body.logprobs)) return "Field 'logprobs' is not supported: token log-probabilities are not computed";
     return null;
 }
@@ -3597,6 +3600,31 @@ test "parseStopSequences: array is capped at max_stop_sequences, non-strings and
     try std.testing.expectEqualStrings("d", stop[3]);
 }
 
+fn checkParseStopSequenceAllocationFailures(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const stop = try parseStopSequences(allocator, value);
+    defer freeStopSequences(allocator, stop);
+}
+
+test "parseStopSequences: single string cleans up after every allocation failure" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "\"stop\"", .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseStopSequenceAllocationFailures,
+        .{parsed.value},
+    );
+}
+
+test "parseStopSequences: array cleans up after every allocation failure" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"a\",\"b\",\"c\",\"d\"]", .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseStopSequenceAllocationFailures,
+        .{parsed.value},
+    );
+}
+
 test "combinedStopStrings: no client stops returns the built-in list unallocated" {
     const combined = try combinedStopStrings(std.testing.allocator, &.{});
     try std.testing.expectEqual(chat_stop_strs.len, combined.len);
@@ -3616,11 +3644,21 @@ test "firstUnsupportedChatParam: defaults are accepted" {
     try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
 }
 
-test "firstUnsupportedChatParam: n=1 is accepted, n>1 is rejected" {
+test "firstUnsupportedChatParam: only n=1 is accepted" {
     var body = ChatRequestBody{ .n = 1 };
     try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
+
+    body.n = 0;
+    try std.testing.expectEqualStrings(
+        "Field 'n' must be 1: only a single completion choice is generated",
+        firstUnsupportedChatParam(body).?,
+    );
+
     body.n = 2;
-    try std.testing.expect(firstUnsupportedChatParam(body) != null);
+    try std.testing.expectEqualStrings(
+        "Field 'n' must be 1: only a single completion choice is generated",
+        firstUnsupportedChatParam(body).?,
+    );
 }
 
 test "logprobsRequested: null and false are not requested; true and a positive count are" {
