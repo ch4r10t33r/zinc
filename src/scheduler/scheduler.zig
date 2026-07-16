@@ -450,3 +450,94 @@ test "Scheduler state collection respects scratch capacity" {
     try std.testing.expectEqual(@as(u32, 0), pending[0]);
     try std.testing.expectEqual(@as(u32, 1), pending[1]);
 }
+
+test "Scheduler transition rejects an out-of-range slot id" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    try std.testing.expectError(error.InvalidSlot, sched.transition(5, .prefilling));
+}
+
+test "Scheduler transition rejects an in-range but empty slot" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    // Slot 1 is never submitted to -- in range, but holds no request.
+    _ = try sched.submit(&.{1}, .{});
+    try std.testing.expectError(error.InvalidSlot, sched.transition(1, .prefilling));
+}
+
+test "Scheduler transition propagates the underlying Request.InvalidTransition error" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 1);
+    defer sched.deinit();
+
+    const slot = try sched.submit(&.{1}, .{});
+    // submit() leaves the request in .pending; pending -> completed is invalid.
+    try std.testing.expectError(error.InvalidTransition, sched.transition(slot, .completed));
+}
+
+test "Scheduler release is a no-op for an out-of-range slot id" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    _ = try sched.submit(&.{1}, .{});
+    sched.release(99); // must not panic or touch valid slots
+    try std.testing.expectEqual(@as(u32, 1), sched.activeCount());
+}
+
+test "Scheduler release is idempotent on an already-released slot" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    const slot = try sched.submit(&.{1}, .{});
+    sched.release(slot);
+    sched.release(slot); // second release on the same (now-empty) slot: no-op, no double free
+    try std.testing.expectEqual(@as(u32, 0), sched.activeCount());
+}
+
+test "Scheduler a fresh scheduler is idle and has a free slot" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    try std.testing.expect(sched.isIdle());
+    try std.testing.expect(sched.hasFreeSlot());
+}
+
+test "Scheduler is not idle while a request is queued but not yet admitted" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 1);
+    defer sched.deinit();
+
+    _ = try sched.enqueue(&.{1}, .{});
+    try std.testing.expect(!sched.isIdle());
+    try std.testing.expect(sched.hasFreeSlot()); // slot free, just not yet admitted
+}
+
+test "Scheduler admitNext returns null when there is nothing pending" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    try std.testing.expectEqual(@as(?u32, null), try sched.admitNext());
+}
+
+test "Scheduler with zero capacity always reports full/busy without crashing" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 0);
+    defer sched.deinit();
+
+    try std.testing.expect(sched.isFull()); // activeCount() 0 >= max_parallel 0
+    try std.testing.expect(!sched.hasFreeSlot());
+    try std.testing.expect(sched.isIdle());
+    try std.testing.expectError(error.AllSlotsBusy, sched.submit(&.{1}, .{}));
+
+    _ = try sched.enqueue(&.{1}, .{}); // enqueue never fails, even with no slots to admit into
+    try std.testing.expectEqual(@as(?u32, null), try sched.admitNext());
+    try std.testing.expect(!sched.isIdle()); // still has one waiter
+}
