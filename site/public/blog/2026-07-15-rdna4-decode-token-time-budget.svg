@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#171426"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:27px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:14px}
+      .panel{fill:#c7d4e2;font-size:16px;font-weight:700}
+      .lab{fill:#c7d4e2;font-size:14px;font-weight:640}
+      .sub{fill:#8595a8;font-size:12.5px}
+      .axis{fill:#8595a8;font-size:12px}
+      .val{fill:#0f1724;font-size:13px;font-weight:760}
+      .valo{fill:#f6fbff;font-size:13px;font-weight:740}
+      .note{fill:#f2a8b8;font-size:13px;font-weight:640}
+      .mark{fill:#7ee0d3;font-size:12.5px;font-weight:680}
+      .leg{fill:#aebdcc;font-size:12.5px}
+    </style>
+  </defs>
+  <rect width="1200" height="720" fill="url(#bg)"/>
+  <text x="56" y="50" class="title">Weight streaming is under half of a ZINC decode token on RDNA4</text>
+  <text x="56" y="76" class="subtitle">Modeled per-token budget: Qwen3.5-9B Q4_K_M, one RX 9070 XT, ~2k context, decode at 39.6 tok/s (25.2 ms/token).</text>
+
+  <!-- Panel A -->
+  <text x="56" y="122" class="panel">Where one 25.2 ms decode token actually goes</text>
+  <rect x="56" y="138" width="1088" height="250" rx="10" fill="#16202f" stroke="#263548"/>
+
+  <!-- axis ticks 0..27 ms, x0=90 width=1040 scale=38.5185 px/ms -->
+  <g class="axis" text-anchor="middle">
+    <line x1="90" y1="190" x2="90" y2="300" stroke="#263548" stroke-width="1"/>
+    <line x1="282.6" y1="190" x2="282.6" y2="300" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="475.2" y1="190" x2="475.2" y2="300" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="667.8" y1="190" x2="667.8" y2="300" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="860.4" y1="190" x2="860.4" y2="300" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="1053.0" y1="190" x2="1053.0" y2="300" stroke="#263548" stroke-width="1"/>
+    <text x="90" y="316">0</text><text x="282.6" y="316">5</text><text x="475.2" y="316">10</text><text x="667.8" y="316">15</text><text x="860.4" y="316">20</text><text x="1053.0" y="316">25 ms</text>
+  </g>
+
+  <!-- stacked budget bar, y=210 h=64 -->
+  <rect x="90" y="210" width="412.1" height="64" rx="3" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="502.1" y="210" width="23.1" height="64" fill="#6ea8ff" fill-opacity="0.95"/>
+  <rect x="525.2" y="210" width="208.0" height="64" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="733.2" y="210" width="269.6" height="64" fill="#f6a35c" fill-opacity="0.95"/>
+  <rect x="1002.8" y="210" width="57.8" height="64" rx="3" fill="#f2a8b8" fill-opacity="0.95"/>
+
+  <text x="296" y="247" text-anchor="middle" class="val">weight streaming 10.7 ms</text>
+  <text x="629" y="247" text-anchor="middle" class="valo">attention, norms, RoPE, SwiGLU 5.4 ms</text>
+  <text x="868" y="247" text-anchor="middle" class="val">dispatch + sync 7.0 ms</text>
+
+  <!-- peak-ideal marker inside streaming at 8.59 ms -> x=420.9, label to the left -->
+  <line x1="420.9" y1="200" x2="420.9" y2="284" stroke="#f6fbff" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="414" y="352" text-anchor="end" class="mark">peak-bandwidth ideal</text>
+  <text x="414" y="368" text-anchor="end" class="axis">8.6 ms &#183; 116 tok/s</text>
+
+  <!-- achievable floor marker at end of streaming, 10.7 ms -> x=502.1, label to the right -->
+  <line x1="502.1" y1="200" x2="502.1" y2="284" stroke="#7ee0d3" stroke-width="1.6"/>
+  <text x="510" y="352" text-anchor="start" class="mark">achievable stream floor</text>
+  <text x="510" y="368" text-anchor="start" class="axis">10.7 ms &#183; 93 tok/s</text>
+
+  <!-- small segment callouts for the thin pieces -->
+  <text x="513" y="203" text-anchor="middle" class="sub">KV 0.6</text>
+  <text x="1031" y="203" text-anchor="middle" class="sub">LM head 1.5</text>
+
+  <!-- Panel B -->
+  <text x="56" y="438" class="panel">Decode throughput against its own ceiling</text>
+  <rect x="56" y="454" width="1088" height="212" rx="10" fill="#16202f" stroke="#263548"/>
+  <text x="80" y="482" class="sub">Bars are tokens per second. The gap from 93 down to 39.6 is the non-streaming 14.5 ms above, not the memory bus.</text>
+
+  <!-- tok/s bars, x0=320 width to value*6.583 -->
+  <text x="300" y="524" text-anchor="end" class="lab">Peak-bandwidth ideal</text>
+  <rect x="320" y="508" width="763.6" height="34" rx="3" fill="#3b4a5e" fill-opacity="0.9"/>
+  <text x="1095" y="531" class="valo">116</text>
+
+  <text x="300" y="574" text-anchor="end" class="lab">Achievable stream floor</text>
+  <rect x="320" y="558" width="612.2" height="34" rx="3" fill="#4fd1c5" fill-opacity="0.55"/>
+  <text x="944" y="581" class="valo">93</text>
+
+  <text x="300" y="624" text-anchor="end" class="lab">ZINC measured</text>
+  <rect x="320" y="608" width="260.7" height="34" rx="3" fill="#4fd1c5" fill-opacity="0.95"/>
+  <text x="592" y="631" class="valo">39.6</text>
+  <text x="648" y="631" class="note">34% of peak &#183; 43% of the achievable floor</text>
+
+  <!-- legend -->
+  <rect x="80" y="648" width="12" height="12" rx="3" fill="#4fd1c5"/><text x="98" y="658" class="leg">bandwidth-bound weight read</text>
+  <rect x="300" y="648" width="12" height="12" rx="3" fill="#b794f6"/><text x="318" y="658" class="leg">latency-bound small kernels</text>
+  <rect x="520" y="648" width="12" height="12" rx="3" fill="#f6a35c"/><text x="538" y="658" class="leg">kernel dispatch + pipeline barriers</text>
+  <rect x="800" y="648" width="12" height="12" rx="3" fill="#f2a8b8"/><text x="818" y="658" class="leg">LM head over 151k vocab + sampling</text>
+</svg>

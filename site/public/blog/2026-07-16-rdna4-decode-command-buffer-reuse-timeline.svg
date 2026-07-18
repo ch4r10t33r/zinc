@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 780" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#171426"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:27px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:14px}
+      .panel{fill:#c7d4e2;font-size:16px;font-weight:700}
+      .lane{fill:#c7d4e2;font-size:13px;font-weight:680}
+      .lab{fill:#c7d4e2;font-size:14px;font-weight:640}
+      .sub{fill:#8595a8;font-size:12.5px}
+      .axis{fill:#8595a8;font-size:12px}
+      .val{fill:#0f1724;font-size:12.5px;font-weight:760}
+      .valo{fill:#f6fbff;font-size:13px;font-weight:740}
+      .note{fill:#f2a8b8;font-size:12.5px;font-weight:640}
+      .mark{fill:#7ee0d3;font-size:12.5px;font-weight:680}
+      .leg{fill:#aebdcc;font-size:12.5px}
+    </style>
+  </defs>
+  <rect width="1200" height="780" fill="url(#bg)"/>
+  <text x="56" y="50" class="title">Command buffer reuse takes the rebuild off RDNA4's decode path</text>
+  <text x="56" y="76" class="subtitle">Modeled per-token decode profile: Qwen3.5-9B Q4_K_M, one RX 9070 XT, ~2k context. Time axis in milliseconds.</text>
+
+  <!-- ================= Panel A ================= -->
+  <text x="56" y="120" class="panel">One decode token as a CPU / GPU timeline</text>
+  <rect x="56" y="134" width="1088" height="404" rx="10" fill="#16202f" stroke="#263548"/>
+
+  <!-- shared time axis, x0=170 width=940, 0..26 ms -> 36.15 px/ms -->
+  <g class="axis" text-anchor="middle">
+    <line x1="170" y1="160" x2="170" y2="500" stroke="#263548" stroke-width="1"/>
+    <line x1="350.8" y1="160" x2="350.8" y2="500" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="531.5" y1="160" x2="531.5" y2="500" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="712.3" y1="160" x2="712.3" y2="500" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="893.1" y1="160" x2="893.1" y2="500" stroke="#22303f" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="1073.8" y1="160" x2="1073.8" y2="500" stroke="#263548" stroke-width="1"/>
+    <text x="170" y="516">0</text><text x="350.8" y="516">5</text><text x="531.5" y="516">10</text><text x="712.3" y="516">15</text><text x="893.1" y="516">20</text><text x="1073.8" y="516">25 ms</text>
+  </g>
+
+  <!-- Before block header -->
+  <text x="72" y="192" class="lane" fill="#f2a8b8">Today: rebuild + re-record every token</text>
+
+  <!-- legend (top-right of panel A) -->
+  <rect x="726" y="182" width="12" height="12" rx="3" fill="#4fd1c5"/><text x="744" y="192" class="leg">streaming GEMV</text>
+  <rect x="884" y="182" width="12" height="12" rx="3" fill="#b794f6"/><text x="902" y="192" class="leg">attn / norm / RoPE</text>
+  <rect x="1052" y="182" width="12" height="12" rx="3" fill="#f2a8b8"/><text x="1070" y="192" class="leg">barrier</text>
+
+  <!-- BEFORE: CPU lane y=204 h=26 -->
+  <text x="160" y="222" text-anchor="end" class="lane">CPU</text>
+  <rect x="170" y="204" width="108.5" height="26" rx="3" fill="#f6a35c" fill-opacity="0.95"/>
+  <text x="224" y="221" text-anchor="middle" class="val">build + record 3.0</text>
+  <text x="676" y="221" text-anchor="middle" class="sub">idle, blocked on GPU</text>
+
+  <!-- BEFORE: GPU lane y=240 h=26, starts at 3.0ms x=278.5 -->
+  <text x="160" y="258" text-anchor="end" class="lane">GPU</text>
+  <!-- 7 busy blocks (~2.6ms) + 6 barrier gaps (~0.67ms); alternate teal/purple -->
+  <rect x="278.5" y="240" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="396.7" y="240" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="514.9" y="240" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="633.1" y="240" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="751.3" y="240" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="869.5" y="240" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="987.7" y="240" width="86.1" height="26" fill="#f2a8b8" fill-opacity="0.95"/>
+  <!-- barrier gap markers -->
+  <g fill="#f2a8b8" fill-opacity="0.85">
+    <rect x="372.5" y="240" width="24.2" height="26"/><rect x="490.7" y="240" width="24.2" height="26"/>
+    <rect x="608.9" y="240" width="24.2" height="26"/><rect x="727.1" y="240" width="24.2" height="26"/>
+    <rect x="845.3" y="240" width="24.2" height="26"/><rect x="963.5" y="240" width="24.2" height="26"/>
+  </g>
+  <text x="627" y="288" text-anchor="middle" class="sub">18.2 ms kernels busy &#183; 4.0 ms barrier bubbles (pink) &#183; token = 3.0 + 22.2 = 25.2 ms &#8594; 39.6 tok/s</text>
+
+  <!-- divider -->
+  <line x1="72" y1="312" x2="1128" y2="312" stroke="#263548" stroke-width="1" stroke-dasharray="2 5"/>
+
+  <!-- After block header -->
+  <text x="72" y="346" class="lane" fill="#7ee0d3">With command buffer reuse: patch KV params, resubmit the recorded buffer</text>
+
+  <!-- AFTER: CPU lane y=360 h=26 -->
+  <text x="160" y="378" text-anchor="end" class="lane">CPU</text>
+  <rect x="170" y="360" width="12" height="26" rx="2" fill="#f6a35c" fill-opacity="0.95"/>
+  <text x="192" y="378" text-anchor="start" class="sub">patch KV params + resubmit 0.3 ms, overlapped with prior token &#8212; off the critical path</text>
+
+  <!-- AFTER: GPU lane y=396 h=26, starts ~0.3ms x=180.8 -->
+  <text x="160" y="414" text-anchor="end" class="lane">GPU</text>
+  <rect x="180.8" y="396" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="299.0" y="396" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="417.2" y="396" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="535.4" y="396" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="653.6" y="396" width="94" height="26" fill="#4fd1c5" fill-opacity="0.95"/>
+  <rect x="771.8" y="396" width="94" height="26" fill="#b794f6" fill-opacity="0.95"/>
+  <rect x="890.0" y="396" width="86.1" height="26" fill="#f2a8b8" fill-opacity="0.95"/>
+  <g fill="#f2a8b8" fill-opacity="0.85">
+    <rect x="274.8" y="396" width="24.2" height="26"/><rect x="393.0" y="396" width="24.2" height="26"/>
+    <rect x="511.2" y="396" width="24.2" height="26"/><rect x="629.4" y="396" width="24.2" height="26"/>
+    <rect x="747.6" y="396" width="24.2" height="26"/><rect x="865.8" y="396" width="24.2" height="26"/>
+  </g>
+  <!-- saved region bracket 22.5->25.2 ms -->
+  <rect x="976.1" y="396" width="97.7" height="26" rx="3" fill="#7ee0d3" fill-opacity="0.14" stroke="#7ee0d3" stroke-dasharray="4 3"/>
+  <text x="1024" y="446" text-anchor="middle" class="mark">3.0 ms removed</text>
+  <text x="1024" y="462" text-anchor="middle" class="axis">token &#8594; 22.2 ms</text>
+  <text x="360" y="446" text-anchor="middle" class="sub">Barriers (pink) survive reuse &#8212; they need kernel fusion, not a recorded buffer.</text>
+
+  <!-- ================= Panel B ================= -->
+  <text x="56" y="576" class="panel">Projected decode throughput, one lever at a time</text>
+  <rect x="56" y="590" width="1088" height="164" rx="10" fill="#16202f" stroke="#263548"/>
+  <text x="80" y="618" class="sub">Bars are tokens per second. Reuse and fusion figures are modeled from the budget above, not measured yet.</text>
+
+  <!-- bars x0=400, 60 tok/s -> 660px, 11 px/tok -->
+  <text x="380" y="654" text-anchor="end" class="lab">ZINC today</text>
+  <rect x="400" y="638" width="435.6" height="26" rx="3" fill="#4fd1c5" fill-opacity="0.95"/>
+  <text x="847" y="658" class="valo">39.6</text>
+
+  <text x="380" y="692" text-anchor="end" class="lab">+ command buffer reuse</text>
+  <rect x="400" y="676" width="495.5" height="26" rx="3" fill="#4fd1c5" fill-opacity="0.6"/>
+  <text x="907" y="696" class="valo">45.0</text>
+  <text x="963" y="696" class="note">projected &#183; +14%</text>
+
+  <text x="380" y="730" text-anchor="end" class="lab">+ reuse + kernel fusion</text>
+  <rect x="400" y="714" width="558.4" height="26" rx="3" fill="#4fd1c5" fill-opacity="0.35"/>
+  <text x="970" y="734" class="valo">50.8</text>
+  <text x="1026" y="734" class="note">projected</text>
+
+</svg>
