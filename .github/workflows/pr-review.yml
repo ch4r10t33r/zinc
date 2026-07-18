@@ -2,26 +2,37 @@ name: GLM Code Review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
 
 permissions:
   contents: read
   issues: write
   pull-requests: write
 
+concurrency:
+  group: glm-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   review:
-    if: ${{ !github.event.pull_request.draft }}
+    if: >-
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
+      (github.event_name == 'push' && startsWith(github.event.ref, 'refs/heads/'))
     runs-on: ubuntu-latest
     env:
       GITHUB_API_URL: ${{ github.api_url }}
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ github.token }}
+      GITHUB_EVENT_NAME: ${{ github.event_name }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
+      PUSH_BEFORE: ${{ github.event.before }}
+      PUSH_AFTER: ${{ github.event.after }}
+      PUSH_FORCED: ${{ github.event.forced }}
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY || secrets.ANTHROPIC_AUTH_TOKEN }}
       ZAI_BASE_URL: https://api.z.ai/api/coding/paas/v4
       ZAI_MODEL: glm-5.2
     steps:
-      - name: Review PR with GLM-5.2
+      - name: Review with GLM-5.2
         run: |
           python3 <<'PY'
           import json
@@ -32,6 +43,7 @@ jobs:
           import urllib.request
 
           marker = "<!-- glm-code-review -->"
+          zero_sha = "0" * 40
 
           def request_json(url, method="GET", headers=None, payload=None):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -56,7 +68,6 @@ jobs:
                   raise
 
           repo = os.environ["GITHUB_REPOSITORY"]
-          pr_number = os.environ["PR_NUMBER"]
           github_token = os.environ["GITHUB_TOKEN"]
           zai_key = os.environ["ZAI_API_KEY"].strip()
           if not zai_key:
@@ -65,18 +76,72 @@ jobs:
           github_api = os.environ["GITHUB_API_URL"].rstrip("/")
           zai_base = os.environ["ZAI_BASE_URL"].rstrip("/")
           model = os.environ["ZAI_MODEL"]
+          event_name = os.environ["GITHUB_EVENT_NAME"]
 
-          diff_url = f"{github_api}/repos/{repo}/pulls/{pr_number}"
-          diff_headers = {
-              "Accept": "application/vnd.github.v3.diff",
+          gh_headers = {
               "Authorization": f"Bearer {github_token}",
+              "Accept": "application/vnd.github+json",
               "User-Agent": "zinc-glm-review",
           }
-          diff = request_text(diff_url, diff_headers)
+          gh_diff_headers = {
+              "Authorization": f"Bearer {github_token}",
+              "Accept": "application/vnd.github.v3.diff",
+              "User-Agent": "zinc-glm-review",
+          }
+
+          # ── Resolve what to diff and where to post the review ──────────
+          #
+          # pull_request_target: diff the whole current PR (base...head), post/
+          # update a single rolling comment on the PR -- unchanged from before.
+          #
+          # push: diff only what this push actually added, so unrelated history
+          # never gets pulled into the "review". Then post to the open PR for
+          # this branch if one exists (continuing that PR's rolling comment),
+          # otherwise post a standalone commit comment so the review is still
+          # visible even before a PR exists.
+          if event_name == "pull_request_target":
+              pr_number = os.environ["PR_NUMBER"]
+              diff_url = f"{github_api}/repos/{repo}/pulls/{pr_number}"
+              diff = request_text(diff_url, gh_diff_headers)
+              post_pr_number = pr_number
+              post_commit_sha = None
+          elif event_name == "push":
+              after = os.environ["PUSH_AFTER"]
+              before = os.environ["PUSH_BEFORE"]
+              forced = os.environ["PUSH_FORCED"] == "true"
+
+              if after == zero_sha:
+                  print("Branch deleted; nothing to review.")
+                  sys.exit(0)
+
+              commit_info = request_json(f"{github_api}/repos/{repo}/commits/{after}", headers=gh_headers)
+              if len(commit_info.get("parents", [])) > 1:
+                  print("Merge commit; already covered by its originating PR review.")
+                  sys.exit(0)
+
+              # A brand-new branch (before == zero_sha) or a force-push/rebase
+              # (before may no longer be an ancestor of after) makes `before`
+              # unreliable as a diff base -- comparing against it could pull in
+              # unrelated upstream history. Fall back to just the tip commit.
+              base = f"{after}^" if (before == zero_sha or forced) else before
+              diff_url = f"{github_api}/repos/{repo}/compare/{base}...{after}"
+              diff = request_text(diff_url, gh_diff_headers)
+
+              pulls_url = f"{github_api}/repos/{repo}/commits/{after}/pulls"
+              associated = request_json(pulls_url, headers={**gh_headers, "Accept": "application/vnd.github.groot-preview+json"}) or []
+              open_pr = next((p for p in associated if p.get("state") == "open"), None)
+              post_pr_number = str(open_pr["number"]) if open_pr else None
+              post_commit_sha = after if open_pr is None else None
+          else:
+              raise SystemExit(f"Unexpected event: {event_name}")
+
           diff_limit = 120000
           truncated = len(diff) > diff_limit
           if truncated:
               diff = diff[:diff_limit]
+          if not diff.strip():
+              print("Empty diff; nothing to review.")
+              sys.exit(0)
 
           system_prompt = (
               "You are a senior engineer reviewing a GitHub pull request.\n"
@@ -134,35 +199,32 @@ jobs:
               verdict = "BLOCK" if re.search(r"(?i)\bcritical\b|\bhigh severity\b|🔴|🟠", content) else "PASS"
 
           body = f"{marker}\n\n## GLM Review\n\n{content}\n\n**Verdict:** {verdict}\n"
-          comments_url = f"{github_api}/repos/{repo}/issues/{pr_number}/comments?per_page=100"
-          comments = request_json(
-              comments_url,
-              headers={
-                  "Authorization": f"Bearer {github_token}",
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": "zinc-glm-review",
-              },
-          )
 
-          existing = None
-          for comment in comments:
-              if marker in comment.get("body", "") and comment.get("user", {}).get("login") == "github-actions[bot]":
-                  existing = comment
-                  break
+          if post_pr_number is not None:
+              comments_url = f"{github_api}/repos/{repo}/issues/{post_pr_number}/comments?per_page=100"
+              comments = request_json(comments_url, headers=gh_headers)
 
-          write_headers = {
-              "Authorization": f"Bearer {github_token}",
-              "Accept": "application/vnd.github+json",
-              "Content-Type": "application/json",
-              "User-Agent": "zinc-glm-review",
-          }
+              existing = None
+              for comment in comments:
+                  if marker in comment.get("body", "") and comment.get("user", {}).get("login") == "github-actions[bot]":
+                      existing = comment
+                      break
 
-          if existing is None:
-              request_json(comments_url.rsplit("?", 1)[0], method="POST", headers=write_headers, payload={"body": body})
-              print("Posted GLM review comment.")
+              write_headers = {**gh_headers, "Content-Type": "application/json"}
+              if existing is None:
+                  request_json(comments_url.rsplit("?", 1)[0], method="POST", headers=write_headers, payload={"body": body})
+                  print(f"Posted GLM review comment on PR #{post_pr_number}.")
+              else:
+                  request_json(existing["url"], method="PATCH", headers=write_headers, payload={"body": body})
+                  print(f"Updated existing GLM review comment on PR #{post_pr_number}.")
           else:
-              request_json(existing["url"], method="PATCH", headers=write_headers, payload={"body": body})
-              print("Updated existing GLM review comment.")
+              # No open PR for this push yet -- leave the review on the commit
+              # itself so it's still visible (each commit gets its own comment;
+              # there's no earlier one to update).
+              commit_comments_url = f"{github_api}/repos/{repo}/commits/{post_commit_sha}/comments"
+              write_headers = {**gh_headers, "Content-Type": "application/json"}
+              request_json(commit_comments_url, method="POST", headers=write_headers, payload={"body": body})
+              print(f"Posted GLM review as a commit comment on {post_commit_sha}.")
 
           if verdict == "BLOCK":
               raise SystemExit("GLM review flagged High or Critical findings")
