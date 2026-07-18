@@ -6839,6 +6839,11 @@ pub const InferenceEngine = struct {
     /// `batched_prefill_scratch_retain_max_tokens`); see
     /// `acquireBatchedPrefillScratch`.
     batched_prefill_scratch_cache: ?BatchedPrefillScratch = null,
+    /// Debug guard: true while an acquired scratch is live. Generation is
+    /// serialized per engine and the prefill paths that acquire scratch
+    /// never nest, so overlapping acquires would be a refactoring bug;
+    /// asserted in `acquireBatchedPrefillScratch`.
+    batched_prefill_scratch_in_use: bool = false,
     lm_head_private_buf: MetalBuffer,
     expert_ids_buf: MetalBuffer,
 
@@ -9924,21 +9929,28 @@ pub const InferenceEngine = struct {
         kv_dim: u32,
         inter_dim: u32,
     ) !*BatchedPrefillScratch {
+        // The scratch-acquiring prefill paths are alternatives selected per
+        // model architecture (or strictly sequential validation replays);
+        // they never nest. Catch any future refactor that overlaps them.
+        std.debug.assert(!self.batched_prefill_scratch_in_use);
         if (self.batched_prefill_scratch_cache) |*cached| {
             if (cached.n_tokens >= n_tokens) {
                 cached.resetForReuse();
+                self.batched_prefill_scratch_in_use = true;
                 return cached;
             }
             cached.deinit();
             self.batched_prefill_scratch_cache = null;
         }
         self.batched_prefill_scratch_cache = try BatchedPrefillScratch.init(self, n_tokens, q_dim, kv_dim, inter_dim);
+        self.batched_prefill_scratch_in_use = true;
         return &self.batched_prefill_scratch_cache.?;
     }
 
     /// Retain the scratch for the next request when it is small enough,
     /// otherwise free it (see `batched_prefill_scratch_retain_max_tokens`).
     fn releaseBatchedPrefillScratch(self: *InferenceEngine) void {
+        self.batched_prefill_scratch_in_use = false;
         if (self.batched_prefill_scratch_cache) |*cached| {
             if (cached.n_tokens > batched_prefill_scratch_retain_max_tokens) {
                 cached.deinit();
@@ -38260,6 +38272,79 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_swiglu.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "acquireBatchedPrefillScratch reuses, re-zeroes, grows, and evicts oversized scratch" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.batched_prefill_scratch_cache = null;
+    engine.batched_prefill_scratch_in_use = false;
+    engine.config = .{
+        .architecture = .gemma,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 48,
+    };
+    defer if (engine.batched_prefill_scratch_cache) |*s| {
+        s.deinit();
+        engine.batched_prefill_scratch_cache = null;
+    };
+
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+
+    // First acquire allocates and marks the scratch in use.
+    const first = try engine.acquireBatchedPrefillScratch(2, q_dim, kv_dim, inter_dim);
+    const first_hidden_handle = first.hidden.handle;
+    try std.testing.expect(engine.batched_prefill_scratch_in_use);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(!engine.batched_prefill_scratch_in_use);
+    // Small scratch is retained across release.
+    try std.testing.expect(engine.batched_prefill_scratch_cache != null);
+
+    // Same-capacity acquire reuses the identical buffers (no reallocation)
+    // and re-zeroes moe_active_block_count, the one init()-zeroed buffer.
+    {
+        const cached = &engine.batched_prefill_scratch_cache.?;
+        const bytes = cached.moe_active_block_count.cpu_ptr.?;
+        bytes[0] = 0xAB; // dirty it, as a prior request's routing profile would
+    }
+    const second = try engine.acquireBatchedPrefillScratch(2, q_dim, kv_dim, inter_dim);
+    try std.testing.expectEqual(first_hidden_handle, second.hidden.handle);
+    try std.testing.expectEqual(@as(u8, 0), second.moe_active_block_count.cpu_ptr.?[0]);
+    engine.releaseBatchedPrefillScratch();
+
+    // A larger request reallocates: capacity grows and buffers change.
+    const third = try engine.acquireBatchedPrefillScratch(4, q_dim, kv_dim, inter_dim);
+    try std.testing.expectEqual(@as(u32, 4), third.n_tokens);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(engine.batched_prefill_scratch_cache != null);
+
+    // A request over the retention cap is freed at release, restoring the
+    // pre-cache transient behavior so long prompts cannot pin memory.
+    _ = try engine.acquireBatchedPrefillScratch(batched_prefill_scratch_retain_max_tokens + 1, q_dim, kv_dim, inter_dim);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(engine.batched_prefill_scratch_cache == null);
 }
 
 test "BatchedPrefillScratch sizes active-block shared output scratch by token" {
