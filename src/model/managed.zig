@@ -169,7 +169,9 @@ fn preflightCatalogDrift(
     writer: anytype,
 ) !void {
     if (metadata.size_bytes) |size_bytes| {
-        if (size_bytes != entry.size_bytes) {
+        // size_bytes == 0 means the entry carries no pinned size (e.g. `-hf`
+        // downloads), so there is no catalog expectation to drift from.
+        if (entry.size_bytes != 0 and size_bytes != entry.size_bytes) {
             try writer.print(
                 "Catalog note: upstream size is {d:.2} GiB but pinned catalog size is {d:.2} GiB; continuing because sha256 pin is authoritative.\n",
                 .{ bytesToGiB(size_bytes), bytesToGiB(entry.size_bytes) },
@@ -199,12 +201,32 @@ pub fn runtimePaths(allocator: std.mem.Allocator) !RuntimePaths {
     };
 }
 
+// A model id names a single directory under `<cache_root>/models/`. Ids
+// arrive from the catalog, `-hf` cache-id derivation, CLI arguments, server
+// request bodies, and the active-model config file; restricting them to one
+// filesystem-safe path component here makes every id-keyed cache path
+// (resolve / isInstalled / remove) traversal-proof regardless of caller.
+fn isValidModelId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 128) return false;
+    if (id[0] == '.' or id[0] == '-') return false;
+    for (id) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Returns the absolute path to the installed GGUF file for the given model id.
 ///
 /// @param model_id Catalog model identifier (e.g. `"qwen3-2b"`).
 /// @param allocator Used to build the path; caller owns the returned slice.
 /// @returns Heap-allocated absolute path `<cache_root>/models/<model_id>/model.gguf`.
+/// @note Ids that are not a single filesystem-safe path component fail with
+/// `error.InvalidModelId`, so no caller can resolve a path outside the cache.
 pub fn resolveInstalledModelPath(model_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (!isValidModelId(model_id)) return error.InvalidModelId;
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
     return try std.fs.path.join(allocator, &.{ paths.cache_root, "models", model_id, "model.gguf" });
@@ -215,7 +237,10 @@ pub fn resolveInstalledModelPath(model_id: []const u8, allocator: std.mem.Alloca
 /// @param model_id Catalog model identifier.
 /// @param allocator Used to build the path; caller owns the returned slice.
 /// @returns Heap-allocated absolute path `<cache_root>/models/<model_id>/manifest.json`.
+/// @note Ids that are not a single filesystem-safe path component fail with
+/// `error.InvalidModelId`, so no caller can resolve a path outside the cache.
 pub fn resolveManifestPath(model_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (!isValidModelId(model_id)) return error.InvalidModelId;
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
     return try std.fs.path.join(allocator, &.{ paths.cache_root, "models", model_id, "manifest.json" });
@@ -494,6 +519,7 @@ pub fn pullModelWithObserver(
     writer: anytype,
     observer: ?*const DownloadObserver,
 ) !void {
+    if (!isValidModelId(entry.id)) return error.InvalidModelId;
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
 
@@ -505,6 +531,11 @@ pub fn pullModelWithObserver(
     defer allocator.free(manifest_path);
 
     if (isInstalled(entry.id, allocator)) {
+        // No pinned sha256 (e.g. `-hf` downloads): trust the cached file.
+        if (entry.sha256.len == 0) {
+            try writer.print("Already installed: {s}\n", .{final_path});
+            return;
+        }
         const actual_sha = try computeFileSha256Hex(final_path, allocator);
         defer allocator.free(actual_sha);
         if (std.ascii.eqlIgnoreCase(actual_sha, entry.sha256)) {
@@ -603,17 +634,34 @@ pub fn pullModelWithObserver(
     }
 
     const stat = try partial_file.stat();
-    try writer.writeAll("Verifying sha256...\n");
     if (observer) |obs| {
         if (obs.on_verifying) |cb| cb(obs.context, stat.size);
     }
 
-    if (entry.sha256.len > 0) {
+    // Prefer the pinned catalog digest; entries without one (`-hf` synthesizes
+    // them from the Hugging Face manifest, which may omit `lfs.sha256`) fall
+    // back to the digest the upstream HEAD preflight advertised (Hugging
+    // Face's x-linked-etag is the LFS sha256), so those downloads still get
+    // end-to-end integrity. Only when neither source has a digest is the
+    // file installed unverified — loudly, not silently.
+    var upstream_sha_buf: [64]u8 = undefined;
+    const expected_sha: []const u8 = blk: {
+        if (entry.sha256.len > 0) break :blk entry.sha256;
+        if (upstream_metadata.sha256_hex) |hex| {
+            upstream_sha_buf = hex;
+            break :blk upstream_sha_buf[0..];
+        }
+        break :blk "";
+    };
+    if (expected_sha.len > 0) {
+        try writer.writeAll("Verifying sha256...\n");
         const actual_sha = try computeFileSha256Hex(partial_path, allocator);
         defer allocator.free(actual_sha);
-        if (!std.ascii.eqlIgnoreCase(actual_sha, entry.sha256)) {
+        if (!std.ascii.eqlIgnoreCase(actual_sha, expected_sha)) {
             return error.ChecksumMismatch;
         }
+    } else {
+        try writer.writeAll("Warning: neither the catalog nor upstream provided a sha256; installing without integrity verification.\n");
     }
 
     std.fs.deleteFileAbsolute(final_path) catch {};
@@ -623,7 +671,11 @@ pub fn pullModelWithObserver(
     if (observer) |obs| {
         if (obs.on_complete) |cb| cb(obs.context, stat.size);
     }
-    try writer.print("sha256 verified\nInstalled: {s}\n", .{final_path});
+    if (expected_sha.len > 0) {
+        try writer.print("sha256 verified\nInstalled: {s}\n", .{final_path});
+    } else {
+        try writer.print("Installed (unverified): {s}\n", .{final_path});
+    }
 }
 
 /// Converts a byte count to gibibytes (GiB) as a floating-point value.
@@ -781,6 +833,7 @@ fn computeFileSha256Hex(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn resolveInstalledModelDir(model_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (!isValidModelId(model_id)) return error.InvalidModelId;
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
     return try std.fs.path.join(allocator, &.{ paths.cache_root, "models", model_id });
@@ -925,6 +978,32 @@ fn findStringEnd(s: []const u8) ?usize {
         if (s[i] == '"') return i;
     }
     return null;
+}
+
+test "isValidModelId accepts catalog and hf cache ids" {
+    try std.testing.expect(isValidModelId("qwen35-9b-q4k-m"));
+    try std.testing.expect(isValidModelId("hf--unsloth-qwen3.5-9b-gguf--q4_k_m"));
+}
+
+test "isValidModelId rejects ids that are not a single safe path component" {
+    try std.testing.expect(!isValidModelId(""));
+    try std.testing.expect(!isValidModelId("."));
+    try std.testing.expect(!isValidModelId(".."));
+    try std.testing.expect(!isValidModelId("../../../home/user"));
+    try std.testing.expect(!isValidModelId("a/b"));
+    try std.testing.expect(!isValidModelId("a\\b"));
+    try std.testing.expect(!isValidModelId(".hidden"));
+    try std.testing.expect(!isValidModelId("-flag-like"));
+    try std.testing.expect(!isValidModelId("id with space"));
+    try std.testing.expect(!isValidModelId("x" ** 129));
+}
+
+test "model paths cannot be resolved for traversal ids" {
+    try std.testing.expectError(error.InvalidModelId, resolveInstalledModelPath("../escape", std.testing.allocator));
+    try std.testing.expectError(error.InvalidModelId, resolveManifestPath("../escape", std.testing.allocator));
+    try std.testing.expectError(error.InvalidModelId, resolveInstalledModelDir("../escape", std.testing.allocator));
+    try std.testing.expect(!isInstalled("../escape", std.testing.allocator));
+    try std.testing.expectError(error.InvalidModelId, removeInstalledModel("../escape", std.testing.allocator));
 }
 
 test "resolve cache root prefers XDG cache home" {

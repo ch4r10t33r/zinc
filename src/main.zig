@@ -29,6 +29,7 @@ else
     };
 const gguf_mod = @import("model/gguf.zig");
 const managed_mod = @import("model/managed.zig");
+const hf_mod = @import("model/hf.zig");
 const tokenizer_mod = @import("model/tokenizer.zig");
 const graph_mod = @import("compute/graph.zig");
 const memory_plan = @import("gpu/memory_plan.zig");
@@ -139,6 +140,7 @@ comptime {
     }
     // Platform-independent modules
     _ = @import("model/config.zig");
+    _ = @import("model/hf.zig");
     _ = @import("model/gguf.zig");
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
@@ -164,6 +166,8 @@ pub const Config = struct {
     model_path: ?[]const u8 = null,
     /// Managed model identifier from the built-in catalog/cache.
     model_id: ?[]const u8 = null,
+    /// Hugging Face `owner/repo[:quant]` spec to download and load (`-hf`).
+    hf_spec: ?[]const u8 = null,
     /// HTTP server port.
     port: u16 = 8080,
     /// GPU device index used when explicitly set with `-d/--device`.
@@ -448,12 +452,14 @@ const banner =
     \\  zinc -m <model.gguf> [-p 8080]
     \\  zinc chat [-m <model.gguf> | --model-id <id>] [-p 9090]
     \\  zinc --model-id <id> [--prompt "Hello"]
+    \\  zinc -hf <owner/model[:quant]> [--prompt "Hello"]
     \\  zinc --check [-m <model.gguf> | --model-id <id>]
     \\  zinc model <list|pull|use|active|rm> [args]
     \\
     \\Common options:
     \\  -m, --model <path>       GGUF model file to load
     \\  --model-id <id>          Managed model id from the local catalog/cache
+    \\  -hf, --hf-repo <spec>    Hugging Face repo (owner/model[:quant]) to download and load
     \\  --prompt <text>          Run one prompt in CLI mode instead of starting the server
     \\  --chat                   Apply the model chat template to --prompt
     \\  --raw                    Do not auto-apply chat templates to --prompt
@@ -472,7 +478,7 @@ const banner =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -492,12 +498,14 @@ const banner_full =
     \\  zinc -m <model.gguf> [-p 8080]
     \\  zinc chat [-m <model.gguf> | --model-id <id>] [-p 9090]
     \\  zinc --model-id <id> [--prompt "Hello"]
+    \\  zinc -hf <owner/model[:quant]> [--prompt "Hello"]
     \\  zinc --check [-m <model.gguf> | --model-id <id>]
     \\  zinc model <list|pull|use|active|rm> [args]
     \\
     \\Common options:
     \\  -m, --model <path>       GGUF model file to load
     \\  --model-id <id>          Managed model id from the local catalog/cache
+    \\  -hf, --hf-repo <spec>    Hugging Face repo (owner/model[:quant]) to download and load
     \\  --prompt <text>          Run one prompt in CLI mode instead of starting the server
     \\  --chat                   Apply the model chat template to --prompt
     \\  --raw                    Do not auto-apply chat templates to --prompt
@@ -516,7 +524,7 @@ const banner_full =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -601,6 +609,10 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             config.model_id = args[i];
+        } else if (std.mem.eql(u8, arg, "-hf") or std.mem.eql(u8, arg, "--hf-repo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.hf_spec = args[i];
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -670,6 +682,9 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
 
     if (config.command == .chat and config.prompt != null) {
         return error.ChatCommandDoesNotTakePrompt;
+    }
+    if (config.hf_spec != null and (config.model_path != null or config.model_id != null)) {
+        return error.ConflictingModelSources;
     }
     if (config.chat and config.raw_prompt) {
         return error.ConflictingPromptModes;
@@ -822,6 +837,19 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
 }
 
 fn resolveStartupModel(config: Config, allocator: std.mem.Allocator) !ResolvedStartupModel {
+    if (config.hf_spec) |spec| {
+        var stdout_buffer: [512]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        const path = try hf_mod.ensureModel(spec, allocator, &stdout_writer.interface);
+        return .{
+            .spec = .{
+                .model_path = path,
+                .requested_context_length = config.context_length,
+            },
+            .owned_path = path,
+        };
+    }
+
     if (config.model_id) |model_id| {
         const path = try managed_mod.resolveInstalledModelPath(model_id, allocator);
         const model_id_copy = try allocator.dupe(u8, model_id);
@@ -1547,7 +1575,12 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
         },
         .model_rm => {
             const model_id = config.command_model_id orelse return error.MissingArgValue;
-            _ = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
+            // `-hf` downloads share the managed cache but have no catalog
+            // entry, so accept any id that is installed on disk and only
+            // reject ids that are neither in the catalog nor installed.
+            if (catalog_mod.find(model_id) == null and !managed_mod.isInstalled(model_id, allocator)) {
+                return error.UnknownManagedModel;
+            }
 
             if (try tryRemoveManagedModelViaLocalServer(config.port, model_id, config.command_force, allocator)) |server_response| {
                 defer {
@@ -2879,6 +2912,19 @@ test "parseArgs: full args" {
     try std.testing.expectEqual(@as(u8, 3), config.kv_quant);
     try std.testing.expectEqualStrings("graph.json", config.graph_report_path.?);
     try std.testing.expectEqualStrings("graph.dot", config.graph_dot_path.?);
+}
+
+test "parseArgs: -hf sets hf_spec" {
+    const args = [_][:0]const u8{ "zinc", "-hf", "unsloth/Qwen3.5-9B-GGUF:Q4_K_M" };
+    const config = try parseArgs(&args);
+    try std.testing.expectEqualStrings("unsloth/Qwen3.5-9B-GGUF:Q4_K_M", config.hf_spec.?);
+}
+
+test "parseArgs: -hf conflicts with -m and --model-id" {
+    const with_model = [_][:0]const u8{ "zinc", "-hf", "a/b", "-m", "model.gguf" };
+    try std.testing.expectError(error.ConflictingModelSources, parseArgs(&with_model));
+    const with_id = [_][:0]const u8{ "zinc", "-hf", "a/b", "--model-id", "qwen35-9b-q4k-m" };
+    try std.testing.expectError(error.ConflictingModelSources, parseArgs(&with_id));
 }
 
 test "parseArgs: allows large context requests" {
