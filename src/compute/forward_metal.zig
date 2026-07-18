@@ -537,8 +537,13 @@ fn isQwen35Dense9bDownQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u3
 }
 
 fn isQwen35Dense9bDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
-    // Same shape contract as the Q4_K predicate: the block constant counts
-    // K-dimension 256-element superblocks, which Q4_K and Q6_K share.
+    // Same shape contract as the Q4_K predicate. The block constant counts
+    // K-dimension superblocks in *elements* (QK_K = 256 for every K-quant;
+    // see GGMLType.blockSize), which Q4_K and Q6_K share — only their bytes
+    // per superblock differ (144 vs 210), and byte layout is owned by the
+    // kernel picked per quant type in dispatchQwenSharedBatchedGemmOnCmd,
+    // never by this predicate. The 27B constants make the same point:
+    // qwen35_27b_dense_down_q4k_blocks == qwen35_27b_dense_down_q6k_blocks.
     return isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K);
 }
 
