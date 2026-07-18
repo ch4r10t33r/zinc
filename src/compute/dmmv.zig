@@ -6056,6 +6056,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8_1) |*p| p.deinit();
+        if (self.pipeline_mxfp4) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }

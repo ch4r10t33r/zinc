@@ -220,3 +220,57 @@ test "KvPagePool free nonexistent request is no-op" {
     pool.freePages(999);
     try std.testing.expectEqual(@as(u32, 4), pool.freeCount());
 }
+
+test "KvPagePool positionBase returns 0 for an empty page-id slice" {
+    const allocator = std.testing.allocator;
+    var pool = try KvPagePool.init(allocator, 4, 256);
+    defer pool.deinit();
+
+    // Documented special case: an empty slice has no meaningful base.
+    try std.testing.expectEqual(@as(u32, 0), pool.positionBase(&.{}));
+}
+
+test "KvPagePool maxContext scales with page_size and is zero for zero pages" {
+    const allocator = std.testing.allocator;
+    var pool = try KvPagePool.init(allocator, 4, 256);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), pool.maxContext(0));
+    try std.testing.expectEqual(@as(u32, 256), pool.maxContext(1));
+    try std.testing.expectEqual(@as(u32, 1024), pool.maxContext(4));
+}
+
+test "KvPagePool allocPages(0) returns an empty slice without touching the free list" {
+    const allocator = std.testing.allocator;
+    var pool = try KvPagePool.init(allocator, 4, 256);
+    defer pool.deinit();
+
+    const pages = try pool.allocPages(1, 0);
+    defer allocator.free(pages);
+    try std.testing.expectEqual(@as(usize, 0), pages.len);
+    try std.testing.expectEqual(@as(u32, 4), pool.freeCount());
+}
+
+test "KvPagePool with zero total pages always reports exhaustion" {
+    const allocator = std.testing.allocator;
+    var pool = try KvPagePool.init(allocator, 0, 256);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), pool.freeCount());
+    try std.testing.expectError(error.KvCacheExhausted, pool.allocPages(1, 1));
+    // Allocating zero pages from an empty pool is still a valid no-op.
+    const pages = try pool.allocPages(1, 0);
+    defer allocator.free(pages);
+    try std.testing.expectEqual(@as(usize, 0), pages.len);
+}
+
+test "KvPagePool allocating exactly all remaining pages succeeds; one more fails" {
+    const allocator = std.testing.allocator;
+    var pool = try KvPagePool.init(allocator, 3, 256);
+    defer pool.deinit();
+
+    const pages = try pool.allocPages(1, 3); // exactly all of them
+    defer allocator.free(pages);
+    try std.testing.expectEqual(@as(u32, 0), pool.freeCount());
+    try std.testing.expectError(error.KvCacheExhausted, pool.allocPages(2, 1));
+}

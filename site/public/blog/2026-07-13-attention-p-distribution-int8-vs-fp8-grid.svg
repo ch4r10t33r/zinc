@@ -1,0 +1,290 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#171426"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:27px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:14px}
+      .panel{fill:#c7d4e2;font-size:16px;font-weight:700}
+      .lab{fill:#c7d4e2;font-size:14px;font-weight:640}
+      .sub{fill:#8595a8;font-size:12px}
+      .axis{fill:#8595a8;font-size:12px}
+      .val{fill:#f6fbff;font-size:13px;font-weight:740}
+      .note{fill:#f2a8b8;font-size:13px;font-weight:640}
+      .ok{fill:#5fe0c8;font-size:13px;font-weight:640}
+      .leg{fill:#aebdcc;font-size:13px}
+    </style>
+  </defs>
+<rect width="1200" height="800" fill="url(#bg)"/>
+<text x="56" y="50" class="title">The softmax makes P an exponential, and int8 has no exponent</text>
+<text x="56" y="76" class="subtitle">Left: where a Qwen3.5-9B attention row keeps its probability mass, and which values each 8-bit grid can actually represent.</text>
+<text x="56" y="96" class="subtitle">Right: per-channel absolute max of K, relative to the median channel. Measured on ZINC, layer 20, all 32 query heads, RX 9070 XT.</text>
+<text x="56" y="136" class="panel">Where the attention mass lives, against the 8-bit grids</text>
+<rect x="88" y="152" width="690" height="540" rx="10" fill="#16202f" stroke="#263548"/>
+<rect x="470" y="164" width="14" height="12" rx="3" fill="#5fe0c8" fill-opacity="0.75"/><text x="490" y="175" class="leg">4k prompt</text>
+<rect x="580" y="164" width="14" height="12" rx="3" fill="#b48cff" fill-opacity="0.85"/><text x="600" y="175" class="leg">32k prompt</text>
+<rect x="110" y="200" width="331.7" height="240" fill="#ff6b8a" fill-opacity="0.07"/>
+<line x1="441.7" y1="200" x2="441.7" y2="470" stroke="#ff6b8a" stroke-width="1.6" stroke-dasharray="5 4"/>
+<rect x="130.0" y="430.0" width="42" height="10.0" rx="3" fill="#5fe0c8" fill-opacity="0.75"/>
+<rect x="176.0" y="395.0" width="42" height="45.0" rx="3" fill="#b48cff" fill-opacity="0.85"/>
+<text x="151.0" y="424.0" text-anchor="middle" class="val">2%</text>
+<text x="197.0" y="389.0" text-anchor="middle" class="val">9%</text>
+<rect x="258.0" y="410.0" width="42" height="30.0" rx="3" fill="#5fe0c8" fill-opacity="0.75"/>
+<rect x="304.0" y="350.0" width="42" height="90.0" rx="3" fill="#b48cff" fill-opacity="0.85"/>
+<text x="279.0" y="404.0" text-anchor="middle" class="val">6%</text>
+<text x="325.0" y="344.0" text-anchor="middle" class="val">18%</text>
+<rect x="386.0" y="355.0" width="42" height="85.0" rx="3" fill="#5fe0c8" fill-opacity="0.75"/>
+<rect x="432.0" y="305.0" width="42" height="135.0" rx="3" fill="#b48cff" fill-opacity="0.85"/>
+<text x="407.0" y="349.0" text-anchor="middle" class="val">17%</text>
+<text x="453.0" y="299.0" text-anchor="middle" class="val">27%</text>
+<rect x="514.0" y="275.0" width="42" height="165.0" rx="3" fill="#5fe0c8" fill-opacity="0.75"/>
+<rect x="560.0" y="300.0" width="42" height="140.0" rx="3" fill="#b48cff" fill-opacity="0.85"/>
+<text x="535.0" y="269.0" text-anchor="middle" class="val">33%</text>
+<text x="581.0" y="294.0" text-anchor="middle" class="val">28%</text>
+<rect x="642.0" y="230.0" width="42" height="210.0" rx="3" fill="#5fe0c8" fill-opacity="0.75"/>
+<rect x="688.0" y="350.0" width="42" height="90.0" rx="3" fill="#b48cff" fill-opacity="0.85"/>
+<text x="663.0" y="224.0" text-anchor="middle" class="val">42%</text>
+<text x="709.0" y="344.0" text-anchor="middle" class="val">18%</text>
+<line x1="110" y1="440" x2="750" y2="440" stroke="#3a4a5e" stroke-width="1.4"/>
+<text x="174.0" y="458" text-anchor="middle" class="axis">1e-5 to 1e-4</text>
+<text x="302.0" y="458" text-anchor="middle" class="axis">1e-4 to 1e-3</text>
+<text x="430.0" y="458" text-anchor="middle" class="axis">1e-3 to 1e-2</text>
+<text x="558.0" y="458" text-anchor="middle" class="axis">1e-2 to 0.1</text>
+<text x="686.0" y="458" text-anchor="middle" class="axis">0.1 to 1</text>
+<text x="118" y="218" class="note">int8 rounds everything left of the line to zero</text>
+<text x="118" y="236" class="sub">12 percent of the row mass at 4k. 38 percent at 32k.</text>
+<text x="110" y="480" class="sub">share of the softmax row sum, by magnitude decade</text>
+<text x="110" y="510" class="lab">int8, static scale 127</text>
+<text x="110" y="528" class="sub">127 uniform steps. The left three decades of the axis contain no representable value at all.</text>
+<line x1="480.7" y1="538" x2="480.7" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="519.2" y1="538" x2="519.2" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="541.8" y1="538" x2="541.8" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="557.8" y1="538" x2="557.8" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="570.2" y1="538" x2="570.2" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="580.3" y1="538" x2="580.3" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="596.3" y1="538" x2="596.3" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="608.7" y1="538" x2="608.7" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="618.8" y1="538" x2="618.8" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="634.8" y1="538" x2="634.8" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="647.2" y1="538" x2="647.2" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="657.4" y1="538" x2="657.4" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="673.4" y1="538" x2="673.4" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="685.8" y1="538" x2="685.8" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="695.9" y1="538" x2="695.9" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="711.9" y1="538" x2="711.9" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="724.3" y1="538" x2="724.3" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="734.4" y1="538" x2="734.4" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="743.0" y1="538" x2="743.0" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="750.0" y1="538" x2="750.0" y2="560" stroke="#ff9db2" stroke-width="1.5"/>
+<line x1="110" y1="549" x2="750" y2="549" stroke="#3a4a5e" stroke-width="1"/>
+<text x="110" y="596" class="lab">fp8 e4m3, static scale 448</text>
+<text x="110" y="614" class="sub">8 steps per binade, 18 binades with subnormals. Smallest representable probability about 4e-6.</text>
+<line x1="110.0" y1="624" x2="110.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="114.8" y1="624" x2="114.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="119.6" y1="624" x2="119.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="124.4" y1="624" x2="124.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="129.2" y1="624" x2="129.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="134.1" y1="624" x2="134.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="138.9" y1="624" x2="138.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="143.7" y1="624" x2="143.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="148.5" y1="624" x2="148.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="153.3" y1="624" x2="153.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="158.1" y1="624" x2="158.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="162.9" y1="624" x2="162.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="167.7" y1="624" x2="167.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="172.5" y1="624" x2="172.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="177.3" y1="624" x2="177.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="182.2" y1="624" x2="182.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="187.0" y1="624" x2="187.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="191.8" y1="624" x2="191.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="196.6" y1="624" x2="196.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="201.4" y1="624" x2="201.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="206.2" y1="624" x2="206.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="211.0" y1="624" x2="211.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="215.8" y1="624" x2="215.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="220.6" y1="624" x2="220.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="225.4" y1="624" x2="225.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="230.3" y1="624" x2="230.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="235.1" y1="624" x2="235.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="239.9" y1="624" x2="239.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="244.7" y1="624" x2="244.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="249.5" y1="624" x2="249.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="254.3" y1="624" x2="254.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="259.1" y1="624" x2="259.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="263.9" y1="624" x2="263.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="268.7" y1="624" x2="268.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="273.5" y1="624" x2="273.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="278.4" y1="624" x2="278.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="283.2" y1="624" x2="283.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="288.0" y1="624" x2="288.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="292.8" y1="624" x2="292.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="297.6" y1="624" x2="297.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="302.4" y1="624" x2="302.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="307.2" y1="624" x2="307.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="312.0" y1="624" x2="312.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="316.8" y1="624" x2="316.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="321.6" y1="624" x2="321.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="326.5" y1="624" x2="326.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="331.3" y1="624" x2="331.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="336.1" y1="624" x2="336.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="340.9" y1="624" x2="340.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="345.7" y1="624" x2="345.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="350.5" y1="624" x2="350.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="355.3" y1="624" x2="355.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="360.1" y1="624" x2="360.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="364.9" y1="624" x2="364.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="369.7" y1="624" x2="369.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="374.6" y1="624" x2="374.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="379.4" y1="624" x2="379.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="384.2" y1="624" x2="384.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="389.0" y1="624" x2="389.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="393.8" y1="624" x2="393.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="398.6" y1="624" x2="398.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="403.4" y1="624" x2="403.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="408.2" y1="624" x2="408.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="413.0" y1="624" x2="413.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="417.8" y1="624" x2="417.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="422.7" y1="624" x2="422.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="427.5" y1="624" x2="427.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="432.3" y1="624" x2="432.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="437.1" y1="624" x2="437.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="441.9" y1="624" x2="441.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="446.7" y1="624" x2="446.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="451.5" y1="624" x2="451.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="456.3" y1="624" x2="456.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="461.1" y1="624" x2="461.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="465.9" y1="624" x2="465.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="470.8" y1="624" x2="470.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="475.6" y1="624" x2="475.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="480.4" y1="624" x2="480.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="485.2" y1="624" x2="485.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="490.0" y1="624" x2="490.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="494.8" y1="624" x2="494.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="499.6" y1="624" x2="499.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="504.4" y1="624" x2="504.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="509.2" y1="624" x2="509.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="514.0" y1="624" x2="514.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="518.9" y1="624" x2="518.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="523.7" y1="624" x2="523.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="528.5" y1="624" x2="528.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="533.3" y1="624" x2="533.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="538.1" y1="624" x2="538.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="542.9" y1="624" x2="542.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="547.7" y1="624" x2="547.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="552.5" y1="624" x2="552.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="557.3" y1="624" x2="557.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="562.1" y1="624" x2="562.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="566.9" y1="624" x2="566.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="571.8" y1="624" x2="571.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="576.6" y1="624" x2="576.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="581.4" y1="624" x2="581.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="586.2" y1="624" x2="586.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="591.0" y1="624" x2="591.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="595.8" y1="624" x2="595.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="600.6" y1="624" x2="600.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="605.4" y1="624" x2="605.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="610.2" y1="624" x2="610.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="615.0" y1="624" x2="615.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="619.9" y1="624" x2="619.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="624.7" y1="624" x2="624.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="629.5" y1="624" x2="629.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="634.3" y1="624" x2="634.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="639.1" y1="624" x2="639.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="643.9" y1="624" x2="643.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="648.7" y1="624" x2="648.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="653.5" y1="624" x2="653.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="658.3" y1="624" x2="658.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="663.1" y1="624" x2="663.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="668.0" y1="624" x2="668.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="672.8" y1="624" x2="672.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="677.6" y1="624" x2="677.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="682.4" y1="624" x2="682.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="687.2" y1="624" x2="687.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="692.0" y1="624" x2="692.0" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="696.8" y1="624" x2="696.8" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="701.6" y1="624" x2="701.6" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="706.4" y1="624" x2="706.4" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="711.2" y1="624" x2="711.2" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="716.1" y1="624" x2="716.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="720.9" y1="624" x2="720.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="725.7" y1="624" x2="725.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="730.5" y1="624" x2="730.5" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="735.3" y1="624" x2="735.3" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="740.1" y1="624" x2="740.1" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="744.9" y1="624" x2="744.9" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="749.7" y1="624" x2="749.7" y2="646" stroke="#5fe0c8" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="110" y1="635" x2="750" y2="635" stroke="#3a4a5e" stroke-width="1"/>
+<text x="110" y="676" class="ok">Same 8 bits, same matrix rate. Only one of them spends the bits where the mass is.</text>
+<text x="826" y="136" class="panel">K channel outliers</text>
+<rect x="812" y="152" width="332" height="540" rx="10" fill="#16202f" stroke="#263548"/>
+<line x1="866" y1="500.0" x2="1122" y2="500.0" stroke="#263548" stroke-width="1"/>
+<text x="858" y="504.0" text-anchor="end" class="axis">0.25x</text>
+<line x1="866" y1="422.5" x2="1122" y2="422.5" stroke="#263548" stroke-width="1"/>
+<text x="858" y="426.5" text-anchor="end" class="axis">1x</text>
+<line x1="866" y1="345.0" x2="1122" y2="345.0" stroke="#263548" stroke-width="1"/>
+<text x="858" y="349.0" text-anchor="end" class="axis">4x</text>
+<line x1="866" y1="267.5" x2="1122" y2="267.5" stroke="#263548" stroke-width="1"/>
+<text x="858" y="271.5" text-anchor="end" class="axis">16x</text>
+<line x1="866" y1="190.0" x2="1122" y2="190.0" stroke="#263548" stroke-width="1"/>
+<text x="858" y="194.0" text-anchor="end" class="axis">64x</text>
+<circle cx="924.4" cy="471.0" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="918.8" cy="455.9" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="934.8" cy="450.1" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="916.3" cy="442.4" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="931.1" cy="436.4" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="925.7" cy="431.6" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="915.9" cy="428.4" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="930.2" cy="425.4" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="915.2" cy="422.5" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="927.9" cy="419.8" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="916.2" cy="417.2" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="916.9" cy="412.3" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="927.6" cy="407.8" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="940.5" cy="401.7" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="918.0" cy="396.2" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="921.1" cy="389.6" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="934.1" cy="381.0" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="944.3" cy="371.3" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="932.5" cy="361.1" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="926.7" cy="350.9" r="4.2" fill="#8fa3b8" fill-opacity="0.9"/>
+<circle cx="945.2" cy="283.6" r="4.2" fill="#ff6b8a" fill-opacity="0.9"/>
+<circle cx="915.5" cy="259.4" r="4.2" fill="#ff6b8a" fill-opacity="0.9"/>
+<circle cx="941.5" cy="240.4" r="4.2" fill="#ff6b8a" fill-opacity="0.9"/>
+<circle cx="923.3" cy="220.6" r="4.2" fill="#ff6b8a" fill-opacity="0.9"/>
+<circle cx="918.6" cy="210.9" r="4.2" fill="#ff6b8a" fill-opacity="0.9"/>
+<circle cx="1047.8" cy="461.2" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1053.9" cy="451.1" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1070.1" cy="444.1" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1049.8" cy="438.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1062.6" cy="433.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1064.4" cy="429.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1055.9" cy="426.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1061.5" cy="424.2" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1046.0" cy="422.5" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1045.9" cy="420.3" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1050.6" cy="417.7" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1065.8" cy="414.2" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1057.7" cy="410.0" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1054.1" cy="405.7" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1062.7" cy="399.8" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1058.5" cy="394.5" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1053.6" cy="388.1" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1069.4" cy="381.0" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1066.4" cy="373.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1051.8" cy="364.9" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1062.4" cy="357.5" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1060.8" cy="352.5" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1072.0" cy="347.9" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1067.3" cy="345.0" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<circle cx="1053.2" cy="343.6" r="4.2" fill="#5fe0c8" fill-opacity="0.9"/>
+<text x="930" y="528" text-anchor="middle" class="lab">raw K</text>
+<text x="930" y="546" text-anchor="middle" class="sub">max 44x median</text>
+<text x="1060" y="528" text-anchor="middle" class="lab" font-size="13">K, channel mean removed</text>
+<text x="1060" y="546" text-anchor="middle" class="sub">max 4.1x median</text>
+<text x="834" y="596" class="note">A per-tensor int8 scale set by a 44x</text>
+<text x="834" y="614" class="note">channel leaves the typical channel</text>
+<text x="834" y="632" class="note">3 of the 127 available levels.</text>
+<text x="834" y="662" class="ok">Softmax ignores a per-row constant,</text>
+<text x="834" y="680" class="ok">so the subtraction is exact and free.</text>
+<text x="56" y="730" class="sub">RDNA4 matrix core rates: 1024 FP16 FLOP and 2048 INT8 ops per clock per compute unit (AMD GPUOpen). P gets its quantization scale for free from the row</text>
+<text x="56" y="750" class="sub">max that flash attention already tracks. What it does not get for free is a grid that can hold the tail of an exponential.</text>
+</svg>

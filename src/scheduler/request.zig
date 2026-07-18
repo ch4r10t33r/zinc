@@ -191,3 +191,87 @@ test "Request generation params defaults" {
     try std.testing.expectEqual(@as(f32, 1.0), params.top_p);
     try std.testing.expect(params.stream);
 }
+
+// ── Full state-machine transition matrix ──────────────────────
+//
+// Only pending -> completed was covered before. The three terminal states
+// (completed, cancelled, failed) reject every transition, including to
+// themselves, and that had zero coverage.
+
+fn expectValidTransition(state: RequestState, target: RequestState) !void {
+    const allocator = std.testing.allocator;
+    var req = Request.init(allocator, 1, &.{}, .{});
+    defer req.deinit();
+    req.state = state;
+    try req.transition(target);
+    try std.testing.expectEqual(target, req.state);
+}
+
+fn expectInvalidTransition(state: RequestState, target: RequestState) !void {
+    const allocator = std.testing.allocator;
+    var req = Request.init(allocator, 1, &.{}, .{});
+    defer req.deinit();
+    req.state = state;
+    try std.testing.expectError(error.InvalidTransition, req.transition(target));
+    try std.testing.expectEqual(state, req.state); // a rejected transition must not mutate state
+}
+
+test "Request transition: from pending, only prefilling and cancelled are valid" {
+    try expectValidTransition(.pending, .prefilling);
+    try expectValidTransition(.pending, .cancelled);
+    try expectInvalidTransition(.pending, .decoding);
+    try expectInvalidTransition(.pending, .completed);
+    try expectInvalidTransition(.pending, .failed);
+    try expectInvalidTransition(.pending, .pending);
+}
+
+test "Request transition: from prefilling, decoding/failed/cancelled are valid" {
+    try expectValidTransition(.prefilling, .decoding);
+    try expectValidTransition(.prefilling, .failed);
+    try expectValidTransition(.prefilling, .cancelled);
+    try expectInvalidTransition(.prefilling, .pending);
+    try expectInvalidTransition(.prefilling, .completed);
+    try expectInvalidTransition(.prefilling, .prefilling);
+}
+
+test "Request transition: from decoding, completed/failed/cancelled are valid" {
+    try expectValidTransition(.decoding, .completed);
+    try expectValidTransition(.decoding, .failed);
+    try expectValidTransition(.decoding, .cancelled);
+    try expectInvalidTransition(.decoding, .pending);
+    try expectInvalidTransition(.decoding, .prefilling);
+    try expectInvalidTransition(.decoding, .decoding);
+}
+
+test "Request transition: completed is terminal, every transition is rejected" {
+    inline for (std.meta.fields(RequestState)) |f| {
+        try expectInvalidTransition(.completed, @field(RequestState, f.name));
+    }
+}
+
+test "Request transition: cancelled is terminal, every transition is rejected" {
+    inline for (std.meta.fields(RequestState)) |f| {
+        try expectInvalidTransition(.cancelled, @field(RequestState, f.name));
+    }
+}
+
+test "Request transition: failed is terminal, every transition is rejected" {
+    inline for (std.meta.fields(RequestState)) |f| {
+        try expectInvalidTransition(.failed, @field(RequestState, f.name));
+    }
+}
+
+test "Request shouldStop is immediately true when max_tokens is 0" {
+    const allocator = std.testing.allocator;
+    var req = Request.init(allocator, 1, &.{}, .{ .max_tokens = 0 });
+    defer req.deinit();
+    // No tokens generated yet, but the budget is already exhausted.
+    try std.testing.expect(req.shouldStop(999));
+}
+
+test "Request shouldStop is false with zero tokens generated and a normal budget" {
+    const allocator = std.testing.allocator;
+    var req = Request.init(allocator, 1, &.{}, .{ .max_tokens = 10 });
+    defer req.deinit();
+    try std.testing.expect(!req.shouldStop(999));
+}

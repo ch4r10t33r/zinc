@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 780" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg12" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#1b1526"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:30px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:15px}
+      .lane{fill:#e6eef7;font-size:16px;font-weight:700}
+      .lanesub{fill:#8f9fb1;font-size:13px}
+      .seg{fill:#e9f2fb;font-size:13px;font-weight:700}
+      .tot{fill:#f6fbff;font-size:17px;font-weight:800}
+      .gain{fill:#7ef0c2;font-size:15px;font-weight:800}
+      .leg{fill:#aebdcc;font-size:14px}
+      .note{fill:#9fb0c0;font-size:14px}
+      .tbl{fill:#c7d4e2;font-size:14px}
+      .tblh{fill:#8f9fb1;font-size:13px;font-weight:700}
+      .hot{fill:#ff8fb0;font-size:14px;font-weight:700}
+    </style>
+  </defs>
+
+  <rect width="1200" height="780" fill="url(#bg12)"/>
+
+  <text class="title" x="48" y="60">Where one K block of a prefill tile spends its issue slots</text>
+  <text class="subtitle" x="48" y="88">RX 9070 XT, one CU, one 16x64 output tile, one 32-element K block of a Q4_K weight row. Matrix and vector instructions issue down the same pipe, so the bar is time.</text>
+
+  <!-- legend -->
+  <rect x="48" y="112" width="16" height="16" rx="3" fill="#5b8cff"/>
+  <text class="leg" x="72" y="125">weight unpack (vector)</text>
+  <rect x="238" y="112" width="16" height="16" rx="3" fill="#ffb648"/>
+  <text class="leg" x="262" y="125">WMMA matmul (matrix)</text>
+  <rect x="440" y="112" width="16" height="16" rx="3" fill="#ff5d8f"/>
+  <text class="leg" x="464" y="125">block descale (vector)</text>
+
+  <!-- lane 1: fp16 -->
+  <text class="lane" x="48" y="180">fp16 WMMA, today</text>
+  <text class="lanesub" x="48" y="200">Q4_K unpacked to fp16 in registers</text>
+  <rect x="330" y="160" width="300" height="46" rx="4" fill="#5b8cff"/>
+  <text class="seg" x="480" y="189" text-anchor="middle">32 cyc</text>
+  <rect x="630" y="160" width="600" height="46" rx="4" fill="#ffb648" opacity="0.95"/>
+  <text class="seg" x="900" y="189" text-anchor="middle" fill="#1b1206">64 cyc  (1024 FLOP/clk)</text>
+  <text class="tot" x="1000" y="234" text-anchor="end">96 cycles</text>
+  <text class="gain" x="1160" y="234" text-anchor="end">1.00x</text>
+
+  <!-- lane 2: int8 naive -->
+  <text class="lane" x="48" y="290">int8 WMMA, fp32 descale</text>
+  <text class="lanesub" x="48" y="310">int32 sum drained to float every 32 weights</text>
+  <rect x="330" y="270" width="150" height="46" rx="4" fill="#5b8cff"/>
+  <text class="seg" x="405" y="299" text-anchor="middle">16</text>
+  <rect x="480" y="270" width="300" height="46" rx="4" fill="#ffb648" opacity="0.95"/>
+  <text class="seg" x="630" y="299" text-anchor="middle" fill="#1b1206">32 cyc  (2048 op/clk)</text>
+  <rect x="780" y="270" width="300" height="46" rx="4" fill="#ff5d8f" opacity="0.95"/>
+  <text class="seg" x="930" y="299" text-anchor="middle" fill="#2a0a16">32 cyc</text>
+  <text class="tot" x="1000" y="344" text-anchor="end">80 cycles</text>
+  <text class="gain" x="1160" y="344" text-anchor="end">1.20x</text>
+  <text class="hot" x="330" y="344">the matmul halved and the descale ate the win</text>
+
+  <!-- lane 3: integer subscale -->
+  <text class="lane" x="48" y="400">int8 WMMA, integer sub-scale</text>
+  <text class="lanesub" x="48" y="420">6-bit Q4_K scales folded into an int32 mad,<tspan x="48" dy="18">one float convert per 256-weight super-block</tspan></text>
+  <rect x="330" y="380" width="150" height="46" rx="4" fill="#5b8cff"/>
+  <text class="seg" x="405" y="409" text-anchor="middle">16</text>
+  <rect x="480" y="380" width="300" height="46" rx="4" fill="#ffb648" opacity="0.95"/>
+  <text class="seg" x="630" y="409" text-anchor="middle" fill="#1b1206">32 cyc</text>
+  <rect x="780" y="380" width="188" height="46" rx="4" fill="#ff5d8f" opacity="0.95"/>
+  <text class="seg" x="874" y="409" text-anchor="middle" fill="#2a0a16">20</text>
+  <text class="tot" x="1000" y="454" text-anchor="end">68 cycles</text>
+  <text class="gain" x="1160" y="454" text-anchor="end">1.41x</text>
+
+  <!-- lane 4: wide K -->
+  <text class="lane" x="48" y="510">+ wide-K WMMA, packed unpack</text>
+  <text class="lanesub" x="48" y="530">two 16x16x16 iu8 ops fused to K=32, 128-bit loads</text>
+  <rect x="330" y="490" width="75" height="46" rx="4" fill="#5b8cff"/>
+  <text class="seg" x="367" y="519" text-anchor="middle">8</text>
+  <rect x="405" y="490" width="300" height="46" rx="4" fill="#ffb648" opacity="0.95"/>
+  <text class="seg" x="555" y="519" text-anchor="middle" fill="#1b1206">32 cyc</text>
+  <rect x="705" y="490" width="188" height="46" rx="4" fill="#ff5d8f" opacity="0.95"/>
+  <text class="seg" x="799" y="519" text-anchor="middle" fill="#2a0a16">20</text>
+  <text class="tot" x="1000" y="564" text-anchor="end">60 cycles</text>
+  <text class="gain" x="1160" y="564" text-anchor="end">1.61x</text>
+
+  <!-- inset table -->
+  <rect x="48" y="600" width="520" height="140" rx="10" fill="#111c2c" stroke="#2a3a50"/>
+  <text class="tblh" x="68" y="626">AMD matrix rate, FLOP or OP per clock per CU</text>
+  <line x1="68" y1="638" x2="548" y2="638" stroke="#2a3a50"/>
+  <text class="tblh" x="68" y="662">precision</text>
+  <text class="tblh" x="300" y="662" text-anchor="end">RX 7900 XTX (RDNA3)</text>
+  <text class="tblh" x="530" y="662" text-anchor="end">RX 9070 XT (RDNA4)</text>
+  <text class="tbl" x="68" y="692">FP16 / BF16</text>
+  <text class="tbl" x="300" y="692" text-anchor="end">512</text>
+  <text class="tbl" x="530" y="692" text-anchor="end">1024</text>
+  <text class="tbl" x="68" y="720">INT8</text>
+  <text class="tbl" x="300" y="720" text-anchor="end">512</text>
+  <text class="tbl" x="530" y="720" text-anchor="end" fill="#7ef0c2" font-weight="800">2048</text>
+
+  <text class="note" x="600" y="632">On RDNA3 an int8 matmul buys nothing: the matrix core</text>
+  <text class="note" x="600" y="654">runs int8 at the same 512 ops per clock as fp16, so the</text>
+  <text class="note" x="600" y="676">descale is pure loss. RDNA4 is the first AMD consumer</text>
+  <text class="note" x="600" y="698">part where the quantized GEMM has a rate to win, and the</text>
+  <text class="note" x="600" y="720">win only survives if the descale stays off the vector pipe.</text>
+</svg>

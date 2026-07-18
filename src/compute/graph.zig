@@ -1158,3 +1158,478 @@ test "Graph: dot and json exports include node labels" {
     try std.testing.expect(std.mem.indexOf(u8, dot_buf.written(), "digraph zinc_decode") != null);
     try std.testing.expect(std.mem.indexOf(u8, dot_buf.written(), "n0 -> n1") != null);
 }
+
+// ── Empty and single-node graphs ─────────────────────────────
+
+test "Graph: empty graph topologicalOrder returns an empty slice" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "empty");
+    defer g.deinit();
+
+    const order = try g.topologicalOrder(allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 0), order.len);
+}
+
+test "Graph: empty graph analyze returns all-zero, non-null arrays" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "empty");
+    defer g.deinit();
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), analysis.node_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.edge_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.root_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.leaf_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.max_depth);
+    try std.testing.expectEqual(@as(u32, 0), analysis.critical_path_node_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.max_parallel_width);
+    try std.testing.expectEqual(@as(usize, 0), analysis.depth_widths.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.op_counts.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.critical_path.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.hotspots.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), analysis.edges.len);
+}
+
+test "Graph: empty graph exports do not crash and contain empty arrays" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "empty");
+    defer g.deinit();
+
+    var json_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer json_buf.deinit();
+    try g.writeJsonReport(&json_buf.writer, allocator);
+    try std.testing.expect(std.mem.indexOf(u8, json_buf.written(), "\"node_count\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_buf.written(), "\"critical_path\": []") != null);
+
+    var dot_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer dot_buf.deinit();
+    try g.writeDot(&dot_buf.writer, allocator);
+    try std.testing.expect(std.mem.indexOf(u8, dot_buf.written(), "digraph zinc_decode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dot_buf.written(), "0 nodes, 0 edges") != null);
+}
+
+test "Graph: single node with no dependencies is both root and leaf" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "single");
+    defer g.deinit();
+
+    _ = try g.addNode(.embed, "only");
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), analysis.node_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.edge_count);
+    try std.testing.expectEqual(@as(u32, 1), analysis.root_count);
+    try std.testing.expectEqual(@as(u32, 1), analysis.leaf_count);
+    try std.testing.expectEqual(@as(u32, 0), analysis.max_depth);
+    try std.testing.expectEqual(@as(u32, 1), analysis.critical_path_node_count);
+    try std.testing.expect(analysis.nodes[0].is_root);
+    try std.testing.expect(analysis.nodes[0].is_leaf);
+    try std.testing.expect(analysis.nodes[0].is_on_critical_path);
+}
+
+// ── Cycle detection ───────────────────────────────────────────
+
+test "Graph: two-node cycle is detected" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "cycle2");
+    defer g.deinit();
+
+    const a = try g.addNode(.embed, "a");
+    const b = try g.addNode(.embed, "b");
+    g.addDependency(a, b);
+    g.addDependency(b, a);
+
+    try std.testing.expectError(error.CyclicDependency, g.topologicalOrder(allocator));
+}
+
+test "Graph: self-dependency is detected as a cycle" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "self_cycle");
+    defer g.deinit();
+
+    const a = try g.addNode(.embed, "a");
+    g.addDependency(a, a);
+
+    try std.testing.expectError(error.CyclicDependency, g.topologicalOrder(allocator));
+}
+
+test "Graph: three-node cycle is detected" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "cycle3");
+    defer g.deinit();
+
+    const a = try g.addNode(.embed, "a");
+    const b = try g.addNode(.embed, "b");
+    const c = try g.addNode(.embed, "c");
+    g.addDependency(a, b);
+    g.addDependency(b, c);
+    g.addDependency(c, a);
+
+    try std.testing.expectError(error.CyclicDependency, g.topologicalOrder(allocator));
+}
+
+test "Graph: a cycle among some nodes still fails even with other acyclic nodes present" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "partial_cycle");
+    defer g.deinit();
+
+    const root = try g.addNode(.embed, "root");
+    const a = try g.addNode(.embed, "a");
+    const b = try g.addNode(.embed, "b");
+    g.addDependency(a, root); // acyclic edge
+    g.addDependency(a, b);
+    g.addDependency(b, a); // a <-> b cycle
+
+    try std.testing.expectError(error.CyclicDependency, g.topologicalOrder(allocator));
+}
+
+test "Graph: analyze also surfaces CyclicDependency instead of silently misanalyzing" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "cycle_analyze");
+    defer g.deinit();
+
+    const a = try g.addNode(.embed, "a");
+    const b = try g.addNode(.embed, "b");
+    g.addDependency(a, b);
+    g.addDependency(b, a);
+
+    try std.testing.expectError(error.CyclicDependency, g.analyze(allocator));
+}
+
+// ── Fixed-size array boundaries ───────────────────────────────
+
+test "Graph: setInputs at exactly the 4-input capacity" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "inputs");
+    defer g.deinit();
+
+    const n = try g.addNode(.flash_attn, "attn");
+    g.setInputs(n, &.{ 10, 11, 12, 13 });
+
+    try std.testing.expectEqual(@as(u8, 4), g.nodes.items[0].n_inputs);
+    try std.testing.expectEqual(@as(?u32, 10), g.nodes.items[0].inputs[0]);
+    try std.testing.expectEqual(@as(?u32, 13), g.nodes.items[0].inputs[3]);
+}
+
+test "Graph: addDependency at exactly the 8-dependency capacity" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "deps");
+    defer g.deinit();
+
+    const target = try g.addNode(.moe_gather, "gather");
+    var deps: [8]u32 = undefined;
+    for (&deps, 0..) |*d, i| {
+        d.* = try g.addNode(.dmmv, "expert");
+        g.addDependency(target, d.*);
+        _ = i;
+    }
+
+    try std.testing.expectEqual(@as(u8, 8), g.nodes.items[target].n_deps);
+    const order = try g.topologicalOrder(allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 9), order.len);
+    try std.testing.expectEqual(target, order[order.len - 1]);
+}
+
+// ── Setters not exercised by any prior test ───────────────────
+
+test "Graph: setLayerIndex, setExecDomain, setHostSync, setNote, setThreadsPerWorkgroup are reflected in analysis" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "setters");
+    defer g.deinit();
+
+    const n = try g.addNode(.kv_cache_write, "kv_write");
+    g.setLayerIndex(n, 7);
+    g.setExecDomain(n, .cpu_host);
+    g.setHostSync(n, true);
+    g.setNote(n, "diagnostic note");
+    g.setThreadsPerWorkgroup(n, 128);
+    g.setOutput(n, 99);
+
+    try std.testing.expectEqual(@as(?u32, 7), g.nodes.items[0].layer_index);
+    try std.testing.expectEqual(ExecDomain.cpu_host, g.nodes.items[0].domain);
+    try std.testing.expect(g.nodes.items[0].requires_host_sync);
+    try std.testing.expectEqualStrings("diagnostic note", g.nodes.items[0].note.?);
+    try std.testing.expectEqual(@as(u32, 128), g.nodes.items[0].threads_per_workgroup);
+    try std.testing.expectEqual(@as(?u32, 99), g.nodes.items[0].output);
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), analysis.nodes[0].layer_index);
+    try std.testing.expectEqual(ExecDomain.cpu_host, analysis.nodes[0].domain);
+    try std.testing.expect(analysis.nodes[0].requires_host_sync);
+    try std.testing.expectEqualStrings("diagnostic note", analysis.nodes[0].note.?);
+    // cpu_host with requires_host_sync forces the host_sync classification
+    // regardless of size/intensity heuristics -- see classifyNode's priority order.
+    try std.testing.expectEqual(BottleneckKind.host_sync, analysis.nodes[0].bottleneck);
+}
+
+test "Graph: setAssumedDecodeSeqLen is propagated into analysis" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "seqlen");
+    defer g.deinit();
+    g.setAssumedDecodeSeqLen(4096);
+    _ = try g.addNode(.embed, "e");
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(u32, 4096), analysis.assumed_decode_seq_len);
+}
+
+// ── Tie-breaking determinism ───────────────────────────────────
+
+test "Graph: op_counts ties preserve OpType declaration order" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "ties");
+    defer g.deinit();
+
+    // matmul is declared before dmmv in OpType; equal counts (1 each) must not
+    // reorder them ahead of declaration order (the sort only swaps on strictly
+    // greater count).
+    _ = try g.addNode(.dmmv, "d");
+    _ = try g.addNode(.matmul, "m");
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(usize, 2), analysis.op_counts.len);
+    try std.testing.expectEqual(OpType.matmul, analysis.op_counts[0].op);
+    try std.testing.expectEqual(OpType.dmmv, analysis.op_counts[1].op);
+}
+
+test "Graph: two branches tied for max depth pick the first one reached in topo order" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "tied_depth");
+    defer g.deinit();
+
+    const root = try g.addNode(.embed, "root");
+    const left = try g.addNode(.dmmv, "left"); // depth 1
+    const right = try g.addNode(.dmmv, "right"); // depth 1, same depth as left
+    g.addDependency(left, root);
+    g.addDependency(right, root);
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(u32, 1), analysis.max_depth);
+    try std.testing.expectEqual(@as(u32, 2), analysis.critical_path_node_count);
+    // Insertion order is the tie-break: "left" was added (and reached in topo
+    // order) before "right", so it is the one recorded on the critical path.
+    try std.testing.expectEqualStrings("left", analysis.critical_path[analysis.critical_path.len - 1].name);
+}
+
+// ── Private cost/classification helpers (direct unit tests) ──
+
+fn testNode(op: OpType, domain: ExecDomain) Node {
+    return .{
+        .id = 0,
+        .op = op,
+        .name = "n",
+        .layer_index = null,
+        .domain = domain,
+        .inputs = .{ null, null, null, null },
+        .output = null,
+        .n_inputs = 0,
+        .workgroup_count = .{ 1, 1, 1 },
+        .push_constants = undefined,
+        .push_constant_size = 0,
+        .threads_per_workgroup = 64,
+        .read_bytes = 0,
+        .write_bytes = 0,
+        .weight_bytes = 0,
+        .flops = 0,
+        .requires_host_sync = false,
+        .note = null,
+        .pipeline_index = null,
+        .depends_on = .{ null, null, null, null, null, null, null, null },
+        .n_deps = 0,
+    };
+}
+
+test "totalWorkgroups multiplies all three dimensions" {
+    try std.testing.expectEqual(@as(u64, 1), totalWorkgroups(.{ 1, 1, 1 }));
+    try std.testing.expectEqual(@as(u64, 24), totalWorkgroups(.{ 2, 3, 4 }));
+    try std.testing.expectEqual(@as(u64, 0), totalWorkgroups(.{ 0, 5, 5 }));
+}
+
+test "totalBytes and arithmeticIntensity handle the zero-bytes case without dividing by zero" {
+    var node = testNode(.dmmv, .gpu_compute);
+    try std.testing.expectEqual(@as(u64, 0), totalBytes(&node));
+    try std.testing.expectEqual(@as(f64, 0.0), arithmeticIntensity(&node));
+
+    node.read_bytes = 100;
+    node.write_bytes = 50;
+    node.weight_bytes = 850;
+    node.flops = 2000;
+    try std.testing.expectEqual(@as(u64, 1000), totalBytes(&node));
+    try std.testing.expectEqual(@as(f64, 2.0), arithmeticIntensity(&node));
+}
+
+test "estimateBandwidthTimeUs returns null when bytes or bandwidth is zero" {
+    try std.testing.expectEqual(@as(?f64, null), estimateBandwidthTimeUs(0, 500));
+    try std.testing.expectEqual(@as(?f64, null), estimateBandwidthTimeUs(1000, 0));
+}
+
+test "estimateBandwidthTimeUs computes bytes / bandwidth in microseconds" {
+    // 1 GB at 1000 GB/s = 1 ms = 1000 us.
+    const result = estimateBandwidthTimeUs(1_000_000_000, 1000).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1000.0), result, 0.001);
+}
+
+test "estimateBandwidthCeilingPct returns null without a usable hardware context" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 100, 1, 1 };
+    try std.testing.expectEqual(@as(?f64, null), estimateBandwidthCeilingPct(&node, .{ .compute_units = 0, .wave_size = 64 }));
+    try std.testing.expectEqual(@as(?f64, null), estimateBandwidthCeilingPct(&node, .{ .compute_units = 64, .wave_size = 0 }));
+
+    node.domain = .cpu_host;
+    try std.testing.expectEqual(@as(?f64, null), estimateBandwidthCeilingPct(&node, .{ .compute_units = 64, .wave_size = 64 }));
+}
+
+test "estimateBandwidthCeilingPct returns 0 for a zero-workgroup dispatch" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 0, 1, 1 };
+    try std.testing.expectEqual(@as(?f64, 0.0), estimateBandwidthCeilingPct(&node, .{ .compute_units = 64, .wave_size = 64 }));
+}
+
+test "estimateBandwidthCeilingPct saturates at 100 for an oversubscribed dispatch" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 100_000, 1, 1 };
+    node.threads_per_workgroup = 64;
+    const pct = estimateBandwidthCeilingPct(&node, .{ .compute_units = 64, .wave_size = 64 }).?;
+    try std.testing.expectEqual(@as(f64, 100.0), pct);
+}
+
+test "classifyNode: host_sync takes priority regardless of size or domain" {
+    const hw = HardwareInfo{ .compute_units = 64, .wave_size = 64 };
+    var node = testNode(.dmmv, .gpu_compute);
+    node.requires_host_sync = true;
+    node.workgroup_count = .{ 1000, 1, 1 }; // would otherwise not be launch_latency
+    try std.testing.expectEqual(BottleneckKind.host_sync, classifyNode(&node, hw).kind);
+
+    var node2 = testNode(.copy, .cpu_host);
+    try std.testing.expectEqual(BottleneckKind.host_sync, classifyNode(&node2, hw).kind);
+}
+
+test "classifyNode: gpu_transfer domain is classified as transfer" {
+    const hw = HardwareInfo{ .compute_units = 64, .wave_size = 64 };
+    var node = testNode(.copy, .gpu_transfer);
+    node.workgroup_count = .{ 1000, 1, 1 };
+    try std.testing.expectEqual(BottleneckKind.transfer, classifyNode(&node, hw).kind);
+}
+
+test "classifyNode: low occupancy is classified as occupancy before launch_latency or intensity checks" {
+    const hw = HardwareInfo{ .compute_units = 64, .wave_size = 64 };
+    var node = testNode(.dmmv, .gpu_compute);
+    // total_waves = 4 workgroups * 1 wave each = 4; target = 64*4 = 256 -> ~1.6% ceiling, well under 35%.
+    node.workgroup_count = .{ 4, 1, 1 };
+    node.threads_per_workgroup = 64;
+    try std.testing.expectEqual(BottleneckKind.occupancy, classifyNode(&node, hw).kind);
+}
+
+test "classifyNode: small dispatch with no hardware context falls to launch_latency" {
+    // No hardware context -> ceiling is null, so the occupancy branch cannot
+    // fire; wg_total <= 8 still routes to launch_latency.
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 8, 1, 1 };
+    try std.testing.expectEqual(BottleneckKind.launch_latency, classifyNode(&node, .{}).kind);
+}
+
+test "classifyNode: launch_latency boundary at exactly 256 KiB and 32 workgroups" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 32, 1, 1 };
+    node.read_bytes = 256 * 1024;
+    node.flops = 1; // keep intensity tiny so this doesn't fall through to memory_bandwidth first regardless
+    try std.testing.expectEqual(BottleneckKind.launch_latency, classifyNode(&node, .{}).kind);
+
+    // One byte over the threshold no longer qualifies as launch_latency.
+    node.read_bytes = 256 * 1024 + 1;
+    try std.testing.expectEqual(BottleneckKind.memory_bandwidth, classifyNode(&node, .{}).kind);
+}
+
+test "classifyNode: memory_bandwidth boundary at intensity strictly less than 2.0" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 100, 1, 1 }; // large enough to skip launch_latency
+    node.read_bytes = 1000;
+    node.flops = 1999; // intensity 1.999 < 2.0
+    try std.testing.expectEqual(BottleneckKind.memory_bandwidth, classifyNode(&node, .{}).kind);
+
+    // Exactly 2.0 must NOT classify as memory_bandwidth (strict less-than).
+    node.flops = 2000;
+    try std.testing.expectEqual(BottleneckKind.unknown, classifyNode(&node, .{}).kind);
+}
+
+test "classifyNode: compute boundary at intensity >= 8.0" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 100, 1, 1 };
+    node.read_bytes = 1000;
+    node.flops = 8000; // intensity exactly 8.0
+    try std.testing.expectEqual(BottleneckKind.compute, classifyNode(&node, .{}).kind);
+
+    node.flops = 7999; // just under 8.0
+    try std.testing.expectEqual(BottleneckKind.unknown, classifyNode(&node, .{}).kind);
+}
+
+test "classifyNode: mixed intensity with no other signal is unknown" {
+    var node = testNode(.dmmv, .gpu_compute);
+    node.workgroup_count = .{ 100, 1, 1 };
+    node.read_bytes = 1000;
+    node.flops = 5000; // intensity 5.0, between the memory and compute thresholds
+    try std.testing.expectEqual(BottleneckKind.unknown, classifyNode(&node, .{}).kind);
+}
+
+// ── Hotspot ranking ────────────────────────────────────────────
+
+test "Graph: without a hardware context, hotspots rank by total_bytes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "no_hw");
+    defer g.deinit();
+
+    const small = try g.addNode(.dmmv, "small");
+    g.setCostEstimate(small, 100, 0, 0, 0);
+    const big = try g.addNode(.dmmv, "big");
+    g.setCostEstimate(big, 10_000, 0, 0, 0);
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqualStrings("big", analysis.hotspots[0].name);
+    try std.testing.expect(analysis.hotspots[0].estimated_bandwidth_time_us == null);
+    try std.testing.expect(analysis.hotspots[0].estimated_share_pct > analysis.hotspots[1].estimated_share_pct);
+}
+
+test "Graph: hotspots are capped at 12 even with more nodes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "many_nodes");
+    defer g.deinit();
+
+    for (0..20) |i| {
+        const n = try g.addNode(.dmmv, "node");
+        // Give each node a distinct byte count so ranking is unambiguous.
+        g.setCostEstimate(n, @intCast(i + 1), 0, 0, 0);
+    }
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(usize, 20), analysis.node_count);
+    try std.testing.expectEqual(@as(usize, 12), analysis.hotspots.len);
+    // Highest byte count (i=19 -> 20 bytes) should rank first.
+    try std.testing.expectEqual(@as(u64, 20), analysis.hotspots[0].total_bytes);
+}
+
+test "Graph: zero-cost graph gives every hotspot a zero share percentage" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator, "zero_cost");
+    defer g.deinit();
+    _ = try g.addNode(.embed, "a");
+    _ = try g.addNode(.embed, "b");
+
+    var analysis = try g.analyze(allocator);
+    defer analysis.deinit();
+    for (analysis.hotspots) |h| {
+        try std.testing.expectEqual(@as(f64, 0.0), h.estimated_share_pct);
+    }
+}
