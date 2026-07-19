@@ -9348,6 +9348,34 @@ pub const InferenceEngine = struct {
             return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
         }
 
+        // Long prompts on the 9B dense-hybrid path: process the prompt in
+        // sequential batched chunks instead of falling back to the per-token
+        // replay. The SSM delta/conv kernels carry state in the persistent
+        // per-layer buffers, and the full-attention prefix recorder threads
+        // engine.position through RoPE, KV writes, and the causal window,
+        // so each continuation chunk resumes exactly where the last ended.
+        if (prompt_tokens.len > queued_prefill_embed_tokens and
+            defaultQwen35Dense9bQueuedPrefillEnabled(self.config) and
+            self.canUseQueuedTokenMajorPrefill(queued_prefill_embed_tokens))
+        {
+            var offset: usize = 0;
+            while (offset < prompt_tokens.len) {
+                const chunk_len = @min(queued_prefill_embed_tokens, prompt_tokens.len - offset);
+                const chunk = prompt_tokens[offset .. offset + chunk_len];
+                if (chunk.len > 1) {
+                    try self.prefillBatchQueuedTokenMajor(state, chunk);
+                } else {
+                    // A trailing single token cannot take the queued path;
+                    // finish it through the position-correct decode step.
+                    try self.loadTokenEmbedding(chunk[0]);
+                    try runDecodeStep(self, true, null, 0, null, null, 0);
+                    state.position = self.position;
+                }
+                offset += chunk_len;
+            }
+            return;
+        }
+
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbedding(token_id);
             try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null, 0);
@@ -21669,7 +21697,12 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
     // anyway; keep them on the validated per-token path.
     if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
     if (prompt_len > queued_prefill_embed_tokens) return false;
-    if (engine.position != 0) return false;
+    // Continuation chunks (nonzero position) are supported only on the 9B
+    // dense-hybrid path, whose SSM kernels carry state in the persistent
+    // per-layer buffers and whose full-attention recorder threads the
+    // chunk-start position through RoPE/KV-write/flash dispatches. The MoE
+    // route-packed prefix has not been audited for nonzero bases.
+    if (engine.position != 0 and !defaultQwen35Dense9bQueuedPrefillEnabled(engine.config)) return false;
     if (!engine.private_decode_buffers and !qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(engine.config)) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
 
@@ -22075,6 +22108,7 @@ fn canUseQwen35Dense9bPrefixFullAttnDensePrefillLayer(
     hidden_dim: u32,
     n_tokens: u32,
 ) bool {
+
     return qwen35Dense9bPrefixFullAttnDensePrefillLayerBlocker(engine, lt, layer_idx, hidden_dim, n_tokens) == .ok;
 }
 
@@ -22237,6 +22271,11 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, layer_idx, hidden_dim, inter_dim, n_tokens)) return false;
 
     const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+    // Chunk-start absolute position. Zero for a fresh prompt; nonzero when a
+    // long prompt is prefilled in sequential chunks (the SSM state buffers
+    // carry across chunks on their own; RoPE angles, KV write offsets, and
+    // the flash-attention causal window must be told the base explicitly).
+    const pos_base: u32 = engine.position;
     const q_t = lt.attn_q orelse return error.MissingTensor;
     const k_t = lt.attn_k orelse return error.MissingTensor;
     const v_t = lt.attn_v orelse return error.MissingTensor;
@@ -22274,15 +22313,15 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
 
     const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
     dispatch_before = cmd.dispatch_count;
-    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, pos_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
     profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
     recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
 
     if (engine.kv_cache_q8) {
         const n_blocks = n_tokens * (attn.kv_dim / 32);
-        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_blocks);
+        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, @intCast(@as(u64, pos_base) * attn.kv_cache_bytes_per_token), n_blocks);
     } else {
-        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_tokens * attn.kv_dim);
+        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, pos_base * attn.kv_dim, n_tokens * attn.kv_dim);
     }
     if (profile) |p| p.full_attn_kv_write_calls += 1;
     profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
@@ -22307,7 +22346,7 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     }
 
     dispatch_before = cmd.dispatch_count;
-    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, pos_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
     profileFullAttnBarrierBuffers(cmd, profile, .flash, &.{
         &engine.qwen_ssm_prefill_proj_qkv_buf,
         &engine.kv_k_cache[layer_idx],
@@ -22328,9 +22367,9 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
             attn.head_dim,
             cfg.n_heads,
             attn.n_kv_heads,
+            pos_base + n_tokens,
             n_tokens,
-            n_tokens,
-            0,
+            pos_base,
             attn.sliding_window_size,
             attn.kv_cache_head_stride_bytes,
             attn.kv_cache_bytes_per_token,
@@ -22347,9 +22386,9 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
             attn.head_dim,
             cfg.n_heads,
             attn.n_kv_heads,
+            pos_base + n_tokens,
             n_tokens,
-            n_tokens,
-            0,
+            pos_base,
             attn.sliding_window_size,
         );
     }
