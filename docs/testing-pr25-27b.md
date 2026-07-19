@@ -3,8 +3,19 @@
 PR #25 chunks long prompts through the layer-major batched prefill on
 Apple Silicon/Metal. The 9B half is verified (see the PR description); the
 27B half is only architecturally reasoned about — it needs to actually run
-on a machine with enough disk and memory for the 27B model (~17 GB) before
+on a machine with enough disk *and unified memory* for the 27B model before
 merging.
+
+**Hardware requirement, found by trying this on a 16 GiB Mac:** disk space
+alone is not enough. The Q4_K_M weights are ~16 GB by themselves, and Metal
+caps usable GPU memory at 85% of `recommendedMaxWorkingSetSize` (see
+`memoryPlanningBudget` in `forward_metal.zig`). On a 16 GiB machine that
+budget comes out to ~10 GB — smaller than the weights alone — so the engine
+fails fast with `ContextLengthDoesNotFit` before any prompt is even
+processed, regardless of `-c`. This isn't a PR #25 bug; the same failure
+happens on an unpatched `main` build. You need a Mac with meaningfully more
+unified memory than the model's own weight size — 32 GB is the practical
+floor, 64 GB+ gives comfortable context headroom.
 
 This is the same verification loop that caught a real bug on the 9B side
 (a KV-cache byte/block offset mismatch that produced fast, wrong output),
@@ -33,6 +44,19 @@ Keep both `zig-out/bin/zinc` binaries around; you'll run both.
 
 ~16.8 GB download, cached under `~/.cache/zig/zinc` /
 `~/Library/Caches/zinc` (both binaries share the same cache, so pull once).
+
+Before running anything, sanity-check the machine can actually load the
+model at all:
+
+```bash
+/tmp/zinc-pr25/zig-out/bin/zinc --model-id qwen36-27b-q4k-m --prompt "Hello" -n 5
+```
+
+If this fails with `ContextLengthDoesNotFit` / `No decode context fits
+within N GiB Metal planning budget`, the machine doesn't have enough
+unified memory for this model — see the hardware requirement note above.
+No further steps here will work until that's resolved; this is unrelated
+to PR #25.
 
 ## 3. Prompt lengths to test
 
