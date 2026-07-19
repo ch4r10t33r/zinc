@@ -1095,6 +1095,26 @@ fn shouldUseQwen35Dense27bQueuedTokenMajorPrefill(cfg: ModelConfig, prompt_len: 
         prompt_len <= qwen35_dense27b_queued_prefill_max_tokens;
 }
 
+/// Largest prompt (in tokens) the queued/batched prefill path can process in
+/// a single call for this model, or null if the model has no such path. Used
+/// both to gate multi-chunk continuation prefill and as the chunk size when
+/// a prompt exceeds it.
+///
+/// The two models have very different validated ceilings and must not share
+/// one: the 9B's is the shared 256-token embed-buffer cap
+/// (queued_prefill_embed_tokens); the 27B's is the much narrower
+/// qwen35_dense27b_queued_prefill_max_tokens (40), a limit
+/// shouldUseQwen35Dense27bQueuedTokenMajorPrefill has always enforced as its
+/// own single-shot ceiling. Reuse each model's existing validated number
+/// rather than inventing a shared one.
+fn queuedTokenMajorChunkTokens(cfg: ModelConfig) ?u32 {
+    if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return @intCast(queued_prefill_embed_tokens);
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and cfg.full_attn_interval == 4) {
+        return @intCast(qwen35_dense27b_queued_prefill_max_tokens);
+    }
+    return null;
+}
+
 fn defaultQwen35Dense9bQueuedPrefillEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen35 and
         cfg.hidden_dim == 4096 and
@@ -9348,32 +9368,38 @@ pub const InferenceEngine = struct {
             return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
         }
 
-        // Long prompts on the 9B dense-hybrid path: process the prompt in
-        // sequential batched chunks instead of falling back to the per-token
-        // replay. The SSM delta/conv kernels carry state in the persistent
-        // per-layer buffers, and the full-attention prefix recorder threads
-        // engine.position through RoPE, KV writes, and the causal window,
-        // so each continuation chunk resumes exactly where the last ended.
-        if (prompt_tokens.len > queued_prefill_embed_tokens and
-            defaultQwen35Dense9bQueuedPrefillEnabled(self.config) and
-            self.canUseQueuedTokenMajorPrefill(queued_prefill_embed_tokens))
-        {
-            var offset: usize = 0;
-            while (offset < prompt_tokens.len) {
-                const chunk_len = @min(queued_prefill_embed_tokens, prompt_tokens.len - offset);
-                const chunk = prompt_tokens[offset .. offset + chunk_len];
-                if (chunk.len > 1) {
-                    try self.prefillBatchQueuedTokenMajor(state, chunk);
-                } else {
-                    // A trailing single token cannot take the queued path;
-                    // finish it through the position-correct decode step.
-                    try self.loadTokenEmbedding(chunk[0]);
-                    try runDecodeStep(self, true, null, 0, null, null, 0);
-                    state.position = self.position;
+        // Long prompts on the 9B/27B dense-hybrid paths: process the prompt
+        // in sequential batched chunks instead of falling back to the
+        // per-token replay. The SSM delta/conv kernels carry state in the
+        // persistent per-layer buffers, and the full-attention prefix
+        // recorder threads engine.position through RoPE, KV writes, and the
+        // causal window, so each continuation chunk resumes exactly where
+        // the last ended. Chunk size is each model's own validated
+        // single-shot ceiling (see queuedTokenMajorChunkTokens) -- 256 for
+        // the 9B, a much narrower 40 for the 27B.
+        if (queuedTokenMajorChunkTokens(self.config)) |max_chunk_tokens| {
+            if (prompt_tokens.len > max_chunk_tokens) {
+                var offset: usize = 0;
+                while (offset < prompt_tokens.len) {
+                    const chunk_len = @min(max_chunk_tokens, prompt_tokens.len - offset);
+                    const chunk = prompt_tokens[offset .. offset + chunk_len];
+                    if (self.canUseQueuedTokenMajorPrefill(chunk.len)) {
+                        try self.prefillBatchQueuedTokenMajor(state, chunk);
+                    } else {
+                        // A trailing remainder below this model's own
+                        // minimum queued-path size (or a single token)
+                        // cannot take the queued path; finish it through
+                        // the position-correct per-token decode step.
+                        for (chunk, 0..) |token_id, i| {
+                            try self.loadTokenEmbedding(token_id);
+                            try runDecodeStep(self, i + 1 == chunk.len, null, 0, null, null, 0);
+                        }
+                        state.position = self.position;
+                    }
+                    offset += chunk_len;
                 }
-                offset += chunk_len;
+                return;
             }
-            return;
         }
 
         for (prompt_tokens, 0..) |token_id, i| {
@@ -21697,12 +21723,13 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
     // anyway; keep them on the validated per-token path.
     if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
     if (prompt_len > queued_prefill_embed_tokens) return false;
-    // Continuation chunks (nonzero position) are supported only on the 9B
-    // dense-hybrid path, whose SSM kernels carry state in the persistent
-    // per-layer buffers and whose full-attention recorder threads the
-    // chunk-start position through RoPE/KV-write/flash dispatches. The MoE
-    // route-packed prefix has not been audited for nonzero bases.
-    if (engine.position != 0 and !defaultQwen35Dense9bQueuedPrefillEnabled(engine.config)) return false;
+    // Continuation chunks (nonzero position) are supported on the 9B and 27B
+    // dense-hybrid paths, which share the SSM kernels that carry state in
+    // the persistent per-layer buffers and the full-attention recorder that
+    // threads the chunk-start position through RoPE/KV-write/flash
+    // dispatches. The MoE route-packed prefix has not been audited for
+    // nonzero bases.
+    if (engine.position != 0 and queuedTokenMajorChunkTokens(engine.config) == null) return false;
     if (!engine.private_decode_buffers and !qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(engine.config)) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
 
