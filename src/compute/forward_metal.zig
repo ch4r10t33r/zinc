@@ -38332,6 +38332,122 @@ test "BatchedPrefillScratch sizes the packed Q+gate landing buffer at 2x q_dim" 
     try std.testing.expectEqual(@as(usize, n_tokens * q_dim * @sizeOf(f32)), scratch.q.size);
 }
 
+test "packed Q+gate GEMM into q_gate_packed then deinterleave recovers per-head Q and gate" {
+    // Exercises the exact new dispatch pair `recordQwenRoutePackedPrefixAttentionLayerOnCmd`
+    // runs for `gate_mode.packed_q_gate`: a single wide GEMM (M = 2*q_dim) landing in a
+    // `q_gate_packed`-shaped buffer, then `dispatchDeinterleaveBatchedOnCmd` splitting it into
+    // separate q_dim-wide Q/gate buffers. Real GPU dispatch, real Q8_0 weight bytes, CPU
+    // reference for the GEMM half and the known per-head-interleaved layout for the split half.
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var gemm_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
+    defer metal_pipeline.freePipeline(&gemm_pipe);
+    var deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave_batched");
+    defer metal_pipeline.freePipeline(&deinterleave_pipe);
+
+    const head_dim: u32 = 4;
+    const n_heads: u32 = 2;
+    const q_dim: u32 = head_dim * n_heads; // 8
+    const m_packed: u32 = q_dim * 2; // 16 -- packed GEMM output width
+    const k: u32 = 32; // one Q8_0 block per row
+    const n_tokens: u32 = 3;
+    const blocks_per_row: usize = k / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, m_packed * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * k * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var packed_buf = try metal_buffer.createBuffer(ctx, n_tokens * m_packed * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&packed_buf);
+    var q_buf = try metal_buffer.createBuffer(ctx, n_tokens * q_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&q_buf);
+    var gate_buf = try metal_buffer.createBuffer(ctx, n_tokens * q_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    for (0..m_packed) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 3)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_tokens * k) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = GemmPush{
+        .ne00 = @intCast(k),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = k * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(m_packed),
+        .ne1 = @intCast(n_tokens),
+        .src0_off = 0,
+    };
+    const gemm_bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &packed_buf };
+    const deinterleave_push = DeinterleaveBatchedPush{ .head_dim = head_dim, .n_heads = n_heads, .n_tokens = n_tokens };
+    const deinterleave_bufs = [_]*const MetalBuffer{ &packed_buf, &q_buf, &gate_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2WithTgMem(&gemm_pipe, .{ @intCast((n_tokens + 31) / 32), @intCast((m_packed + 63) / 64), 1 }, .{ 128, 1, 1 }, &gemm_bufs, &push, @sizeOf(GemmPush), 0, 8192);
+    cmd.barrier();
+    const deinterleave_total = head_dim * n_heads * n_tokens;
+    cmd.dispatchV2(&deinterleave_pipe, .{ (deinterleave_total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &deinterleave_bufs, &deinterleave_push, @sizeOf(DeinterleaveBatchedPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, k);
+    defer allocator.free(ref_row);
+    const expected = try allocator.alloc(f32, n_tokens * m_packed);
+    defer allocator.free(expected);
+    for (0..n_tokens) |token| {
+        const token_input = input_ptr[token * k .. (token + 1) * k];
+        for (0..m_packed) |row| {
+            dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(k), .q8_0, ref_row);
+            var acc: f32 = 0;
+            for (0..k) |i| acc += ref_row[i] * token_input[i];
+            expected[token * m_packed + row] = acc;
+        }
+    }
+
+    const q_ptr: [*]const f32 = @ptrCast(@alignCast(q_buf.cpu_ptr.?));
+    const gate_ptr: [*]const f32 = @ptrCast(@alignCast(gate_buf.cpu_ptr.?));
+    for (0..n_tokens) |token| {
+        for (0..n_heads) |head| {
+            for (0..head_dim) |e| {
+                // Per-head packed layout: [Q(head_dim) | gate(head_dim)] per head,
+                // heads concatenated -- matches the single-token `deinterleave` shader
+                // contract this batched path shares.
+                const packed_q_row = head * 2 * head_dim + e;
+                const packed_gate_row = head * 2 * head_dim + head_dim + e;
+                const q_idx = token * q_dim + head * head_dim + e;
+                const gate_idx = token * q_dim + head * head_dim + e;
+                try std.testing.expectApproxEqAbs(expected[token * m_packed + packed_q_row], q_ptr[q_idx], 0.1);
+                try std.testing.expectApproxEqAbs(expected[token * m_packed + packed_gate_row], gate_ptr[gate_idx], 0.1);
+            }
+        }
+    }
+}
+
 test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(0, 256));
     try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
