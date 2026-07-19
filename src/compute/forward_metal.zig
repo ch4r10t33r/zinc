@@ -536,6 +536,17 @@ fn isQwen35Dense9bDownQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u3
         std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
 }
 
+fn isQwen35Dense9bDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    // Same shape contract as the Q4_K predicate. The block constant counts
+    // K-dimension superblocks in *elements* (QK_K = 256 for every K-quant;
+    // see GGMLType.blockSize), which Q4_K and Q6_K share — only their bytes
+    // per superblock differ (144 vs 210), and byte layout is owned by the
+    // kernel picked per quant type in dispatchQwenSharedBatchedGemmOnCmd,
+    // never by this predicate. The 27B constants make the same point:
+    // qwen35_27b_dense_down_q4k_blocks == qwen35_27b_dense_down_q6k_blocks.
+    return isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K);
+}
+
 fn isQwen35DensePrefillGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
         return isQwen35Dense9bGateUpQ4kTarget(cfg, tensor_name, M, K);
@@ -545,7 +556,14 @@ fn isQwen35DensePrefillGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8
 
 fn isQwen35DensePrefillDownTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32, quant_type: GGMLType) bool {
     if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
-        return quant_type == .q4_k and isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K);
+        // Q4_K_M exports of the 9B (including the catalog model) quantize
+        // ffn_down as Q6_K; the batched gemm_q6k path handles it, so gating
+        // on Q4_K alone disabled the whole layer-major prefill for them.
+        return switch (quant_type) {
+            .q4_k => isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K),
+            .q6_k => isQwen35Dense9bDownQ6kTarget(cfg, tensor_name, M, K),
+            else => false,
+        };
     }
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         return switch (quant_type) {
