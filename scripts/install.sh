@@ -29,6 +29,12 @@ arch="$(uname -m)"
 case "${os}-${arch}" in
   Linux-x86_64) target="linux-x86_64" ;;
   Darwin-arm64) target="macos-aarch64" ;;
+  Darwin-x86_64)
+    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+      fail "this shell is running under Rosetta translation on Apple Silicon. Run it natively instead, e.g.: arch -arm64 zsh -c \"\$(curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh)\""
+    fi
+    fail "no prebuilt binary for ${os}/${arch}. Build from source instead: https://github.com/${REPO}#start-here"
+    ;;
   *)
     fail "no prebuilt binary for ${os}/${arch}. Build from source instead: https://github.com/${REPO}#start-here"
     ;;
@@ -80,7 +86,7 @@ fi
 log "checksum verified"
 
 # ── Install ───────────────────────────────────────────────────
-tar -xzf "${tmp}/${asset}" -C "$tmp"
+tar -xzf "${tmp}/${asset}" -C "$tmp" --no-same-owner
 tree_name="zinc-${tag}-${target}"
 [ -d "${tmp}/${tree_name}" ] || fail "unexpected archive layout: missing ${tree_name}/"
 [ -x "${tmp}/${tree_name}/bin/zinc" ] || fail "unexpected archive layout: missing bin/zinc"

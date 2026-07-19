@@ -88,7 +88,8 @@ The installer downloads the latest release for your platform, verifies its
 SHA-256 checksum, installs under `~/.local/share/zinc`, and links the binary
 into `~/.local/bin/zinc`. Pin a version with `ZINC_VERSION=vX.Y.Z`. Prefer
 manual? Grab a tarball and `SHA256SUMS.txt` from the
-[releases page](https://github.com/zolotukhin/zinc/releases).
+[releases page](https://github.com/zolotukhin/zinc/releases), or read
+[`scripts/install.sh`](scripts/install.sh) before piping it into `bash`.
 
 ### Or build from source
 
