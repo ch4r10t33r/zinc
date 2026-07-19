@@ -9383,8 +9383,11 @@ pub const InferenceEngine = struct {
                 while (offset < prompt_tokens.len) {
                     const chunk_len = @min(max_chunk_tokens, prompt_tokens.len - offset);
                     const chunk = prompt_tokens[offset .. offset + chunk_len];
+                    // Only the last chunk needs LM-head logits; earlier chunks
+                    // exist purely to populate the KV cache and SSM state.
+                    const is_final_chunk = offset + chunk_len == prompt_tokens.len;
                     if (self.canUseQueuedTokenMajorPrefill(chunk.len)) {
-                        try self.prefillBatchQueuedTokenMajor(state, chunk);
+                        try self.prefillBatchQueuedTokenMajorEmit(state, chunk, is_final_chunk);
                     } else {
                         // A trailing remainder below this model's own
                         // minimum queued-path size (or a single token)
@@ -9392,7 +9395,7 @@ pub const InferenceEngine = struct {
                         // the position-correct per-token decode step.
                         for (chunk, 0..) |token_id, i| {
                             try self.loadTokenEmbedding(token_id);
-                            try runDecodeStep(self, i + 1 == chunk.len, null, 0, null, null, 0);
+                            try runDecodeStep(self, is_final_chunk and i + 1 == chunk.len, null, 0, null, null, 0);
                         }
                         state.position = self.position;
                     }
@@ -9434,12 +9437,31 @@ pub const InferenceEngine = struct {
     }
 
     fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        return self.prefillBatchQueuedTokenMajorEmit(state, prompt_tokens, true);
+    }
+
+    /// `emit_final_logits` is false for every chunk but the last when a long
+    /// prompt is prefilled in sequential chunks: an intermediate chunk's last
+    /// token still needs its full forward pass (KV write + SSM state carry),
+    /// but its LM-head projection would be thrown away, so it is skipped.
+    /// This removes work that is definitionally discarded (one vocab-sized
+    /// matmul per intermediate chunk); the wall-clock effect is small — a
+    /// single LM head is a fraction of a chunk's per-layer weight reads — and
+    /// measured within run-to-run noise on a bandwidth-rich M-series, but it
+    /// is the correct thing to skip and matters more on memory-constrained
+    /// machines.
+    fn prefillBatchQueuedTokenMajorEmit(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, emit_final_logits: bool) !void {
         // Mirror the reference implementation's Metal graph submission style: encode/commit the
         // token-major prompt graph ahead of the CPU and synchronize only at the
         // final prompt token. SSM recurrence and MoE routing stay on the existing
         // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
         // projections over the queued prompt embeddings.
         if (self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            // Single-command prefill is gated off for every chunked config
+            // (see canUseSingleCommandQueuedTokenMajorPrefill), so a
+            // continuation chunk never reaches it; it only ever runs a whole
+            // prompt in one shot, which always emits final logits.
+            std.debug.assert(emit_final_logits);
             return self.prefillBatchQueuedTokenMajorSingleCommand(state, prompt_tokens);
         }
 
@@ -9520,7 +9542,7 @@ pub const InferenceEngine = struct {
                         @max(@as(usize, 1), @as(usize, @intCast(self.qwen35_dense_prefill_active_layers)))
                     else
                         0;
-                    try runDecodeStep(self, i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, start_layer);
+                    try runDecodeStep(self, emit_final_logits and i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, start_layer);
                 }
                 recordQueuedPrefillChunkWork(profile, &chunk_cmd, profileElapsedNs(record_start), is_final_chunk);
                 if (is_final_chunk) {
@@ -9565,7 +9587,7 @@ pub const InferenceEngine = struct {
             @intCast(final_wait_start - first_async_submit_ns)
         else
             0;
-        try runDecodeStep(self, true, final_src, final_offset, null, null, final_start_layer);
+        try runDecodeStep(self, emit_final_logits, final_src, final_offset, null, null, final_start_layer);
         recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
         pending_completed_by_final_wait = true;
         state.position = self.position;
@@ -22135,7 +22157,6 @@ fn canUseQwen35Dense9bPrefixFullAttnDensePrefillLayer(
     hidden_dim: u32,
     n_tokens: u32,
 ) bool {
-
     return qwen35Dense9bPrefixFullAttnDensePrefillLayerBlocker(engine, lt, layer_idx, hidden_dim, n_tokens) == .ok;
 }
 
@@ -35504,6 +35525,19 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 36));
     try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 40));
     try std.testing.expect(!shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 41));
+
+    // PR #25 long-prompt chunking: each model's chunk size is its own
+    // validated single-shot ceiling, never a shared constant (a 40-wide
+    // 27B chunk fed to the 9B's 256-token buffers, or vice versa, would be
+    // a real bug). Models without a fast prefill path are not chunked.
+    try std.testing.expectEqual(@as(?u32, @intCast(queued_prefill_embed_tokens)), queuedTokenMajorChunkTokens(qwen35_9b_cfg));
+    try std.testing.expectEqual(@as(?u32, @intCast(qwen35_dense27b_queued_prefill_max_tokens)), queuedTokenMajorChunkTokens(qwen35_27b_cfg));
+    try std.testing.expect(queuedTokenMajorChunkTokens(qwen35_9b_cfg).? != queuedTokenMajorChunkTokens(qwen35_27b_cfg).?);
+    {
+        var no_fast_path = qwen35_27b_cfg;
+        no_fast_path.full_attn_interval = 2; // 27B chunking requires interval == 4
+        try std.testing.expectEqual(@as(?u32, null), queuedTokenMajorChunkTokens(no_fast_path));
+    }
     try std.testing.expect(isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 8192));
     try std.testing.expect(!isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 10240));
     try std.testing.expect(!isQwenSsmConvD4_8192Shape(qwen35_27b_cfg, 8192));
