@@ -6384,6 +6384,7 @@ const BatchedPrefillScratch = struct {
     v: MetalBuffer,
     attn_out: MetalBuffer,
     gate: MetalBuffer,
+    q_gate_packed: MetalBuffer,
     up: MetalBuffer,
     swiglu: MetalBuffer,
     down: MetalBuffer,
@@ -6445,6 +6446,17 @@ const BatchedPrefillScratch = struct {
         const ao = try metal_buffer.createBuffer(ctx, n * q_dim * f32_sz);
         errdefer {
             var mut = ao;
+            metal_buffer.freeBuffer(&mut);
+        }
+        // Landing buffer for a full-attention layer whose Q projection packs
+        // the attention gate into the same tensor (Q+gate interleaved,
+        // 2x q_dim rows) rather than a separate attn_gate tensor. Sized off
+        // the same q_dim as `q`/`attn_out` so it always fits whichever
+        // layer's attn.q_dim this scratch was sized for -- see
+        // `classifyFullAttnGate` and `resolveLayerAttentionParams`.
+        const qgp = try metal_buffer.createBuffer(ctx, n * q_dim * 2 * f32_sz);
+        errdefer {
+            var mut = qgp;
             metal_buffer.freeBuffer(&mut);
         }
         const gb = try metal_buffer.createBuffer(ctx, n * ffn_scratch_n * f32_sz);
@@ -6526,6 +6538,7 @@ const BatchedPrefillScratch = struct {
             .v = vb,
             .attn_out = ao,
             .gate = gb,
+            .q_gate_packed = qgp,
             .up = ub,
             .swiglu = sw,
             .down = db,
@@ -6551,6 +6564,7 @@ const BatchedPrefillScratch = struct {
         metal_buffer.freeBuffer(&self.v);
         metal_buffer.freeBuffer(&self.attn_out);
         metal_buffer.freeBuffer(&self.gate);
+        metal_buffer.freeBuffer(&self.q_gate_packed);
         metal_buffer.freeBuffer(&self.up);
         metal_buffer.freeBuffer(&self.swiglu);
         metal_buffer.freeBuffer(&self.down);
@@ -18656,7 +18670,7 @@ fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, lay
     const o_t = lt.attn_output orelse return false;
     const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
     const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
-    if (gate_mode.packed_q_gate) return false;
+    if (gate_mode.packed_q_gate and engine.deinterleave_batched_pipe.handle == null) return false;
 
     if (!canUseQwenSharedBatchedGemm(engine, q_t.info.type_) or
         !canUseQwenSharedBatchedGemm(engine, k_t.info.type_) or
@@ -18899,7 +18913,11 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
     dispatchRmsNormOnCmd(engine, cmd, &scratch.hidden, &scratch.norm, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
     profileBarrier(cmd, profile, .full_attn);
 
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
+    if (gate_mode.packed_q_gate) {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, q_t, &scratch.norm, &scratch.q_gate_packed, attn.q_dim * 2, hidden_dim, n_tokens);
+    } else {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
+    }
     try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
     try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
     if (gate_mode.separate_attn_gate) {
@@ -18907,6 +18925,15 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
         try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, attn.q_dim, hidden_dim, n_tokens);
     }
     profileBarrier(cmd, profile, .full_attn);
+
+    if (gate_mode.packed_q_gate) {
+        // Q and the attention gate were projected together above (2x q_dim
+        // rows); split them apart into the same `scratch.q`/`scratch.gate`
+        // buffers the non-packed path writes directly, so every dispatch
+        // below this point is identical regardless of gate layout.
+        dispatchDeinterleaveBatchedOnCmd(engine, cmd, &scratch.q_gate_packed, &scratch.q, &scratch.gate, attn.head_dim, cfg.n_heads, n_tokens);
+        profileBarrier(cmd, profile, .full_attn);
+    }
 
     // Keep the reference implementation's layer-major graph shape through Q/K-norm attention
     // layers instead of falling back to token-major decode. The layout matches
@@ -38260,6 +38287,49 @@ test "BatchedPrefillScratch sizes active-block shared output scratch by token" {
     try std.testing.expectEqual(route_slots, scratch.moe_route_slots);
     try std.testing.expectEqual(@as(usize, n_tokens * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "BatchedPrefillScratch sizes the packed Q+gate landing buffer at 2x q_dim" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.config = .{
+        .architecture = .qwen2_moe,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 32,
+        .ssm_d_state = 8,
+        .ssm_dt_rank = 4,
+        .ssm_n_group = 1,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 48,
+    };
+
+    const n_tokens: u32 = 40;
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+    var scratch = try BatchedPrefillScratch.init(&engine, n_tokens, q_dim, kv_dim, inter_dim);
+    defer scratch.deinit();
+
+    // Must fit a single Q+gate GEMM dispatch (2x q_dim output rows) before
+    // `dispatchDeinterleaveBatchedOnCmd` splits it into `scratch.q` /
+    // `scratch.gate`, each of which stays at plain q_dim width.
+    try std.testing.expectEqual(@as(usize, n_tokens * q_dim * 2 * @sizeOf(f32)), scratch.q_gate_packed.size);
+    try std.testing.expectEqual(@as(usize, n_tokens * q_dim * @sizeOf(f32)), scratch.q.size);
 }
 
 test "maxPackedMoeRouteBlocks bounds active route block grid" {
