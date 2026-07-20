@@ -23,6 +23,10 @@ fail() {
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 
+has_file_matching() {
+  find "$1" -maxdepth 1 -type f -name "$2" -print -quit | grep -q .
+}
+
 # ── Platform detection ────────────────────────────────────────
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -75,7 +79,8 @@ curl -fsSL -o "${tmp}/${asset}" "$asset_url" ||
 curl -fsSL -o "${tmp}/SHA256SUMS.txt" "$sums_url" ||
   fail "checksum download failed: ${sums_url}"
 
-expected="$(grep " ${asset}\$" "${tmp}/SHA256SUMS.txt" | awk '{print $1}')"
+expected="$(awk -v asset="$asset" '$2 == asset { print $1; found = 1; exit } END { exit found ? 0 : 1 }' "${tmp}/SHA256SUMS.txt")" ||
+  fail "no checksum entry for ${asset} in SHA256SUMS.txt"
 [ -n "$expected" ] || fail "no checksum entry for ${asset} in SHA256SUMS.txt"
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
@@ -90,6 +95,18 @@ tar -xzf "${tmp}/${asset}" -C "$tmp" --no-same-owner
 tree_name="zinc-${tag}-${target}"
 [ -d "${tmp}/${tree_name}" ] || fail "unexpected archive layout: missing ${tree_name}/"
 [ -x "${tmp}/${tree_name}/bin/zinc" ] || fail "unexpected archive layout: missing bin/zinc"
+case "$target" in
+  linux-x86_64)
+    shader_dir="${tmp}/${tree_name}/share/zinc/shaders"
+    [ -d "$shader_dir" ] || fail "unexpected archive layout: missing share/zinc/shaders/"
+    has_file_matching "$shader_dir" "*.spv" || fail "unexpected archive layout: no SPIR-V shaders in share/zinc/shaders/"
+    ;;
+  macos-aarch64)
+    shader_dir="${tmp}/${tree_name}/share/zinc/shaders/metal"
+    [ -d "$shader_dir" ] || fail "unexpected archive layout: missing share/zinc/shaders/metal/"
+    has_file_matching "$shader_dir" "*.metal" || fail "unexpected archive layout: no Metal shaders in share/zinc/shaders/metal/"
+    ;;
+esac
 
 mkdir -p "$install_root" "$bin_dir"
 rm -rf "${install_root:?}/${tree_name}"

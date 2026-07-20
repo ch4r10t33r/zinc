@@ -47,8 +47,22 @@ From 1.0 on, breaking changes require a MAJOR bump.
 5. **Verify the draft**: download both tarballs, check
    `sha256sum -c SHA256SUMS.txt`, run `bin/zinc --version` (must print
    `X.Y.Z`) and `bin/zinc --check` on at least one machine per platform.
-6. **Publish the release** in the GitHub UI.
-7. **Verify the installer** end to end on a clean machine:
+6. **Smoke-test the installer before publishing** on at least one machine per
+   platform. Put the downloaded draft assets under a local tag directory so the
+   installer exercises the same `<base>/<tag>/<asset>` URL contract it uses for
+   GitHub Releases:
+
+   ```bash
+   mkdir -p /tmp/zinc-release-smoke/vX.Y.Z
+   cp zinc-vX.Y.Z-*.tar.gz SHA256SUMS.txt /tmp/zinc-release-smoke/vX.Y.Z/
+   ZINC_VERSION=vX.Y.Z \
+     ZINC_BASE_URL=file:///tmp/zinc-release-smoke \
+     bash scripts/install.sh
+   ~/.local/bin/zinc --version
+   ```
+
+7. **Publish the release** in the GitHub UI.
+8. **Verify the public installer** end to end on a clean machine:
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/zolotukhin/zinc/main/scripts/install.sh | bash
